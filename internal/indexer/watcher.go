@@ -150,6 +150,11 @@ func (w *Watcher) loop() {
 func (w *Watcher) handleEvent(event fsnotify.Event) {
 	path := event.Name
 
+	// Skip events from always-excluded directories.
+	if inExcludedDir(path) {
+		return
+	}
+
 	// If a new directory is created, watch it recursively.
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
@@ -270,12 +275,29 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 	)
 }
 
+// alwaysExcludeDirs are directories that should never be watched,
+// regardless of configuration.
+var alwaysExcludeDirs = map[string]bool{
+	".git":         true,
+	"node_modules": true,
+	"vendor":       true,
+	".hg":          true,
+	".svn":         true,
+	"__pycache__":  true,
+	".mypy_cache":  true,
+	".tox":         true,
+	".venv":        true,
+}
+
 func (w *Watcher) addRecursive(root string) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
+			if alwaysExcludeDirs[d.Name()] {
+				return filepath.SkipDir
+			}
 			if w.isExcluded(path) {
 				return filepath.SkipDir
 			}
@@ -283,6 +305,23 @@ func (w *Watcher) addRecursive(root string) error {
 		}
 		return nil
 	})
+}
+
+// inExcludedDir checks if the path contains an always-excluded directory component.
+func inExcludedDir(path string) bool {
+	dir := path
+	for {
+		base := filepath.Base(dir)
+		if alwaysExcludeDirs[base] {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return false
 }
 
 func (w *Watcher) isExcluded(path string) bool {
