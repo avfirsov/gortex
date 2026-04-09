@@ -11,8 +11,11 @@ Built for AI coding agents (Claude Code, Cursor, Codex) — one `smart_context` 
 
 - **Knowledge graph** — every file, symbol, import, call chain, and type relationship in one queryable structure
 - **Multi-repo workspaces** — index multiple repositories into a single graph with cross-repo symbol resolution, project grouping, reference tags, and per-repo scoping
-- **25 languages** — Go, TypeScript, JavaScript, Python, Rust, Java, C#, Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Bash, SQL, Protobuf, Markdown, HTML, CSS, YAML, TOML, HCL, Dockerfile
+- **26 languages** — Go, TypeScript, JavaScript, Python, Rust, Java, C#, Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, Bash, SQL, Protobuf, Markdown, HTML, CSS, YAML, TOML, HCL, Dockerfile
 - **44 MCP tools** — symbol lookup, call chains, blast radius, community detection, process discovery, contract verification, cycle detection, dead code analysis, scaffolding, multi-repo management, and 6 agent-optimized tools
+- **Type-aware resolution** — infers receiver types from variable declarations, composite literals, and Go constructor conventions to disambiguate same-named methods across types
+- **On-disk persistence** — snapshots the graph on shutdown, restores on startup with incremental re-indexing of only changed files (~200ms vs 3-5s full re-index)
+- **Bridge Mode** — HTTP/JSON API exposing all MCP tools for IDE plugins, CI tools, and web UIs with CORS support and tool discovery endpoint
 - **6 MCP resources** — lightweight graph context without tool calls
 - **Two-tier config** — global config (`~/.config/gortex/config.yaml`) for projects and repo lists, per-repo `.gortex.yaml` for guards, excludes, and local overrides
 - **Guard rules** — project-specific constraints (co-change, boundary) enforced via `check_guards`
@@ -21,6 +24,7 @@ Built for AI coding agents (Claude Code, Cursor, Codex) — one `smart_context` 
 - **IMPLEMENTS inference** — structural interface satisfaction for Go, TypeScript, Java, Rust, C#, Scala, Swift, Protobuf
 - **PreToolUse hooks** — automatic graph context injection on Read and Grep
 - **Benchmarked** — per-language parsing, query engine, indexer benchmarks
+- **Eval framework** — SWE-bench harness for A/B benchmarking tool effectiveness with Docker-based environments and multi-model support
 - **Zero dependencies** — everything runs in-process, in memory, no external services
 
 ## Quick Start
@@ -38,8 +42,11 @@ gortex init --analyze /path/to/repo
 # Index a repo and print stats
 gortex status --index /path/to/repo
 
-# Start MCP server with watch mode
+# Start MCP server with watch mode and graph caching
 gortex serve --index /path/to/repo --watch
+
+# Start HTTP bridge API for external integrations
+gortex bridge --index /path/to/repo --web --cors-origin '*'
 
 # Multi-repo: track additional repos and set active project
 gortex serve --index /path/to/repo --track /path/to/other-repo --project my-project
@@ -125,7 +132,7 @@ All query tools (`search_symbols`, `get_symbol`, `find_usages`, `get_file_summar
 
 `gortex init` also sets up Kiro IDE integration automatically:
 
-- **MCP server:** `.kiro/settings/mcp.json` — all 40 tools auto-approved for zero-friction use
+- **MCP server:** `.kiro/settings/mcp.json` — all 44 tools auto-approved for zero-friction use
 - **Steering files:** `.kiro/steering/gortex-workflow.md` (always active) teaches Kiro to prefer graph queries over file reads. Additional manual steering files for explore, debug, impact, and refactor workflows are available via `#` in chat.
 - **Agent hooks:**
   - `gortex-smart-context` — on each prompt, assembles task-relevant context from the graph in one call
@@ -136,7 +143,9 @@ All query tools (`search_symbols`, `get_symbol`, `find_usages`, `get_file_summar
 
 ```
 gortex init [path]           Set up Gortex for a project + install global skills
-gortex serve [flags]         Start the MCP server
+gortex serve [flags]         Start the MCP server (--bridge to add HTTP API)
+gortex bridge [flags]        Start standalone HTTP bridge API
+gortex eval-server [flags]   Start eval HTTP server for benchmarking
 gortex index [path...]       Index one or more repositories and print stats
 gortex status [flags]        Show index status (per-repo and per-project in multi-repo mode)
 gortex track <path>          Add a repository to the tracked workspace
@@ -266,24 +275,67 @@ When running `gortex serve`, a web visualization is available at `http://localho
 - Filter by node kind, hide test files, search by name
 - Click nodes to highlight neighborhood
 
+## Bridge Mode
+
+The `gortex bridge` command exposes all MCP tools as an HTTP/JSON API for external integrations:
+
+```bash
+# Standalone bridge with web UI
+gortex bridge --index /path/to/repo --web --port 4747
+
+# Bridge alongside MCP stdio
+gortex serve --index /path/to/repo --bridge --port 8765
+```
+
+**Endpoints:**
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Status, node/edge counts, uptime |
+| `/tools` | GET | List all available tools with descriptions |
+| `/tool/{name}` | POST | Invoke any MCP tool with JSON arguments |
+| `/stats` | GET | Graph statistics by kind and language |
+
+CORS is enabled by default (`--cors-origin '*'`). The bridge can serve the web UI on the same port with `--web`.
+
+## Graph Persistence
+
+Gortex snapshots the graph to disk on shutdown and restores it on startup, with incremental re-indexing of only changed files:
+
+```bash
+# Default cache directory: ~/.cache/gortex/
+gortex serve --index /path/to/repo
+
+# Custom cache directory
+gortex serve --index /path/to/repo --cache-dir /tmp/gortex-cache
+
+# Disable caching
+gortex serve --index /path/to/repo --no-cache
+```
+
+The persistence layer uses a pluggable backend interface (`persistence.Store`). The default backend serializes as gob+gzip. Cache is keyed by repo path + git commit hash, with version validation to invalidate on binary upgrades.
+
 ## Architecture
 
 ```
 gortex binary
   CLI (cobra)  ──> MultiIndexer ──> In-Memory Graph (shared, per-repo indexed)
   MCP Server ──────────────────────> Query Engine (repo/project/ref scoping)
+  Bridge API ──────────────────────> (HTTP/JSON over MCP tools)
   Web Server ──────────────────────> (Nodes + Edges + byRepo index)
                    MultiWatcher <── filesystem events (fsnotify, per-repo)
-                   CrossRepoResolver ──> cross-repo edge creation
+                   CrossRepoResolver ──> cross-repo edge creation (type-aware)
+                   Persistence ──> gob+gzip snapshot (pluggable backend)
 ```
 
 **Data flow:**
-1. MultiIndexer walks each repo directory concurrently, dispatches files to language-specific extractors (tree-sitter)
-2. Extractors produce nodes (files, functions, types, etc.) and edges (calls, imports, defines, etc.)
-3. In multi-repo mode, nodes get `RepoPrefix` and IDs become `<repo_prefix>/<path>::<Symbol>`
-4. Resolver links cross-file references; CrossRepoResolver links cross-repo references with same-repo preference
-5. Query Engine answers traversal queries with optional repo/project/ref scoping
-6. MultiWatcher detects changes per-repo and surgically patches the graph (debounced per-file), then re-resolves cross-repo edges
+1. On startup, loads cached graph snapshot if available; otherwise performs full indexing
+2. MultiIndexer walks each repo directory concurrently, dispatches files to language-specific extractors (tree-sitter)
+3. Extractors produce nodes (files, functions, types, etc.) and edges (calls, imports, defines, etc.) with type environment metadata
+4. In multi-repo mode, nodes get `RepoPrefix` and IDs become `<repo_prefix>/<path>::<Symbol>`
+5. Resolver links cross-file references with type-aware method matching; CrossRepoResolver links cross-repo references with same-repo preference
+6. Query Engine answers traversal queries with optional repo/project/ref scoping
+7. MultiWatcher detects changes per-repo and surgically patches the graph (debounced per-file), then re-resolves cross-repo edges
+8. On shutdown, persists graph snapshot for fast restart
 
 ## Graph Schema
 
@@ -293,7 +345,7 @@ gortex binary
 
 **Multi-repo fields:** Nodes carry `repo_prefix` (empty in single-repo mode). Edges carry `cross_repo` (true when connecting nodes in different repos). Node IDs use `<repo_prefix>/<path>::<Symbol>` format in multi-repo mode.
 
-## Language Support (25 languages)
+## Language Support (26 languages)
 
 ### Code Languages
 | Language | Functions | Methods + MemberOf | Types | Interfaces | Imports | Calls | Variables |
@@ -313,6 +365,7 @@ gortex binary
 | Elixir | Full | Full (defmodule) | Modules | - | Full | Full | Attributes |
 | C | Full | - | Structs/Enums | - | Full | Full | Globals |
 | C++ | Full | Full | Classes/Structs | - | Full | Full | - |
+| Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
 | Bash | Full | - | - | - | source/. | Full | Exports |
 
 ### Data & Config Languages
