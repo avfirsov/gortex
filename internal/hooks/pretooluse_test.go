@@ -7,78 +7,156 @@ import (
 
 func TestEnrichGlob_SourcePattern(t *testing.T) {
 	result := enrichGlob(map[string]any{"pattern": "**/*.go"})
-	if result == "" {
+	if result.context == "" {
 		t.Fatal("expected guidance for source glob pattern, got empty")
 	}
-	if !strings.Contains(result, "search_symbols") {
+	if !strings.Contains(result.context, "search_symbols") {
 		t.Error("expected guidance to mention search_symbols")
 	}
-	if !strings.Contains(result, "PREFER graph tools") {
+	if !strings.Contains(result.context, "PREFER graph tools") {
 		t.Error("expected PREFER graph tools header")
 	}
 }
 
 func TestEnrichGlob_NonSourcePattern(t *testing.T) {
 	result := enrichGlob(map[string]any{"pattern": "**/*.json"})
-	if result != "" {
-		t.Errorf("expected empty for non-source glob, got: %s", result)
+	if result.context != "" {
+		t.Errorf("expected empty for non-source glob, got: %s", result.context)
 	}
 }
 
 func TestEnrichGlob_EmptyPattern(t *testing.T) {
 	result := enrichGlob(map[string]any{"pattern": ""})
-	if result != "" {
-		t.Errorf("expected empty for empty pattern, got: %s", result)
+	if result.context != "" {
+		t.Errorf("expected empty for empty pattern, got: %s", result.context)
 	}
 }
 
-func TestEnrichRead_Guidance(t *testing.T) {
-	// Port 0 means bridge won't respond — should still return guidance.
+func TestEnrichRead_NonIndexed_Guidance(t *testing.T) {
+	// Port 0 means bridge won't respond — file is not indexed.
+	// Should return advisory guidance (not deny).
 	result := enrichRead(map[string]any{"file_path": "/tmp/foo.go"}, 0)
-	if result == "" {
-		t.Fatal("expected guidance for source file read, got empty")
+	if result.context == "" {
+		t.Fatal("expected guidance for unindexed source file, got empty")
 	}
-	if !strings.Contains(result, "get_symbol_source") {
+	if result.deny {
+		t.Error("should not deny when file is not indexed")
+	}
+	if !strings.Contains(result.context, "get_symbol_source") {
 		t.Error("expected guidance to mention get_symbol_source")
 	}
-	if !strings.Contains(result, "get_editing_context") {
+	if !strings.Contains(result.context, "get_editing_context") {
 		t.Error("expected guidance to mention get_editing_context")
 	}
 }
 
 func TestEnrichRead_NonSourceFile(t *testing.T) {
 	result := enrichRead(map[string]any{"file_path": "/tmp/config.json"}, 0)
-	if result != "" {
-		t.Errorf("expected empty for non-source file, got: %s", result)
+	if result.context != "" || result.deny {
+		t.Errorf("expected pass-through for non-source file, got: context=%q deny=%v", result.context, result.deny)
+	}
+}
+
+func TestEnrichRead_NarrowRead_Allowed(t *testing.T) {
+	// A read with offset+limit is narrow (for editing) — should always pass through.
+	result := enrichRead(map[string]any{
+		"file_path": "/tmp/foo.go",
+		"offset":    float64(100),
+		"limit":     float64(20),
+	}, 0)
+	if result.deny {
+		t.Error("narrow read (offset+limit) should not be denied")
+	}
+	if result.context != "" {
+		t.Error("narrow read should not produce guidance")
+	}
+}
+
+func TestEnrichRead_OffsetOnly_Allowed(t *testing.T) {
+	result := enrichRead(map[string]any{
+		"file_path": "/tmp/foo.go",
+		"offset":    float64(50),
+	}, 0)
+	if result.deny {
+		t.Error("read with offset only should not be denied")
+	}
+}
+
+func TestEnrichRead_SmallLimit_Allowed(t *testing.T) {
+	result := enrichRead(map[string]any{
+		"file_path": "/tmp/foo.go",
+		"limit":     float64(30),
+	}, 0)
+	if result.deny {
+		t.Error("read with small limit should not be denied")
+	}
+}
+
+func TestEnrichRead_LargeLimit_NotNarrow(t *testing.T) {
+	// Limit > 50 without offset is a whole-file read — should get guidance.
+	result := enrichRead(map[string]any{
+		"file_path": "/tmp/foo.go",
+		"limit":     float64(500),
+	}, 0)
+	// Not indexed (port 0), so advisory only.
+	if result.deny {
+		t.Error("should not deny unindexed file")
+	}
+	if result.context == "" {
+		t.Error("expected advisory guidance for large-limit read of source file")
 	}
 }
 
 func TestEnrichGrep_Guidance(t *testing.T) {
 	// Port 0 means bridge won't respond — should still return guidance.
 	result := enrichGrep(map[string]any{"pattern": "handleFindUsages"}, 0)
-	if result == "" {
+	if result.context == "" {
 		t.Fatal("expected guidance for grep, got empty")
 	}
-	if !strings.Contains(result, "search_symbols") {
+	if result.deny {
+		t.Error("grep should never be denied")
+	}
+	if !strings.Contains(result.context, "search_symbols") {
 		t.Error("expected guidance to mention search_symbols")
 	}
-	if !strings.Contains(result, "find_usages") {
+	if !strings.Contains(result.context, "find_usages") {
 		t.Error("expected guidance to mention find_usages")
 	}
 }
 
 func TestEnrichGrep_ShortPattern(t *testing.T) {
 	result := enrichGrep(map[string]any{"pattern": "ab"}, 0)
-	if result != "" {
-		t.Errorf("expected empty for short pattern, got: %s", result)
+	if result.context != "" {
+		t.Errorf("expected empty for short pattern, got: %s", result.context)
+	}
+}
+
+func TestIsNarrowRead(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+		want  bool
+	}{
+		{"offset+limit", map[string]any{"offset": float64(10), "limit": float64(20)}, true},
+		{"offset only", map[string]any{"offset": float64(10)}, true},
+		{"small limit only", map[string]any{"limit": float64(30)}, true},
+		{"large limit only", map[string]any{"limit": float64(500)}, false},
+		{"no offset no limit", map[string]any{}, false},
+		{"nil values", map[string]any{"file_path": "foo.go"}, false},
+	}
+	for _, tt := range tests {
+		got := isNarrowRead(tt.input)
+		if got != tt.want {
+			t.Errorf("isNarrowRead(%s) = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
 func TestEnrich_DispatchesCorrectly(t *testing.T) {
 	tests := []struct {
-		tool     string
-		input    map[string]any
-		wantNon  bool
+		tool    string
+		input   map[string]any
+		wantNon bool // expect non-empty context or deny
 	}{
 		{"Read", map[string]any{"file_path": "/tmp/foo.go"}, true},
 		{"Grep", map[string]any{"pattern": "handleFoo"}, true},
@@ -92,11 +170,12 @@ func TestEnrich_DispatchesCorrectly(t *testing.T) {
 			ToolName:      tt.tool,
 			ToolInput:     tt.input,
 		}, 0)
-		if tt.wantNon && result == "" {
-			t.Errorf("enrich(%s) returned empty, expected non-empty", tt.tool)
+		hasOutput := result.context != "" || result.deny
+		if tt.wantNon && !hasOutput {
+			t.Errorf("enrich(%s) returned no output, expected non-empty", tt.tool)
 		}
-		if !tt.wantNon && result != "" {
-			t.Errorf("enrich(%s) returned non-empty, expected empty", tt.tool)
+		if !tt.wantNon && hasOutput {
+			t.Errorf("enrich(%s) returned output, expected empty", tt.tool)
 		}
 	}
 }

@@ -86,7 +86,7 @@ func Default() *Config {
 		Index: IndexConfig{
 			Exclude: []string{
 				"vendor/**", "node_modules/**", ".git/**",
-				"dist/**", "build/**",
+				"dist/**", "build/**", ".terraform/**",
 			},
 			Workers: runtime.NumCPU(),
 		},

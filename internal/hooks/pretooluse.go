@@ -25,15 +25,24 @@ type HookOutput struct {
 	HookSpecificOutput *HookSpecificOutput `json:"hookSpecificOutput,omitempty"`
 }
 
-// HookSpecificOutput carries the additional context to inject.
+// HookSpecificOutput carries the permission decision and/or additional context.
 type HookSpecificOutput struct {
-	HookEventName     string `json:"hookEventName"`
-	AdditionalContext string `json:"additionalContext"`
+	HookEventName            string `json:"hookEventName"`
+	AdditionalContext        string `json:"additionalContext,omitempty"`
+	PermissionDecision       string `json:"permissionDecision,omitempty"`
+	PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
+}
+
+// enrichResult carries both the context text and whether the call should be blocked.
+type enrichResult struct {
+	context string
+	deny    bool
+	reason  string
 }
 
 // RunPreToolUse handles a PreToolUse hook invocation.
-// It reads from stdin, checks if the tool call can be enriched,
-// queries the Gortex web server, and writes enrichment to stdout.
+// It reads from stdin, checks if the tool call can be enriched or blocked,
+// queries the Gortex web server, and writes the decision to stdout.
 func RunPreToolUse(gortexPort int) {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -49,16 +58,22 @@ func RunPreToolUse(gortexPort int) {
 		return
 	}
 
-	context := enrich(input, gortexPort)
-	if context == "" {
+	result := enrich(input, gortexPort)
+	if result.context == "" && !result.deny {
 		return
 	}
 
 	output := HookOutput{
 		HookSpecificOutput: &HookSpecificOutput{
-			HookEventName:     "PreToolUse",
-			AdditionalContext: context,
+			HookEventName: "PreToolUse",
 		},
+	}
+
+	if result.deny {
+		output.HookSpecificOutput.PermissionDecision = "deny"
+		output.HookSpecificOutput.PermissionDecisionReason = result.reason
+	} else {
+		output.HookSpecificOutput.AdditionalContext = result.context
 	}
 
 	out, err := json.Marshal(output)
@@ -68,7 +83,7 @@ func RunPreToolUse(gortexPort int) {
 	fmt.Print(string(out))
 }
 
-func enrich(input HookInput, port int) string {
+func enrich(input HookInput, port int) enrichResult {
 	switch input.ToolName {
 	case "Read":
 		return enrichRead(input.ToolInput, port)
@@ -77,22 +92,60 @@ func enrich(input HookInput, port int) string {
 	case "Glob":
 		return enrichGlob(input.ToolInput)
 	default:
-		return ""
+		return enrichResult{}
 	}
 }
 
-// enrichRead calls get_file_summary for the file being read, and suggests graph alternatives.
-func enrichRead(toolInput map[string]any, port int) string {
+// enrichRead blocks whole-file reads of indexed source files and suggests graph tools.
+// Narrow reads (with offset+limit for editing) are allowed through with advisory context.
+func enrichRead(toolInput map[string]any, port int) enrichResult {
 	filePath, ok := toolInput["file_path"].(string)
 	if !ok || filePath == "" {
-		return ""
+		return enrichResult{}
 	}
 
-	// Skip non-source files.
+	// Skip non-source files — allow reading .md, .yaml, .json, etc.
 	if !looksLikeSourceFile(filePath) {
-		return ""
+		return enrichResult{}
 	}
 
+	// Detect narrow reads (offset+limit for editing). These are legitimate
+	// and should pass through — the agent already knows what it needs.
+	if isNarrowRead(toolInput) {
+		return enrichResult{}
+	}
+
+	// Check if Gortex has this file indexed (bridge must be running).
+	fileIndexed := false
+	symbolCount := 0
+	resp, err := queryGortex(port, "/api/graph/file?path="+url.QueryEscape(filePath))
+	if err == nil && resp != "" {
+		var result struct {
+			Nodes []any `json:"nodes"`
+		}
+		if json.Unmarshal([]byte(resp), &result) == nil && len(result.Nodes) > 1 {
+			fileIndexed = true
+			symbolCount = len(result.Nodes) - 1 // subtract the file node
+		}
+	}
+
+	// If the file is indexed, BLOCK the read and provide graph alternatives.
+	if fileIndexed {
+		var reason strings.Builder
+		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Use graph tools instead:\n", filePath, symbolCount)
+		reason.WriteString("  - `get_symbol_source` — read one symbol (80%% fewer tokens)\n")
+		reason.WriteString("  - `get_editing_context` — full file context before editing\n")
+		reason.WriteString("  - `get_file_summary` — all symbols and imports\n")
+		reason.WriteString("  - `smart_context` — task-aware minimal context\n")
+		reason.WriteString("  - `batch_symbols` — multiple symbols in one call\n")
+
+		return enrichResult{
+			deny:   true,
+			reason: reason.String(),
+		}
+	}
+
+	// File not indexed — allow with advisory.
 	var guidance strings.Builder
 	guidance.WriteString("[Gortex] PREFER graph tools over Read for source files:\n")
 	guidance.WriteString("  - To read one symbol: use `get_symbol_source` (80% fewer tokens)\n")
@@ -100,28 +153,41 @@ func enrichRead(toolInput map[string]any, port int) string {
 	guidance.WriteString("  - To get a file overview: use `get_file_summary`\n")
 	guidance.WriteString("  - For task-level context: use `smart_context`\n")
 
-	resp, err := queryGortex(port, "/api/graph/file?path="+url.QueryEscape(filePath))
-	if err != nil || resp == "" {
-		return guidance.String()
+	return enrichResult{context: guidance.String()}
+}
+
+// isNarrowRead returns true if the Read has offset+limit targeting a small range,
+// indicating the agent is reading a specific section for editing.
+func isNarrowRead(toolInput map[string]any) bool {
+	_, hasOffset := toolInput["offset"]
+	_, hasLimit := toolInput["limit"]
+
+	if hasOffset && hasLimit {
+		// Any offset+limit read is considered narrow (the agent knows what it wants).
+		return true
 	}
 
-	// Parse to check if there are any symbols.
-	var result struct {
-		Nodes []any `json:"nodes"`
-	}
-	if err := json.Unmarshal([]byte(resp), &result); err != nil || len(result.Nodes) <= 1 {
-		return guidance.String()
+	if hasOffset {
+		// Offset alone means "read from this line" — likely targeted.
+		return true
 	}
 
-	fmt.Fprintf(&guidance, "\nFile context for %s:\n%s", filePath, resp)
-	return guidance.String()
+	if hasLimit {
+		// Limit alone — check if it's a small read.
+		if limitVal, ok := toFloat64(toolInput["limit"]); ok && limitVal <= 50 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // enrichGrep provides symbol search results for the grep pattern and suggests graph alternatives.
-func enrichGrep(toolInput map[string]any, port int) string {
+// Grep is not blocked — it's too useful for non-symbol searches (strings, patterns, config).
+func enrichGrep(toolInput map[string]any, port int) enrichResult {
 	pattern, ok := toolInput["pattern"].(string)
 	if !ok || len(pattern) < 3 {
-		return ""
+		return enrichResult{}
 	}
 
 	var guidance strings.Builder
@@ -133,23 +199,24 @@ func enrichGrep(toolInput map[string]any, port int) string {
 
 	resp, err := queryGortex(port, "/api/graph/search?q="+url.QueryEscape(pattern))
 	if err != nil || resp == "" || resp == "[]" || resp == "[]\n" || resp == "null\n" {
-		return guidance.String()
+		return enrichResult{context: guidance.String()}
 	}
 
 	var nodes []any
 	if err := json.Unmarshal([]byte(resp), &nodes); err != nil || len(nodes) == 0 {
-		return guidance.String()
+		return enrichResult{context: guidance.String()}
 	}
 
 	fmt.Fprintf(&guidance, "\n%d symbols match \"%s\" in the knowledge graph.", len(nodes), pattern)
-	return guidance.String()
+	return enrichResult{context: guidance.String()}
 }
 
 // enrichGlob suggests graph alternatives for file discovery.
-func enrichGlob(toolInput map[string]any) string {
+// Glob is not blocked — it's needed for file pattern matching.
+func enrichGlob(toolInput map[string]any) enrichResult {
 	pattern, ok := toolInput["pattern"].(string)
 	if !ok || pattern == "" {
-		return ""
+		return enrichResult{}
 	}
 
 	// Only intervene for source file patterns.
@@ -167,14 +234,16 @@ func enrichGlob(toolInput map[string]any) string {
 		}
 	}
 	if !isSourceGlob {
-		return ""
+		return enrichResult{}
 	}
 
-	return "[Gortex] PREFER graph tools over Glob for source files:\n" +
-		"  - To find a symbol by name: use `search_symbols`\n" +
-		"  - To find files containing a symbol: use `search_symbols` (returns file paths)\n" +
-		"  - To understand file structure: use `get_file_summary`\n" +
-		"  - For task-level file discovery: use `smart_context`"
+	return enrichResult{
+		context: "[Gortex] PREFER graph tools over Glob for source files:\n" +
+			"  - To find a symbol by name: use `search_symbols`\n" +
+			"  - To find files containing a symbol: use `search_symbols` (returns file paths)\n" +
+			"  - To understand file structure: use `get_file_summary`\n" +
+			"  - For task-level file discovery: use `smart_context`",
+	}
 }
 
 func queryGortex(port int, path string) (string, error) {
@@ -210,4 +279,19 @@ func looksLikeSourceFile(path string) bool {
 		}
 	}
 	return false
+}
+
+// toFloat64 attempts to convert an any value to float64.
+// JSON numbers are decoded as float64 by encoding/json.
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }

@@ -11,6 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"strings"
+
 	"github.com/zzet/gortex/internal/bridge"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/embedding"
@@ -21,6 +23,10 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/semantic"
+	"github.com/zzet/gortex/internal/semantic/goanalysis"
+	"github.com/zzet/gortex/internal/semantic/lsp"
+	"github.com/zzet/gortex/internal/semantic/scip"
 	"github.com/zzet/gortex/internal/web"
 	"github.com/zzet/gortex/internal/web/hub"
 )
@@ -38,6 +44,9 @@ var (
 	bridgeEmbeddings      bool
 	bridgeEmbeddingsURL   string
 	bridgeEmbeddingsModel string
+	bridgeSemantic        bool
+	bridgeNoSemantic      bool
+	bridgeSemanticMode    string
 )
 
 var bridgeCmd = &cobra.Command{
@@ -60,6 +69,9 @@ func init() {
 	bridgeCmd.Flags().BoolVar(&bridgeEmbeddings, "embeddings", false, "enable semantic search")
 	bridgeCmd.Flags().StringVar(&bridgeEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
 	bridgeCmd.Flags().StringVar(&bridgeEmbeddingsModel, "embeddings-model", "", "embedding model name")
+	bridgeCmd.Flags().BoolVar(&bridgeSemantic, "semantic", false, "enable semantic enrichment (SCIP, go/types, LSP)")
+	bridgeCmd.Flags().BoolVar(&bridgeNoSemantic, "no-semantic", false, "disable semantic enrichment")
+	bridgeCmd.Flags().StringVar(&bridgeSemanticMode, "semantic-mode", "typecheck", "Go analysis mode: typecheck or callgraph")
 	rootCmd.AddCommand(bridgeCmd)
 }
 
@@ -91,6 +103,56 @@ func runBridge(_ *cobra.Command, _ []string) error {
 			idx.SetEmbedder(embedder)
 			fmt.Fprintf(os.Stderr, "[gortex] bridge: semantic search enabled (local)\n")
 		}
+	}
+
+	// Set up semantic enrichment.
+	if !bridgeNoSemantic && (bridgeSemantic || cfg.Semantic.Enabled) {
+		semCfg := cfg.Semantic
+		semCfg.Enabled = true
+
+		semInternalCfg := semantic.Config{
+			Enabled:           semCfg.Enabled,
+			TimeoutSeconds:    semCfg.TimeoutSeconds,
+			EnrichOnWatch:     semCfg.EnrichOnWatch,
+			WatchDebounceMs:   semCfg.WatchDebounceMs,
+			RefuteUnconfirmed: semCfg.RefuteUnconfirmed,
+		}
+		for _, pc := range semCfg.Providers {
+			semInternalCfg.Providers = append(semInternalCfg.Providers, semantic.ProviderConfig{
+				Name:        pc.Name,
+				Command:     pc.Command,
+				Args:        pc.Args,
+				Languages:   pc.Languages,
+				Priority:    pc.Priority,
+				Enabled:     pc.Enabled,
+				Mode:        pc.Mode,
+				Daemon:      pc.Daemon,
+				MaxParallel: pc.MaxParallel,
+			})
+		}
+
+		semMgr := semantic.NewManager(semInternalCfg, logger)
+
+		mode := goanalysis.ModeTypeCheck
+		if bridgeSemanticMode == "callgraph" {
+			mode = goanalysis.ModeCallGraph
+		}
+		semMgr.RegisterProvider(goanalysis.NewProvider(mode, false, logger))
+
+		for _, pc := range semCfg.Providers {
+			if !pc.Enabled {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(pc.Name, "scip-") && pc.Command != "":
+				semMgr.RegisterProvider(scip.NewProvider(pc.Command, pc.Args, pc.Languages, semCfg.TimeoutSeconds, logger))
+			case strings.HasPrefix(pc.Name, "gopls") || pc.Daemon:
+				semMgr.RegisterProvider(lsp.NewProvider(pc.Command, pc.Args, pc.Languages, pc.Daemon, pc.MaxParallel, logger))
+			}
+		}
+
+		idx.SetSemanticManager(semMgr)
+		fmt.Fprintf(os.Stderr, "[gortex] bridge: semantic enrichment enabled (mode: %s)\n", bridgeSemanticMode)
 	}
 
 	// Multi-repo support.
@@ -138,6 +200,10 @@ func runBridge(_ *cobra.Command, _ []string) error {
 	eng.SetSearchProvider(idx.Search)
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, multiOpts...)
+
+	if semMgr := idx.SemanticManager(); semMgr != nil {
+		srv.SetSemanticManager(semMgr)
+	}
 
 	// Create persistence store.
 	var store persistence.Store
