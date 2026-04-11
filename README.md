@@ -13,8 +13,8 @@ Built for AI coding agents (Claude Code, Cursor, Codex) — one `smart_context` 
 
 - **Knowledge graph** — every file, symbol, import, call chain, and type relationship in one queryable structure
 - **Multi-repo workspaces** — index multiple repositories into a single graph with cross-repo symbol resolution, project grouping, reference tags, and per-repo scoping
-- **26 languages** — Go, TypeScript, JavaScript, Python, Rust, Java, C#, Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, Bash, SQL, Protobuf, Markdown, HTML, CSS, YAML, TOML, HCL, Dockerfile
-- **44 MCP tools** — symbol lookup, call chains, blast radius, community detection, process discovery, contract verification, cycle detection, dead code analysis, scaffolding, multi-repo management, and 6 agent-optimized tools
+- **33 languages** — Go, TypeScript, JavaScript, Python, Rust, Java, C#, Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, OCaml, Lua, Zig, Haskell, Clojure, Erlang, R, Bash/Zsh, SQL, Protobuf, Markdown, HTML, CSS, YAML, TOML, HCL/Terraform, Dockerfile
+- **48 MCP tools** — symbol lookup, call chains, blast radius, community detection, process discovery, contract detection, cycle detection, dead code analysis, scaffolding, multi-repo management, and 6 agent-optimized tools
 - **Semantic search** — hybrid BM25 + vector search with RRF fusion. Built-in GloVe word vectors for offline use, or connect to Ollama/OpenAI for transformer-quality embeddings. Build tags for ONNX, GoMLX, and Hugot offline transformer backends
 - **Type-aware resolution** — infers receiver types from variable declarations, composite literals, and Go constructor conventions to disambiguate same-named methods across types
 - **On-disk persistence** — snapshots the graph on shutdown, restores on startup with incremental re-indexing of only changed files (~200ms vs 3-5s full re-index)
@@ -447,7 +447,7 @@ gortex binary
 
 **Multi-repo fields:** Nodes carry `repo_prefix` (empty in single-repo mode). Edges carry `cross_repo` (true when connecting nodes in different repos). Node IDs use `<repo_prefix>/<path>::<Symbol>` format in multi-repo mode.
 
-## Language Support (26 languages)
+## Language Support (33 languages)
 
 ### Code Languages
 | Language | Functions | Methods + MemberOf | Types | Interfaces | Imports | Calls | Variables |
@@ -468,7 +468,14 @@ gortex binary
 | C | Full | - | Structs/Enums | - | Full | Full | Globals |
 | C++ | Full | Full | Classes/Structs | - | Full | Full | - |
 | Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
-| Bash | Full | - | - | - | source/. | Full | Exports |
+| OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
+| Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
+| Zig | Full | - | Structs/Enums/Unions | - | @import | Full | Full |
+| Haskell | Full | - | data/newtype/type | class | import | Full | - |
+| Clojure | Full (defn) | - | defrecord/deftype | defprotocol | require/use | Full | def |
+| Erlang | Full | - | -type/-record | - | -import | Full | - |
+| R | Full | - | - | - | library/require/source | Full | Full |
+| Bash/Zsh | Full | - | - | - | source/. | Full | Exports |
 
 ### Data & Config Languages
 | Language | What it extracts |
@@ -480,7 +487,7 @@ gortex binary
 | CSS | Class selectors, ID selectors, custom properties, @import |
 | YAML | Top-level keys |
 | TOML | Tables, key-value pairs |
-| HCL | Resource/data/module/variable/output blocks |
+| HCL/Terraform | Resource/data/module/variable/output blocks (.tf, .tfvars, .hcl) |
 | Dockerfile | FROM (base images), ENV/ARG variables |
 
 ## Building
