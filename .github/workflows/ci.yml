@@ -67,8 +67,8 @@ jobs:
       - name: Build with ONNX tag
         run: go build -tags embeddings_onnx -o gortex-onnx ./cmd/gortex/
 
-      - name: Build with Hugot tag
-        run: go build -tags embeddings_hugot -o gortex-hugot ./cmd/gortex/
+      - name: Build default (Hugot bundled — no tag)
+        run: go build -o gortex-default ./cmd/gortex/
 
       - name: Build with GoMLX tag
         run: go build -tags embeddings_gomlx -o gortex-gomlx ./cmd/gortex/

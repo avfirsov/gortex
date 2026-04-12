@@ -1,5 +1,3 @@
-//go:build embeddings_hugot
-
 package embedding
 
 import (

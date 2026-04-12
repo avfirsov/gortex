@@ -451,19 +451,20 @@ gortex serve --index . --embeddings-url https://api.openai.com/v1 \
   --embeddings-model text-embedding-3-small
 ```
 
-| Tier | Flag | Quality | Offline |
-|------|------|---------|---------|
-| Built-in | `--embeddings` | Basic (GloVe word averaging) | Yes |
-| API | `--embeddings-url` | Best (transformer model) | No |
-| ONNX | `--embeddings` + build tag | Best | Yes |
-| GoMLX | `--embeddings` + build tag | Good | Yes |
-| Hugot | `--embeddings` + build tag | Good | Yes |
+| Tier | Flag | Quality | Offline | Default build? |
+|------|------|---------|---------|----------------|
+| Hugot (pure Go) | `--embeddings` | Good (MiniLM-L6-v2) | Yes (model auto-downloads on first use) | **Yes** |
+| Built-in | `--embeddings` (when Hugot unavailable) | Basic (GloVe word averaging) | Yes | Yes |
+| API | `--embeddings-url` | Best (transformer model) | No | Yes |
+| ONNX | `--embeddings` + build tag | Best | Yes (model + libonnxruntime required) | No |
+| GoMLX | `--embeddings` + build tag | Good | Yes (XLA plugin auto-downloads) | No |
 
-Offline transformer backends via build tags:
+The default build ships with Hugot using the pure-Go ONNX runtime — no native dependencies, no manual model placement. The MiniLM-L6-v2 model downloads to `~/.cache/gortex/models/` on first use (~90 MB).
+
+Opt-in faster backends via build tags:
 ```bash
 go build -tags embeddings_onnx ./cmd/gortex/   # needs: brew install onnxruntime
 go build -tags embeddings_gomlx ./cmd/gortex/  # auto-downloads XLA plugin
-go build -tags embeddings_hugot ./cmd/gortex/  # auto-downloads XLA plugin
 ```
 
 ## Token Savings

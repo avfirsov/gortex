@@ -1,7 +1,15 @@
 // Package embedding provides pluggable embedding providers for semantic search.
-// The default build includes StaticProvider (word vector averaging) and APIProvider
-// (Ollama/OpenAI). Build tags enable transformer backends: embeddings_onnx,
-// embeddings_gomlx, embeddings_hugot.
+//
+// The default build includes the Hugot provider (pure-Go ONNX runtime via
+// hugot.NewGoSession) which auto-downloads MiniLM-L6-v2 on first use — no
+// external runtime, no manual model placement. The legacy StaticProvider
+// (GloVe word vectors) and APIProvider (Ollama/OpenAI) are also always
+// available.
+//
+// Opt-in build tags enable faster transformer backends for users who are
+// willing to manage native dependencies:
+//   - embeddings_onnx  — yalue/onnxruntime_go with libonnxruntime on PATH
+//   - embeddings_gomlx — hugot with XLA/PJRT plugin (~100MB auto-download)
 package embedding
 
 import "context"
@@ -22,19 +30,22 @@ type Provider interface {
 }
 
 // NewLocalProvider returns the best available local embedding provider.
-// Build tags determine which transformer providers are compiled in.
-// Falls back to StaticProvider if no transformer backend is available.
+// Preference order: ONNX (fastest, requires libonnxruntime) → GoMLX (XLA) →
+// Hugot (pure Go, always compiled in) → Static (GloVe word vectors fallback).
 func NewLocalProvider() (Provider, error) {
-	// Try transformer backends (compiled in via build tags).
+	// Opt-in transformer backends (compiled in via build tags).
 	if p, err := newONNXProvider(); err == nil {
 		return p, nil
 	}
 	if p, err := newGoMLXProvider(); err == nil {
 		return p, nil
 	}
+	// Default transformer backend: Hugot with the pure-Go ONNX runtime.
+	// Auto-downloads the MiniLM-L6-v2 model to ~/.cache/gortex/models/ on
+	// first use.
 	if p, err := newHugotProvider(); err == nil {
 		return p, nil
 	}
-	// Fallback: static word vectors (always available).
+	// Fallback: static word vectors (always available, no network).
 	return NewStaticProvider()
 }

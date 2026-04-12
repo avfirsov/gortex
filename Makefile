@@ -20,8 +20,10 @@ build-onnx: deps-onnx
 build-gomlx: deps-gomlx
 	go build -tags embeddings_gomlx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
+# Hugot is bundled by default now — this target is kept as a compatibility
+# alias and also ensures the dep is explicitly recorded in go.mod.
 build-hugot: deps-hugot
-	go build -tags embeddings_hugot -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 test:
 	go test -race ./...
