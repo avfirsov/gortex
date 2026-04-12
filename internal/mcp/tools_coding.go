@@ -123,6 +123,15 @@ func (s *Server) registerCodingTools() {
 	)
 
 	s.mcpServer.AddTool(
+		mcp.NewTool("plan_turn",
+			mcp.WithDescription("Opening-move router. Returns a short ranked list of recommended tool calls (with pre-filled args) for a task — 'what should I call first?'. Use before smart_context when you want a cheaper routing decision; call smart_context directly when you're committed to exploring."),
+			mcp.WithString("task", mcp.Required(), mcp.Description("Natural-language description of the task")),
+			mcp.WithNumber("max_calls", mcp.Description("Max recommended calls (default: 4)")),
+		),
+		s.handlePlanTurn,
+	)
+
+	s.mcpServer.AddTool(
 		mcp.NewTool("get_recent_changes",
 			mcp.WithDescription("Returns files and symbols that changed since the last call (watch mode only). Use to re-orient after the user edits files outside of Claude Code's view, without re-reading anything."),
 			mcp.WithString("since", mcp.Description("ISO 8601 timestamp (omit for all changes since index)")),
