@@ -99,8 +99,8 @@ tag-release:
 	if git rev-parse --verify "refs/tags/$$TAG" >/dev/null 2>&1; then \
 		echo "tag $$TAG already exists"; exit 1; \
 	fi; \
-	if [ -n "$$(git status --porcelain)" ]; then \
-		echo "working tree has uncommitted changes — commit the bump first"; exit 1; \
+	if ! git diff-index --quiet HEAD --; then \
+		echo "tracked files have uncommitted changes — commit the bump first (run \`git status\` to see them)"; exit 1; \
 	fi; \
 	git tag -a "$$TAG" -m "Release $$TAG"; \
 	echo "Tagged $$TAG. Push with: git push origin $$TAG"
