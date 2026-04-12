@@ -1,13 +1,11 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -140,7 +138,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if err := srv.Listen(); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(),
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())
 	return srv.Serve()
@@ -253,7 +251,7 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	resp, err := c.Control(daemon.ControlReload, nil)
 	if err != nil {
 		return err
@@ -261,7 +259,7 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 	if !resp.OK {
 		return fmt.Errorf("reload rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
-	fmt.Fprintln(os.Stderr, "[gortex daemon] reloaded")
+	_, _ = fmt.Fprintln(os.Stderr, "[gortex daemon] reloaded")
 	return nil
 }
 
@@ -270,7 +268,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil {
 		return err
@@ -283,22 +281,22 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("parse status: %w", err)
 	}
 	w := cmd.OutOrStdout()
-	fmt.Fprintf(w, "daemon      %s\n", st.Version)
-	fmt.Fprintf(w, "pid         %d\n", st.PID)
-	fmt.Fprintf(w, "socket      %s\n", st.SocketPath)
-	fmt.Fprintf(w, "uptime      %s\n", formatDuration(time.Duration(st.UptimeSeconds)*time.Second))
-	fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
+	_, _ = fmt.Fprintf(w, "daemon      %s\n", st.Version)
+	_, _ = fmt.Fprintf(w, "pid         %d\n", st.PID)
+	_, _ = fmt.Fprintf(w, "socket      %s\n", st.SocketPath)
+	_, _ = fmt.Fprintf(w, "uptime      %s\n", formatDuration(time.Duration(st.UptimeSeconds)*time.Second))
+	_, _ = fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
 	if st.MemoryBytes > 0 {
-		fmt.Fprintf(w, "memory      %d bytes\n", st.MemoryBytes)
+		_, _ = fmt.Fprintf(w, "memory      %d bytes\n", st.MemoryBytes)
 	}
 	if len(st.TrackedRepos) > 0 {
-		fmt.Fprintln(w, "tracked repos:")
+		_, _ = fmt.Fprintln(w, "tracked repos:")
 		for _, r := range st.TrackedRepos {
-			fmt.Fprintf(w, "  %-20s %s  (%d files, %d nodes, %d edges)\n",
+			_, _ = fmt.Fprintf(w, "  %-20s %s  (%d files, %d nodes, %d edges)\n",
 				r.Prefix, r.Path, r.Files, r.Nodes, r.Edges)
 		}
 	} else {
-		fmt.Fprintln(w, "tracked repos: (none)")
+		_, _ = fmt.Fprintln(w, "tracked repos: (none)")
 	}
 	return nil
 }
@@ -309,13 +307,13 @@ func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("open log %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	lines, err := tailLines(f, daemonTail)
 	if err != nil {
 		return err
 	}
 	for _, l := range lines {
-		fmt.Fprintln(cmd.OutOrStdout(), l)
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), l)
 	}
 	return nil
 }
@@ -405,40 +403,3 @@ func formatDuration(d time.Duration) string {
 
 // stubController is a placeholder Controller so `gortex daemon start`
 // works end-to-end before the real MultiIndexer integration lands. It
-// accepts track/untrack/reload/status calls, records them, and returns
-// empty results. Replaced by the real controller in the next milestone.
-type stubController struct {
-	tracked []daemon.TrackedRepoStatus
-}
-
-func (c *stubController) Track(_ context.Context, p daemon.TrackParams) (json.RawMessage, error) {
-	abs, _ := filepath.Abs(p.Path)
-	c.tracked = append(c.tracked, daemon.TrackedRepoStatus{
-		Prefix: filepath.Base(abs), Path: abs, Name: p.Name, Project: p.Project, Ref: p.Ref,
-	})
-	return json.RawMessage(fmt.Sprintf(`{"status":"tracked","path":%q}`, abs)), nil
-}
-
-func (c *stubController) Untrack(_ context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
-	kept := c.tracked[:0]
-	var removed int
-	for _, r := range c.tracked {
-		if r.Prefix == p.PathOrPrefix || r.Path == p.PathOrPrefix {
-			removed++
-			continue
-		}
-		kept = append(kept, r)
-	}
-	c.tracked = kept
-	return json.RawMessage(fmt.Sprintf(`{"removed":%d}`, removed)), nil
-}
-
-func (c *stubController) Reload(_ context.Context) (json.RawMessage, error) {
-	return json.RawMessage(`{"reloaded":true}`), nil
-}
-
-func (c *stubController) Status(_ context.Context) (daemon.StatusResponse, error) {
-	return daemon.StatusResponse{TrackedRepos: c.tracked}, nil
-}
-
-func (c *stubController) Shutdown(_ context.Context) error { return nil }

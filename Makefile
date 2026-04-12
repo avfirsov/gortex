@@ -11,7 +11,7 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.d
 
 .PHONY: build build-onnx build-gomlx build-hugot \
        test bench bench-rpi bench-rpi-quick bench-rpi-profile bench-compare \
-       lint fmt clean install \
+       lint fmt clean install tag-release \
        deps-onnx deps-gomlx deps-hugot deps-vectors
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,34 @@ clean:
 
 install:
 	go install -ldflags '$(LDFLAGS)' ./cmd/gortex/
+
+# tag-release stamps the working copy with a git tag that matches the
+# version currently in cmd/gortex/main.go. Workflow:
+#
+#     ./gortex version bump minor   # edits main.go
+#     git commit -am "Bump version to v0.2.0"
+#     make tag-release              # reads ./gortex, creates tag
+#     git push && git push origin v0.2.0
+#
+# Builds without VERSION ldflags on purpose so `gortex version --short`
+# reflects the literal main.go value (not `git describe` drift). Strips
+# the +build slot because git tags shouldn't carry build metadata. Emits
+# a clear error on dev builds, duplicate tags, or a dirty tree so
+# misfires don't silently create broken releases.
+tag-release:
+	@go build -o $(BINARY) ./cmd/gortex/
+	@TAG=$$(./$(BINARY) version --short | sed 's/+.*//'); \
+	if [ "$$TAG" = "v0.0.0-dev" ]; then \
+		echo "refusing to tag dev build — run \`./$(BINARY) version bump …\` first"; exit 1; \
+	fi; \
+	if git rev-parse --verify "refs/tags/$$TAG" >/dev/null 2>&1; then \
+		echo "tag $$TAG already exists"; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "working tree has uncommitted changes — commit the bump first"; exit 1; \
+	fi; \
+	git tag -a "$$TAG" -m "Release $$TAG"; \
+	echo "Tagged $$TAG. Push with: git push origin $$TAG"
 
 # Cross-compile for Raspberry Pi (ARM64)
 build-rpi:

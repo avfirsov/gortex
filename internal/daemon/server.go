@@ -40,7 +40,6 @@ type Server struct {
 	listener net.Listener
 	started  time.Time
 
-	mu       sync.Mutex
 	shutdown chan struct{}
 	doneOnce sync.Once
 	conns    map[net.Conn]struct{}

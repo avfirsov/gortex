@@ -105,13 +105,13 @@ func loadSnapshot(g *graph.Graph, logger *zap.Logger) (loaded bool, err error) {
 		}
 		return false, fmt.Errorf("open snapshot: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return false, fmt.Errorf("gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	var snap daemonSnapshot
 	if err := gob.NewDecoder(gz).Decode(&snap); err != nil {

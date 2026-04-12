@@ -39,7 +39,7 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil {
 		return err
@@ -52,23 +52,23 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 		return fmt.Errorf("parse status: %w", err)
 	}
 	w := cmd.OutOrStdout()
-	fmt.Fprintf(w, "daemon      %s (pid %d, uptime %s)\n",
+	_, _ = fmt.Fprintf(w, "daemon      %s (pid %d, uptime %s)\n",
 		st.Version, st.PID, time.Duration(st.UptimeSeconds)*time.Second)
-	fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
+	_, _ = fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
 	if st.MemoryBytes > 0 {
-		fmt.Fprintf(w, "memory      %.1f MB\n", float64(st.MemoryBytes)/(1024*1024))
+		_, _ = fmt.Fprintf(w, "memory      %.1f MB\n", float64(st.MemoryBytes)/(1024*1024))
 	}
 	if len(st.TrackedRepos) == 0 {
-		fmt.Fprintln(w, "tracked repos: (none — run `gortex track <path>` to add one)")
+		_, _ = fmt.Fprintln(w, "tracked repos: (none — run `gortex track <path>` to add one)")
 		return nil
 	}
-	fmt.Fprintln(w, "tracked repos:")
+	_, _ = fmt.Fprintln(w, "tracked repos:")
 	// Sort by prefix for stable output across runs.
 	sort.Slice(st.TrackedRepos, func(i, j int) bool {
 		return st.TrackedRepos[i].Prefix < st.TrackedRepos[j].Prefix
 	})
 	for _, r := range st.TrackedRepos {
-		fmt.Fprintf(w, "  %-24s %s  (%d files, %d nodes, %d edges)\n",
+		_, _ = fmt.Fprintf(w, "  %-24s %s  (%d files, %d nodes, %d edges)\n",
 			r.Prefix, r.Path, r.Files, r.Nodes, r.Edges)
 	}
 	return nil

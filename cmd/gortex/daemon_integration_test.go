@@ -102,7 +102,7 @@ func TestDaemon_EndToEnd_GraphStatsOverMCPProxy(t *testing.T) {
 		ClientName: "integration-test",
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	require.NotEmpty(t, client.Ack.SessionID)
 
@@ -156,7 +156,7 @@ func TestDaemon_EndToEnd_UntrackedCWDRejectedViaProxy(t *testing.T) {
 		CWD:  untracked,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Skip initialize — the guard fires regardless of MCP state. That's
 	// actually the right behavior: untracked cwds can't do anything
@@ -211,7 +211,7 @@ func TestDaemon_EndToEnd_TrackAddsRepoLive(t *testing.T) {
 	// Now a proxy from the same cwd should pass the guard.
 	client2, err := daemon.DialTo(socket, daemon.Handshake{Mode: daemon.ModeMCP, CWD: second})
 	require.NoError(t, err)
-	defer client2.Close()
+	defer func() { _ = client2.Close() }()
 
 	initFrame := []byte(`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"i","version":"0"}}}`)
 	require.NoError(t, client2.WriteMCPFrame(initFrame))

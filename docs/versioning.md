@@ -53,20 +53,33 @@ Gortex exposes two user-visible surfaces — **the MCP tool API** and **the CLI*
 
 ## Tagging a release
 
-1. **Update the changelog** (see `CHANGELOG.md`, if present, for the format). Note which bump category each entry falls into.
-2. **Pick the version** by the rules above — take the highest category that applies across all changes since the last tag.
-3. **Tag and push:**
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-4. **Watch the release workflow** at Actions → Release. Goreleaser picks up the tag, builds the matrix, publishes to GitHub Releases, and updates the Homebrew tap.
-
-Pre-releases use a `-<identifier>` suffix and are marked "pre-release" on GitHub automatically:
+Recommended workflow — `gortex version bump` + `make tag-release`:
 
 ```bash
-git tag v0.2.0-rc.1
-git push origin v0.2.0-rc.1
+# 1. Bump the source-of-truth version in cmd/gortex/main.go
+gortex version bump minor                 # or major / patch
+# (for a release candidate: gortex version bump minor --pre rc.1)
+
+# 2. Commit the bump
+git add cmd/gortex/main.go
+git commit -m "Bump version to v0.2.0"
+
+# 3. Create the tag from the freshly-bumped value
+make tag-release                          # annotated git tag, name pulled from ./gortex
+
+# 4. Push
+git push && git push origin v0.2.0
+```
+
+`make tag-release` rebuilds the binary without VERSION ldflags so `gortex version --short` reflects the literal value in `main.go`, strips the `+<commit>` build slot (git tags don't carry it), and creates an annotated tag. It refuses to run on a dev build, a duplicate tag, or a dirty working tree — so a misfire doesn't silently create a broken release.
+
+The push triggers the release workflow at **Actions → Release**. Goreleaser picks up the tag, builds the matrix, publishes to GitHub Releases, and updates the Homebrew tap.
+
+If you want to do the tagging by hand instead (e.g., to sign the tag):
+
+```bash
+git tag -s v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
 ```
 
 ## Programmatic access

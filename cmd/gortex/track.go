@@ -56,7 +56,7 @@ func runTrack(_ *cobra.Command, args []string) error {
 	if daemon.IsRunning() {
 		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 		if err == nil {
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			resp, ctlErr := c.Control(daemon.ControlTrack, daemon.TrackParams{Path: absPath})
 			if ctlErr != nil {
 				return ctlErr
@@ -113,7 +113,7 @@ func runUntrack(_ *cobra.Command, args []string) error {
 	if daemon.IsRunning() {
 		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 		if err == nil {
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			resp, ctlErr := c.Control(daemon.ControlUntrack, daemon.UntrackParams{PathOrPrefix: target})
 			if ctlErr != nil {
 				return ctlErr

@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -225,15 +224,3 @@ func (c *realController) Shutdown(_ context.Context) error {
 	return nil
 }
 
-// touchedRecently is a small helper used by status — daemon uptime is
-// not the same as any repo's last-index time, so we want the freshest
-// of the bunch for display.
-func touchedRecently(metas map[string]*indexer.RepoMetadata) time.Time {
-	var latest time.Time
-	for _, m := range metas {
-		if m.LastIndexTime.After(latest) {
-			latest = m.LastIndexTime
-		}
-	}
-	return latest
-}

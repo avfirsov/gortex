@@ -78,7 +78,7 @@ func runInitGlobal(cmd *cobra.Command, root string) error {
 	// Step 5 (optional) — track the current repo via the daemon.
 	if initTrackRepo {
 		if !daemon.IsRunning() {
-			steps = append(steps, fmt.Sprintf("⚠ skipping --track: daemon is not running (try `gortex daemon start`)"))
+			steps = append(steps, "⚠ skipping --track: daemon is not running (try `gortex daemon start`)")
 		} else {
 			resp, err := trackViaDaemon(abs)
 			if err != nil {
@@ -89,15 +89,15 @@ func runInitGlobal(cmd *cobra.Command, root string) error {
 	}
 
 	w := cmd.ErrOrStderr()
-	fmt.Fprintf(w, "[gortex init --global] done:\n")
+	_, _ = fmt.Fprintf(w,"[gortex init --global] done:\n")
 	for _, s := range steps {
-		fmt.Fprintf(w, "  • %s\n", s)
+		_, _ = fmt.Fprintf(w,"  • %s\n", s)
 	}
 	if !initStartDaemon {
-		fmt.Fprintf(w, "\nNext: start the daemon → `gortex daemon start --detach`\n")
+		_, _ = fmt.Fprintf(w,"\nNext: start the daemon → `gortex daemon start --detach`\n")
 	}
 	if !initTrackRepo && initStartDaemon {
-		fmt.Fprintf(w, "Then: track this repo → `gortex track .` (or open Claude Code here and follow the suggestion)\n")
+		_, _ = fmt.Fprintf(w,"Then: track this repo → `gortex track .` (or open Claude Code here and follow the suggestion)\n")
 	}
 	return nil
 }
@@ -199,7 +199,7 @@ func trackViaDaemon(absPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	resp, err := c.Control(daemon.ControlTrack, daemon.TrackParams{Path: absPath})
 	if err != nil {
 		return "", err

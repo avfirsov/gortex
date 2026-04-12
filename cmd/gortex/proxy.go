@@ -36,7 +36,7 @@ func runProxy(ctx context.Context) (ran bool, err error) {
 		}
 		return false, fmt.Errorf("dial daemon: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	fmt.Fprintf(os.Stderr,
 		"[gortex serve] proxying to daemon (session %s, default_repo=%q)\n",
