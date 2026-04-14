@@ -323,7 +323,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	}
 	_, _ = fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
 	if st.MemoryBytes > 0 {
-		_, _ = fmt.Fprintf(w, "memory      %d bytes\n", st.MemoryBytes)
+		_, _ = fmt.Fprintf(w, "memory      %s\n", formatBytes(st.MemoryBytes))
 	}
 	if len(st.TrackedRepos) > 0 {
 		_, _ = fmt.Fprintln(w, "tracked repos:")
@@ -435,6 +435,19 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 	return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+func formatBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // stubController is a placeholder Controller so `gortex daemon start`

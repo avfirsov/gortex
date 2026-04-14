@@ -394,18 +394,22 @@ func installHook(settingsPath string) error {
 		settings = make(map[string]any)
 	}
 
-	// Resolve the gortex binary path for the hook command.
-	// Try: 1) the binary that's running now, 2) "gortex" in PATH.
-	hookCommand := "gortex hook"
-	if exe, err := os.Executable(); err == nil {
-		hookCommand = exe + " hook"
-	}
+	// Resolve the gortex binary on PATH so the hook command points at the
+	// user's installed binary (Homebrew, `go install`, etc.) — never at the
+	// transient `os.Executable()` path of whatever invoked `init`. That avoids
+	// baking ephemeral paths like `/tmp/gortex-something` into long-lived
+	// settings.json when a developer runs `go build -o /tmp/... && init`.
+	hookCommand := resolveHookCommand()
 
 	// Ensure hooks map exists.
 	if _, ok := settings["hooks"]; !ok {
 		settings["hooks"] = make(map[string]any)
 	}
 	hooks := settings["hooks"].(map[string]any)
+
+	// Heal any pre-existing Gortex hook entries that point at a stale path
+	// (under /tmp, macOS go-build cache, or a file that no longer exists).
+	healedCount := healStaleHookCommands(hooks, hookCommand)
 
 	// Upgrade the old PreToolUse matcher in place, if present.
 	matcherUpgraded := upgradeGortexMatcher(hooks)
@@ -466,8 +470,8 @@ func installHook(settingsPath string) error {
 	}
 
 	// Nothing to do if everything was already installed, no duplicates to
-	// collapse, and no matcher upgrade.
-	if preToolUseInstalled && preCompactInstalled && stopInstalled && !matcherUpgraded && dedupedCount == 0 {
+	// collapse, no matcher upgrade, and no stale paths healed.
+	if preToolUseInstalled && preCompactInstalled && stopInstalled && !matcherUpgraded && dedupedCount == 0 && healedCount == 0 {
 		fmt.Fprintf(os.Stderr, "[gortex init] all hooks already present in %s\n", settingsPath)
 		return nil
 	}
@@ -488,6 +492,9 @@ func installHook(settingsPath string) error {
 	if dedupedCount > 0 {
 		changes = append(changes, fmt.Sprintf("removed %d duplicate entries", dedupedCount))
 	}
+	if healedCount > 0 {
+		changes = append(changes, fmt.Sprintf("rewrote %d stale hook path(s)", healedCount))
+	}
 	if !preToolUseInstalled {
 		changes = append(changes, "installed PreToolUse")
 	}
@@ -500,6 +507,86 @@ func installHook(settingsPath string) error {
 	fmt.Fprintf(os.Stderr, "[gortex init] %s in %s\n",
 		strings.Join(changes, ", "), settingsPath)
 	return nil
+}
+
+// resolveHookCommand returns the command string to bake into Claude Code's
+// hook configuration. It prefers the gortex binary on PATH (so users running
+// the brew/`go install`-shipped binary get a stable absolute path) and falls
+// back to bare "gortex hook" — relying on PATH lookup at hook-fire time —
+// when no installed binary is found.
+func resolveHookCommand() string {
+	if path, err := exec.LookPath("gortex"); err == nil {
+		return path + " hook"
+	}
+	fmt.Fprintln(os.Stderr,
+		"[gortex init] warning: `gortex` not found on PATH; "+
+			"writing bare \"gortex hook\" into settings — install gortex to PATH for a stable hook command")
+	return "gortex hook"
+}
+
+// hookCommandPathIsEphemeral reports whether cmd's binary path lives in a
+// location that is wiped between sessions (system tmpdirs, macOS go-build
+// cache) or no longer exists on disk. Used by healStaleHookCommands to detect
+// settings.json entries that survived past their backing binary.
+func hookCommandPathIsEphemeral(cmd string) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
+	}
+	bin := fields[0]
+	// Absolute paths under transient roots are always suspect.
+	ephemeralPrefixes := []string{"/tmp/", "/var/folders/", "/private/tmp/", "/private/var/folders/"}
+	for _, p := range ephemeralPrefixes {
+		if strings.HasPrefix(bin, p) {
+			return true
+		}
+	}
+	// Any absolute path that no longer resolves to a file is also stale.
+	if filepath.IsAbs(bin) {
+		if _, err := os.Stat(bin); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// healStaleHookCommands rewrites Gortex hook entries whose command points at
+// an ephemeral or missing binary path. Returns the number of entries rewritten.
+// Non-Gortex entries and Gortex entries with healthy paths are left untouched.
+func healStaleHookCommands(hooks map[string]any, newCommand string) int {
+	healed := 0
+	for _, event := range []string{"PreToolUse", "PreCompact", "Stop"} {
+		list, ok := hooks[event].([]any)
+		if !ok {
+			continue
+		}
+		for _, h := range list {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				continue
+			}
+			inner, ok := hm["hooks"].([]any)
+			if !ok {
+				continue
+			}
+			for _, e := range inner {
+				em, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				cmd, _ := em["command"].(string)
+				if !commandInvokesGortexHook(cmd) {
+					continue
+				}
+				if !hookCommandPathIsEphemeral(cmd) {
+					continue
+				}
+				em["command"] = newCommand
+				healed++
+			}
+		}
+	}
+	return healed
 }
 
 // appendHookEntry adds an entry to hooks[event], creating the list if needed.
