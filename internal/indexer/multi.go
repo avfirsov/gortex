@@ -592,9 +592,46 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 	// parametric consumer contract per wrapper at extraction time —
 	// useless for matching. InlineWrappers walks incoming call edges
 	// of each wrapper, re-reads the caller's source, and emits a
-	// specific consumer contract per literal path. Runs before Match
-	// so the inlined contracts participate in pairing.
-	contracts.InlineWrappers(merged, g, mi.wrapperSourceReader())
+	// specific consumer contract per literal path. The returned
+	// contracts are also persisted into their owning repo's per-repo
+	// registry so subsequent `contracts list`/`check` calls see them
+	// (MergedContractRegistry rebuilds fresh each call and would
+	// otherwise lose them).
+	inlined := contracts.InlineWrappers(merged, g, mi.wrapperSourceReader())
+	if len(inlined) > 0 {
+		mi.mu.RLock()
+		for _, c := range inlined {
+			if c.RepoPrefix == "" {
+				continue
+			}
+			idx, ok := mi.indexers[c.RepoPrefix]
+			if !ok {
+				continue
+			}
+			cr := idx.ContractRegistry()
+			if cr == nil {
+				continue
+			}
+			// Skip if the same contract is already persisted —
+			// ReconcileContractEdges runs on every repo change, and
+			// appending the same inlined contract on every pass would
+			// blow up the registry with duplicates. Compare on the
+			// Registry.All() dedupe key.
+			alreadyPersisted := false
+			for _, existing := range cr.ByID(c.ID) {
+				if existing.SymbolID == c.SymbolID &&
+					existing.FilePath == c.FilePath &&
+					existing.Role == c.Role {
+					alreadyPersisted = true
+					break
+				}
+			}
+			if !alreadyPersisted {
+				cr.Add(c)
+			}
+		}
+		mi.mu.RUnlock()
+	}
 
 	// Bind provider-contract SymbolIDs that came from spec files
 	// (.proto for gRPC, OpenAPI YAML/JSON for HTTP). Without this

@@ -44,6 +44,23 @@ type httpPattern struct {
 
 var httpPatterns = []httpPattern{
 	// ---- Go providers (high confidence, framework-specific) ----
+	// Go 1.22+ stdlib mux: mux.HandleFunc("METHOD /path", h). The
+	// method is embedded in the pattern as a prefix and must be
+	// split out so the resulting contract ID matches the consumer
+	// side's http::METHOD::path shape.
+	{
+		re:         regexp.MustCompile(`(?:Handle|HandleFunc)\(\s*["` + "`" + `](GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^"` + "`" + `]*)["` + "`" + `]\s*(?:,\s*(\w+))?`),
+		role:       RoleProvider,
+		methodGrp:  1,
+		pathGrp:    2,
+		handlerGrp: 3,
+		framework:  "net/http",
+		confidence: 0.95,
+		languages:  []string{"go"},
+	},
+	// Legacy net/http HandleFunc with pattern-only path (method set
+	// elsewhere or meant to catch any method). Kept after the 1.22+
+	// form so the specific pattern wins when both match.
 	{
 		re:         regexp.MustCompile(`(?:Handle|HandleFunc)\(\s*["` + "`" + `]([^"` + "`" + `]+)["` + "`" + `]\s*(?:,\s*(\w+))?`),
 		role:       RoleProvider,

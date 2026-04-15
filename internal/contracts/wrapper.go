@@ -33,10 +33,13 @@ type SourceReader func(n *graph.Node) ([]byte, bool)
 //     - Anything else (runtime expression) → skip silently.
 //  3. Repeat until no new wrappers are found, bounded by a safety cap.
 //
-// Returns the number of inlined contracts added.
-func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) int {
+// Returns the set of contracts added (so callers can persist them into
+// their per-repo registries — the transient merged registry MultiIndexer
+// hands in is rebuilt on every ReconcileContractEdges call, so mutations
+// to it don't survive between invocations).
+func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract {
 	if reg == nil || g == nil || read == nil {
-		return 0
+		return nil
 	}
 
 	wrappers := seedWrappers(reg)
@@ -45,7 +48,7 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) int {
 		seen[w.SymbolID] = true
 	}
 
-	added := 0
+	var added []Contract
 	// Safety cap against pathological chains.
 	const maxPasses = 8
 
@@ -94,7 +97,7 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) int {
 					}
 					reg.Add(c)
 					commitInlinedContractToGraph(g, c)
-					added++
+					added = append(added, c)
 				case argBareParam:
 					if !seen[caller.ID] {
 						seen[caller.ID] = true
@@ -142,10 +145,12 @@ func isWrapperPath(path string) bool {
 }
 
 // commitInlinedContractToGraph adds the contract as a graph node (if not
-// already present) and a symbol → contract EdgeConsumes edge. Mirrors
-// the commitContracts logic in the indexer but runs at wrapper-inline
-// time so late-emitted contracts also appear in contracts list output
-// and in the matcher's graph view.
+// already present) and a symbol → contract EdgeConsumes edge (also
+// idempotent). Mirrors the commitContracts logic in the indexer but
+// runs at wrapper-inline time so late-emitted contracts appear in
+// contracts list output and in the matcher's graph view. Idempotency
+// matters because ReconcileContractEdges runs on every repo change —
+// without it each track/index would duplicate edges.
 func commitInlinedContractToGraph(g *graph.Graph, c Contract) {
 	if g == nil {
 		return
@@ -161,13 +166,19 @@ func commitInlinedContractToGraph(g *graph.Graph, c Contract) {
 			Meta:       map[string]any{"type": string(c.Type), "role": string(c.Role)},
 		})
 	}
-	if c.SymbolID != "" {
-		g.AddEdge(&graph.Edge{
-			From:     c.SymbolID,
-			To:       c.ID,
-			Kind:     graph.EdgeConsumes,
-			FilePath: c.FilePath,
-			Line:     c.Line,
-		})
+	if c.SymbolID == "" {
+		return
 	}
+	for _, existing := range g.GetOutEdges(c.SymbolID) {
+		if existing.Kind == graph.EdgeConsumes && existing.To == c.ID {
+			return
+		}
+	}
+	g.AddEdge(&graph.Edge{
+		From:     c.SymbolID,
+		To:       c.ID,
+		Kind:     graph.EdgeConsumes,
+		FilePath: c.FilePath,
+		Line:     c.Line,
+	})
 }

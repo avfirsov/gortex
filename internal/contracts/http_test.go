@@ -368,6 +368,74 @@ func TestNormalizeHTTPPath(t *testing.T) {
 // short snippets resembling the shape of tuck_app's TuckApiClient
 // methods, including Dart's bare-$id interpolation style that
 // NormalizeHTTPPath collapses to {id}.
+// TestHTTPExtractor_Go_StdlibMux_1_22 covers the Go 1.22+ stdlib mux
+// pattern where the HTTP method is embedded in the pattern string as
+// "METHOD /path". Without splitting it, the contract ID ended up as
+// "http::ANY::/DELETE /v1/..." which never pairs with a consumer
+// "http::DELETE::/v1/...". core-api uses this pattern on 40+ routes;
+// this is the regression that kept them all orphan.
+func TestHTTPExtractor_Go_StdlibMux_1_22(t *testing.T) {
+	src := []byte(`package main
+
+import "net/http"
+
+func wire(mux *http.ServeMux, h *Handler) {
+	mux.HandleFunc("GET /v1/tucks", h.ListTucks)
+	mux.HandleFunc("POST /v1/tucks", h.CreateTuck)
+	mux.HandleFunc("DELETE /v1/tucks/{id}", h.DeleteTuck)
+	mux.HandleFunc("PATCH /v1/tucks/{id}/progress", h.UpdateProgress)
+}
+`)
+	nodes := makeNodes("main.go", []struct {
+		name       string
+		start, end int
+	}{
+		{"wire", 5, 10},
+	})
+
+	ext := &HTTPExtractor{}
+	contracts := ext.Extract("main.go", src, nodes, nil)
+
+	byID := make(map[string]Contract)
+	for _, c := range contracts {
+		byID[c.ID] = c
+	}
+
+	want := []struct {
+		id, method, path string
+	}{
+		{"http::GET::/v1/tucks", "GET", "/v1/tucks"},
+		{"http::POST::/v1/tucks", "POST", "/v1/tucks"},
+		{"http::DELETE::/v1/tucks/{id}", "DELETE", "/v1/tucks/{id}"},
+		{"http::PATCH::/v1/tucks/{id}/progress", "PATCH", "/v1/tucks/{id}/progress"},
+	}
+	for _, w := range want {
+		c, ok := byID[w.id]
+		if !ok {
+			t.Errorf("missing contract %s; have: %v", w.id, keysOf(byID))
+			continue
+		}
+		if c.Role != RoleProvider {
+			t.Errorf("%s: role want provider, got %s", w.id, c.Role)
+		}
+		if c.Meta["method"] != w.method {
+			t.Errorf("%s: method want %s, got %v", w.id, w.method, c.Meta["method"])
+		}
+		if c.Meta["path"] != w.path {
+			t.Errorf("%s: path want %s, got %v", w.id, w.path, c.Meta["path"])
+		}
+	}
+}
+
+// keysOf returns the keys of a map of Contracts for failure diagnostics.
+func keysOf(m map[string]Contract) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 func TestHTTPExtractor_Dart_Consumers(t *testing.T) {
 	src := []byte(`class TuckApiClient {
   final Dio _dio;
