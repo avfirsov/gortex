@@ -1,46 +1,30 @@
 import type { Metadata } from 'next'
-import { Inter, JetBrains_Mono } from 'next/font/google'
+import { IBM_Plex_Sans, JetBrains_Mono } from 'next/font/google'
 import './globals.css'
-import { Sidebar } from '@/components/layout/Sidebar'
-import { Header } from '@/components/layout/Header'
-import { StatusBar } from '@/components/layout/StatusBar'
+import { AppShell } from '@/components/chrome/AppShell'
 
-const inter = Inter({
-  variable: '--font-inter',
+const ibmPlexSans = IBM_Plex_Sans({
+  variable: '--font-ibm-plex',
+  weight: ['300', '400', '500', '600', '700'],
   subsets: ['latin'],
 })
 
 const jetbrainsMono = JetBrains_Mono({
   variable: '--font-jetbrains-mono',
+  weight: ['400', '500', '600'],
   subsets: ['latin'],
 })
 
 export const metadata: Metadata = {
-  title: 'Gortex',
-  description: 'Code intelligence engine — graph explorer and analysis dashboard',
+  title: 'Gortex — Code intelligence',
+  description: 'Knowledge graph and analysis dashboard for understanding code, dependencies, processes, and contracts across repositories.',
 }
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html
-      lang="en"
-      className={`${inter.variable} ${jetbrainsMono.variable} dark h-full antialiased`}
-    >
-      <body className="h-full bg-zinc-950 text-zinc-100">
-        <div className="flex h-full flex-col">
-          <Header />
-          <div className="flex flex-1 overflow-hidden">
-            <Sidebar />
-            <main className="flex-1 overflow-y-auto bg-zinc-950 p-6">
-              {children}
-            </main>
-          </div>
-          <StatusBar />
-        </div>
+    <html lang="en" data-theme="ink" data-density="comfortable" className={`${ibmPlexSans.variable} ${jetbrainsMono.variable}`}>
+      <body>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   )

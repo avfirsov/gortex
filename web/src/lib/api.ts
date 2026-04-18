@@ -1,7 +1,7 @@
 import type {
   HealthResponse, ToolInfo, GraphStats, ToolResponse, GraphData,
   SubGraph, GortexNode, GraphChangeEvent, CommunityResult, Community,
-  Process, IndexHealth,
+  Process, IndexHealth, CaveatsResponse, ActivityResponse, DashboardSnapshot,
 } from './types'
 
 // Single base URL for the gortex server (http://.../v1/*). The old
@@ -180,6 +180,22 @@ export const api = {
 
   graphStats: async (): Promise<GraphStats> => {
     return callToolJSON<GraphStats>('graph_stats', {})
+  },
+
+  // Aggregated server endpoints (added by the dashboard rewrite)
+  caveats: async (): Promise<CaveatsResponse> => {
+    const res = await serverFetch('/v1/caveats')
+    return res.json()
+  },
+
+  activity: async (limit = 50): Promise<ActivityResponse> => {
+    const res = await serverFetch(`/v1/activity?limit=${limit}`)
+    return res.json()
+  },
+
+  dashboard: async (): Promise<DashboardSnapshot> => {
+    const res = await serverFetch('/v1/dashboard')
+    return res.json()
   },
 
   // Raw tool call

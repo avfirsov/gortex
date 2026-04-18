@@ -116,3 +116,32 @@ export interface IndexHealth {
   language_coverage: Record<string, boolean>
   last_index_time: string
 }
+
+export interface CaveatEntry {
+  id: string
+  severity: 'risk' | 'hot' | 'cycle' | 'unowned' | 'deprecated' | 'boundary'
+  symbol: string
+  title: string
+  desc: string
+  owner: string
+  age: string
+}
+
+export interface CaveatsResponse {
+  caveats: CaveatEntry[]
+}
+
+export interface ActivityResponse {
+  events: GraphChangeEvent[]
+}
+
+export interface DashboardSnapshot {
+  stats: {
+    total_nodes: number
+    total_edges: number
+    by_kind: Record<string, number>
+    by_language: Record<string, number>
+  }
+  caveats: number
+  activity: number
+}

@@ -32,6 +32,9 @@ import (
 //	GET  /v1/stats        graph stats by kind/language
 //	GET  /v1/graph        full brief-graph dump (nodes+edges+stats)
 //	GET  /v1/events       SSE stream of graph-change events
+//	GET  /v1/activity     ring buffer of recent graph-change events
+//	GET  /v1/caveats      aggregated hotspots/dead-code/cycles/guards
+//	GET  /v1/dashboard    bundled stats+per-repo+caveat counts snapshot
 //
 // /v1/graph scoping (?project/?repo) and /v1/events streaming require
 // a ConfigManager and an event hub respectively, wired via
@@ -46,6 +49,7 @@ type Handler struct {
 	eventHub      *hub.Hub               // nil when watch mode is off
 	configManager *config.ConfigManager // nil in single-repo mode
 	serverID      string                 // UUID; empty until SetServerID wires it
+	activity      *activityBuffer        // ring buffer of recent graph events
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -57,6 +61,7 @@ func NewHandler(mcpServer *mcpserver.MCPServer, g *graph.Graph, version string, 
 		logger:    logger,
 		mux:       http.NewServeMux(),
 		startTime: time.Now(),
+		activity:  newActivityBuffer(100),
 	}
 	h.registerRoutes()
 	return h
@@ -70,9 +75,13 @@ func (h *Handler) Mux() *http.ServeMux { return h.mux }
 func (h *Handler) Graph() *graph.Graph { return h.graph }
 
 // SetEventHub wires the watch-mode event hub so /v1/events can stream
-// graph-change events to subscribers. When nil, /v1/events responds
-// with a single keepalive frame and closes.
-func (h *Handler) SetEventHub(h2 *hub.Hub) { h.eventHub = h2 }
+// graph-change events to subscribers, and starts the activity-buffer
+// collector so /v1/activity can backfill the dashboard feed. When nil,
+// /v1/events responds with a single keepalive frame and closes.
+func (h *Handler) SetEventHub(h2 *hub.Hub) {
+	h.eventHub = h2
+	h.startActivityCollector(h2)
+}
 
 // SetConfigManager wires the multi-repo config so /v1/graph can scope
 // its dump by ?project=<name>. Without it, only ?repo=<name> filtering
@@ -108,6 +117,9 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("GET /v1/stats", h.handleStats)
 	h.mux.HandleFunc("GET /v1/graph", h.handleGetGraph)
 	h.mux.HandleFunc("GET /v1/events", h.handleEvents)
+	h.mux.HandleFunc("GET /v1/activity", h.handleActivity)
+	h.mux.HandleFunc("GET /v1/caveats", h.handleCaveats)
+	h.mux.HandleFunc("GET /v1/dashboard", h.handleDashboard)
 }
 
 // --- /health ---
