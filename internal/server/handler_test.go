@@ -95,6 +95,23 @@ func TestStatsEndpoint(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Equal(t, 2, resp.TotalNodes)
 	assert.Equal(t, 2, resp.ByKind["function"])
+	assert.False(t, resp.StartedAt.IsZero(), "StartedAt should be populated")
+	assert.Empty(t, resp.ServerID, "ServerID empty until SetServerID is called")
+}
+
+func TestStatsEndpoint_WithServerID(t *testing.T) {
+	h := newTestHandler(t)
+	h.SetServerID("11111111-2222-3333-4444-555555555555")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp StatsResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, "11111111-2222-3333-4444-555555555555", resp.ServerID)
 }
 
 func TestToolCallValid(t *testing.T) {
@@ -145,6 +162,73 @@ func TestToolCallEmptyName(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestToolCallAcceptsQueryFormat(t *testing.T) {
+	h := newTestHandler(t)
+	// echo returns its "message" argument; here we smuggle the format
+	// through "message" to assert the merge happened. Use a tool that
+	// echoes the argument map — simplest path is to register a fresh
+	// tool that stringifies args.
+	body := `{"arguments":{"message":"fmt"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/echo?format=gcx", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// The echo tool ignores "format", so the ok status is the
+	// only observable contract here — the point is that the merge
+	// didn't corrupt the request. Dedicated merge logic is covered by
+	// TestToolCall_MergesQueryFormat.
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestToolCall_MergesQueryFormat(t *testing.T) {
+	g := graph.New()
+	srv := mcpserver.NewMCPServer("gortex-test", "0.0.1-test",
+		mcpserver.WithToolCapabilities(false),
+	)
+	srv.AddTool(
+		mcp.NewTool("spy",
+			mcp.WithDescription("returns its format arg"),
+			mcp.WithString("format"),
+		),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.GetArguments()
+			fmtArg, _ := args["format"].(string)
+			return mcp.NewToolResultText(fmtArg), nil
+		},
+	)
+	h := NewHandler(srv, g, "0.0.1-test", zap.NewNop())
+
+	// Query param.
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/spy?format=gcx", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp ToolResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Len(t, resp.Content, 1)
+	assert.Equal(t, "gcx", resp.Content[0].Text)
+
+	// Body-level format field.
+	req = httptest.NewRequest(http.MethodPost, "/v1/tools/spy",
+		strings.NewReader(`{"format":"toon"}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Len(t, resp.Content, 1)
+	assert.Equal(t, "toon", resp.Content[0].Text)
+
+	// Explicit arguments.format wins over query.
+	req = httptest.NewRequest(http.MethodPost, "/v1/tools/spy?format=gcx",
+		strings.NewReader(`{"arguments":{"format":"json"}}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Len(t, resp.Content, 1)
+	assert.Equal(t, "json", resp.Content[0].Text)
 }
 
 func TestPanicRecovery(t *testing.T) {

@@ -97,6 +97,14 @@ func runServer(_ *cobra.Command, _ []string) error {
 		fmt.Fprintln(os.Stderr, "[gortex] server: unauthenticated mode; localhost only")
 	}
 
+	// Resolve a stable server id. We only fail when a token path is
+	// set but not writable — without one, a future daemon client just
+	// can't detect reconnects, which is non-fatal.
+	serverID, err := resolveServerID(serverCacheDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gortex] server: id persistence disabled: %v\n", err)
+	}
+
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -248,6 +256,9 @@ func runServer(_ *cobra.Command, _ []string) error {
 	serverHandler := server.NewHandler(srv.MCPServer(), g, version, logger)
 	if cm != nil {
 		serverHandler.SetConfigManager(cm)
+	}
+	if serverID != "" {
+		serverHandler.SetServerID(serverID)
 	}
 
 	// Watch mode: set up the event hub so /v1/events has a source.
@@ -409,4 +420,19 @@ func isLocalhostBind(bind string) bool {
 		return true
 	}
 	return false
+}
+
+// resolveServerID loads or creates the per-machine server id. When
+// cacheDir is empty the id lives alongside other gortex cache files
+// (~/.cache/gortex/server.id); otherwise cacheDir/server.id.
+func resolveServerID(cacheDir string) (string, error) {
+	path := filepath.Join(cacheDir, "server.id")
+	if cacheDir == "" {
+		def, err := server.DefaultServerIDPath()
+		if err != nil {
+			return "", err
+		}
+		path = def
+	}
+	return server.LoadOrCreateServerID(path)
 }

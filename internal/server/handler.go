@@ -45,6 +45,7 @@ type Handler struct {
 	startTime     time.Time
 	eventHub      *hub.Hub               // nil when watch mode is off
 	configManager *config.ConfigManager // nil in single-repo mode
+	serverID      string                 // UUID; empty until SetServerID wires it
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -77,6 +78,11 @@ func (h *Handler) SetEventHub(h2 *hub.Hub) { h.eventHub = h2 }
 // its dump by ?project=<name>. Without it, only ?repo=<name> filtering
 // is available.
 func (h *Handler) SetConfigManager(cm *config.ConfigManager) { h.configManager = cm }
+
+// SetServerID attaches a stable UUID to /v1/stats responses so daemon
+// clients can detect server restarts (and therefore index-restart
+// races) by watching for id changes.
+func (h *Handler) SetServerID(id string) { h.serverID = id }
 
 // ServeHTTP implements http.Handler with panic recovery middleware.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -151,9 +157,12 @@ func (h *Handler) handleListTools(w http.ResponseWriter, _ *http.Request) {
 
 // --- /tool/{name} ---
 
-// ToolRequest is the expected JSON body for POST /tool/{tool_name}.
+// ToolRequest is the expected JSON body for POST /v1/tools/{tool_name}.
+// Format is a convenience top-level alias for arguments["format"],
+// merged into Arguments before the tool is invoked.
 type ToolRequest struct {
 	Arguments map[string]any `json:"arguments"`
+	Format    string         `json:"format,omitempty"`
 }
 
 // ToolResponse wraps the MCP tool call result for JSON serialization.
@@ -193,6 +202,7 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var args map[string]any
+	var bodyFormat string
 	if len(body) > 0 {
 		var req ToolRequest
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -202,9 +212,23 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			args = req.Arguments
+			bodyFormat = req.Format
 			if args == nil {
 				_ = json.Unmarshal(body, &args)
 			}
+		}
+	}
+
+	// Merge ?format=<fmt> query param or body-level "format" into the
+	// arguments map so tools that understand the argument (gcx, toon,
+	// compact, ...) honor it without callers having to nest it under
+	// "arguments". Explicit arguments.format still wins.
+	if format := firstNonEmpty(r.URL.Query().Get("format"), bodyFormat); format != "" {
+		if args == nil {
+			args = make(map[string]any)
+		}
+		if _, ok := args["format"]; !ok {
+			args["format"] = format
 		}
 	}
 
@@ -245,8 +269,13 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 
 // --- /stats ---
 
-// StatsResponse is the JSON structure for the /stats endpoint.
+// StatsResponse is the JSON structure for the /v1/stats endpoint.
+// ServerID is a per-machine UUID that changes on server restart so
+// daemon clients can detect reconnects; StartedAt is the wall-clock
+// time of this process start.
 type StatsResponse struct {
+	ServerID   string         `json:"server_id,omitempty"`
+	StartedAt  time.Time      `json:"started_at"`
 	TotalNodes int            `json:"total_nodes"`
 	TotalEdges int            `json:"total_edges"`
 	ByKind     map[string]int `json:"by_kind"`
@@ -256,6 +285,8 @@ type StatsResponse struct {
 func (h *Handler) handleStats(w http.ResponseWriter, _ *http.Request) {
 	stats := h.graph.Stats()
 	resp := StatsResponse{
+		ServerID:   h.serverID,
+		StartedAt:  h.startTime,
 		TotalNodes: stats.TotalNodes,
 		TotalEdges: stats.TotalEdges,
 		ByKind:     stats.ByKind,
@@ -312,6 +343,15 @@ func (h *Handler) availableToolNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // WriteJSON writes a JSON response with the given status code.

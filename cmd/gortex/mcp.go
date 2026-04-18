@@ -294,6 +294,11 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		if cm != nil {
 			serverHandler.SetConfigManager(cm)
 		}
+		if id, err := resolveServerID(mcpCacheDir); err == nil {
+			serverHandler.SetServerID(id)
+		} else {
+			fmt.Fprintf(os.Stderr, "[gortex] server: id persistence disabled: %v\n", err)
+		}
 		handler := server.WithAuth(serverHandler, authToken)
 		corsOpts := server.CORSOptions{AllowOrigins: []string{mcpCORSOrigin}}
 		handler = server.WithCORS(handler, corsOpts)
