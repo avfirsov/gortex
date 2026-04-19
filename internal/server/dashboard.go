@@ -215,7 +215,8 @@ type processEntry struct {
 	Repos   int      `json:"repos"`
 	Score   int      `json:"score"`
 	Risk    string   `json:"risk"`    // ok | warn | risk
-	Crosses []string `json:"crosses"` // repo prefixes this flow touches
+	Crosses  []string `json:"crosses"`  // repo prefixes this flow touches
+	Category string   `json:"category"` // product | tests | internal
 }
 
 // rawProcessSummary mirrors the MCP get_processes list response. Files
@@ -245,16 +246,38 @@ func processEntryFromRaw(p rawProcessSummary) processEntry {
 		crosses = []string{}
 	}
 	return processEntry{
-		ID:      p.ID,
-		Name:    p.Name,
-		Entry:   p.EntryPoint,
-		Steps:   p.StepCount,
-		Files:   p.FileCount,
-		Repos:   len(crosses),
-		Score:   int(p.Score),
-		Risk:    risk,
-		Crosses: crosses,
+		ID:       p.ID,
+		Name:     p.Name,
+		Entry:    p.EntryPoint,
+		Steps:    p.StepCount,
+		Files:    p.FileCount,
+		Repos:    len(crosses),
+		Score:    int(p.Score),
+		Risk:     risk,
+		Crosses:  crosses,
+		Category: categorizeProcess(p.EntryPoint),
 	}
+}
+
+// categorizeProcess buckets a flow by its entry point path so the
+// Investigations UI can tab between production code, test entry points,
+// and Go `internal/` package flows.
+func categorizeProcess(entry string) string {
+	// Split "<repo>/<path>::<sym>" into the path half.
+	path, sym, hasSym := strings.Cut(entry, "::")
+	if hasSym {
+		if strings.HasPrefix(sym, "Test") || strings.HasPrefix(sym, "Benchmark") || strings.HasPrefix(sym, "Example") || strings.HasPrefix(sym, "Fuzz") {
+			return "tests"
+		}
+	}
+	lower := strings.ToLower(path)
+	if strings.HasSuffix(lower, "_test.go") || strings.Contains(lower, "_test.") {
+		return "tests"
+	}
+	if strings.Contains(path, "/internal/") || strings.HasPrefix(path, "internal/") {
+		return "internal"
+	}
+	return "product"
 }
 
 func (h *Handler) handleProcesses(w http.ResponseWriter, r *http.Request) {

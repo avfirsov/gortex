@@ -283,6 +283,45 @@ func (g *Graph) lockTwoWrite(idA, idB string) func() {
 	}
 }
 
+// lockThreeWrite locks up to three shards for write in ascending index
+// order, deduplicating any that collide. Used by ReindexEdge, which
+// mutates the From shard's outEdgeIdx plus both in-edge buckets when a
+// resolver step retargets an edge; missing any of the three races with
+// concurrent AddEdge on that shard (bug: "concurrent map read and map
+// write" in addEdgeToBucket).
+func (g *Graph) lockThreeWrite(idA, idB, idC string) func() {
+	a, b, c := shardIdx(idA), shardIdx(idB), shardIdx(idC)
+	// Sort (a, b, c) ascending without allocating a slice.
+	if a > b {
+		a, b = b, a
+	}
+	if b > c {
+		b, c = c, b
+	}
+	if a > b {
+		a, b = b, a
+	}
+	// Dedupe: lock each distinct index once.
+	idxs := [3]int{a, -1, -1}
+	n := 1
+	if b != a {
+		idxs[n] = b
+		n++
+	}
+	if c != b && c != a {
+		idxs[n] = c
+		n++
+	}
+	for i := 0; i < n; i++ {
+		g.shards[idxs[i]].mu.Lock()
+	}
+	return func() {
+		for i := n - 1; i >= 0; i-- {
+			g.shards[idxs[i]].mu.Unlock()
+		}
+	}
+}
+
 // lockAllWrite / lockAllRead take every shard's lock in order. Used by
 // operations that have to touch the whole graph (AllNodes, Stats,
 // EvictRepo). Callers must match with unlockAllWrite / unlockAllRead.
@@ -382,7 +421,10 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 	if oldTo == e.To {
 		return
 	}
-	unlock := g.lockTwoWrite(oldTo, e.To)
+	// Must lock the From shard too — we mutate sFrom.outEdgeIdx below,
+	// and without its lock a concurrent AddEdge on From panics the
+	// runtime with "concurrent map read and map write".
+	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
 	defer unlock()
 
 	// Old identity uses oldTo; the current edge struct already has the

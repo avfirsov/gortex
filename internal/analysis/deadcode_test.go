@@ -118,7 +118,7 @@ func genDeadCodeGraph() *rapid.Generator[deadCodeGraphResult] {
 
 		// Generate 1-2 live symbols that are process members
 		numProcess := rapid.IntRange(1, 2).Draw(t, "numProcess")
-		var procSteps []string
+		var procSteps []Step
 		for i := range numProcess {
 			id := fmt.Sprintf("pkg/entry%d.go::entryFunc%d", i, i)
 			g.AddNode(&graph.Node{
@@ -130,14 +130,14 @@ func genDeadCodeGraph() *rapid.Generator[deadCodeGraphResult] {
 				EndLine:   10,
 				Language:  "go",
 			})
-			procSteps = append(procSteps, id)
+			procSteps = append(procSteps, Step{ID: id, Depth: i})
 			processes.NodeToProcs[id] = []string{"process-0"}
 			liveIDs = append(liveIDs, id)
 		}
 		processes.Processes = []Process{{
 			ID:         "process-0",
 			Name:       "test process",
-			EntryPoint: procSteps[0],
+			EntryPoint: procSteps[0].ID,
 			Steps:      procSteps,
 			StepCount:  len(procSteps),
 		}}

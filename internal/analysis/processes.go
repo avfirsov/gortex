@@ -8,12 +8,23 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// Step is one node in a discovered execution flow. Depth preserves the
+// call-tree shape so the UI can render branches instead of flattening
+// siblings into a false sequence: traceForward emits DFS preorder, and
+// the parent of a step is the nearest preceding step with a smaller
+// depth. Sibling order in the slice is the child-declaration order of
+// the parent function.
+type Step struct {
+	ID    string `json:"id"`
+	Depth int    `json:"depth"`
+}
+
 // Process represents a discovered execution flow in the codebase.
 type Process struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`        // human-readable name
 	EntryPoint string   `json:"entry_point"` // node ID of the entry function
-	Steps      []string `json:"steps"`       // ordered node IDs in the flow
+	Steps      []Step   `json:"steps"`       // DFS preorder with call-tree depth
 	StepCount  int      `json:"step_count"`
 	Files      []string `json:"files"` // unique files touched
 	Score      float64  `json:"score"` // entry point confidence score
@@ -87,8 +98,8 @@ func DiscoverProcesses(g *graph.Graph) *ProcessResult {
 		seen[c.node.ID] = true
 
 		fileSet := make(map[string]bool)
-		for _, sid := range steps {
-			if n, ok := nodeMap[sid]; ok {
+		for _, s := range steps {
+			if n, ok := nodeMap[s.ID]; ok {
 				fileSet[n.FilePath] = true
 			}
 		}
@@ -110,8 +121,8 @@ func DiscoverProcesses(g *graph.Graph) *ProcessResult {
 		}
 		result.Processes = append(result.Processes, proc)
 
-		for _, sid := range steps {
-			result.NodeToProcs[sid] = append(result.NodeToProcs[sid], procID)
+		for _, s := range steps {
+			result.NodeToProcs[s.ID] = append(result.NodeToProcs[s.ID], procID)
 		}
 	}
 
@@ -193,8 +204,8 @@ func isExported(name, lang string) bool {
 	return !strings.HasPrefix(name, "_")
 }
 
-func traceForward(startID string, callees map[string][]string, maxDepth int) []string {
-	var result []string
+func traceForward(startID string, callees map[string][]string, maxDepth int) []Step {
+	var result []Step
 	visited := make(map[string]bool)
 
 	var dfs func(id string, depth int)
@@ -203,7 +214,7 @@ func traceForward(startID string, callees map[string][]string, maxDepth int) []s
 			return
 		}
 		visited[id] = true
-		result = append(result, id)
+		result = append(result, Step{ID: id, Depth: depth})
 
 		for _, callee := range callees[id] {
 			if !visited[callee] {

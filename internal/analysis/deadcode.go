@@ -84,7 +84,7 @@ func FindDeadCode(g *graph.Graph, processes *ProcessResult, excludePatterns []st
 			entryPoints[proc.EntryPoint] = true
 			// Also consider all nodes that participate in any process
 			for _, step := range proc.Steps {
-				entryPoints[step] = true
+				entryPoints[step.ID] = true
 			}
 		}
 	}

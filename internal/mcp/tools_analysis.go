@@ -138,7 +138,7 @@ func (s *Server) handleGetProcesses(_ context.Context, req mcp.CallToolRequest) 
 			StepCount:    p.StepCount,
 			FileCount:    len(p.Files),
 			Score:        p.Score,
-			RepoPrefixes: uniqueRepoPrefixes(p.Steps),
+			RepoPrefixes: uniqueRepoPrefixesFromSteps(p.Steps),
 		})
 	}
 	return mcp.NewToolResultJSON(map[string]any{
@@ -183,14 +183,14 @@ func majorityRepoPrefix(ids []string) string {
 	return best
 }
 
-// uniqueRepoPrefixes returns the ordered set of distinct repo prefixes
-// touched by a step list. Order is preserved so "crosses" badges render
-// in call sequence.
-func uniqueRepoPrefixes(ids []string) []string {
+// uniqueRepoPrefixesFromSteps returns the ordered set of distinct repo
+// prefixes touched by a process flow, preserving DFS order so the UI
+// renders "crosses" badges in call sequence rather than alphabetical.
+func uniqueRepoPrefixesFromSteps(steps []analysis.Step) []string {
 	seen := make(map[string]struct{}, 4)
 	out := make([]string, 0, 4)
-	for _, id := range ids {
-		p := repoPrefixOf(id)
+	for _, s := range steps {
+		p := repoPrefixOf(s.ID)
 		if p == "" {
 			continue
 		}

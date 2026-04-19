@@ -4,72 +4,52 @@ import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '@/components/primitives/Icon'
 import { CaveatBadge } from '@/components/primitives/Caveat'
 import { CodeBlock } from '@/components/primitives/CodeBlock'
+import { FlowSteps } from '@/components/primitives/FlowSteps'
 import {
   useContracts, useGuards, useProcesses, useProcessDetail,
-  useActivity, useSymbolSource, useSymbol,
+  useActivity, useSymbolSource, useSymbol, useRepos,
 } from '@/lib/hooks'
+import { parseStepId } from '@/lib/flow'
+import type { ProcessCategory } from '@/lib/schema'
 import { useInspector } from '@/lib/inspector'
 
-type StepInfo = {
-  repo: string
-  path: string
-  symbol: string
-  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'builtin' | 'unresolved'
-}
+type CategoryFilter = ProcessCategory | 'all'
+const CATEGORY_TABS: { key: CategoryFilter; label: string }[] = [
+  { key: 'all', label: 'all' },
+  { key: 'product', label: 'product' },
+  { key: 'tests', label: 'tests' },
+  { key: 'internal', label: 'internal' },
+]
 
-// Splits a node ID into its parts. Handles first-party IDs
-// ("<repo>/<path>::<sym>") as well as resolver-emitted externs
-// ("stdlib::encoding/json::NewEncoder" / "dep::github.com/..::Wrap" /
-// "external::<path>" / "builtin::<lang>::<cat>::<method>") so the UI
-// can badge cross-boundary calls.
-function parseStepId(id: string): StepInfo {
-  if (id.startsWith('builtin::')) {
-    const parts = id.slice('builtin::'.length).split('::')
-    const method = parts[parts.length - 1] ?? ''
-    const path = parts.slice(0, -1).join(' · ')
-    return { repo: 'builtin', path, symbol: method, kind: 'builtin' }
-  }
-  if (id.startsWith('stdlib::') || id.startsWith('dep::')) {
-    const rest = id.slice(id.indexOf('::') + 2)
-    const sym = rest.lastIndexOf('::')
-    const path = sym >= 0 ? rest.slice(0, sym) : rest
-    const symbol = sym >= 0 ? rest.slice(sym + 2) : ''
-    return { repo: id.startsWith('stdlib::') ? 'stdlib' : 'dep', path, symbol, kind: id.startsWith('stdlib::') ? 'stdlib' : 'dep' }
-  }
-  if (id.startsWith('external::')) {
-    const rest = id.slice('external::'.length)
-    const sym = rest.lastIndexOf('::')
-    const path = sym >= 0 ? rest.slice(0, sym) : rest
-    const symbol = sym >= 0 ? rest.slice(sym + 2) : ''
-    return { repo: 'external', path, symbol, kind: 'external' }
-  }
-  if (id.startsWith('unresolved::')) {
-    const sym = id.slice('unresolved::'.length).replace(/^\*\./, '')
-    return { repo: '', path: '', symbol: sym, kind: 'unresolved' }
-  }
-  const symIdx = id.indexOf('::')
-  const pathPart = symIdx >= 0 ? id.slice(0, symIdx) : id
-  const symbol = symIdx >= 0 ? id.slice(symIdx + 2) : id
-  const slashIdx = pathPart.indexOf('/')
-  if (slashIdx >= 0) {
-    return { repo: pathPart.slice(0, slashIdx), path: pathPart.slice(slashIdx + 1), symbol, kind: 'firstParty' }
-  }
-  return { repo: '', path: pathPart, symbol, kind: 'firstParty' }
-}
-
-// Hard cap on how many flow steps we render. Some flows (e.g. sqlite)
-// have 800+ steps — listing them all would drown the tile and the UI
-// doesn't gain much past the first few dozen.
-const STEP_LIMIT = 40
+// Same hard cap as ProcessesView — sqlite-style flows have 800+ steps
+// and scrolling past a couple hundred isn't useful in either view.
+const STEP_LIMIT = 200
 
 export function InvestigationView() {
   const { data: processes, loading: procLoading } = useProcesses()
+  const [category, setCategory] = useState<CategoryFilter>('all')
   const [selectedProc, setSelectedProc] = useState<string | null>(null)
-  useEffect(() => {
-    if (!selectedProc && processes && processes.length > 0) {
-      setSelectedProc(processes[0].id)
+
+  const counts = useMemo(() => {
+    const c: Record<CategoryFilter, number> = { all: 0, product: 0, tests: 0, internal: 0 }
+    for (const p of processes ?? []) {
+      c.all++
+      c[p.category]++
     }
-  }, [processes, selectedProc])
+    return c
+  }, [processes])
+
+  const filtered = useMemo(() => {
+    const list = processes ?? []
+    return category === 'all' ? list : list.filter((p) => p.category === category)
+  }, [processes, category])
+
+  useEffect(() => {
+    if (filtered.length === 0) return
+    if (!selectedProc || !filtered.some((p) => p.id === selectedProc)) {
+      setSelectedProc(filtered[0].id)
+    }
+  }, [filtered, selectedProc])
 
   const { data: detail } = useProcessDetail(selectedProc)
   const steps = useMemo(() => (detail?.steps ?? []).slice(0, STEP_LIMIT), [detail])
@@ -77,7 +57,7 @@ export function InvestigationView() {
   const [stepIdx, setStepIdx] = useState(0)
   useEffect(() => { setStepIdx(0) }, [selectedProc])
 
-  const selectedStepId = steps[stepIdx] ?? null
+  const selectedStepId = steps[stepIdx]?.id ?? null
   const { data: source, loading: sourceLoading } = useSymbolSource(selectedStepId)
   const { data: node } = useSymbol(selectedStepId)
 
@@ -106,8 +86,10 @@ export function InvestigationView() {
   const { data: activity } = useActivity(20)
   const { data: contracts } = useContracts()
   const { data: guards } = useGuards()
+  const { data: repos } = useRepos()
+  const repoColor = (id: string) => repos?.find((r) => r.id === id)?.color || 'var(--fg-2)'
 
-  const proc = processes?.find((p) => p.id === selectedProc) ?? processes?.[0]
+  const proc = processes?.find((p) => p.id === selectedProc) ?? filtered[0]
 
   return (
     <>
@@ -122,22 +104,39 @@ export function InvestigationView() {
           <h1>{proc?.name ?? (procLoading ? 'Loading flow…' : 'No processes discovered')}</h1>
           <div className="sub">
             {proc
-              ? `${proc.crosses.length > 0 ? proc.crosses.join(' → ') : 'single repo'} · ${proc.steps} steps · score ${proc.score}`
+              ? `${proc.category} · ${proc.crosses.length > 0 ? proc.crosses.join(' → ') : 'single repo'} · ${proc.steps} steps · score ${proc.score}`
               : 'Process detection runs after indexing — try re-indexing the repository.'}
           </div>
         </div>
-        {processes && processes.length > 1 && (
-          <div className="actions">
-            <select
-              value={selectedProc ?? ''}
-              onChange={(e) => setSelectedProc(e.target.value)}
-              className="btn"
-              style={{ padding: '4px 8px' }}
-            >
-              {processes.slice(0, 20).map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
+        {processes && processes.length > 0 && (
+          <div className="actions" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <div className="scope-switch" role="tablist">
+              {CATEGORY_TABS.map((t) => (
+                <button
+                  key={t.key}
+                  role="tab"
+                  type="button"
+                  className={category === t.key ? 'active' : ''}
+                  onClick={() => setCategory(t.key)}
+                  disabled={counts[t.key] === 0 && t.key !== 'all'}
+                  title={`${counts[t.key]} flow${counts[t.key] === 1 ? '' : 's'}`}
+                >
+                  {t.label} <span className="faint" style={{ marginLeft: 4 }}>{counts[t.key]}</span>
+                </button>
               ))}
-            </select>
+            </div>
+            {filtered.length > 1 && (
+              <select
+                value={selectedProc ?? ''}
+                onChange={(e) => setSelectedProc(e.target.value)}
+                className="btn"
+                style={{ padding: '4px 8px' }}
+              >
+                {filtered.slice(0, 20).map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            )}
           </div>
         )}
       </div>
@@ -151,47 +150,15 @@ export function InvestigationView() {
                 {detail ? `${steps.length}${detail.steps.length > STEP_LIMIT ? ` of ${detail.steps.length}` : ''} steps` : 'loading…'}
               </span>
             </div>
-            <div className="tile-bd">
-              {steps.length === 0 && !procLoading && (
-                <div className="faint" style={{ fontSize: 12, padding: 14 }}>
-                  No steps available for this process.
-                </div>
-              )}
-              {steps.map((sid, i) => {
-                const cur = parseStepId(sid)
-                const prev = i > 0 ? parseStepId(steps[i - 1]) : null
-                const crosses = prev && prev.repo !== cur.repo ? (
-                  <div className="repo-hop">
-                    <Icon name="arrowr" size={10} /> crosses {prev.repo || '—'} → {cur.repo || '—'}
-                  </div>
-                ) : null
-                return (
-                  <div key={sid + ':' + i}>
-                    {crosses}
-                    <div
-                      className="flow-step"
-                      style={{
-                        background: stepIdx === i ? 'var(--accent-soft)' : 'transparent',
-                        borderRadius: 4,
-                        cursor: 'pointer',
-                      }}
-                      onClick={() => setStepIdx(i)}
-                    >
-                      <div className="idx">
-                        <span className="no">{i + 1}</span>
-                      </div>
-                      <div className="body">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                          {cur.repo && <span className="repo-tag">{cur.repo}</span>}
-                          <span className="where">
-                            {cur.path ? `${cur.path}:${cur.symbol}` : cur.symbol}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
+            <div className="tile-bd" style={{ padding: '8px 10px' }}>
+              <FlowSteps
+                steps={steps}
+                selectedIdx={stepIdx}
+                onSelect={setStepIdx}
+                repoColor={repoColor}
+                totalSteps={detail?.steps.length}
+                limitNote={STEP_LIMIT}
+              />
             </div>
           </div>
 

@@ -89,7 +89,9 @@ export interface Process {
   id: string
   name: string
   entry_point: string
-  steps: string[]
+  // Flat DFS preorder; depth reconstructs the call tree. See
+  // internal/analysis/processes.go::Step.
+  steps: { id: string; depth: number }[]
   step_count: number
   files: string[]
   file_count: number

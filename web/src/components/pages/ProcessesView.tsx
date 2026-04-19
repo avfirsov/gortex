@@ -3,80 +3,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '@/components/primitives/Icon'
 import { CodeBlock } from '@/components/primitives/CodeBlock'
+import { FlowSteps } from '@/components/primitives/FlowSteps'
 import {
   useProcesses, useRepos, useProcessDetail, useSymbolSource, useSymbol,
 } from '@/lib/hooks'
+import { parseStepId } from '@/lib/flow'
 import { useInspector } from '@/lib/inspector'
 import { scopeOf, type CodeScope } from '@/lib/utils'
 
 // Hard cap on rendered steps; sqlite flows have 800+ steps and
 // scrolling a single list past a few hundred rows is useless.
 const STEP_LIMIT = 200
-
-// crossLabel formats the other side of a repo-hop arrow. First-party
-// steps show the repo name; externs show "stdlib (encoding/json)" so
-// the user sees both the bucket and which package was called.
-function crossLabel(s: StepInfo): string {
-  if (s.kind === 'stdlib') return s.path ? `stdlib (${s.path})` : 'stdlib'
-  if (s.kind === 'dep') return s.path ? `dep (${s.path})` : 'dep'
-  if (s.kind === 'external') return s.path ? `external (${s.path})` : 'external'
-  if (s.kind === 'builtin') return s.path ? `builtin (${s.path})` : 'builtin'
-  if (s.kind === 'unresolved') return 'unresolved'
-  return s.repo || '—'
-}
-
-type StepInfo = {
-  repo: string
-  path: string
-  symbol: string
-  // kind reflects where the target lives. 'firstParty' is indexed code
-  // in one of the tracked repos; the rest are resolver-emitted stubs
-  // (see internal/resolver/resolver.go — resolveImport / resolveExtern
-  // and the builtin classifier in builtins.go).
-  kind: 'firstParty' | 'stdlib' | 'dep' | 'external' | 'builtin' | 'unresolved'
-}
-
-function parseStepId(id: string): StepInfo {
-  // `builtin::<lang>::<category>::<method>` — classifier output for
-  // language built-ins (String.startsWith, Array.push, list.append, …)
-  // that the resolver couldn't attribute to an import.
-  if (id.startsWith('builtin::')) {
-    const rest = id.slice('builtin::'.length)
-    const parts = rest.split('::')
-    // lang::category::method. If the format ever grows, fall back to
-    // joining all but the last segment as path so we never drop data.
-    const method = parts[parts.length - 1] ?? ''
-    const path = parts.slice(0, -1).join(' · ')
-    return { repo: 'builtin', path, symbol: method, kind: 'builtin' }
-  }
-  // Prefixes emitted by the resolver for externs — no real file to read.
-  if (id.startsWith('stdlib::') || id.startsWith('dep::')) {
-    const rest = id.slice(id.indexOf('::') + 2)
-    const sym = rest.lastIndexOf('::')
-    const path = sym >= 0 ? rest.slice(0, sym) : rest
-    const symbol = sym >= 0 ? rest.slice(sym + 2) : ''
-    return { repo: id.startsWith('stdlib::') ? 'stdlib' : 'dep', path, symbol, kind: id.startsWith('stdlib::') ? 'stdlib' : 'dep' }
-  }
-  if (id.startsWith('external::')) {
-    const rest = id.slice('external::'.length)
-    const sym = rest.lastIndexOf('::')
-    const path = sym >= 0 ? rest.slice(0, sym) : rest
-    const symbol = sym >= 0 ? rest.slice(sym + 2) : ''
-    return { repo: 'external', path, symbol, kind: 'external' }
-  }
-  if (id.startsWith('unresolved::')) {
-    const sym = id.slice('unresolved::'.length).replace(/^\*\./, '')
-    return { repo: '', path: '', symbol: sym, kind: 'unresolved' }
-  }
-  const sepIdx = id.indexOf('::')
-  const pathPart = sepIdx >= 0 ? id.slice(0, sepIdx) : id
-  const symbol = sepIdx >= 0 ? id.slice(sepIdx + 2) : id
-  const slashIdx = pathPart.indexOf('/')
-  if (slashIdx >= 0) {
-    return { repo: pathPart.slice(0, slashIdx), path: pathPart.slice(slashIdx + 1), symbol, kind: 'firstParty' }
-  }
-  return { repo: '', path: pathPart, symbol, kind: 'firstParty' }
-}
 
 export function ProcessesView() {
   const { data: processes, loading, error, refetch } = useProcesses()
@@ -112,7 +49,7 @@ export function ProcessesView() {
 
   const { data: detail, loading: detailLoading } = useProcessDetail(sel)
   const steps = useMemo(() => (detail?.steps ?? []).slice(0, STEP_LIMIT), [detail])
-  const selectedStepId = steps[stepIdx] ?? null
+  const selectedStepId = steps[stepIdx]?.id ?? null
   const selectedInfo = selectedStepId ? parseStepId(selectedStepId) : null
   // Externs (stdlib::, dep::, external::, unresolved::) have no on-disk
   // source and no graph node — skip the round-trip.
@@ -297,108 +234,17 @@ export function ProcessesView() {
               </div>
             </div>
             <div style={{ padding: '8px 10px' }}>
-              {detailLoading && (
+              {detailLoading ? (
                 <div className="faint" style={{ fontSize: 12, padding: 12 }}>Loading steps…</div>
-              )}
-              {!detailLoading && steps.length === 0 && (
-                <div className="faint" style={{ fontSize: 12, padding: 12 }}>
-                  No steps available for this flow.
-                </div>
-              )}
-              {steps.map((sid, i) => {
-                const cur = parseStepId(sid)
-                const prev = i > 0 ? parseStepId(steps[i - 1]) : null
-                const crosses = prev && prev.repo !== cur.repo ? (
-                  <div className="repo-hop" style={{ margin: '4px 0 2px' }}>
-                    <Icon name="arrowr" size={10} /> crosses {crossLabel(prev)} → {crossLabel(cur)}
-                  </div>
-                ) : null
-                const isSel = stepIdx === i
-                const repoBadge = cur.kind === 'stdlib'
-                  ? { label: 'stdlib', color: 'var(--violet)' }
-                  : cur.kind === 'dep'
-                  ? { label: 'dep', color: 'var(--warn)' }
-                  : cur.kind === 'builtin'
-                  ? { label: cur.path || 'builtin', color: 'var(--violet)' }
-                  : cur.kind === 'external'
-                  ? { label: 'external', color: 'var(--fg-3)' }
-                  : cur.kind === 'unresolved'
-                  ? { label: 'unresolved', color: 'var(--fg-3)' }
-                  : cur.repo
-                  ? { label: cur.repo, color: repoColor(cur.repo) }
-                  : null
-                return (
-                  <div key={sid + ':' + i}>
-                    {crosses}
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: '28px 1fr',
-                        alignItems: 'start',
-                        gap: 10,
-                        padding: '6px 8px',
-                        borderBottom: '1px dashed var(--line-1)',
-                        background: isSel ? 'var(--accent-soft)' : 'transparent',
-                        borderRadius: 4,
-                        cursor: 'pointer',
-                      }}
-                      onClick={() => setStepIdx(i)}
-                    >
-                      <span
-                        className="mono"
-                        style={{
-                          display: 'inline-grid',
-                          placeItems: 'center',
-                          width: 20,
-                          height: 20,
-                          borderRadius: 50,
-                          background: 'var(--bg-3)',
-                          color: 'var(--fg-0)',
-                          fontSize: 10.5,
-                          marginTop: 2,
-                        }}
-                      >
-                        {i + 1}
-                      </span>
-                      <div style={{ minWidth: 0 }}>
-                        <div className="hstack" style={{ gap: 6, flexWrap: 'wrap' }}>
-                          {repoBadge && (
-                            <span
-                              className="repo-tag"
-                              style={{ borderLeft: `2px solid ${repoBadge.color}`, paddingLeft: 4 }}
-                            >
-                              {repoBadge.label}
-                            </span>
-                          )}
-                          <span className="mono" style={{ fontSize: 11.5, color: 'var(--fg-0)', wordBreak: 'break-word' }}>
-                            {cur.symbol}
-                          </span>
-                        </div>
-                        {cur.path && (
-                          <div
-                            className="mono faint"
-                            style={{
-                              fontSize: 10.5,
-                              marginTop: 2,
-                              overflowWrap: 'anywhere',
-                              lineHeight: 1.4,
-                            }}
-                          >
-                            {cur.path}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-              {detail && detail.steps.length > STEP_LIMIT && (
-                <div
-                  className="faint"
-                  style={{ fontSize: 11, padding: '10px 4px', textAlign: 'center' }}
-                >
-                  Showing first {STEP_LIMIT} of {detail.steps.length} steps.
-                </div>
+              ) : (
+                <FlowSteps
+                  steps={steps}
+                  selectedIdx={stepIdx}
+                  onSelect={setStepIdx}
+                  repoColor={repoColor}
+                  totalSteps={detail?.steps.length}
+                  limitNote={STEP_LIMIT}
+                />
               )}
             </div>
           </div>

@@ -65,7 +65,7 @@ func testGraph() (*graph.Graph, *analysis.CommunityResult, *analysis.ProcessResu
 		Processes: []analysis.Process{
 			{
 				ID: "proc-0", Name: "request-handling", EntryPoint: "server/handler.go::HandleRequest",
-				Steps: []string{"server/handler.go::HandleRequest", "parser/parse.go::Parse"},
+				Steps: []analysis.Step{{ID: "server/handler.go::HandleRequest", Depth: 0}, {ID: "parser/parse.go::Parse", Depth: 1}},
 				Files: []string{"server/handler.go", "parser/parse.go"},
 			},
 		},

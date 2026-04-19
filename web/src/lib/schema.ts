@@ -18,6 +18,8 @@ export type Repo = {
   color: string
 }
 
+export type ProcessCategory = 'product' | 'tests' | 'internal'
+
 export type Process = {
   id: string
   name: string
@@ -28,6 +30,7 @@ export type Process = {
   score: number
   risk: 'ok' | 'warn' | 'risk'
   crosses: string[]
+  category: ProcessCategory
 }
 
 export type ContractKind = 'REST' | 'EVENT' | 'URL' | 'ENV' | 'DEP'

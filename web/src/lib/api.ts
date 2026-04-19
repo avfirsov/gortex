@@ -301,11 +301,20 @@ export type SymbolSearchResult = {
   sig?: string
 }
 
+// A ProcessStep is one node in a discovered flow with its call-tree
+// depth. The frontend reconstructs the tree by reading depth: the
+// parent of step i is the nearest preceding step with depth < i.depth.
+// See internal/analysis/processes.go::Step for the producer side.
+export type ProcessStep = {
+  id: string
+  depth: number
+}
+
 export type ProcessDetail = {
   id: string
   name: string
   entry_point: string
-  steps: string[]
+  steps: ProcessStep[]
   step_count: number
   files: string[]
   score: number
