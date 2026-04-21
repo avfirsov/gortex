@@ -1,0 +1,1 @@
+export const CACHE_TTL_SECONDS = 'CACHE_TTL_SECONDS';

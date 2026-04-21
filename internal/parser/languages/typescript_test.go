@@ -609,3 +609,131 @@ export class M {}
 	}
 	assert.True(t, seen, "string-literal token should produce a binding edge")
 }
+
+func TestTSExtractor_NestJsFieldInject(t *testing.T) {
+	// Field-level @Inject: decorators are CHILDREN of public_field_definition
+	// in tree-sitter-typescript (unlike method decorators which are siblings).
+	// Both explicit-token and implicit (paren-only) forms should work.
+	src := []byte(`
+import { Inject, Injectable } from '@nestjs/common';
+
+@Injectable()
+export class AuditService {
+  @Inject('DB_URL')
+  private readonly dbUrl!: string;
+
+  @Inject(LOGGER)
+  private readonly log!: Logger;
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("audit.ts", src)
+	require.NoError(t, err)
+
+	var tokens []string
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeConsumes) {
+		if ed.Meta == nil {
+			continue
+		}
+		if v, _ := ed.Meta["via"].(string); v == "@Inject" {
+			tokens = append(tokens, ed.Meta["di_token"].(string))
+		}
+	}
+	assert.Contains(t, tokens, "DB_URL")
+	assert.Contains(t, tokens, "LOGGER")
+}
+
+func TestTSExtractor_NestJsFieldInject_ImplicitToken(t *testing.T) {
+	// `@Inject()` with no argument — currently a no-op because the implicit
+	// form needs the field's type annotation to be the token, and we don't
+	// wire that path yet. Documented here so the behaviour is explicit and
+	// a future change that adds implicit-token support has a test to flip.
+	src := []byte(`
+import { Inject } from '@nestjs/common';
+
+export class X {
+  @Inject()
+  private readonly foo!: Foo;
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("x.ts", src)
+	require.NoError(t, err)
+
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeConsumes) {
+		if ed.Meta != nil {
+			if v, _ := ed.Meta["via"].(string); v == "@Inject" {
+				t.Fatalf("unexpected edge from implicit @Inject(): %+v", ed)
+			}
+		}
+	}
+}
+
+func TestTSExtractor_NestJsDynamicModule(t *testing.T) {
+	// static forRoot(...) returns a DynamicModule whose providers array
+	// must be extracted identically to a @Module({ providers: [...] }).
+	// origin meta surfaces the method name so agents can tell the
+	// binding came from a dynamic module, not a decorator.
+	src := []byte(`
+import { DynamicModule, Module } from '@nestjs/common';
+import { CACHE_TTL } from './tokens';
+
+@Module({})
+export class CacheModule {
+  static forRoot(ttl: number): DynamicModule {
+    return {
+      module: CacheModule,
+      providers: [
+        { provide: CACHE_TTL, useValue: ttl },
+      ],
+      exports: [],
+    };
+  }
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("cache.module.ts", src)
+	require.NoError(t, err)
+
+	var found *graph.Edge
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeProvides) {
+		if ed.Meta == nil {
+			continue
+		}
+		if origin, _ := ed.Meta["origin"].(string); origin == "forRoot" {
+			found = ed
+			break
+		}
+	}
+	require.NotNil(t, found, "expected a forRoot-origin Provides edge")
+	assert.Equal(t, "CACHE_TTL", found.Meta["di_token"])
+	assert.Equal(t, "useValue", found.Meta["binding"])
+}
+
+func TestTSExtractor_NestJsDynamicModule_IgnoresInstanceMethod(t *testing.T) {
+	// Non-static forRoot (unlikely but possible in pathological code)
+	// must not be treated as a dynamic-module factory — NestJS only
+	// calls these at module registration, where they have to be static.
+	src := []byte(`
+import { Module } from '@nestjs/common';
+
+@Module({})
+export class X {
+  forRoot() {
+    return {
+      providers: [{ provide: 'SHOULDNT_EMIT', useValue: 1 }],
+    };
+  }
+}
+`)
+	e := NewTypeScriptExtractor()
+	result, err := e.Extract("x.ts", src)
+	require.NoError(t, err)
+	for _, ed := range edgesOfKind(result.Edges, graph.EdgeProvides) {
+		if ed.Meta != nil {
+			if tok, _ := ed.Meta["di_token"].(string); tok == "SHOULDNT_EMIT" {
+				t.Fatal("instance forRoot should not produce bindings")
+			}
+		}
+	}
+}

@@ -665,59 +665,148 @@ func emitModuleBindings(classNode *sitter.Node, src []byte, classID, filePath st
 		if config == nil {
 			continue
 		}
-		providersNode := objectFieldValue(config, src, "providers")
-		if providersNode == nil || providersNode.Type() != "array" {
+		emitProvidersFromObject(config, src, classID, filePath, result, "@Module")
+	}
+	// Dynamic modules: forRoot / forFeature / forRootAsync /
+	// forFeatureAsync are static methods returning a DynamicModule
+	// config object with the same `providers:` shape as the @Module
+	// decorator. Extraction mirrors the decorator path — the static
+	// method's return object feeds the same helper.
+	emitDynamicModuleBindings(classNode, src, classID, filePath, result)
+}
+
+// emitProvidersFromObject walks the `providers: [...]` array inside a
+// NestJS module config object (whether it came from a @Module decorator
+// or a static DynamicModule return) and emits the appropriate
+// EdgeProvides edges. originTag names the decorator / method the
+// binding originated from so find_usages can tell the agent where to
+// look for the module wiring.
+func emitProvidersFromObject(config *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult, originTag string) {
+	providersNode := objectFieldValue(config, src, "providers")
+	if providersNode == nil || providersNode.Type() != "array" {
+		return
+	}
+	for i := 0; i < int(providersNode.NamedChildCount()); i++ {
+		entry := providersNode.NamedChild(i)
+		if entry == nil || entry.Type() != "object" {
 			continue
 		}
-		for i := 0; i < int(providersNode.NamedChildCount()); i++ {
-			entry := providersNode.NamedChild(i)
-			if entry == nil || entry.Type() != "object" {
+		abstract := objectFieldToken(entry, src, "provide")
+		if abstract == "" {
+			continue
+		}
+		// useClass: abstract type bound to a concrete implementation.
+		if concrete := objectFieldIdentifier(entry, src, "useClass"); concrete != "" {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     classID,
+				To:       "unresolved::" + concrete,
+				Kind:     graph.EdgeProvides,
+				FilePath: filePath,
+				Line:     int(entry.StartPoint().Row) + 1,
+				Meta: map[string]any{
+					"provides_for": abstract,
+					"binding":      "useClass",
+					"origin":       originTag,
+				},
+			})
+			continue
+		}
+		// useValue / useFactory / useExisting: the token IS the public
+		// face of the binding.
+		for _, variant := range []string{"useValue", "useFactory", "useExisting"} {
+			if objectFieldValue(entry, src, variant) == nil {
 				continue
 			}
-			abstract := objectFieldToken(entry, src, "provide")
-			if abstract == "" {
-				continue
-			}
-			// useClass: abstract type bound to a concrete implementation.
-			// Target is the concrete class so the resolver can rewrite
-			// abstract-typed call sites to the bound concrete.
-			if concrete := objectFieldIdentifier(entry, src, "useClass"); concrete != "" {
-				result.Edges = append(result.Edges, &graph.Edge{
-					From:     classID,
-					To:       "unresolved::" + concrete,
-					Kind:     graph.EdgeProvides,
-					FilePath: filePath,
-					Line:     int(entry.StartPoint().Row) + 1,
-					Meta: map[string]any{
-						"provides_for": abstract,
-						"binding":      "useClass",
-					},
-				})
-				continue
-			}
-			// useValue / useFactory / useExisting: the token IS the
-			// public face of the binding — there's no concrete class to
-			// rewrite calls to, just a (module → token) link so
-			// find_usages on the token surfaces the module as a provider.
-			for _, variant := range []string{"useValue", "useFactory", "useExisting"} {
-				if objectFieldValue(entry, src, variant) == nil {
-					continue
-				}
-				result.Edges = append(result.Edges, &graph.Edge{
-					From:     classID,
-					To:       "unresolved::" + abstract,
-					Kind:     graph.EdgeProvides,
-					FilePath: filePath,
-					Line:     int(entry.StartPoint().Row) + 1,
-					Meta: map[string]any{
-						"di_token": abstract,
-						"binding":  variant,
-					},
-				})
-				break
-			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     classID,
+				To:       "unresolved::" + abstract,
+				Kind:     graph.EdgeProvides,
+				FilePath: filePath,
+				Line:     int(entry.StartPoint().Row) + 1,
+				Meta: map[string]any{
+					"di_token": abstract,
+					"binding":  variant,
+					"origin":   originTag,
+				},
+			})
+			break
 		}
 	}
+}
+
+// emitDynamicModuleBindings walks a class for static methods named
+// forRoot / forFeature (+async variants) and extracts providers from
+// any object literals they return. This is the standard NestJS
+// DynamicModule pattern used by ConfigModule.forRoot({...}),
+// TypeOrmModule.forFeature([...]), etc. — the providers array is
+// computed at module import time, so without this pass the agent
+// sees the static method but misses every provider declared inside it.
+var dynamicModuleMethods = map[string]struct{}{
+	"forRoot":         {},
+	"forRootAsync":    {},
+	"forFeature":      {},
+	"forFeatureAsync": {},
+	"register":        {},
+	"registerAsync":   {},
+}
+
+func emitDynamicModuleBindings(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult) {
+	walkNodes(classNode, func(n *sitter.Node) {
+		if n.Type() != "method_definition" {
+			return
+		}
+		nameNode := n.ChildByFieldName("name")
+		if nameNode == nil {
+			return
+		}
+		if _, ok := dynamicModuleMethods[nameNode.Content(src)]; !ok {
+			return
+		}
+		// Static-only: plain instance methods with these names are not
+		// NestJS dynamic-module factories. Look for a `static` keyword
+		// among the method's children.
+		if !methodIsStatic(n) {
+			return
+		}
+		body := n.ChildByFieldName("body")
+		if body == nil {
+			return
+		}
+		// Find the FIRST return_statement that returns an object. Most
+		// real-world forRoot bodies return a single object at the end;
+		// conditional returns (`return cached ?? { ... }`) aren't
+		// attempted here — they're rare and ambiguous.
+		var cfg *sitter.Node
+		walkNodes(body, func(m *sitter.Node) {
+			if cfg != nil || m.Type() != "return_statement" {
+				return
+			}
+			for i := 0; i < int(m.NamedChildCount()); i++ {
+				c := m.NamedChild(i)
+				if c != nil && c.Type() == "object" {
+					cfg = c
+					return
+				}
+			}
+		})
+		if cfg == nil {
+			return
+		}
+		emitProvidersFromObject(cfg, src, classID, filePath, result, nameNode.Content(src))
+	})
+}
+
+// methodIsStatic reports whether a method_definition has the `static`
+// modifier among its children. Tree-sitter-typescript places modifiers
+// as unnamed children (anonymous tokens) preceding the method name.
+func methodIsStatic(m *sitter.Node) bool {
+	for i := 0; i < int(m.ChildCount()); i++ {
+		c := m.Child(i)
+		if c != nil && c.Type() == "static" {
+			return true
+		}
+	}
+	return false
 }
 
 // classDecorators returns decorator nodes applicable to a class_declaration.
@@ -802,54 +891,72 @@ func objectFieldToken(objNode *sitter.Node, src []byte, name string) string {
 	return ""
 }
 
-// emitInjectConsumers scans a class_declaration for a constructor whose
-// parameters carry `@Inject(TOKEN)` decorators. For each, emits an
-// EdgeConsumes from the class (not the constructor method) to the
-// token — the class is what consumes the token across its lifetime,
-// and that's the grain callers want when they ask `find_usages(TOKEN)`.
+// emitInjectConsumers scans a class_declaration for two @Inject shapes
+// and emits an EdgeConsumes for each discovered (class, token) pair:
+//  1. Constructor parameter properties:
+//     `constructor(@Inject(TOKEN) private readonly foo: T) {}`
+//  2. Decorated class fields:
+//     `@Inject(TOKEN) private readonly foo!: T;`
+// Field decorators are siblings of the `public_field_definition` inside
+// class_body (same layout as method decorators), so the walker traverses
+// prev siblings per field. The edge source is the class (not the ctor
+// method or field), matching the grain callers get when they ask
+// `find_usages(TOKEN)`.
 func emitInjectConsumers(classNode *sitter.Node, src []byte, classID, filePath string, result *parser.ExtractionResult) {
 	seen := make(map[string]struct{})
+	emit := func(dec *sitter.Node) {
+		tok := injectDecoratorArg(dec, src)
+		if tok == "" {
+			return
+		}
+		if _, dup := seen[tok]; dup {
+			return
+		}
+		seen[tok] = struct{}{}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     classID,
+			To:       "unresolved::" + tok,
+			Kind:     graph.EdgeConsumes,
+			FilePath: filePath,
+			Line:     int(dec.StartPoint().Row) + 1,
+			Meta: map[string]any{
+				"di_token": tok,
+				"via":      "@Inject",
+			},
+		})
+	}
 	walkNodes(classNode, func(n *sitter.Node) {
-		if n.Type() != "method_definition" {
-			return
-		}
-		nameNode := n.ChildByFieldName("name")
-		if nameNode == nil || nameNode.Content(src) != "constructor" {
-			return
-		}
-		params := n.ChildByFieldName("parameters")
-		if params == nil {
-			return
-		}
-		for i := 0; i < int(params.NamedChildCount()); i++ {
-			p := params.NamedChild(i)
-			if p == nil {
-				continue
+		switch n.Type() {
+		case "method_definition":
+			nameNode := n.ChildByFieldName("name")
+			if nameNode == nil || nameNode.Content(src) != "constructor" {
+				return
 			}
-			for j := 0; j < int(p.ChildCount()); j++ {
-				c := p.Child(j)
-				if c == nil || c.Type() != "decorator" {
+			params := n.ChildByFieldName("parameters")
+			if params == nil {
+				return
+			}
+			for i := 0; i < int(params.NamedChildCount()); i++ {
+				p := params.NamedChild(i)
+				if p == nil {
 					continue
 				}
-				tok := injectDecoratorArg(c, src)
-				if tok == "" {
-					continue
+				for j := 0; j < int(p.ChildCount()); j++ {
+					c := p.Child(j)
+					if c != nil && c.Type() == "decorator" {
+						emit(c)
+					}
 				}
-				if _, dup := seen[tok]; dup {
-					continue
+			}
+		case "public_field_definition":
+			// Unlike method_definition, tree-sitter-typescript embeds
+			// field decorators AS CHILDREN of the field node, not
+			// siblings. Walk direct children for decorator entries.
+			for i := 0; i < int(n.ChildCount()); i++ {
+				c := n.Child(i)
+				if c != nil && c.Type() == "decorator" {
+					emit(c)
 				}
-				seen[tok] = struct{}{}
-				result.Edges = append(result.Edges, &graph.Edge{
-					From:     classID,
-					To:       "unresolved::" + tok,
-					Kind:     graph.EdgeConsumes,
-					FilePath: filePath,
-					Line:     int(c.StartPoint().Row) + 1,
-					Meta: map[string]any{
-						"di_token": tok,
-						"via":      "@Inject",
-					},
-				})
 			}
 		}
 	})

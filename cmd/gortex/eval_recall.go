@@ -414,7 +414,11 @@ func printMissDiagnostics(report *recall.Report) {
 			if len(top3) > 3 {
 				top3 = top3[:3]
 			}
-			fmt.Fprintf(os.Stderr, "  %-28s  %q  want=%v  got=%v\n", m.CaseID, m.Query, m.Expected, top3)
+			rank := "MISS"
+			if m.Rank > 0 {
+				rank = fmt.Sprintf("rank=%d", m.Rank)
+			}
+			fmt.Fprintf(os.Stderr, "  %-38s  %-6s  %q  want=%v  got=%v\n", m.CaseID, rank, m.Query, m.Expected, top3)
 		}
 	}
 }

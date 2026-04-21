@@ -631,6 +631,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	// provides/consumes edges from the merged registry.
 	reporter.Report("extracting contracts", 0, 0)
 	idx.extractGoModContracts(contractReg)
+	idx.extractDIContracts(contractReg)
 	idx.commitContracts(contractReg)
 
 	// Auto-upgrade to Bleve if above threshold. Run in the background
@@ -2047,6 +2048,7 @@ func (idx *Indexer) extractContracts() {
 	idx.contractCacheMu.Unlock()
 
 	idx.extractGoModContracts(reg)
+	idx.extractDIContracts(reg)
 	idx.commitContracts(reg)
 }
 

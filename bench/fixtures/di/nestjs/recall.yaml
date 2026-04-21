@@ -151,7 +151,11 @@ cases:
     tier: di_gap
     query: "call_chain:src/notifications/notifications.controller.ts::NotificationsController.send"
     expected:
+      # Both are legitimate downstream calls from the handler: the guard
+      # fires before the body via @UseGuards dispatch, the body's
+      # `this.notifier.notify()` resolves through the useClass binding.
       - src/notifications/email-notifier.service.ts::EmailNotifier.notify
+      - src/auth/auth.guard.ts::AuthGuard.canActivate
 
   # @Inject(DATABASE_URL) token consumer. There's no type linking
   # ConfigService's dbUrl param to the `{ provide: DATABASE_URL,
@@ -218,3 +222,35 @@ cases:
     query: "call_chain:src/feature/feature-b.service.ts::FeatureBService.callA"
     expected:
       - src/feature/feature-a.service.ts::FeatureAService.doA
+
+  # --- Property (field) injection ---
+  # NestJS permits @Inject on class fields instead of constructor params.
+  # AuditService uses both the implicit (`@Inject() field!: T`) and
+  # explicit-token (`@Inject(TOKEN) field: ...`) shapes. Without field-
+  # level decorator extraction the call chain stops at AuditService —
+  # the call to `this.users.findOne` has no receiver_type on its edge,
+  # and find_usages on DATABASE_URL misses AuditService entirely.
+  - id: di_gap-call_chain-AuditService-recordLogin
+    tier: di_gap
+    query: "call_chain:src/audit/audit.service.ts::AuditService.recordLogin"
+    expected:
+      - src/users/users.service.ts::UsersService.findOne
+
+  - id: di_gap-usages-DATABASE_URL-includes-audit
+    tier: di_gap
+    query: "usages:src/config/config.tokens.ts::DATABASE_URL"
+    expected:
+      - src/audit/audit.service.ts::AuditService
+
+  # --- Dynamic modules (forRoot / forFeature) ---
+  # CacheModule.forRoot(ttl) returns a DynamicModule whose providers
+  # array binds CACHE_TTL_SECONDS to the runtime ttl value. The binding
+  # lives inside a static method body, not a @Module decorator — so
+  # without dynamic-module extraction find_usages on the token surfaces
+  # only the consumer, never the provider module.
+  - id: di_gap-usages-CACHE_TTL_SECONDS
+    tier: di_gap
+    query: "usages:src/cache/cache.tokens.ts::CACHE_TTL_SECONDS"
+    expected:
+      - src/cache/cache.service.ts::CacheService
+      - src/cache/cache.module.ts::CacheModule

@@ -18,6 +18,12 @@ const (
 	ContractEnv     ContractType = "env"
 	ContractOpenAPI    ContractType = "openapi"
 	ContractDependency ContractType = "dependency"
+	// ContractDI covers NestJS-style dependency-injection bindings
+	// derived from the EdgeProvides / EdgeConsumes edges the
+	// TypeScript extractor emits for @Module providers and @Inject
+	// consumers. A matched pair has the same `di::<token>` ID on
+	// both sides so orphan detection works via the standard matcher.
+	ContractDI ContractType = "di"
 )
 
 // Role indicates whether a symbol provides or consumes a contract.

@@ -108,12 +108,15 @@ type RankerResult struct {
 }
 
 // Miss is a single per-case diagnostic row for when a ranker didn't
-// surface any expected ID in top-K.
+// surface any expected ID in top-K. Rank holds the 1-based position of
+// the first-hit expected ID, or 0 when no expected ID appeared at all
+// — lets callers distinguish "found at position 3" from "never found".
 type Miss struct {
 	CaseID   string   `json:"case_id"`
 	Query    string   `json:"query"`
 	Expected []string `json:"expected"`
 	Top      []string `json:"top"` // top-K IDs the ranker returned
+	Rank     int      `json:"rank,omitempty"`
 	// JudgedHit is populated by a post-hoc LLM-judge pass: true when
 	// the judge accepts any entry in Top as answering the Query. Nil
 	// pointer means "not judged."
@@ -227,17 +230,25 @@ func evalOne(fixture Fixture, r Ranker, tc TokenCounter, maxK int) RankerResult 
 		}
 		if firstHit >= 0 {
 			rrSum += 1.0 / float64(firstHit+1)
-		} else {
-			// Capture a miss row: top-K returned + gold expected. Lets
-			// --verbose print actionable diagnostics and lets --judge
-			// rescue the case.
+		}
+		// Capture a row when the case missed outright OR landed outside
+		// the top slot. Rank=0 means "no expected ID in top-K at all"
+		// (the hard miss we've always tracked); Rank>=2 means "found
+		// but not at rank 1" — surfaces ordering bugs the aggregate
+		// R@1 number hides.
+		if firstHit < 0 || firstHit > 0 {
 			topCopy := append([]string(nil), ranked...)
 			expCopy := append([]string(nil), c.Expected...)
+			rank := 0
+			if firstHit >= 0 {
+				rank = firstHit + 1
+			}
 			res.Misses = append(res.Misses, Miss{
 				CaseID:   c.ID,
 				Query:    c.Query,
 				Expected: expCopy,
 				Top:      topCopy,
+				Rank:     rank,
 			})
 		}
 
