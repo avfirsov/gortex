@@ -698,8 +698,8 @@ func phpExtractClassRef(arg *sitter.Node, src []byte) string {
 	switch arg.Type() {
 	case "argument":
 		// Argument wrapper — unwrap to the contained expression.
-		for i := 0; i < int(arg.NamedChildCount()); i++ {
-			return phpExtractClassRef(arg.NamedChild(i), src)
+		if arg.NamedChildCount() > 0 {
+			return phpExtractClassRef(arg.NamedChild(0), src)
 		}
 		return ""
 	case "class_constant_access_expression", "scoped_call_expression":
@@ -731,8 +731,8 @@ func phpExtractStringArray(arg *sitter.Node, src []byte) map[string]struct{} {
 	}
 	// Unwrap argument wrapper.
 	if arg.Type() == "argument" {
-		for i := 0; i < int(arg.NamedChildCount()); i++ {
-			return phpExtractStringArray(arg.NamedChild(i), src)
+		if arg.NamedChildCount() > 0 {
+			return phpExtractStringArray(arg.NamedChild(0), src)
 		}
 		return out
 	}
