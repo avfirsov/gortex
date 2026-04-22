@@ -9,7 +9,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/pkg/wire"
+	wire "github.com/gortexhq/gcx-go"
 )
 
 func newTestNode(id, name string, kind graph.NodeKind, path string, line int) *graph.Node {

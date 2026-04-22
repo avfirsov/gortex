@@ -1,5 +1,0 @@
-GCX1 tool=get_callers.nodes fields=id,kind,name,path,line
-a.go::Caller1	function	Caller1	a.go	5
-b.go::Caller2	method	Caller2	b.go	15
-GCX1 tool=get_callers.edges fields=from,to,kind,origin,confidence
-a.go::Caller1	target	calls	ast_resolved	1

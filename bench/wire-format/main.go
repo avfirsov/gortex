@@ -17,7 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/tokens"
-	"github.com/zzet/gortex/pkg/wire"
+	wire "github.com/gortexhq/gcx-go"
 )
 
 type caseFile struct {

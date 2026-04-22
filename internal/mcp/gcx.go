@@ -11,7 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/pkg/wire"
+	wire "github.com/gortexhq/gcx-go"
 )
 
 // isGCX reports whether the caller requested the GCX1 compact wire

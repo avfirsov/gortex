@@ -8,6 +8,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gofrs/flock v0.13.0
 	github.com/google/uuid v1.6.0
+	github.com/gortexhq/gcx-go v0.0.0-00010101000000-000000000000
 	github.com/jedib0t/go-pretty/v6 v6.7.9
 	github.com/knights-analytics/hugot v0.7.0
 	github.com/mark3labs/mcp-go v0.48.0
@@ -21,7 +22,6 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/yalue/onnxruntime_go v1.27.0
-	github.com/zzet/gortex/pkg/wire v0.1.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/tools v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -96,3 +96,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 )
+
+replace github.com/gortexhq/gcx-go => ../gcx-go

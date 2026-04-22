@@ -1,2 +1,0 @@
-GCX1 tool=get_symbol_source fields=id,source etag=etag-test
-a.go::Foo	func Foo() {\n\tfmt.Println("x\\ty")\n}

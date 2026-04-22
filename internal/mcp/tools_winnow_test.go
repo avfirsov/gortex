@@ -14,7 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/pkg/wire"
+	wire "github.com/gortexhq/gcx-go"
 )
 
 // buildWinnowGraph creates a tiny deterministic graph with four functions

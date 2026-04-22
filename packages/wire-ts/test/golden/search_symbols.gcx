@@ -1,6 +1,0 @@
-GCX1 tool=search_symbols fields=id,kind,name,path,line,sig total=5 truncated=false
-a.go::Foo	function	Foo	a.go	10	func Foo()
-a.go::Bar	function	Bar	a.go	20	func Bar(x int) error
-b.go::Baz	method	Baz	b.go	30	func (s *Svc) Baz()
-c.go::Qux	type	Qux	c.go	40	type Qux struct { A int }
-d.go::Quux	function	Quux	d.go	50	func Quux(ctx context.Context) error
