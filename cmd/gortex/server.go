@@ -52,7 +52,7 @@ var (
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Start the HTTP server API for external integrations",
-	Long:  "Exposes Gortex MCP tools as an HTTP/JSON API under /v1/*: /v1/health, /v1/tools, /v1/tools/{name}, /v1/stats, /v1/graph, /v1/events. The UI is a separate Next.js frontend (see web/) that talks to this server over HTTP.",
+	Long:  "Exposes Gortex MCP tools as an HTTP/JSON API under /v1/*: /v1/health, /v1/tools, /v1/tools/{name}, /v1/stats, /v1/graph, /v1/events. The UI is a separate Next.js frontend (github.com/gortexhq/web) that talks to this server over HTTP.",
 	RunE:  runServer,
 }
 

@@ -118,21 +118,6 @@ build-rpi32:
 	@echo "✓ Built gortex-rpi32 (linux/arm/v7)"
 
 # ---------------------------------------------------------------------------
-# Web UI (Next.js)
-# ---------------------------------------------------------------------------
-
-.PHONY: install-ui dev-ui build-ui
-
-install-ui:
-	cd web && npm install
-
-dev-ui:
-	cd web && npm run dev
-
-build-ui:
-	cd web && npm run build
-
-# ---------------------------------------------------------------------------
 # Embedding backend dependencies
 # ---------------------------------------------------------------------------
 
