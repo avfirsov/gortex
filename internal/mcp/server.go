@@ -80,6 +80,13 @@ type Server struct {
 	multiIndexer *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	activeProject string
+	// scopeWorkspace / scopeProject default-scope every query at this
+	// server instance to a single (workspace, project) tuple. Set by
+	// `gortex server --workspace <slug> [--scope-project <slug>]`
+	// (spec §4.2 / Step J). Tool handlers consult these via the
+	// QueryScope() helper rather than reading the fields directly.
+	scopeWorkspace string
+	scopeProject   string
 	logger       *zap.Logger
 	communities  *analysis.CommunityResult
 	processes    *analysis.ProcessResult
@@ -325,6 +332,13 @@ type MultiRepoOptions struct {
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
 	ActiveProject string
+	// ScopeWorkspace is the spec-launch.md §4.2 workspace slug filter
+	// applied as the default scope on every query. Set by `gortex
+	// server --workspace <slug>` (Step J). Empty disables the filter.
+	ScopeWorkspace string
+	// ScopeProject narrows further inside ScopeWorkspace (no effect
+	// without it). §4.2 project slug.
+	ScopeProject string
 }
 
 // NewServer creates an MCP server with all Gortex tools registered.
@@ -354,6 +368,8 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 		s.multiIndexer = o.MultiIndexer
 		s.configManager = o.ConfigManager
 		s.activeProject = o.ActiveProject
+		s.scopeWorkspace = o.ScopeWorkspace
+		s.scopeProject = o.ScopeProject
 	}
 
 	s.registerCoreTools()
@@ -375,6 +391,50 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 // Call after NewServer with the cache directory and primary repo path.
 func (s *Server) InitFeedback(cacheDir, repoPath string) {
 	s.feedback = newFeedbackManager(cacheDir, repoPath)
+}
+
+// WorkspaceScope returns the default §4.2 workspace slug filter
+// applied to every query (set by `gortex server --workspace`). Empty
+// means no scope; tools that consult it should fall back to the
+// global multi-workspace view.
+func (s *Server) WorkspaceScope() string { return s.scopeWorkspace }
+
+// ProjectScope returns the §4.2 project slug filter; meaningful only
+// when WorkspaceScope() is non-empty.
+func (s *Server) ProjectScope() string { return s.scopeProject }
+
+// resolveQueryScope merges server-level default scope with caller-
+// supplied arg overrides. Caller wins on a per-field basis: a tool
+// call passing `workspace: "tuck"` against a server with
+// `--workspace acme` produces a tuck-scoped query. An empty caller
+// arg falls through to the server default. Used by tool handlers to
+// seed QueryOptions in one place; the spec §11 step P "scope
+// overrides" semantics live here.
+func (s *Server) resolveQueryScope(argWorkspace, argProject string) (workspace, project string) {
+	workspace = s.scopeWorkspace
+	if argWorkspace != "" {
+		workspace = argWorkspace
+	}
+	project = s.scopeProject
+	if argProject != "" {
+		project = argProject
+	}
+	return
+}
+
+// scopeFromRequest pulls `workspace` / `project` arg overrides off
+// the MCP request and merges with the server defaults. Convenience
+// wrapper around resolveQueryScope for handlers that take the
+// request directly.
+func (s *Server) scopeFromRequest(req scopeArgGetter) (workspace, project string) {
+	return s.resolveQueryScope(req.GetString("workspace", ""), req.GetString("project", ""))
+}
+
+// scopeArgGetter is the minimum interface for reading MCP string
+// args; mirrors mcp.CallToolRequest's GetString without forcing
+// every caller to import the mcp pkg here.
+type scopeArgGetter interface {
+	GetString(key, fallback string) string
 }
 
 // InitCombo initializes the query→symbol combo tracker. Persists per-repo,

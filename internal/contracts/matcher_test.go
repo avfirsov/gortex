@@ -5,23 +5,32 @@ import "testing"
 func TestMatch_ProviderConsumerPairing(t *testing.T) {
 	reg := NewRegistry()
 
+	// Two repos, ONE workspace — the §4.2 spec model for legitimate
+	// cross-repo pairing (microservices behind a shared gateway). Both
+	// contracts declare WorkspaceID="acme" so the matcher's boundary
+	// check pairs them as a CrossRepo link. Without a shared workspace
+	// the §4.3 boundary would (correctly) treat them as orphans.
 	reg.Add(Contract{
-		ID:         "http::GET::/api/users",
-		Type:       ContractHTTP,
-		Role:       RoleProvider,
-		SymbolID:   "svc-a::listUsers",
-		FilePath:   "routes.go",
-		RepoPrefix: "svc-a",
-		Confidence: 0.9,
+		ID:          "http::GET::/api/users",
+		Type:        ContractHTTP,
+		Role:        RoleProvider,
+		SymbolID:    "svc-a::listUsers",
+		FilePath:    "routes.go",
+		RepoPrefix:  "svc-a",
+		WorkspaceID: "acme",
+		ProjectID:   "users",
+		Confidence:  0.9,
 	})
 	reg.Add(Contract{
-		ID:         "http::GET::/api/users",
-		Type:       ContractHTTP,
-		Role:       RoleConsumer,
-		SymbolID:   "svc-b::fetchUsers",
-		FilePath:   "client.go",
-		RepoPrefix: "svc-b",
-		Confidence: 0.9,
+		ID:          "http::GET::/api/users",
+		Type:        ContractHTTP,
+		Role:        RoleConsumer,
+		SymbolID:    "svc-b::fetchUsers",
+		FilePath:    "client.go",
+		RepoPrefix:  "svc-b",
+		WorkspaceID: "acme",
+		ProjectID:   "users",
+		Confidence:  0.9,
 	})
 
 	result := Match(reg)
@@ -132,30 +141,38 @@ func TestMatch_SameRepoNotCrossRepo(t *testing.T) {
 func TestMatch_MultipleProvidersSingleConsumer(t *testing.T) {
 	reg := NewRegistry()
 
-	// Two providers for the same route (e.g., two microservices behind a gateway).
+	// Two providers for the same route (e.g., two microservices behind
+	// a gateway). All three repos declare the same WorkspaceID="acme"
+	// so the §4.3 boundary lets the matcher pair them.
 	reg.Add(Contract{
-		ID:         "http::GET::/api/users",
-		Type:       ContractHTTP,
-		Role:       RoleProvider,
-		SymbolID:   "svc-a::listUsers",
-		FilePath:   "a.go",
-		RepoPrefix: "svc-a",
+		ID:          "http::GET::/api/users",
+		Type:        ContractHTTP,
+		Role:        RoleProvider,
+		SymbolID:    "svc-a::listUsers",
+		FilePath:    "a.go",
+		RepoPrefix:  "svc-a",
+		WorkspaceID: "acme",
+		ProjectID:   "users",
 	})
 	reg.Add(Contract{
-		ID:         "http::GET::/api/users",
-		Type:       ContractHTTP,
-		Role:       RoleProvider,
-		SymbolID:   "svc-c::listUsers",
-		FilePath:   "c.go",
-		RepoPrefix: "svc-c",
+		ID:          "http::GET::/api/users",
+		Type:        ContractHTTP,
+		Role:        RoleProvider,
+		SymbolID:    "svc-c::listUsers",
+		FilePath:    "c.go",
+		RepoPrefix:  "svc-c",
+		WorkspaceID: "acme",
+		ProjectID:   "users",
 	})
 	reg.Add(Contract{
-		ID:         "http::GET::/api/users",
-		Type:       ContractHTTP,
-		Role:       RoleConsumer,
-		SymbolID:   "svc-b::fetchUsers",
-		FilePath:   "b.go",
-		RepoPrefix: "svc-b",
+		ID:          "http::GET::/api/users",
+		Type:        ContractHTTP,
+		Role:        RoleConsumer,
+		SymbolID:    "svc-b::fetchUsers",
+		FilePath:    "b.go",
+		RepoPrefix:  "svc-b",
+		WorkspaceID: "acme",
+		ProjectID:   "users",
 	})
 
 	result := Match(reg)

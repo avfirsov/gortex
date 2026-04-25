@@ -262,6 +262,29 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 		}
 	}
 
+	// spec-launch.md §11 step D — backfill `WorkspaceID` / `ProjectID`
+	// onto nodes and contracts loaded from a pre-§4 snapshot. Old
+	// snapshots have these fields as zero (gob decodes unknown fields
+	// silently); without this stamp the matcher's
+	// EffectiveWorkspace falls back to RepoPrefix and explicit
+	// shared-workspace declarations stop working until every file is
+	// touched. Idempotent — re-running on a stamped graph is a no-op.
+	if nodes, conts := state.multiIndexer.BackfillWorkspaceSlugs(); nodes+conts > 0 {
+		logger.Info("daemon: backfilled workspace/project slugs from .gortex.yaml",
+			zap.Int("nodes", nodes),
+			zap.Int("contracts", conts))
+	}
+
+	// Run a cross-repo resolution pass once warmup has stamped the
+	// workspace slugs. Files touched by IncrementalReindex already
+	// re-resolve via the per-repo Resolver; this catches cross-repo
+	// edges in unchanged files plus stamps cross_workspace_deps
+	// eligibility on stubs. Mirrors what MultiIndexer.IndexAll does
+	// for a fresh-start daemon (where there's no snapshot to reconcile
+	// against). After resolution, contract bridge edges may have
+	// changed too, so ReconcileContractEdges runs again.
+	state.multiIndexer.RunGlobalResolve()
+
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch

@@ -57,6 +57,21 @@ type Indexer struct {
 	// When empty, the indexer operates in single-repo mode (backward compatible).
 	repoPrefix string
 
+	// workspaceID is the §4.2 hard graph boundary slug for this repo.
+	// Stamped onto every node emitted by this indexer via applyRepoPrefix
+	// so query-time scoping doesn't have to look it up by repo prefix.
+	// Defaults at the MultiIndexer layer to the per-repo `.gortex.yaml`
+	// `workspace:` slug, falling back to repoPrefix when no slug is
+	// declared (so configs that predate the §4 design keep working).
+	workspaceID string
+
+	// projectID is the §4.2 soft sub-boundary slug. Defaults to the
+	// repo prefix in single-project repos. Monorepos resolve a per-file
+	// projectID via the `projects[]` paths-glob mapping in
+	// `.gortex.yaml`; until that lookup is wired in (Step E/F), every
+	// node from this indexer carries the repo-default value.
+	projectID string
+
 	// contractRegistry holds detected API contracts (HTTP routes, gRPC, etc.).
 	contractRegistry *contracts.Registry
 
@@ -270,6 +285,24 @@ func (idx *Indexer) SetRepoPrefix(prefix string) { idx.repoPrefix = prefix }
 // RepoPrefix returns the current repository prefix.
 func (idx *Indexer) RepoPrefix() string { return idx.repoPrefix }
 
+// SetWorkspaceID sets the §4.2 workspace slug stamped onto nodes
+// emitted by this indexer. Empty means "no workspace declared" — the
+// applyRepoPrefix path will fall back to RepoPrefix so multi-repo
+// configs without `.gortex.yaml::workspace:` keep working.
+func (idx *Indexer) SetWorkspaceID(id string) { idx.workspaceID = id }
+
+// WorkspaceID returns the workspace slug this indexer stamps on nodes.
+func (idx *Indexer) WorkspaceID() string { return idx.workspaceID }
+
+// SetProjectID sets the §4.2 project slug stamped onto nodes emitted
+// by this indexer. Single-project repos pass their repo name (the
+// MultiIndexer default); monorepos compute a per-file slug from the
+// `projects[]` mapping (Step E/F follow-up).
+func (idx *Indexer) SetProjectID(id string) { idx.projectID = id }
+
+// ProjectID returns the project slug this indexer stamps on nodes.
+func (idx *Indexer) ProjectID() string { return idx.projectID }
+
 // SetEmbedder sets the embedding provider for semantic search.
 // When set, buildSearchIndex will create a HybridBackend with vector search.
 func (idx *Indexer) SetEmbedder(p embedding.Provider) { idx.embedder = p }
@@ -353,6 +386,22 @@ func (idx *Indexer) prefixPath(relPath string) string {
 // the edge on a real ID that already carries its own correct prefix
 // (possibly cross-repo, which the resolver marks explicitly).
 func (idx *Indexer) applyRepoPrefix(nodes []*graph.Node, edges []*graph.Edge) {
+	// Stamp WorkspaceID / ProjectID on every node emitted by this
+	// indexer regardless of mode — single-repo and multi-repo both
+	// need the §4 boundary slugs for query scoping and contract
+	// matching. Single-repo callers can leave them empty; the
+	// MultiIndexer path always sets them via SetWorkspaceID /
+	// SetProjectID before calling Index.
+	if idx.workspaceID != "" || idx.projectID != "" {
+		for _, n := range nodes {
+			if idx.workspaceID != "" && n.WorkspaceID == "" {
+				n.WorkspaceID = idx.workspaceID
+			}
+			if idx.projectID != "" && n.ProjectID == "" {
+				n.ProjectID = idx.projectID
+			}
+		}
+	}
 	if idx.repoPrefix == "" {
 		return
 	}
@@ -1128,6 +1177,17 @@ func (idx *Indexer) runContractExtractorsForFile(
 		found := ex.Extract(graphPath, src, fileNodes, fileEdges)
 		for i := range found {
 			found[i].RepoPrefix = idx.repoPrefix
+			// Stamp the §4.2 workspace / project slugs alongside the
+			// repo prefix so the matcher's boundary check (Step G)
+			// has the data it needs without a second registry walk.
+			// Empty slugs default to RepoPrefix at Match time via
+			// Contract.EffectiveWorkspace / EffectiveProject.
+			if idx.workspaceID != "" {
+				found[i].WorkspaceID = idx.workspaceID
+			}
+			if idx.projectID != "" {
+				found[i].ProjectID = idx.projectID
+			}
 		}
 		out = append(out, found...)
 	}
@@ -1951,7 +2011,7 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 		goModFilePath = idx.repoPrefix + "/go.mod"
 	}
 	found := goModExtractor.Extract(goModFilePath, goModSrc, nil, nil)
-	reg.AddAll(found, idx.repoPrefix)
+	reg.AddAllScoped(found, idx.repoPrefix, idx.workspaceID, idx.projectID)
 }
 
 // extractContracts scans all file nodes in the graph and runs contract

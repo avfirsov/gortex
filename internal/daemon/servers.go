@@ -1,0 +1,574 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	toml "github.com/pelletier/go-toml/v2"
+)
+
+// ServerEntry describes one Gortex server reachable from the daemon.
+// Lifted out of `~/.gortex/servers.toml` (spec-launch.md §11 step L).
+//
+// The "slug" is the local identity used in CLI output, log lines, and
+// daemon-side routing. URL accepts both TCP (`http://host:port`,
+// `https://...`) and Unix-domain socket forms (`unix:///path/to.sock`)
+// per Step K.
+//
+// Auth: prefer AuthTokenEnv (an env-var name the daemon resolves at
+// connect time) over AuthToken (a literal value). Putting raw
+// secrets in `servers.toml` is allowed for parity with how
+// `~/.config/gortex/config.yaml` already gets written by `gortex
+// track`, but the env-var form is the recommended path.
+//
+// Workspaces is the optional pre-declared roster: when set, the
+// daemon trusts this list without making the `GET
+// /v1/workspaces/<ws>/repos` roundtrip on first use. Empty means
+// "discover at runtime"; `WorkspaceRosterCache` falls back to
+// querying the server for the roster on demand.
+type ServerEntry struct {
+	Slug          string   `toml:"slug"`
+	URL           string   `toml:"url"`
+	AuthToken     string   `toml:"auth_token,omitempty"`
+	AuthTokenEnv  string   `toml:"auth_token_env,omitempty"`
+	Workspaces    []string `toml:"workspaces,omitempty"`
+	// Default flips a single ServerEntry to the "use me when no
+	// workspace context disambiguates" pick. Conflict (multiple
+	// entries marked Default=true) is rejected at load time.
+	Default bool `toml:"default,omitempty"`
+}
+
+// ServersConfig is the on-disk schema for `~/.gortex/servers.toml`.
+type ServersConfig struct {
+	Server []ServerEntry `toml:"server"`
+}
+
+// ServersConfigPath returns the path the daemon reads / writes for
+// the multi-server roster. Order of preference mirrors SocketPath:
+//
+//  1. $GORTEX_DAEMON_SERVERS — explicit override (tests, custom
+//     deployments).
+//  2. $HOME/.gortex/servers.toml — the canonical user-level file
+//     spec-launch.md §11 step L names. Note this is NOT under
+//     `~/.config/gortex/` (where global.yaml lives) — `~/.gortex/`
+//     is the daemon-control directory and is the same place tracking
+//     scripts and `gortex daemon` already write to.
+//  3. $TEMPDIR/gortex-servers.toml — last-resort fallback so the
+//     daemon can still come up in an environment with no $HOME.
+func ServersConfigPath() string {
+	if override := os.Getenv("GORTEX_DAEMON_SERVERS"); override != "" {
+		return override
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "gortex-servers.toml")
+	}
+	return filepath.Join(home, ".gortex", "servers.toml")
+}
+
+// LoadServersConfig reads and validates ~/.gortex/servers.toml. A
+// missing file is not an error — the daemon may run with zero
+// configured servers (e.g. before a user sets one up). Empty/zero
+// ServersConfig is returned in that case.
+//
+// Validation rejects:
+//   - duplicate slugs
+//   - empty URLs
+//   - URLs that aren't `http(s)://...` or `unix://...`
+//   - more than one ServerEntry marked Default=true
+func LoadServersConfig(path string) (*ServersConfig, error) {
+	if path == "" {
+		path = ServersConfigPath()
+	}
+	cfg := &ServersConfig{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("read servers config %s: %w", path, err)
+	}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse servers config %s: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate servers config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Validate enforces the ServersConfig invariants.
+func (c *ServersConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	seenSlug := make(map[string]bool, len(c.Server))
+	defaultCount := 0
+	for i, s := range c.Server {
+		if s.Slug == "" {
+			return fmt.Errorf("server[%d]: slug is required", i)
+		}
+		if seenSlug[s.Slug] {
+			return fmt.Errorf("server[%d]: duplicate slug %q", i, s.Slug)
+		}
+		seenSlug[s.Slug] = true
+		if s.URL == "" {
+			return fmt.Errorf("server[%q]: url is required", s.Slug)
+		}
+		if !isSupportedServerURL(s.URL) {
+			return fmt.Errorf("server[%q]: url %q must start with http://, https://, or unix://", s.Slug, s.URL)
+		}
+		if s.Default {
+			defaultCount++
+			if defaultCount > 1 {
+				return fmt.Errorf("server[%q]: only one entry may set default=true", s.Slug)
+			}
+		}
+	}
+	return nil
+}
+
+// isSupportedServerURL allows http(s) for TCP and unix:// for socket
+// transports — the same shape gortex server's --bind flag accepts.
+func isSupportedServerURL(u string) bool {
+	switch {
+	case strings.HasPrefix(u, "http://"),
+		strings.HasPrefix(u, "https://"),
+		strings.HasPrefix(u, "unix://"):
+		return true
+	}
+	return false
+}
+
+// FindBySlug returns the ServerEntry with the given slug, or nil.
+func (c *ServersConfig) FindBySlug(slug string) *ServerEntry {
+	if c == nil {
+		return nil
+	}
+	for i := range c.Server {
+		if c.Server[i].Slug == slug {
+			return &c.Server[i]
+		}
+	}
+	return nil
+}
+
+// DefaultServer returns the entry marked Default=true, falling back
+// to the first server in the list when no explicit default is set.
+// Returns nil only when the list is empty.
+func (c *ServersConfig) DefaultServer() *ServerEntry {
+	if c == nil || len(c.Server) == 0 {
+		return nil
+	}
+	for i := range c.Server {
+		if c.Server[i].Default {
+			return &c.Server[i]
+		}
+	}
+	return &c.Server[0]
+}
+
+// ServerClient is the daemon-side HTTP client targeting one
+// ServerEntry. Holds a transport configured for the entry's URL form
+// (TCP vs unix:// chooses Dial vs DialUnix transparently). Step M.
+//
+// The client is goroutine-safe; the daemon shares one per slug
+// across multiple worker goroutines and reuses connections via the
+// underlying http.Transport.
+type ServerClient struct {
+	Entry      ServerEntry
+	BaseURL    string // canonical form passed to http.NewRequest
+	httpClient *http.Client
+}
+
+// NewServerClient builds a ServerClient. For unix:// entries the
+// returned client dials the socket on every request; HTTP keep-alive
+// works the same as for TCP. The auth token is resolved at request
+// time so an env-var rotation lands on the next call.
+func NewServerClient(entry ServerEntry) (*ServerClient, error) {
+	if !isSupportedServerURL(entry.URL) {
+		return nil, fmt.Errorf("server %q: unsupported url scheme: %s", entry.Slug, entry.URL)
+	}
+	cli := &ServerClient{Entry: entry}
+	if strings.HasPrefix(entry.URL, "unix://") {
+		// Strip the scheme so http.Request takes a relative path; the
+		// dialer ignores the host part. Use a synthetic
+		// http://unix/<path> base so url.Parse downstream stays
+		// happy.
+		socket := strings.TrimPrefix(entry.URL, "unix://")
+		cli.BaseURL = "http://unix"
+		cli.httpClient = &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", socket)
+				},
+			},
+		}
+	} else {
+		// TCP / TLS — Go's default transport handles both http:// and
+		// https:// URLs; we just plug a sane timeout so a hung server
+		// doesn't wedge the daemon.
+		cli.BaseURL = strings.TrimRight(entry.URL, "/")
+		cli.httpClient = &http.Client{Timeout: 60 * time.Second}
+	}
+	return cli, nil
+}
+
+// resolveAuthToken returns the bearer token for the next request,
+// resolving AuthTokenEnv against os.Getenv each call so rotated
+// tokens take effect without a daemon restart.
+func (c *ServerClient) resolveAuthToken() string {
+	if c.Entry.AuthToken != "" {
+		return c.Entry.AuthToken
+	}
+	if c.Entry.AuthTokenEnv != "" {
+		return os.Getenv(c.Entry.AuthTokenEnv)
+	}
+	return ""
+}
+
+// ProxyTool forwards a single MCP tool invocation to this server's
+// `POST /v1/tools/<name>` endpoint and returns the raw response
+// bytes. Step M — used by the daemon's hybrid-read router (Step P)
+// when a query's scope routes to a remote workspace.
+//
+// The body is passed through verbatim — the caller (typically the
+// daemon's RouteToolCall) is responsible for shape, the server
+// handler is responsible for parsing. Returning bytes (not a
+// decoded struct) keeps this client agnostic to the per-tool
+// response shapes.
+func (c *ServerClient) ProxyTool(toolName string, body []byte) ([]byte, int, error) {
+	u, err := url.JoinPath(c.BaseURL, "v1", "tools", toolName)
+	if err != nil {
+		return nil, 0, fmt.Errorf("join proxy URL: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, 0, fmt.Errorf("build proxy request: %w", err)
+	}
+	if tok := c.resolveAuthToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("proxy %s/%s: %w", c.Entry.Slug, toolName, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read proxy response: %w", err)
+	}
+	return out, resp.StatusCode, nil
+}
+
+// FetchWorkspaceRoster calls `GET /v1/workspaces/<ws>/repos` on the
+// server and returns the list of repo prefixes in that workspace.
+// Step N — used by the daemon's lookup logic to know which server
+// owns a given workspace.
+func (c *ServerClient) FetchWorkspaceRoster(workspace string) ([]string, error) {
+	u, err := url.JoinPath(c.BaseURL, "v1", "workspaces", workspace, "repos")
+	if err != nil {
+		return nil, fmt.Errorf("join roster URL: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build roster request: %w", err)
+	}
+	if tok := c.resolveAuthToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch roster from %q: %w", c.Entry.Slug, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrWorkspaceNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server %q roster %s: status %d", c.Entry.Slug, workspace, resp.StatusCode)
+	}
+	var payload struct {
+		Repos []string `json:"repos"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode roster: %w", err)
+	}
+	return payload.Repos, nil
+}
+
+// ErrWorkspaceNotFound is returned by FetchWorkspaceRoster when the
+// server doesn't host the requested workspace. Distinct from a
+// transport error so the daemon's lookup loop can keep iterating
+// servers without surfacing a noisy connectivity warning.
+var ErrWorkspaceNotFound = errors.New("workspace not found on server")
+
+// WorkspaceRosterCache caches roster lookups per (slug, workspace).
+// TTL is intentionally short — the alpha use case is a developer
+// adding/removing repos in one of their tracked workspaces and
+// expecting the daemon to notice within a minute or two without a
+// restart. Step N.
+type WorkspaceRosterCache struct {
+	mu      sync.RWMutex
+	entries map[rosterKey]rosterEntry
+	ttl     time.Duration
+}
+
+type rosterKey struct {
+	slug      string
+	workspace string
+}
+
+type rosterEntry struct {
+	repos    []string
+	expires  time.Time
+	notFound bool
+}
+
+// NewWorkspaceRosterCache builds an in-memory cache with the given
+// TTL. ttl <= 0 means "always fetch" (no caching).
+func NewWorkspaceRosterCache(ttl time.Duration) *WorkspaceRosterCache {
+	return &WorkspaceRosterCache{
+		entries: make(map[rosterKey]rosterEntry),
+		ttl:     ttl,
+	}
+}
+
+// Lookup returns the cached roster for (slug, workspace) and whether
+// the entry is still fresh. notFound==true means the server told us
+// the workspace isn't hosted there; callers should not retry until
+// the entry expires.
+func (c *WorkspaceRosterCache) Lookup(slug, workspace string) (repos []string, found bool, fresh bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.entries[rosterKey{slug: slug, workspace: workspace}]
+	if !ok {
+		return nil, false, false
+	}
+	if c.ttl > 0 && time.Now().After(e.expires) {
+		return nil, false, false
+	}
+	return e.repos, !e.notFound, true
+}
+
+// Set stores a positive (workspace exists, repos list) result.
+func (c *WorkspaceRosterCache) Set(slug, workspace string, repos []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[rosterKey{slug: slug, workspace: workspace}] = rosterEntry{
+		repos:   append([]string(nil), repos...),
+		expires: time.Now().Add(c.ttl),
+	}
+}
+
+// SetNotFound stores a negative result (server doesn't host the
+// workspace) so callers don't retry until the TTL expires.
+func (c *WorkspaceRosterCache) SetNotFound(slug, workspace string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[rosterKey{slug: slug, workspace: workspace}] = rosterEntry{
+		notFound: true,
+		expires:  time.Now().Add(c.ttl),
+	}
+}
+
+// Invalidate drops every cached entry — used after a `servers.toml`
+// reload or when the daemon learns a server is down.
+func (c *WorkspaceRosterCache) Invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[rosterKey]rosterEntry)
+}
+
+// LookupResult is what RouteForCwd returns: the chosen ServerEntry
+// (nil when no server claims the workspace), the workspace slug
+// resolved from cwd, and an explanation of which §9.3 priority fired.
+type LookupResult struct {
+	Server    *ServerEntry
+	Workspace string
+	// Source is one of:
+	//   "scope-override" — the caller passed an explicit scope (priority 1)
+	//   "config-yaml"    — `.gortex.yaml::workspace` walking up from cwd (priority 2)
+	//   "roster"         — the daemon found the cwd's repo in a server's roster (priority 3)
+	//   "default"        — the servers.toml `default = "<slug>"` entry (priority 4)
+	Source string
+}
+
+// CwdResolver looks up a workspace slug for a current working directory
+// by walking up to find a `.gortex.yaml` with a `workspace:` key. Lifted
+// out as an interface so tests can inject a stub instead of touching
+// the filesystem. Step O.
+type CwdResolver func(cwd string) (workspace string, ok bool)
+
+// DefaultCwdResolver walks parent directories from `cwd` looking for
+// a `.gortex.yaml`. Returns the first non-empty `workspace:` value it
+// finds. Stops at filesystem root or after 32 levels (defensive).
+//
+// The implementation is deliberately tiny — the daemon's hot path
+// will hit it on every routed query, so we don't shell out to the
+// full config loader for one field. yaml-shaped scan that just looks
+// for `workspace: <slug>` at the top level matches the §4.4 schema.
+func DefaultCwdResolver(cwd string) (string, bool) {
+	dir := cwd
+	for i := 0; i < 32; i++ {
+		path := filepath.Join(dir, ".gortex.yaml")
+		if data, err := os.ReadFile(path); err == nil {
+			if ws := scanWorkspaceField(data); ws != "" {
+				return ws, true
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "", false
+}
+
+// scanWorkspaceField looks for a top-level `workspace: <slug>` line
+// in the file. The slug is whatever follows up to a comment / EOL,
+// trimmed of quotes and whitespace. We intentionally do NOT pull in
+// the full yaml decoder here — this gets called on every query and
+// the .gortex.yaml schema is already fully validated at config load
+// time. If a malformed file ends up here, we fall back to "no
+// workspace" rather than failing the lookup.
+func scanWorkspaceField(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "workspace:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(trimmed, "workspace:"))
+		// Strip inline comments.
+		if idx := strings.Index(v, "#"); idx >= 0 {
+			v = strings.TrimSpace(v[:idx])
+		}
+		// Strip quotes.
+		v = strings.Trim(v, `"' `)
+		if v == "" {
+			// Could be a struct shape (e.g. `workspace:\n  auto_detect: true`)
+			// — that's the legacy config.WorkspaceConfig shape from before
+			// §4.2, and the spec migrated it to `multi:` already. Skip.
+			continue
+		}
+		return v
+	}
+	return ""
+}
+
+// RouteForCwd implements the §9.3 priority chain:
+//
+//  1. ScopeOverride (caller-supplied workspace/server slug) wins.
+//  2. `.gortex.yaml::workspace` resolved from cwd.
+//  3. Roster discovery — the daemon walks every configured server's
+//     roster and picks the one that owns the cwd's workspace. Cached.
+//  4. servers.toml's `default` entry.
+//
+// `scopeOverride` is the workspace slug the caller passed via the
+// query's scope field (Step P) — empty means "no override". When the
+// caller passed a slug, we still resolve which ServerEntry hosts it
+// via the same roster lookup the cwd path would use.
+//
+// The function does NOT make HTTP calls — it consults the supplied
+// roster cache and returns an empty Server when the cache doesn't
+// know yet. Callers that want roster-fetch behaviour should call
+// ServerClient.FetchWorkspaceRoster on cache misses and then
+// re-invoke this routine.
+func RouteForCwd(
+	cfg *ServersConfig,
+	rosters *WorkspaceRosterCache,
+	resolver CwdResolver,
+	cwd string,
+	scopeOverride string,
+) LookupResult {
+	if cfg == nil {
+		return LookupResult{}
+	}
+	resolveServerForWorkspace := func(ws string) *ServerEntry {
+		// Pre-declared `workspaces = [...]` lists in servers.toml win
+		// — the user told us authoritatively which server hosts what.
+		for i := range cfg.Server {
+			for _, w := range cfg.Server[i].Workspaces {
+				if w == ws {
+					return &cfg.Server[i]
+				}
+			}
+		}
+		// Fall back to the cached roster (populated lazily by the
+		// caller's prior FetchWorkspaceRoster calls).
+		if rosters != nil {
+			for i := range cfg.Server {
+				if _, exists, fresh := rosters.Lookup(cfg.Server[i].Slug, ws); exists && fresh {
+					return &cfg.Server[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	if scopeOverride != "" {
+		if s := resolveServerForWorkspace(scopeOverride); s != nil {
+			return LookupResult{Server: s, Workspace: scopeOverride, Source: "scope-override"}
+		}
+		// Caller-supplied scope but we don't yet know which server
+		// hosts it — return the workspace slug so the caller can
+		// trigger a roster fetch and retry. This is preferable to
+		// silently falling through to the default server, which
+		// would mask a typo'd scope.
+		return LookupResult{Workspace: scopeOverride, Source: "scope-override"}
+	}
+
+	if resolver != nil {
+		if ws, ok := resolver(cwd); ok {
+			if s := resolveServerForWorkspace(ws); s != nil {
+				return LookupResult{Server: s, Workspace: ws, Source: "config-yaml"}
+			}
+			// .gortex.yaml says workspace = <ws> but no server claims
+			// it — same shape as scope-override, return the slug for
+			// the caller to fetch+retry.
+			return LookupResult{Workspace: ws, Source: "config-yaml"}
+		}
+	}
+
+	// Fall through: pick the default server from servers.toml. The
+	// returned LookupResult.Workspace is empty because we don't know
+	// what cwd's workspace actually is — the daemon may want to
+	// surface this as a warning ("running unscoped").
+	if def := cfg.DefaultServer(); def != nil {
+		return LookupResult{Server: def, Source: "default"}
+	}
+
+	return LookupResult{}
+}
+
+// AllSlugs returns every server slug in declaration order. Useful
+// when a caller wants to walk every configured server (e.g. when the
+// roster cache is empty and the daemon needs to discover which one
+// hosts a workspace via FetchWorkspaceRoster).
+func (c *ServersConfig) AllSlugs() []string {
+	if c == nil {
+		return nil
+	}
+	out := make([]string, len(c.Server))
+	for i := range c.Server {
+		out[i] = c.Server[i].Slug
+	}
+	return out
+}

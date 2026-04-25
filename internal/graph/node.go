@@ -32,6 +32,22 @@ type Node struct {
 	Language string `json:"language"`
 	Meta       map[string]any `json:"meta,omitempty"`
 	RepoPrefix string         `json:"repo_prefix,omitempty"`
+	// WorkspaceID is the hard graph boundary introduced by spec-launch.md
+	// §4.2. Two nodes with different WorkspaceIDs are not allowed to be
+	// matched as contract provider/consumer pairs (§4.3 Match boundary)
+	// and queries scope by it by default. Defaults at warmup time to the
+	// per-repo `.gortex.yaml::workspace` setting; falls back to
+	// RepoPrefix when no workspace is declared (so old configs keep
+	// working) and to "" only for snapshot records written before the
+	// field existed (gob decodes unknown fields as zero — warmup
+	// backfills these from config).
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	// ProjectID is the soft sub-boundary inside a workspace (§4.2). One
+	// project per repo by default; monorepos can declare projects[] in
+	// .gortex.yaml. Contract pairing is bounded to a single
+	// (workspace_id, project_id); cross-project contracts become orphans.
+	// Defaults to the repo name when no projects[] mapping matches.
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 // Brief returns a compact representation with only the fields needed for listing.
@@ -45,6 +61,12 @@ func (n *Node) Brief() map[string]any {
 	}
 	if n.RepoPrefix != "" {
 		b["repo_prefix"] = n.RepoPrefix
+	}
+	if n.WorkspaceID != "" {
+		b["workspace_id"] = n.WorkspaceID
+	}
+	if n.ProjectID != "" {
+		b["project_id"] = n.ProjectID
 	}
 	return b
 }

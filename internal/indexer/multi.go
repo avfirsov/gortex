@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 )
 
@@ -247,8 +248,18 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 	}
 	mi.mu.Unlock()
 
-	// TODO: After all repos are indexed, run CrossRepoResolver.ResolveAll()
-	// to create cross-repo edges. This will be implemented in Task 7.1.
+	// spec-launch.md §11 step H: run a global cross-repo resolution
+	// pass once every repo is indexed, with the §4.2 cross-workspace
+	// boundary check wired in. Without this, repos that import each
+	// other have unresolved edges that only resolve when an editor
+	// touches a file (the watcher path is the only other place this
+	// resolver runs). The boundary lookup means cross-workspace
+	// candidates only resolve when an explicit `cross_workspace_deps`
+	// declaration covers them — preserving §4.5 criterion 4.
+	cr := resolver.NewCrossRepo(mi.graph)
+	cr.SetCrossWorkspaceDepLookup(mi.crossWorkspaceLookup())
+	cr.ResolveAll()
+	mi.ReconcileContractEdges()
 
 	if len(indexErrors) > 0 && len(results) == 0 {
 		return nil, fmt.Errorf("all repos failed to index: %s", strings.Join(indexErrors, "; "))
@@ -362,6 +373,16 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	}
 	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
 
+	// Lazy-load the per-repo `.gortex.yaml` so GetRepoConfig sees the
+	// §4.2 workspace / project slugs declared inside the repo. Without
+	// this the production code path never reads the file and every
+	// repo silently falls back to `workspace = repoPrefix`, making
+	// shared-workspace cross-repo matching impossible to express. Idempotent
+	// — repeated calls just re-cache the parse.
+	if mi.configMgr != nil {
+		mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
+	}
+
 	cfg := mi.configMgr.GetRepoConfig(prefix)
 	idx := New(mi.graph, mi.registry, cfg.Index, mi.logger)
 	idx.search = mi.search
@@ -371,6 +392,13 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	if willBeMultiRepo {
 		idx.SetRepoPrefix(prefix)
 	}
+	// §4.2 workspace / project slugs stamped on every node. Defaults
+	// per spec §4.4: workspace = `.gortex.yaml::workspace` if declared,
+	// else repoPrefix; project = `.gortex.yaml::project` if declared,
+	// else repoPrefix. The WorkspaceID-keyed contract registry (Step
+	// F/G) and the boundary-enforced matcher (Step G) consume these.
+	idx.SetWorkspaceID(resolveWorkspaceID(cfg, prefix))
+	idx.SetProjectID(resolveProjectID(cfg, prefix))
 
 	result, err := idx.IndexCtx(ctx, absPath)
 	if err != nil {
@@ -459,6 +487,13 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
 
+	// Pick up `.gortex.yaml` workspace/project declarations on
+	// reconcile too — config can change between sessions, and warmup-
+	// time reconcile is the path that runs after a daemon restart.
+	if mi.configMgr != nil {
+		mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
+	}
+
 	cfg := mi.configMgr.GetRepoConfig(prefix)
 	idx := New(mi.graph, mi.registry, cfg.Index, mi.logger)
 	idx.search = mi.search
@@ -468,6 +503,8 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	if willBeMultiRepo {
 		idx.SetRepoPrefix(prefix)
 	}
+	idx.SetWorkspaceID(resolveWorkspaceID(cfg, prefix))
+	idx.SetProjectID(resolveProjectID(cfg, prefix))
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
 
@@ -678,7 +715,12 @@ func (mi *MultiIndexer) MergedContractRegistry() *contracts.Registry {
 		if cr == nil {
 			continue
 		}
-		merged.AddAll(cr.All(), repoPrefix)
+		// Re-stamp the §4.2 slugs from the indexer alongside the repo
+		// prefix on merge. The contracts already carry these slugs from
+		// their source registry, but AddAllScoped is idempotent (skips
+		// non-empty existing values) so this stays correct even if a
+		// future code path forgets the stamp on first insert.
+		merged.AddAllScoped(cr.All(), repoPrefix, idx.WorkspaceID(), idx.ProjectID())
 	}
 	return merged
 }

@@ -22,6 +22,42 @@ type QueryOptions struct {
 	Limit   int    `json:"limit"`
 	Detail  string `json:"detail"`             // "brief" or "full"
 	MinTier string `json:"min_tier,omitempty"` // see graph.Origin* constants; "" = no filter
+	// WorkspaceID, when set, restricts traversal to nodes whose
+	// effective workspace (Node.WorkspaceID || Node.RepoPrefix per
+	// spec-launch.md §4.4) equals this slug. Empty disables the
+	// filter — preserves the legacy global-graph behaviour for
+	// callers that don't care about the §4 boundary. Step I.
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	// ProjectID applies the same scoping for the soft sub-boundary.
+	// Honoured only when WorkspaceID is also set; on its own it would
+	// be ambiguous (two workspaces could declare a project with the
+	// same name).
+	ProjectID string `json:"project_id,omitempty"`
+}
+
+// scopeAllows reports whether a node passes the workspace/project
+// scope expressed in opts. Empty WorkspaceID means "no scope" — every
+// node passes. Same effective-fallback rule as the matcher: missing
+// WorkspaceID on the node falls back to its RepoPrefix.
+func (o QueryOptions) scopeAllows(n *graph.Node) bool {
+	if o.WorkspaceID == "" || n == nil {
+		return true
+	}
+	ws := n.WorkspaceID
+	if ws == "" {
+		ws = n.RepoPrefix
+	}
+	if ws != o.WorkspaceID {
+		return false
+	}
+	if o.ProjectID == "" {
+		return true
+	}
+	proj := n.ProjectID
+	if proj == "" {
+		proj = n.RepoPrefix
+	}
+	return proj == o.ProjectID
 }
 
 // FilterByMinTier drops edges whose Origin rank is below minTier.

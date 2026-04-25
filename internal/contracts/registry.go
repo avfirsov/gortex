@@ -7,20 +7,22 @@ import (
 
 // Registry collects contracts from all repos and provides indexed lookups.
 type Registry struct {
-	mu         sync.RWMutex
-	byID       map[string][]Contract // contractID -> contracts
-	byRepo     map[string][]Contract // repoPrefix -> contracts
-	bySymbol   map[string][]Contract // symbolID -> contracts
-	byFilePath map[string][]Contract // filePath -> contracts
+	mu          sync.RWMutex
+	byID        map[string][]Contract // contractID -> contracts
+	byRepo      map[string][]Contract // repoPrefix -> contracts
+	bySymbol    map[string][]Contract // symbolID -> contracts
+	byFilePath  map[string][]Contract // filePath -> contracts
+	byWorkspace map[string][]Contract // workspaceID -> contracts (§4.2)
 }
 
 // NewRegistry creates an empty contract registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		byID:       make(map[string][]Contract),
-		byRepo:     make(map[string][]Contract),
-		bySymbol:   make(map[string][]Contract),
-		byFilePath: make(map[string][]Contract),
+		byID:        make(map[string][]Contract),
+		byRepo:      make(map[string][]Contract),
+		bySymbol:    make(map[string][]Contract),
+		byFilePath:  make(map[string][]Contract),
+		byWorkspace: make(map[string][]Contract),
 	}
 }
 
@@ -34,12 +36,36 @@ func (r *Registry) Add(c Contract) {
 		r.bySymbol[c.SymbolID] = append(r.bySymbol[c.SymbolID], c)
 	}
 	r.byFilePath[c.FilePath] = append(r.byFilePath[c.FilePath], c)
+	r.byWorkspace[c.EffectiveWorkspace()] = append(r.byWorkspace[c.EffectiveWorkspace()], c)
 }
 
 // AddAll inserts multiple contracts, assigning the repo prefix to each.
+// Existing WorkspaceID / ProjectID values on the contracts are
+// preserved — callers that need to also stamp those slugs should use
+// AddAllScoped.
 func (r *Registry) AddAll(contracts []Contract, repoPrefix string) {
 	for i := range contracts {
 		contracts[i].RepoPrefix = repoPrefix
+		r.Add(contracts[i])
+	}
+}
+
+// AddAllScoped inserts multiple contracts, assigning the repo prefix
+// and (when non-empty) the §4.2 WorkspaceID / ProjectID slugs. Mirrors
+// the indexer-side stamp applied to graph nodes via Indexer.applyRepoPrefix.
+// Empty workspaceID / projectID arguments leave the contract's existing
+// values untouched (so a per-file resolver can pre-stamp a stricter
+// projectID for monorepo paths-glob matches and the AddAllScoped call
+// won't blunt it back to the repo-default).
+func (r *Registry) AddAllScoped(contracts []Contract, repoPrefix, workspaceID, projectID string) {
+	for i := range contracts {
+		contracts[i].RepoPrefix = repoPrefix
+		if workspaceID != "" && contracts[i].WorkspaceID == "" {
+			contracts[i].WorkspaceID = workspaceID
+		}
+		if projectID != "" && contracts[i].ProjectID == "" {
+			contracts[i].ProjectID = projectID
+		}
 		r.Add(contracts[i])
 	}
 }
@@ -60,6 +86,7 @@ func (r *Registry) ReplaceByID(id string, list []Contract) {
 			r.bySymbol[old.SymbolID] = removeContract(r.bySymbol[old.SymbolID], old)
 		}
 		r.byFilePath[old.FilePath] = removeContract(r.byFilePath[old.FilePath], old)
+		r.byWorkspace[old.EffectiveWorkspace()] = removeContract(r.byWorkspace[old.EffectiveWorkspace()], old)
 	}
 	r.byID[id] = nil
 
@@ -71,6 +98,7 @@ func (r *Registry) ReplaceByID(id string, list []Contract) {
 			r.bySymbol[c.SymbolID] = append(r.bySymbol[c.SymbolID], c)
 		}
 		r.byFilePath[c.FilePath] = append(r.byFilePath[c.FilePath], c)
+		r.byWorkspace[c.EffectiveWorkspace()] = append(r.byWorkspace[c.EffectiveWorkspace()], c)
 	}
 }
 
@@ -174,6 +202,32 @@ func (r *Registry) ByFile(filePath string) []Contract {
 	return out
 }
 
+// ByWorkspace returns every contract whose effective workspace
+// (WorkspaceID || RepoPrefix per §4.4) equals workspaceID. Used by
+// per-workspace `contracts check` calls so each workspace's matcher
+// pass sees only its own contracts.
+func (r *Registry) ByWorkspace(workspaceID string) []Contract {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	src := r.byWorkspace[workspaceID]
+	out := make([]Contract, len(src))
+	copy(out, src)
+	return out
+}
+
+// AllWorkspaces returns the deduplicated list of effective workspace
+// slugs present in the registry. The matcher uses this to drive its
+// per-workspace pairing pass (§4.3 boundary).
+func (r *Registry) AllWorkspaces() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.byWorkspace))
+	for ws := range r.byWorkspace {
+		out = append(out, ws)
+	}
+	return out
+}
+
 // AllIDs returns a deduplicated list of contract IDs in the registry.
 func (r *Registry) AllIDs() []string {
 	r.mu.RLock()
@@ -211,6 +265,7 @@ func (r *Registry) Clear() {
 	r.byRepo = make(map[string][]Contract)
 	r.bySymbol = make(map[string][]Contract)
 	r.byFilePath = make(map[string][]Contract)
+	r.byWorkspace = make(map[string][]Contract)
 }
 
 // EvictRepo removes all contracts belonging to the given repo prefix.
@@ -246,6 +301,18 @@ func (r *Registry) EvictRepo(repoPrefix string) int {
 		r.byFilePath[c.FilePath] = removeContract(r.byFilePath[c.FilePath], c)
 		if len(r.byFilePath[c.FilePath]) == 0 {
 			delete(r.byFilePath, c.FilePath)
+		}
+	}
+
+	// Remove from byWorkspace index. A workspace can span multiple
+	// repos (the spec's whole point), so a workspace bucket may still
+	// have entries from sibling repos after this evict — we only
+	// delete the bucket when it goes empty.
+	for _, c := range contracts {
+		ws := c.EffectiveWorkspace()
+		r.byWorkspace[ws] = removeContract(r.byWorkspace[ws], c)
+		if len(r.byWorkspace[ws]) == 0 {
+			delete(r.byWorkspace, ws)
 		}
 	}
 

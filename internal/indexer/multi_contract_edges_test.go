@@ -26,6 +26,22 @@ func newMultiLangRegistry() *parser.Registry {
 	return reg
 }
 
+// writeSharedWorkspaceYAML drops a `.gortex.yaml` into dir declaring
+// `workspace: shared-test` and `project: shared-test`. The cross-
+// repo bridge tests in this file exercise the §4.3 boundary's
+// positive case: two distinct repos in the SAME (workspace, project)
+// must produce CrossRepo provider/consumer pairs. The §4.4 defaults
+// (workspace = repo-name, project = repo-name) put each repo in its
+// own bucket; without explicit shared slugs the matcher (correctly,
+// per spec §4.5 criterion 2 and the cross-project rule in §4.3)
+// declines to pair them. The shared-project declaration is the
+// explicit "yes, these repos are one logical service" opt-in.
+func writeSharedWorkspaceYAML(t *testing.T, dir string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gortex.yaml"),
+		[]byte("workspace: shared-test\nproject: shared-test\n"), 0o644))
+}
+
 // setupHTTPProviderRepo writes a Go file declaring a Gin route that binds
 // GET /api/users to a handler function. After indexing, HTTPExtractor
 // produces a provider contract with SymbolID pointing at the enclosing
@@ -34,6 +50,7 @@ func setupHTTPProviderRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
@@ -57,6 +74,7 @@ func setupHTTPConsumerRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "client.go"), []byte(`package main
@@ -151,6 +169,7 @@ func setupTSConsumerRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "src"), 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "package.json"),
 		[]byte(`{"name":"`+name+`","version":"0.0.0"}`), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "src", "client.ts"), []byte(
@@ -230,6 +249,7 @@ func setupDartConsumerRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "lib", "core"), 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "pubspec.yaml"),
 		[]byte("name: "+name+"\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "lib", "core", "api_client.dart"), []byte(
@@ -328,6 +348,7 @@ func setupTSWrapperRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "lib"), 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "package.json"),
 		[]byte(`{"name":"`+name+`","version":"0.0.0"}`), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "lib", "api.ts"), []byte(
@@ -370,6 +391,7 @@ func setupGoProviderRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
@@ -483,6 +505,7 @@ func setupGoTopicPublisherRepo(t *testing.T, name, topic string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "pub.go"), []byte(
@@ -497,6 +520,7 @@ func setupGoTopicSubscriberRepo(t *testing.T, name, topic string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "sub.go"), []byte(
@@ -553,6 +577,7 @@ func setupGoEnvConsumerRepo(t *testing.T, name, envVar string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.go"), []byte(
@@ -612,6 +637,7 @@ func setupGRPCProtoProviderRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "proto"), 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "proto", "users.proto"), []byte(`syntax = "proto3";
@@ -652,6 +678,7 @@ func setupGRPCGoConsumerRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
@@ -739,6 +766,7 @@ func setupOpenAPIProviderRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "openapi.yaml"), []byte(`openapi: 3.0.0
@@ -772,6 +800,7 @@ func setupHTTPConsumerForOpenAPI(t *testing.T, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	writeSharedWorkspaceYAML(t, dir)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/"+name+"\n\ngo 1.21\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "client.go"), []byte(`package main

@@ -26,6 +26,7 @@ type mcpDispatcher struct {
 	srv          *gortexmcp.Server
 	multiIndexer *indexer.MultiIndexer
 	logger       *zap.Logger
+	router       *daemon.Router
 }
 
 func newMCPDispatcher(srv *gortexmcp.Server, mi *indexer.MultiIndexer, logger *zap.Logger) *mcpDispatcher {
@@ -34,6 +35,13 @@ func newMCPDispatcher(srv *gortexmcp.Server, mi *indexer.MultiIndexer, logger *z
 	}
 	return &mcpDispatcher{srv: srv, multiIndexer: mi, logger: logger}
 }
+
+// SetRouter wires the spec §11 step P hybrid-read router into the
+// daemon's MCP dispatch. With a router set, tools/call frames carrying
+// a `workspace` arg or a session cwd that resolves to a non-local
+// server are proxied; all other frames flow through the local
+// MCPServer.HandleMessage path unchanged.
+func (d *mcpDispatcher) SetRouter(r *daemon.Router) { d.router = r }
 
 // Dispatch implements daemon.MCPDispatcher. It hands the raw JSON-RPC
 // frame to MCPServer.HandleMessage and returns the response bytes.
@@ -58,6 +66,18 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	}
 
 	ctx = gortexmcp.WithSessionID(ctx, sess.ID)
+
+	// spec-launch.md §11 step P — for tools/call frames carrying a
+	// workspace scope or a cwd that routes elsewhere, the daemon
+	// proxies to the right server instead of running locally. Other
+	// frames (initialize, tools/list, notifications) flow through
+	// the local MCPServer below; routing them across a federation
+	// would change semantics that are intentionally machine-local.
+	if d.router != nil {
+		if proxied, ok := d.tryProxyToolCall(ctx, sess, frame); ok {
+			return proxied, nil
+		}
+	}
 
 	// HandleMessage returns either a JSONRPCResponse, a JSONRPCError, or
 	// nil (the message was a notification). It never panics on malformed
@@ -108,6 +128,78 @@ func (d *mcpDispatcher) isCWDTracked(cwd string) bool {
 		}
 	}
 	return false
+}
+
+// tryProxyToolCall inspects a JSON-RPC frame and, if it's a
+// tools/call that the router resolves to a remote server, proxies it
+// and returns the wrapped JSON-RPC response. Returns ok=false when
+// the frame is not a tools/call, the router returns ErrRouteUnresolved
+// (local-fast path), or the proxy itself errors (we let the local
+// path handle it as a fallback so transient network blips don't
+// break the user's session).
+func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Session, frame []byte) ([]byte, bool) {
+	var peek struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &peek); err != nil {
+		return nil, false
+	}
+	if peek.Method != "tools/call" || peek.Params.Name == "" {
+		return nil, false
+	}
+	scope, _ := peek.Params.Arguments["workspace"].(string)
+	body, err := json.Marshal(map[string]any{"arguments": peek.Params.Arguments})
+	if err != nil {
+		return nil, false
+	}
+	out, status, rerr := d.router.RouteToolCall(ctx, peek.Params.Name, body, daemon.RouteContext{
+		Cwd:           sess.CWD,
+		ScopeOverride: scope,
+	})
+	if rerr != nil || status == 0 {
+		// ErrRouteUnresolved or some other failure — let the local
+		// HandleMessage path take over (the same body works there).
+		return nil, false
+	}
+	if status >= 400 {
+		// Surface the upstream error as a JSON-RPC error so the
+		// client sees a structured failure instead of a 4xx that
+		// gets swallowed.
+		resp := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      peek.ID,
+			"error": map[string]any{
+				"code":    -32000,
+				"message": fmt.Sprintf("proxy %s/%s: status %d", "remote", peek.Params.Name, status),
+				"data": map[string]any{
+					"upstream_status": status,
+					"upstream_body":   string(out),
+				},
+			},
+		}
+		buf, _ := json.Marshal(resp)
+		return buf, true
+	}
+	// Success — wrap the proxied bytes as a JSON-RPC result.
+	var result any
+	if err := json.Unmarshal(out, &result); err != nil {
+		// Non-JSON upstream — surface as text content for visibility.
+		result = map[string]any{
+			"content": []map[string]any{{"type": "text", "text": string(out)}},
+		}
+	}
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      peek.ID,
+		"result":  result,
+	}
+	buf, _ := json.Marshal(resp)
+	return buf, true
 }
 
 // notTrackedError builds a JSON-RPC error frame the agent surfaces to

@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/server/hub"
 	"go.uber.org/zap"
@@ -51,10 +53,12 @@ type Handler struct {
 	logger        *zap.Logger
 	mux           *http.ServeMux
 	startTime     time.Time
-	eventHub      *hub.Hub               // nil when watch mode is off
-	configManager *config.ConfigManager // nil in single-repo mode
-	serverID      string                 // UUID; empty until SetServerID wires it
-	activity      *activityBuffer        // ring buffer of recent graph events
+	eventHub      *hub.Hub                 // nil when watch mode is off
+	configManager *config.ConfigManager    // nil in single-repo mode
+	serverID      string                   // UUID; empty until SetServerID wires it
+	activity      *activityBuffer          // ring buffer of recent graph events
+	overlays      *daemon.OverlayManager   // nil when overlay support is off
+	router        *daemon.Router           // nil when single-server (no servers.toml)
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -131,6 +135,73 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("GET /v1/contracts/validate", h.handleContractsValidate)
 	h.mux.HandleFunc("GET /v1/communities", h.handleCommunities)
 	h.mux.HandleFunc("GET /v1/guards", h.handleGuards)
+	// spec-launch.md §11 step N — workspace roster discovery. The
+	// daemon side calls this when it doesn't yet know which server
+	// owns a given workspace; the response lets the daemon's lookup
+	// path skip a roundtrip on every subsequent query against the
+	// workspace.
+	h.mux.HandleFunc("GET /v1/workspaces/{ws}/repos", h.handleWorkspaceRoster)
+	// spec-launch.md §11 step Q — editor overlay sessions. Clients
+	// register a session, push file overlays for in-flight edits, and
+	// the server merges them on top of the indexed graph for the
+	// duration of the session. The actual merge is the daemon's
+	// responsibility (Step P routing); these endpoints just
+	// expose the OverlayManager to MCP clients.
+	h.mux.HandleFunc("POST /v1/overlay/sessions", h.handleOverlayRegister)
+	h.mux.HandleFunc("DELETE /v1/overlay/sessions/{id}", h.handleOverlayDrop)
+	h.mux.HandleFunc("PUT /v1/overlay/sessions/{id}/files", h.handleOverlayPush)
+	h.mux.HandleFunc("DELETE /v1/overlay/sessions/{id}/files", h.handleOverlayDelete)
+	h.mux.HandleFunc("GET /v1/overlay/sessions/{id}/files", h.handleOverlayList)
+}
+
+// SetOverlayManager wires an OverlayManager into the handler so the
+// /v1/overlay/* endpoints become live. Called by the server / daemon
+// during construction; nil disables those endpoints (they return 503).
+func (h *Handler) SetOverlayManager(m *daemon.OverlayManager) { h.overlays = m }
+
+// SetRouter wires the spec-launch.md §11 step P hybrid-read query
+// router. When set, /v1/tools/<name> calls flow through the router;
+// remote workspaces proxy via daemon.ServerClient.ProxyTool, local
+// ones fall through to the in-process MCP tool dispatch. Nil
+// disables routing (the legacy single-server behaviour).
+func (h *Handler) SetRouter(r *daemon.Router) { h.router = r }
+
+// peekRouteContext sniffs the `workspace` / `cwd` arg overrides out
+// of an MCP tool-call body without disturbing it. The body is left
+// available for the local executor to re-parse; we only read enough
+// to make a routing decision. Both nested-args (`{"arguments":
+// {"workspace": "..."}}`) and flat-args (`{"workspace": "..."}`)
+// shapes are handled — the local handler tolerates both, so the
+// router does too.
+func (h *Handler) peekRouteContext(body []byte, r *http.Request) (scope, cwd string) {
+	if len(body) > 0 {
+		var nested struct {
+			Arguments struct {
+				Workspace string `json:"workspace"`
+				Cwd       string `json:"cwd"`
+			} `json:"arguments"`
+			Workspace string `json:"workspace"`
+			Cwd       string `json:"cwd"`
+		}
+		if err := json.Unmarshal(body, &nested); err == nil {
+			if nested.Arguments.Workspace != "" {
+				scope = nested.Arguments.Workspace
+			} else if nested.Workspace != "" {
+				scope = nested.Workspace
+			}
+			if nested.Arguments.Cwd != "" {
+				cwd = nested.Arguments.Cwd
+			} else if nested.Cwd != "" {
+				cwd = nested.Cwd
+			}
+		}
+	}
+	if cwd == "" {
+		// HTTP clients without an explicit cwd in the body can pass
+		// it via header — matches the daemon's session-cwd plumbing.
+		cwd = r.Header.Get("X-Gortex-Cwd")
+	}
+	return scope, cwd
 }
 
 // --- /health ---
@@ -207,6 +278,43 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		WriteJSONError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	// spec-launch.md §11 steps M+P: if a Router is wired, peek the
+	// body for `workspace` / `cwd` overrides and let the router
+	// decide local vs remote. Local path falls through to the
+	// existing in-process tool dispatch below; remote path returns
+	// the proxied response verbatim. Only the proxy short-circuits
+	// — local routing reuses the legacy code so downstream features
+	// (combo / frecency / session state) keep working unchanged.
+	if h.router != nil {
+		scope, cwd := h.peekRouteContext(body, r)
+		out, status, rerr := h.router.RouteToolCall(r.Context(), toolName, body, daemon.RouteContext{
+			ScopeOverride: scope,
+			Cwd:           cwd,
+		})
+		if rerr == nil && status > 0 {
+			// Proxied to a remote server; relay the upstream
+			// response.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write(out)
+			return
+		}
+		if rerr != nil && !errors.Is(rerr, daemon.ErrRouteUnresolved) {
+			h.logger.Warn("router: proxy failed, falling back to local",
+				zap.String("tool", toolName),
+				zap.Error(rerr))
+		}
+		// Either ErrRouteUnresolved (no remote claims this scope) or
+		// the local-fast path — both fall through to the in-process
+		// dispatch below.
+	}
+
 	tool := h.mcpServer.GetTool(toolName)
 	if tool == nil {
 		available := h.availableToolNames()
@@ -215,12 +323,6 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			"message":         fmt.Sprintf("tool '%s' not found", toolName),
 			"available_tools": available,
 		})
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		WriteJSONError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 

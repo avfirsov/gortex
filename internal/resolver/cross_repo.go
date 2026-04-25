@@ -16,6 +16,26 @@ type CrossRepoStats struct {
 	ByRepo         map[string]int `json:"by_repo"`
 }
 
+// CrossWorkspaceDepRule names one allowed dependency from a source
+// workspace into another. Mirrors config.CrossWorkspaceDep but lives
+// here so the resolver doesn't import internal/config (avoids a cycle
+// once future steps wire workspace plumbing through manager.go).
+type CrossWorkspaceDepRule struct {
+	// Workspace is the *target* workspace slug — the workspace whose
+	// nodes are eligible to be referenced from the source workspace.
+	Workspace string
+	// Modules is the list of import-path prefixes that the source
+	// workspace is allowed to follow into the target. Iteration 1
+	// only supports prefix-style matches (longest prefix wins).
+	Modules []string
+}
+
+// CrossWorkspaceDepLookup returns the list of declared cross-workspace
+// dependencies for a *source* workspace. Empty / nil result means the
+// source workspace has no declared cross-workspace deps and so the
+// resolver must keep cross-workspace candidates ineligible.
+type CrossWorkspaceDepLookup func(sourceWorkspaceID string) []CrossWorkspaceDepRule
+
 // CrossRepoResolver resolves unresolved edges across repository boundaries.
 //
 // dirIndex / lastDirIndex are scratch maps populated for the duration
@@ -31,16 +51,95 @@ type CrossRepoStats struct {
 // and both paths iterate graph.AllEdges() / AllNodes() and mutate
 // Edge.To in place. Sharing g.ResolveMutex() serialises both resolver
 // types against the same graph.
+//
+// crossWorkspaceLookup is the §4.2 workspace-boundary check (Step H).
+// Empty (nil) means the resolver is in legacy mode: cross-repo /
+// cross-workspace candidates resolve as if no boundary existed —
+// preserving pre-§4 behaviour for callers that haven't plumbed config
+// through yet. When set, candidates whose WorkspaceID differs from
+// the caller's are accepted only when the source workspace declared
+// the target workspace via `cross_workspace_deps` AND, for import
+// edges, the import path has a declared-module prefix.
 type CrossRepoResolver struct {
-	graph        *graph.Graph
-	dirIndex     map[string][]*graph.Node
-	lastDirIndex map[string][]*graph.Node
-	mu           *sync.Mutex
+	graph                *graph.Graph
+	dirIndex             map[string][]*graph.Node
+	lastDirIndex         map[string][]*graph.Node
+	mu                   *sync.Mutex
+	crossWorkspaceLookup CrossWorkspaceDepLookup
 }
 
 // NewCrossRepo creates a CrossRepoResolver for the given graph.
 func NewCrossRepo(g *graph.Graph) *CrossRepoResolver {
 	return &CrossRepoResolver{graph: g, mu: g.ResolveMutex()}
+}
+
+// SetCrossWorkspaceDepLookup wires the §4.2 boundary rule. After this
+// call, the resolver will refuse cross-workspace candidates that
+// aren't covered by an explicit declaration in the source workspace's
+// `cross_workspace_deps`. Pre-§4 graphs (no WorkspaceID on either
+// side) keep working — when both From and To carry empty workspace
+// slugs the boundary check trivially passes.
+func (cr *CrossRepoResolver) SetCrossWorkspaceDepLookup(lookup CrossWorkspaceDepLookup) {
+	cr.crossWorkspaceLookup = lookup
+}
+
+// callerWorkspaceID returns the §4.2 workspace slug for the From-side
+// of an edge. Falls back to RepoPrefix to match Contract.Effective-
+// Workspace's "missing → repo-name" rule (§4.4 default).
+func (cr *CrossRepoResolver) callerWorkspaceID(e *graph.Edge) string {
+	from := cr.graph.GetNode(e.From)
+	if from == nil {
+		return ""
+	}
+	if from.WorkspaceID != "" {
+		return from.WorkspaceID
+	}
+	return from.RepoPrefix
+}
+
+// candidateWorkspaceID extracts the same slug from a candidate node.
+func candidateWorkspaceID(n *graph.Node) string {
+	if n == nil {
+		return ""
+	}
+	if n.WorkspaceID != "" {
+		return n.WorkspaceID
+	}
+	return n.RepoPrefix
+}
+
+// crossWorkspaceEligible reports whether sourceWS is permitted to
+// reach a candidate in targetWS, optionally constrained by the
+// candidate's import path. importPath == "" means "any module"
+// (function/method calls — they don't carry an import path so the
+// only check is workspace-pair declaration).
+func (cr *CrossRepoResolver) crossWorkspaceEligible(sourceWS, targetWS, importPath string) bool {
+	if sourceWS == targetWS {
+		return true
+	}
+	if cr.crossWorkspaceLookup == nil {
+		// Legacy / unwired callers: no boundary enforcement.
+		return true
+	}
+	rules := cr.crossWorkspaceLookup(sourceWS)
+	for _, rule := range rules {
+		if rule.Workspace != targetWS {
+			continue
+		}
+		if importPath == "" {
+			// Function/method call into a declared cross-workspace
+			// dep is allowed once the workspace pair is declared —
+			// iteration 1 doesn't try to require an import-path
+			// match for non-import edges.
+			return true
+		}
+		for _, m := range rule.Modules {
+			if m == importPath || strings.HasPrefix(importPath, m+"/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ResolveAll resolves all unresolved edges in the graph, trying same-repo
@@ -158,6 +257,7 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 	}
 
 	callerRepo := cr.callerRepoPrefix(e)
+	callerWS := cr.callerWorkspaceID(e)
 
 	// 1. Prefer same-repo match.
 	for _, c := range candidates {
@@ -169,16 +269,23 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 		}
 	}
 
-	// 2. Cross-repo fallback: first function/method match from any repo.
+	// 2. Cross-repo fallback: first function/method match honoring the
+	// §4.2 workspace boundary (Step H). Same-workspace cross-repo is
+	// always eligible; cross-workspace requires a declared
+	// cross_workspace_deps entry covering the workspace pair.
 	for _, c := range candidates {
-		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
-			e.To = c.ID
-			e.CrossRepo = true
-			stats.Resolved++
-			stats.CrossRepoEdges++
-			stats.ByRepo[c.RepoPrefix]++
-			return
+		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod {
+			continue
 		}
+		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
+			continue
+		}
+		e.To = c.ID
+		e.CrossRepo = true
+		stats.Resolved++
+		stats.CrossRepoEdges++
+		stats.ByRepo[c.RepoPrefix]++
+		return
 	}
 
 	stats.Unresolved++
@@ -186,10 +293,20 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 
 func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, stats *CrossRepoStats) {
 	callerRepo := cr.callerRepoPrefix(e)
+	callerWS := cr.callerWorkspaceID(e)
 
 	// Look for a package node with matching qualified name.
 	node := cr.graph.GetNodeByQualName(importPath)
 	if node != nil {
+		// §4.2 boundary check: if the candidate is in a different
+		// workspace, allow only when an explicit cross_workspace_dep
+		// declares it.
+		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(node), importPath) {
+			// Treat as external — the dep wasn't opted in.
+			e.To = "external::" + importPath
+			stats.Unresolved++
+			return
+		}
 		e.To = node.ID
 		if node.RepoPrefix != callerRepo {
 			e.CrossRepo = true
@@ -263,6 +380,12 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		return
 	}
 	if crossRepo != nil {
+		// Apply §4.2 boundary on the directory-match path too.
+		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(crossRepo), importPath) {
+			e.To = "external::" + importPath
+			stats.Unresolved++
+			return
+		}
 		e.To = crossRepo.ID
 		e.CrossRepo = true
 		stats.Resolved++
@@ -284,6 +407,7 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	}
 
 	callerRepo := cr.callerRepoPrefix(e)
+	callerWS := cr.callerWorkspaceID(e)
 	receiverType := edgeReceiverType(e)
 
 	// If we have a type hint, try exact type match first.
@@ -299,17 +423,21 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 				return
 			}
 		}
-		// Cross-repo + exact type.
+		// Cross-repo + exact type — bounded by §4.2 workspace check.
 		for _, c := range candidates {
-			if c.Kind == graph.KindMethod && nodeReceiverType(c) == receiverType {
-				e.To = c.ID
-				e.CrossRepo = true
-				e.Confidence = 0.85
-				stats.Resolved++
-				stats.CrossRepoEdges++
-				stats.ByRepo[c.RepoPrefix]++
-				return
+			if c.Kind != graph.KindMethod || nodeReceiverType(c) != receiverType {
+				continue
 			}
+			if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
+				continue
+			}
+			e.To = c.ID
+			e.CrossRepo = true
+			e.Confidence = 0.85
+			stats.Resolved++
+			stats.CrossRepoEdges++
+			stats.ByRepo[c.RepoPrefix]++
+			return
 		}
 	}
 
@@ -322,14 +450,18 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 		}
 	}
 	for _, c := range candidates {
-		if c.Kind == graph.KindMethod {
-			e.To = c.ID
-			e.CrossRepo = true
-			stats.Resolved++
-			stats.CrossRepoEdges++
-			stats.ByRepo[c.RepoPrefix]++
-			return
+		if c.Kind != graph.KindMethod {
+			continue
 		}
+		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
+			continue
+		}
+		e.To = c.ID
+		e.CrossRepo = true
+		stats.Resolved++
+		stats.CrossRepoEdges++
+		stats.ByRepo[c.RepoPrefix]++
+		return
 	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindFunction && c.RepoPrefix == callerRepo {
@@ -339,14 +471,18 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 		}
 	}
 	for _, c := range candidates {
-		if c.Kind == graph.KindFunction {
-			e.To = c.ID
-			e.CrossRepo = true
-			stats.Resolved++
-			stats.CrossRepoEdges++
-			stats.ByRepo[c.RepoPrefix]++
-			return
+		if c.Kind != graph.KindFunction {
+			continue
 		}
+		if !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
+			continue
+		}
+		e.To = c.ID
+		e.CrossRepo = true
+		stats.Resolved++
+		stats.CrossRepoEdges++
+		stats.ByRepo[c.RepoPrefix]++
+		return
 	}
 
 	stats.Unresolved++

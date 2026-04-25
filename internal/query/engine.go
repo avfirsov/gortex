@@ -151,6 +151,15 @@ func (e *Engine) FindImplementationsMinTier(interfaceID, minTier string) []*grap
 
 // FindUsages returns all nodes that reference a symbol.
 func (e *Engine) FindUsages(nodeID string) *SubGraph {
+	return e.FindUsagesScoped(nodeID, QueryOptions{})
+}
+
+// FindUsagesScoped is FindUsages with an optional §4.2 scope. When
+// opts.WorkspaceID is set, only callers from that workspace are
+// returned — the spec-launch.md §4.5 criterion 3 invariant
+// ("find_usages on a tuck symbol returns hits only from tuck").
+// Empty WorkspaceID preserves the legacy global-graph behaviour.
+func (e *Engine) FindUsagesScoped(nodeID string, opts QueryOptions) *SubGraph {
 	edges := e.g.GetInEdges(nodeID)
 	nodeMap := make(map[string]*graph.Node)
 	var filtered []*graph.Edge
@@ -163,9 +172,13 @@ func (e *Engine) FindUsages(nodeID string) *SubGraph {
 		if edge.Kind == graph.EdgeCalls || edge.Kind == graph.EdgeReferences ||
 			edge.Kind == graph.EdgeInstantiates ||
 			edge.Kind == graph.EdgeProvides || edge.Kind == graph.EdgeConsumes {
+			from := e.g.GetNode(edge.From)
+			if opts.WorkspaceID != "" && !opts.scopeAllows(from) {
+				continue
+			}
 			filtered = append(filtered, edge)
-			if n := e.g.GetNode(edge.From); n != nil {
-				nodeMap[n.ID] = n
+			if from != nil {
+				nodeMap[from.ID] = from
 			}
 		}
 	}
@@ -192,17 +205,55 @@ func (e *Engine) GetCluster(nodeID string, opts QueryOptions) *SubGraph {
 // When a search backend is configured, uses BM25/Bleve ranking with
 // camelCase-aware tokenization. Falls back to substring matching otherwise.
 func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
+	return e.SearchSymbolsScoped(query, limit, QueryOptions{})
+}
+
+// SearchSymbolsScoped is SearchSymbols with the optional spec-launch.md
+// §4.2 workspace/project scope. When opts.WorkspaceID is set, results
+// outside that scope are filtered out and the search re-fetches as
+// needed to fill the requested limit. Empty scope preserves the
+// legacy global behaviour. Step I.
+func (e *Engine) SearchSymbolsScoped(query string, limit int, opts QueryOptions) []*graph.Node {
 	if limit <= 0 {
 		limit = 20
 	}
 
-	// Use full-text search backend if available.
-	if s := e.getSearch(); s != nil && s.Count() > 0 {
-		return e.searchWithBackend(query, limit)
+	// Workspace-scoped searches need to over-fetch from the backend
+	// because the BM25 / substring layers don't know about the §4.2
+	// boundary; we filter post-hoc and may need to keep going to fill
+	// `limit`. The 4× factor is a heuristic — most workspace-bounded
+	// users have an ~all-mine result distribution and so the first
+	// page is usually enough; the extras get truncated cheaply. We
+	// cap at 200 to keep the BM25 walk bounded.
+	fetchLimit := limit
+	if opts.WorkspaceID != "" {
+		fetchLimit = limit * 4
+		if fetchLimit > 200 {
+			fetchLimit = 200
+		}
 	}
 
-	// Fallback: substring search.
-	return e.searchSubstring(query, limit)
+	var raw []*graph.Node
+	if s := e.getSearch(); s != nil && s.Count() > 0 {
+		raw = e.searchWithBackend(query, fetchLimit)
+	} else {
+		raw = e.searchSubstring(query, fetchLimit)
+	}
+
+	if opts.WorkspaceID == "" {
+		return raw
+	}
+	out := make([]*graph.Node, 0, limit)
+	for _, n := range raw {
+		if !opts.scopeAllows(n) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 func (e *Engine) searchWithBackend(query string, limit int) []*graph.Node {
@@ -446,6 +497,9 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	visited[nodeID] = true
 
 	if n := e.g.GetNode(nodeID); n != nil {
+		// The seed always enters the result, regardless of scope —
+		// callers ask "what reaches X" with X already in mind. The
+		// scope check applies to neighbours discovered by traversal.
 		allNodes = append(allNodes, n)
 	}
 
@@ -491,6 +545,19 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 			// Skip unresolved/external targets.
 			if strings.HasPrefix(neighborID, "unresolved::") || strings.HasPrefix(neighborID, "external::") {
 				continue
+			}
+
+			// Step I: §4.2 workspace/project scope. When opts.WorkspaceID
+			// is set, neighbours outside that scope are dropped along
+			// with the edge that pointed at them. Cross-workspace edges
+			// produced by the resolver (Step H) only exist when an
+			// explicit cross_workspace_dep allows them, so this filter
+			// also acts as the query-time enforcement of criterion 3
+			// (find_usages on a tuck symbol returns hits only from tuck).
+			if opts.WorkspaceID != "" {
+				if n := e.g.GetNode(neighborID); n != nil && !opts.scopeAllows(n) {
+					continue
+				}
 			}
 
 			allEdges = append(allEdges, edge)

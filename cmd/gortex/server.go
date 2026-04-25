@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/graph"
@@ -39,6 +41,18 @@ var (
 	serverWatch      bool
 	serverTrack      []string
 	serverProject    string
+	// serverWorkspace is the spec-launch.md §4.2 workspace slug filter
+	// (Step J). When set, the MCP layer scopes every query to this
+	// workspace by default — equivalent to passing `workspace: <slug>`
+	// on each call. Empty means "no scope" (legacy multi-workspace
+	// view).
+	serverWorkspace string
+	// serverScopeProject is the §4.2 project slug filter, intended to
+	// further narrow inside `--workspace`. Named --scope-project to
+	// avoid colliding with the existing --project flag (which selects
+	// the GlobalConfig active-project — a named group of repos, a
+	// distinct concept).
+	serverScopeProject    string
 	serverCacheDir        string
 	serverNoCache         bool
 	serverEmbeddings      bool
@@ -58,13 +72,15 @@ var serverCmd = &cobra.Command{
 
 func init() {
 	serverCmd.Flags().IntVar(&serverPort, "port", 4747, "HTTP port to listen on")
-	serverCmd.Flags().StringVar(&serverBind, "bind", "127.0.0.1", "bind address (e.g. 127.0.0.1, 0.0.0.0); requires --auth-token when not localhost")
+	serverCmd.Flags().StringVar(&serverBind, "bind", "127.0.0.1", "bind address. Accepts: '127.0.0.1' / '0.0.0.0' (TCP, --auth-token required when not localhost) or 'unix:///path/to.sock' for a Unix-domain socket")
 	serverCmd.Flags().StringVar(&serverAuthToken, "auth-token", "", "bearer token required on every /v1/* request (fallback: $GORTEX_SERVER_TOKEN)")
 	serverCmd.Flags().StringVar(&serverIndex, "index", "", "repository path to index on startup")
 	serverCmd.Flags().StringVar(&serverCORSOrigin, "cors-origin", "*", "allowed CORS origin (use '*' for any)")
 	serverCmd.Flags().BoolVar(&serverWatch, "watch", false, "keep graph in sync with filesystem changes")
 	serverCmd.Flags().StringSliceVar(&serverTrack, "track", nil, "additional repository paths to track")
-	serverCmd.Flags().StringVar(&serverProject, "project", "", "active project name")
+	serverCmd.Flags().StringVar(&serverProject, "project", "", "active project name (GlobalConfig group of repos)")
+	serverCmd.Flags().StringVar(&serverWorkspace, "workspace", "", "spec §4.2 workspace slug filter (defaults to all workspaces; pair with --scope-project to narrow further)")
+	serverCmd.Flags().StringVar(&serverScopeProject, "scope-project", "", "spec §4.2 project slug filter inside --workspace (no effect without --workspace)")
 	serverCmd.Flags().StringVar(&serverCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
 	serverCmd.Flags().BoolVar(&serverNoCache, "no-cache", false, "disable graph caching")
 	serverCmd.Flags().BoolVar(&serverEmbeddings, "embeddings", false, "enable semantic search")
@@ -89,8 +105,11 @@ func runServer(_ *cobra.Command, _ []string) error {
 	// Bind/auth policy. Without a token we force the listener onto
 	// localhost; binding to any external interface without auth is a
 	// foot-gun (anyone on the network could invoke arbitrary MCP
-	// tools), so reject that combination up front.
-	if authToken == "" {
+	// tools), so reject that combination up front. Unix-domain
+	// sockets are inherently localhost-bounded by filesystem
+	// permissions, so no token is required for them.
+	usingUnixSocket := strings.HasPrefix(serverBind, "unix://")
+	if authToken == "" && !usingUnixSocket {
 		if !isLocalhostBind(serverBind) {
 			return fmt.Errorf("--bind %q requires --auth-token (or $GORTEX_SERVER_TOKEN); refusing to expose unauthenticated server on external interface", serverBind)
 		}
@@ -224,10 +243,15 @@ func runServer(_ *cobra.Command, _ []string) error {
 	var multiOpts []gortexmcp.MultiRepoOptions
 	if mi != nil || cm != nil {
 		multiOpts = append(multiOpts, gortexmcp.MultiRepoOptions{
-			MultiIndexer:  mi,
-			ConfigManager: cm,
-			ActiveProject: activeProject,
+			MultiIndexer:   mi,
+			ConfigManager:  cm,
+			ActiveProject:  activeProject,
+			ScopeWorkspace: serverWorkspace,
+			ScopeProject:   serverScopeProject,
 		})
+	}
+	if serverScopeProject != "" && serverWorkspace == "" {
+		fmt.Fprintln(os.Stderr, "[gortex] server: --scope-project has no effect without --workspace; ignoring")
 	}
 
 	eng := query.NewEngine(g)
@@ -259,6 +283,47 @@ func runServer(_ *cobra.Command, _ []string) error {
 	}
 	if serverID != "" {
 		serverHandler.SetServerID(serverID)
+	}
+	// spec-launch.md §11 step Q — editor overlay sessions. 5-minute
+	// idle TTL is the iteration-1 default: long enough for an MCP
+	// client to push, query, and tear down between turns; short
+	// enough that a crashed client doesn't leak buffers indefinitely.
+	overlays := daemon.NewOverlayManager(5 * time.Minute)
+	serverHandler.SetOverlayManager(overlays)
+
+	// spec-launch.md §11 steps L, M, O, P — wire the multi-server
+	// router. When `~/.gortex/servers.toml` is present, every
+	// /v1/tools/<name> call flows through the router which decides
+	// local-fast-path vs proxy. Missing or empty servers.toml leaves
+	// the router nil and the handler keeps its single-server
+	// behaviour. The local executor re-enters handleToolCall via
+	// the in-process MCP tool dispatch — encoded by passing the
+	// body straight back to the local mcp server through a
+	// small shim that bypasses the router (preventing infinite
+	// recursion).
+	if scfg, scfgErr := daemon.LoadServersConfig(""); scfgErr == nil && scfg != nil && len(scfg.Server) > 0 {
+		rosters := daemon.NewWorkspaceRosterCache(60 * time.Second)
+		localExec := newLocalToolExecutor(srv, logger)
+		// localSlug is taken from the first server marked default,
+		// then falls back to the first entry. This is the slug the
+		// router treats as "us" — proxy targets that match it run
+		// locally instead of dialing back into ourselves.
+		var localSlug string
+		if def := scfg.DefaultServer(); def != nil {
+			localSlug = def.Slug
+		}
+		router := daemon.NewRouter(daemon.RouterConfig{
+			Servers:      scfg,
+			Rosters:      rosters,
+			LocalSlug:    localSlug,
+			LocalExecute: localExec,
+			Logger:       logger,
+		})
+		serverHandler.SetRouter(router)
+		fmt.Fprintf(os.Stderr, "[gortex] server: multi-server router wired (%d servers, local=%q)\n",
+			len(scfg.Server), localSlug)
+	} else if scfgErr != nil {
+		fmt.Fprintf(os.Stderr, "[gortex] server: servers.toml load error (running single-server): %v\n", scfgErr)
 	}
 
 	// Watch mode: set up the event hub so /v1/events has a source.
@@ -294,20 +359,54 @@ func runServer(_ *cobra.Command, _ []string) error {
 	corsOpts := server.CORSOptions{AllowOrigins: []string{serverCORSOrigin}}
 	handler = server.WithCORS(handler, corsOpts)
 
-	addr := fmt.Sprintf("%s:%d", serverBind, serverPort)
 	httpServer := &http.Server{
-		Addr:    addr,
 		Handler: handler,
 	}
 
-	fmt.Fprintf(os.Stderr, "[gortex] server listening on http://%s\n", addr)
-
 	errCh := make(chan error, 1)
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+	if usingUnixSocket {
+		// Step K: Unix-domain socket transport. Path follows
+		// "unix://" — `unix:///var/run/gortex/<slug>.sock` is the
+		// recommended per-slug shape. Cleaning up a stale socket file
+		// from a previous (crashed) run lets restart-on-failure
+		// supervisors not need a wrapping rm.
+		socketPath := strings.TrimPrefix(serverBind, "unix://")
+		if socketPath == "" {
+			return fmt.Errorf("--bind unix:// requires a path (e.g. unix:///var/run/gortex/main.sock)")
 		}
-	}()
+		// Clean up a stale socket from a crashed previous run. We
+		// only remove if it really is a socket — a regular file
+		// at the path is left alone so we can't accidentally clobber
+		// user data.
+		if fi, err := os.Stat(socketPath); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			_ = os.Remove(socketPath)
+		}
+		// Best-effort dir creation; the listener will surface a clear
+		// error if the dir is missing and uncreatable.
+		_ = os.MkdirAll(filepath.Dir(socketPath), 0o755)
+		ln, err := net.Listen("unix", socketPath)
+		if err != nil {
+			return fmt.Errorf("listen on unix socket %s: %w", socketPath, err)
+		}
+		// Restrict to the running user — agent processes that talk
+		// to this socket already share a uid with the daemon. Other
+		// users on the host shouldn't be able to invoke MCP tools.
+		_ = os.Chmod(socketPath, 0o600)
+		fmt.Fprintf(os.Stderr, "[gortex] server listening on unix://%s\n", socketPath)
+		go func() {
+			if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		}()
+	} else {
+		httpServer.Addr = fmt.Sprintf("%s:%d", serverBind, serverPort)
+		fmt.Fprintf(os.Stderr, "[gortex] server listening on http://%s\n", httpServer.Addr)
+		go func() {
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		}()
+	}
 
 	// Background: index, multi-repo, analyze — graph populates while HTTP is live.
 	go func() {

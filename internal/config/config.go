@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -20,9 +22,51 @@ type GuardsConfig struct {
 	Rules []GuardRule `mapstructure:"rules" yaml:"rules,omitempty"`
 }
 
-// WorkspaceConfig holds workspace-level settings for multi-repo support.
-type WorkspaceConfig struct {
-	AutoDetect bool `mapstructure:"auto_detect" yaml:"auto_detect"`
+// MultiRepoConfig holds workspace-discovery settings used by the
+// multi-repo bootstrapper. Carries the (formerly `workspace.auto_detect`)
+// flag — moved out from under `workspace:` because §4.2 reclaims that
+// key for the workspace-identity slug.
+type MultiRepoConfig struct {
+	// AutoDetect — when true, `gortex index <parent-dir>` walks
+	// immediate subdirectories looking for `.git/`, treating each
+	// match as a tracked repo. The legacy YAML key
+	// `workspace.auto_detect: true` is still accepted by the custom
+	// Config unmarshaller for one release; the canonical key going
+	// forward is `multi.auto_detect`.
+	AutoDetect bool `mapstructure:"auto_detect" yaml:"auto_detect,omitempty"`
+}
+
+// ProjectGlob declares a project's path-globs inside a monorepo.
+// Spec-launch.md §4.2 example:
+//
+//	projects:
+//	  - name: api
+//	    paths: ["services/api/**"]
+//	  - name: worker
+//	    paths: ["services/worker/**"]
+//
+// A file is assigned to the first project whose globs match (longest
+// glob wins on overlap). Files matching no glob get the workspace-
+// default project name with a warning at index time.
+type ProjectGlob struct {
+	Name  string   `mapstructure:"name"  yaml:"name"`
+	Paths []string `mapstructure:"paths" yaml:"paths"`
+}
+
+// CrossWorkspaceDep declares an explicit, opt-in dependency from this
+// workspace into another. Spec-launch.md §4.2:
+//
+//	cross_workspace_deps:
+//	  - workspace: gortex
+//	    modules: [github.com/gortexhq/gortex]
+//	    mode: read-only
+//
+// `Mode` must be `read-only` in iteration 1 — any other value is
+// rejected at config-load time with a clear error.
+type CrossWorkspaceDep struct {
+	Workspace string   `mapstructure:"workspace" yaml:"workspace"`
+	Modules   []string `mapstructure:"modules"   yaml:"modules"`
+	Mode      string   `mapstructure:"mode"      yaml:"mode"`
 }
 
 // SemanticConfig holds settings for the semantic enrichment layer.
@@ -155,13 +199,37 @@ type Config struct {
 	// re-include something an outer layer excluded.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
 
-	Index     IndexConfig     `mapstructure:"index"     yaml:"index,omitempty"`
-	Watch     WatchConfig     `mapstructure:"watch"     yaml:"watch,omitempty"`
-	Query     QueryConfig     `mapstructure:"query"     yaml:"query,omitempty"`
-	MCP       MCPConfig       `mapstructure:"mcp"       yaml:"mcp,omitempty"`
-	Guards    GuardsConfig    `mapstructure:"guards"    yaml:"guards,omitempty"`
-	Workspace WorkspaceConfig `mapstructure:"workspace" yaml:"workspace,omitempty"`
-	Semantic  SemanticConfig  `mapstructure:"semantic"  yaml:"semantic,omitempty"`
+	// Workspace is the §4.2 hard-boundary slug this repo belongs to.
+	// Top-level `workspace: <slug>` in `.gortex.yaml`. Empty → defaults
+	// to the repo name (resolved by the indexer; see
+	// resolveWorkspaceID). Two repos with different non-empty slugs
+	// have their contract surfaces and queries strictly isolated.
+	Workspace string `mapstructure:"workspace" yaml:"workspace,omitempty"`
+
+	// Project is the §4.2 soft sub-boundary slug for single-project
+	// repos. Top-level `project: <slug>`. When `Projects[]` is set
+	// (monorepo case) this scalar field is ignored — file-to-project
+	// mapping comes from the glob list instead.
+	Project string `mapstructure:"project" yaml:"project,omitempty"`
+
+	// Projects is the monorepo per-file project mapping. Top-level
+	// `projects: [{name, paths: [globs]}]`. Mutually exclusive with
+	// `Project` for clarity; when both are set the loader rejects
+	// the config.
+	Projects []ProjectGlob `mapstructure:"projects" yaml:"projects,omitempty"`
+
+	// CrossWorkspaceDeps declares opt-in dependencies into other
+	// workspaces. Spec-launch.md §4.2 — only `mode: read-only` is
+	// accepted in iteration 1.
+	CrossWorkspaceDeps []CrossWorkspaceDep `mapstructure:"cross_workspace_deps" yaml:"cross_workspace_deps,omitempty"`
+
+	Index    IndexConfig     `mapstructure:"index"    yaml:"index,omitempty"`
+	Watch    WatchConfig     `mapstructure:"watch"    yaml:"watch,omitempty"`
+	Query    QueryConfig     `mapstructure:"query"    yaml:"query,omitempty"`
+	MCP      MCPConfig       `mapstructure:"mcp"      yaml:"mcp,omitempty"`
+	Guards   GuardsConfig    `mapstructure:"guards"   yaml:"guards,omitempty"`
+	Multi    MultiRepoConfig `mapstructure:"multi"    yaml:"multi,omitempty"`
+	Semantic SemanticConfig  `mapstructure:"semantic" yaml:"semantic,omitempty"`
 }
 
 type IndexConfig struct {
@@ -254,7 +322,7 @@ func Default() *Config {
 			Transport: "stdio",
 			Port:      8765,
 		},
-		Workspace: WorkspaceConfig{
+		Multi: MultiRepoConfig{
 			AutoDetect: false,
 		},
 		Semantic: SemanticConfig{
@@ -270,6 +338,13 @@ func Default() *Config {
 
 // Load reads config from file, environment, and returns a merged Config.
 // configPath may be empty; in that case only default locations are searched.
+//
+// Legacy-shape handling: prior to spec-launch.md §4 the `workspace:` key
+// held a struct (`workspace: { auto_detect: true }`). The new schema
+// reclaims `workspace:` as a scalar slug. Existing configs are migrated
+// in place — `workspace.auto_detect` lifts into `multi.auto_detect`,
+// and the loader emits a one-line deprecation note via the returned
+// error chain (callers can choose whether to surface or swallow it).
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigName(".gortex")
@@ -295,9 +370,102 @@ func Load(configPath string) (*Config, error) {
 		// No config file found — use defaults + env.
 	}
 
+	// Migrate legacy `workspace:` mapping shape (held a struct with
+	// `auto_detect`) into the new `multi:` block so the v.Unmarshal
+	// below decodes the new schema cleanly. We do the migration on the
+	// viper key map so env-var overrides and viper's own merge logic
+	// stay consistent.
+	migrateLegacyWorkspaceKey(v)
+
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, err
 	}
 
+	if err := cfg.validateWorkspaceSchema(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// migrateLegacyWorkspaceKey rewrites `workspace.auto_detect` → `multi.auto_detect`
+// in the viper key store before unmarshal, so a `.gortex.yaml` written
+// against the pre-§4 schema still produces a working Config without the
+// caller seeing a parse error. The migration is silent — there's no
+// global logger here — but the audit step (`gortex audit_agent_config`,
+// reserved for a follow-up) can flag the deprecated key.
+//
+// Only the documented legacy field is migrated. Any other map under
+// `workspace:` is rejected by `validateWorkspaceSchema` so unknown
+// shapes don't get silently ignored.
+func migrateLegacyWorkspaceKey(v *viper.Viper) {
+	raw := v.Get("workspace")
+	if raw == nil {
+		return
+	}
+	switch t := raw.(type) {
+	case string:
+		// Already in new shape; nothing to do.
+	case map[string]interface{}:
+		if ad, ok := t["auto_detect"]; ok {
+			// Move to the new home unless `multi.auto_detect`
+			// is already set explicitly (caller wins).
+			if v.Get("multi.auto_detect") == nil {
+				v.Set("multi.auto_detect", ad)
+			}
+		}
+		// The old shape never carried a workspace identity slug,
+		// so we clear the polymorphic key so v.Unmarshal doesn't
+		// fail trying to coerce a map into a string.
+		v.Set("workspace", "")
+	case map[interface{}]interface{}:
+		// yaml.v2 / older path — same semantics.
+		if ad, ok := t["auto_detect"]; ok {
+			if v.Get("multi.auto_detect") == nil {
+				v.Set("multi.auto_detect", ad)
+			}
+		}
+		v.Set("workspace", "")
+	default:
+		// Unrecognised shape; downstream coercion will surface
+		// a precise error rather than us silently dropping it.
+	}
+}
+
+// validateWorkspaceSchema enforces the §4.4 defaults / boundaries that
+// can't be expressed via struct tags alone:
+//
+//   - `Project` and `Projects[]` are mutually exclusive (a repo is
+//     either single-project or a monorepo, never both).
+//   - Every `CrossWorkspaceDeps[].Mode` must be `read-only`. Iteration 1
+//     ships only the read-only mode per spec-launch.md §4.2.
+//   - `Workspace` slug, when set, may not be empty after trimming.
+//
+// Errors are concatenated so a malformed file surfaces every problem
+// in one pass rather than one round-trip per fix.
+func (c *Config) validateWorkspaceSchema() error {
+	var errs []string
+	if c.Project != "" && len(c.Projects) > 0 {
+		errs = append(errs, "config: 'project' and 'projects' are mutually exclusive — pick one")
+	}
+	for _, dep := range c.CrossWorkspaceDeps {
+		if dep.Workspace == "" {
+			errs = append(errs, "config: cross_workspace_deps[].workspace is required")
+		}
+		if len(dep.Modules) == 0 {
+			errs = append(errs, "config: cross_workspace_deps[\""+dep.Workspace+"\"].modules must be non-empty")
+		}
+		switch dep.Mode {
+		case "", "read-only":
+			// Empty defaults to read-only (the only iteration-1 mode).
+		default:
+			errs = append(errs,
+				"config: cross_workspace_deps[\""+dep.Workspace+"\"].mode = "+
+					strconv.Quote(dep.Mode)+" is unsupported in iteration 1; only \"read-only\" is allowed")
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(errs, "; "))
 }

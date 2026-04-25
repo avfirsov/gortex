@@ -636,7 +636,7 @@ guards:
 		require.NotNil(t, cfg)
 
 		// New fields should have defaults.
-		assert.False(t, cfg.Workspace.AutoDetect)
+		assert.False(t, cfg.Multi.AutoDetect)
 		// Existing fields should be loaded.
 		assert.Equal(t, 4, cfg.Index.Workers)
 		assert.True(t, cfg.Watch.Enabled)

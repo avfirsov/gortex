@@ -138,7 +138,31 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 	srv.Controller = controller
-	srv.MCPDispatcher = newMCPDispatcher(state.mcpServer, state.multiIndexer, logger)
+	disp := newMCPDispatcher(state.mcpServer, state.multiIndexer, logger)
+	// spec-launch.md §11 step P — wire the multi-server router into
+	// the daemon dispatcher when servers.toml exists. Local-only
+	// daemons (no servers.toml) leave router=nil and dispatch flows
+	// straight to the in-process MCP server unchanged.
+	if scfg, scfgErr := daemon.LoadServersConfig(""); scfgErr == nil && scfg != nil && len(scfg.Server) > 0 {
+		rosters := daemon.NewWorkspaceRosterCache(60 * time.Second)
+		var localSlug string
+		if def := scfg.DefaultServer(); def != nil {
+			localSlug = def.Slug
+		}
+		router := daemon.NewRouter(daemon.RouterConfig{
+			Servers:      scfg,
+			Rosters:      rosters,
+			LocalSlug:    localSlug,
+			LocalExecute: newLocalToolExecutor(state.mcpServer, logger),
+			Logger:       logger,
+		})
+		disp.SetRouter(router)
+		logger.Info("daemon: multi-server router wired",
+			zap.Int("servers", len(scfg.Server)), zap.String("local_slug", localSlug))
+	} else if scfgErr != nil {
+		logger.Warn("daemon: servers.toml load error (running single-server)", zap.Error(scfgErr))
+	}
+	srv.MCPDispatcher = disp
 
 	// Opt-in pprof endpoint. No-op unless GORTEX_DAEMON_PPROF_ADDR is
 	// set — keeps profiling off by default so the daemon doesn't hand

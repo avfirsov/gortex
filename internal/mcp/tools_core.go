@@ -561,7 +561,17 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 
 	sess := s.sessionFor(ctx)
 	sess.recordSearch(q)
-	nodes := s.engine.SearchSymbols(q, limit+10)
+
+	// spec-launch.md §4.2 / §11 step P — apply server-default scope
+	// merged with caller args. `workspace` / `project` args win
+	// per-field; empty falls through to the server's --workspace
+	// flag. SearchSymbolsScoped over-fetches and post-filters, so
+	// ranking is preserved while results stay inside the boundary.
+	workspaceArg := req.GetString("workspace", "")
+	projectArg := req.GetString("project", "")
+	scopeWS, scopeProj := s.resolveQueryScope(workspaceArg, projectArg)
+	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj}
+	nodes := s.engine.SearchSymbolsScoped(q, limit+10, scope)
 
 	// Apply repo/project/ref filter.
 	allowed, filterErr := s.resolveRepoFilter(req)
@@ -675,11 +685,14 @@ func (s *Server) handleGetDependencies(_ context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("id is required"), nil
 	}
 	minTier := req.GetString("min_tier", "")
+	scopeWS, scopeProj := s.scopeFromRequest(&req)
 	opts := query.QueryOptions{
-		Depth:   req.GetInt("depth", 2),
-		Limit:   req.GetInt("limit", 50),
-		Detail:  "brief",
-		MinTier: minTier,
+		Depth:       req.GetInt("depth", 2),
+		Limit:       req.GetInt("limit", 50),
+		Detail:      "brief",
+		MinTier:     minTier,
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
 	}
 	sg := s.engine.GetDependencies(id, opts)
 	sg.FilterByMinTier(minTier)
@@ -693,11 +706,14 @@ func (s *Server) handleGetDependents(_ context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError("id is required"), nil
 	}
 	minTier := req.GetString("min_tier", "")
+	scopeWS, scopeProj := s.scopeFromRequest(&req)
 	opts := query.QueryOptions{
-		Depth:   req.GetInt("depth", 3),
-		Limit:   req.GetInt("limit", 50),
-		Detail:  "brief",
-		MinTier: minTier,
+		Depth:       req.GetInt("depth", 3),
+		Limit:       req.GetInt("limit", 50),
+		Detail:      "brief",
+		MinTier:     minTier,
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
 	}
 	sg := s.engine.GetDependents(id, opts)
 	sg.FilterByMinTier(minTier)
@@ -711,11 +727,14 @@ func (s *Server) handleGetCallChain(_ context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("id is required"), nil
 	}
 	minTier := req.GetString("min_tier", "")
+	scopeWS, scopeProj := s.scopeFromRequest(&req)
 	opts := query.QueryOptions{
-		Depth:   req.GetInt("depth", 4),
-		Limit:   req.GetInt("limit", 50),
-		Detail:  "brief",
-		MinTier: minTier,
+		Depth:       req.GetInt("depth", 4),
+		Limit:       req.GetInt("limit", 50),
+		Detail:      "brief",
+		MinTier:     minTier,
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
 	}
 	sg := s.engine.GetCallChain(id, opts)
 
@@ -736,11 +755,14 @@ func (s *Server) handleGetCallers(_ context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError("id is required"), nil
 	}
 	minTier := req.GetString("min_tier", "")
+	scopeWS, scopeProj := s.scopeFromRequest(&req)
 	opts := query.QueryOptions{
-		Depth:   req.GetInt("depth", 2),
-		Limit:   req.GetInt("limit", 50),
-		Detail:  "brief",
-		MinTier: minTier,
+		Depth:       req.GetInt("depth", 2),
+		Limit:       req.GetInt("limit", 50),
+		Detail:      "brief",
+		MinTier:     minTier,
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
 	}
 	sg := s.engine.GetCallers(id, opts)
 	sg.FilterByMinTier(minTier)
@@ -790,7 +812,17 @@ func (s *Server) handleFindUsages(_ context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError("id is required"), nil
 	}
 	minTier := req.GetString("min_tier", "")
-	sg := s.engine.FindUsages(id)
+
+	// spec-launch.md §4.5 criterion 3 — find_usages on a tuck symbol
+	// returns hits only from tuck. Server-level --workspace + caller
+	// `workspace` arg compose the same way as on search_symbols.
+	workspaceArg := req.GetString("workspace", "")
+	projectArg := req.GetString("project", "")
+	scopeWS, scopeProj := s.resolveQueryScope(workspaceArg, projectArg)
+	sg := s.engine.FindUsagesScoped(id, query.QueryOptions{
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
+	})
 
 	// Apply repo/project/ref filter.
 	allowed, filterErr := s.resolveRepoFilter(req)
@@ -811,10 +843,13 @@ func (s *Server) handleGetCluster(_ context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
 	}
+	scopeWS, scopeProj := s.scopeFromRequest(&req)
 	opts := query.QueryOptions{
-		Depth:  req.GetInt("radius", 2),
-		Limit:  req.GetInt("limit", 50),
-		Detail: "brief",
+		Depth:       req.GetInt("radius", 2),
+		Limit:       req.GetInt("limit", 50),
+		Detail:      "brief",
+		WorkspaceID: scopeWS,
+		ProjectID:   scopeProj,
 	}
 	sg := s.engine.GetCluster(id, opts)
 	enrichSubGraphEdges(sg)

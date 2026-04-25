@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/server/hub"
@@ -196,6 +198,184 @@ func reposFromGraph(g *graph.Graph) []repoEntry {
 
 func (h *Handler) handleRepos(w http.ResponseWriter, _ *http.Request) {
 	WriteJSON(w, http.StatusOK, map[string]any{"repos": reposFromGraph(h.graph)})
+}
+
+// --- /v1/overlay/* — spec-launch.md §11 step Q ---
+
+// handleOverlayRegister handles POST /v1/overlay/sessions.
+// Body: {"workspace_id": "<slug>"}. Response: {"session_id": "..."}.
+func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) {
+	if h.overlays == nil {
+		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		WorkspaceID string `json:"workspace_id"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	id := h.overlays.Register(body.WorkspaceID)
+	WriteJSON(w, http.StatusCreated, map[string]any{
+		"session_id":   id,
+		"workspace_id": body.WorkspaceID,
+	})
+}
+
+// handleOverlayPush handles PUT /v1/overlay/sessions/{id}/files.
+// Body: OverlayFile JSON. Path is required; Content or Deleted=true.
+func (h *Handler) handleOverlayPush(w http.ResponseWriter, r *http.Request) {
+	if h.overlays == nil {
+		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	var overlay daemon.OverlayFile
+	if err := json.NewDecoder(r.Body).Decode(&overlay); err != nil {
+		http.Error(w, "invalid OverlayFile JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.overlays.Push(id, overlay, nil); err != nil {
+		switch {
+		case errors.Is(err, daemon.ErrSessionNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, daemon.ErrOverlayDrift):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleOverlayDelete handles DELETE /v1/overlay/sessions/{id}/files.
+// Body: {"path": "..."}. Removes one overlay file from the session.
+func (h *Handler) handleOverlayDelete(w http.ResponseWriter, r *http.Request) {
+	if h.overlays == nil {
+		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Path == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	if err := h.overlays.Delete(id, body.Path); err != nil {
+		if errors.Is(err, daemon.ErrSessionNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleOverlayDrop handles DELETE /v1/overlay/sessions/{id}.
+// Drops the entire session, discarding every overlay it held.
+func (h *Handler) handleOverlayDrop(w http.ResponseWriter, r *http.Request) {
+	if h.overlays == nil {
+		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	h.overlays.Drop(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleOverlayList handles GET /v1/overlay/sessions/{id}/files.
+// Returns the current overlay snapshot for the session.
+func (h *Handler) handleOverlayList(w http.ResponseWriter, r *http.Request) {
+	if h.overlays == nil {
+		http.Error(w, "overlay support not enabled on this server", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+	files, err := h.overlays.Files(id)
+	if err != nil {
+		if errors.Is(err, daemon.ErrSessionNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	out := make([]daemon.OverlayFile, 0, len(files))
+	for _, f := range files {
+		out = append(out, f)
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"files": out})
+}
+
+// handleWorkspaceRoster serves `GET /v1/workspaces/{ws}/repos` —
+// spec-launch.md §11 step N. Returns the deduplicated list of repo
+// prefixes for the requested workspace slug, or 404 when no node in
+// the graph carries that workspace. The daemon-side
+// WorkspaceRosterCache calls this once per (slug, workspace) and
+// caches the result for ~1 minute (see daemon.NewWorkspaceRosterCache).
+func (h *Handler) handleWorkspaceRoster(w http.ResponseWriter, r *http.Request) {
+	ws := r.PathValue("ws")
+	if ws == "" {
+		http.Error(w, "workspace slug required", http.StatusBadRequest)
+		return
+	}
+	seen := make(map[string]struct{})
+	for _, n := range h.graph.AllNodes() {
+		// Effective workspace match — match on either the explicit
+		// WorkspaceID or the §4.4 fallback (RepoPrefix). Either way
+		// the result list reports RepoPrefix so callers can address
+		// the underlying repo without translating slugs.
+		nodeWS := n.WorkspaceID
+		if nodeWS == "" {
+			nodeWS = n.RepoPrefix
+		}
+		if nodeWS != ws {
+			continue
+		}
+		if n.RepoPrefix == "" {
+			continue
+		}
+		seen[n.RepoPrefix] = struct{}{}
+	}
+	if len(seen) == 0 {
+		http.Error(w, "workspace not found", http.StatusNotFound)
+		return
+	}
+	repos := make([]string, 0, len(seen))
+	for p := range seen {
+		repos = append(repos, p)
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"workspace": ws,
+		"repos":     repos,
+	})
 }
 
 // --- /v1/processes ---

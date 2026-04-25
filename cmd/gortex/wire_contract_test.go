@@ -135,7 +135,11 @@ func describeFields(t reflect.Type) string {
 func wireContractGolden(name string) string {
 	switch name {
 	case "graph.Node":
-		return "684dfbc0222c41d813cbc4991e2bde4cfa6a8e9767096367270f671e046581a1"
+		// Bumped when WorkspaceID and ProjectID were added (spec-launch.md
+		// §4 / iteration-1 Step D). Additive — gob decodes unknown fields
+		// as zero, so older snapshots still load with both new fields
+		// blank; daemon warmup backfills them from config.
+		return "5783f7ad776535db819402df2b60328dcb8f813d8999b97554e6a484d25db792"
 	case "graph.Edge":
 		return "6a543f0f3f663587fc6011ab641bbd91fe66bfc70f87fe548974411e89e871de"
 	case "snapshotHeader":

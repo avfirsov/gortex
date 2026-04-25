@@ -38,7 +38,7 @@ func (idx *Indexer) extractDIContracts(reg *contracts.Registry) {
 	if len(discovered) == 0 {
 		return
 	}
-	reg.AddAll(discovered, idx.repoPrefix)
+	reg.AddAllScoped(discovered, idx.repoPrefix, idx.workspaceID, idx.projectID)
 }
 
 // linkSpringBeans emits EdgeCalls from every class that has an
