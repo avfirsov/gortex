@@ -79,8 +79,8 @@ func init() {
 	serverCmd.Flags().BoolVar(&serverWatch, "watch", false, "keep graph in sync with filesystem changes")
 	serverCmd.Flags().StringSliceVar(&serverTrack, "track", nil, "additional repository paths to track")
 	serverCmd.Flags().StringVar(&serverProject, "project", "", "active project name (GlobalConfig group of repos)")
-	serverCmd.Flags().StringVar(&serverWorkspace, "workspace", "", "spec §4.2 workspace slug filter (defaults to all workspaces; pair with --scope-project to narrow further)")
-	serverCmd.Flags().StringVar(&serverScopeProject, "scope-project", "", "spec §4.2 project slug filter inside --workspace (no effect without --workspace)")
+	serverCmd.Flags().StringVar(&serverWorkspace, "workspace", "", "spec §4.2 workspace slug — restricts BOTH indexing and queries to repos whose resolved workspace matches (RepoEntry override → .gortex.yaml::workspace → repo prefix). Empty means all workspaces.")
+	serverCmd.Flags().StringVar(&serverScopeProject, "scope-project", "", "spec §4.2 project slug — narrows further inside --workspace (also gates indexing). No effect without --workspace.")
 	serverCmd.Flags().StringVar(&serverCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
 	serverCmd.Flags().BoolVar(&serverNoCache, "no-cache", false, "disable graph caching")
 	serverCmd.Flags().BoolVar(&serverEmbeddings, "embeddings", false, "enable semantic search")
@@ -251,7 +251,7 @@ func runServer(_ *cobra.Command, _ []string) error {
 		})
 	}
 	if serverScopeProject != "" && serverWorkspace == "" {
-		fmt.Fprintln(os.Stderr, "[gortex] server: --scope-project has no effect without --workspace; ignoring")
+		fmt.Fprintln(os.Stderr, "[gortex] server: --scope-project without --workspace will match repos across every workspace whose project slug equals this value")
 	}
 
 	eng := query.NewEngine(g)
@@ -413,8 +413,12 @@ func runServer(_ *cobra.Command, _ []string) error {
 		// When MultiIndexer is available (global config has repos), use it exclusively.
 		// Single --index flag is only used when no multi-repo config exists.
 		if mi != nil {
-			fmt.Fprintf(os.Stderr, "[gortex] server: multi-repo indexing...\n")
-			if _, err := mi.IndexAll(); err != nil {
+			if serverWorkspace != "" || serverScopeProject != "" {
+				fmt.Fprintf(os.Stderr, "[gortex] server: multi-repo indexing (scope: workspace=%q project=%q)...\n", serverWorkspace, serverScopeProject)
+			} else {
+				fmt.Fprintf(os.Stderr, "[gortex] server: multi-repo indexing...\n")
+			}
+			if _, err := mi.IndexScoped(serverWorkspace, serverScopeProject); err != nil {
 				fmt.Fprintf(os.Stderr, "[gortex] server: multi-repo indexing error: %v\n", err)
 			}
 		} else if serverIndex != "" {

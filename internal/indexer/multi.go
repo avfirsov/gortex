@@ -79,9 +79,32 @@ func NewMultiIndexer(
 // IndexAll indexes all active repos concurrently. Each repo gets its own
 // Indexer instance with repo-specific config. Returns per-repo IndexResults.
 func (mi *MultiIndexer) IndexAll() (map[string]*IndexResult, error) {
+	return mi.IndexScoped("", "")
+}
+
+// IndexScoped is IndexAll restricted to repos whose §4.2 workspace and
+// project slugs match. Empty filters disable that axis (so empty/empty
+// is equivalent to IndexAll). Resolution honours the same precedence
+// as resolveWorkspaceID/resolveProjectID — RepoEntry override →
+// `.gortex.yaml::workspace` → repo prefix — so a `gortex server
+// --workspace foo` invocation matches both repos that declare
+// `workspace: foo` in their own `.gortex.yaml` and repos pinned to
+// `foo` from the user's global config.
+//
+// Returns an error when the filters exclude every active repo, so a
+// `--workspace typo` surfaces as a startup failure rather than a
+// silently empty graph.
+func (mi *MultiIndexer) IndexScoped(workspaceSlug, projectSlug string) (map[string]*IndexResult, error) {
 	repos := mi.configMgr.ActiveRepos()
 	if len(repos) == 0 {
 		return nil, nil
+	}
+	if workspaceSlug != "" || projectSlug != "" {
+		filtered := mi.filterReposByScope(repos, workspaceSlug, projectSlug)
+		if len(filtered) == 0 {
+			return nil, fmt.Errorf("scope filter matched zero of %d active repos (workspace=%q project=%q)", len(repos), workspaceSlug, projectSlug)
+		}
+		repos = filtered
 	}
 
 	// Single-repo mode: delegate without prefixing.
@@ -98,6 +121,38 @@ func (mi *MultiIndexer) IndexAll() (map[string]*IndexResult, error) {
 		mi.ReconcileContractEdges()
 	}
 	return r, err
+}
+
+// filterReposByScope returns the subset of repos whose resolved §4.2
+// workspace and project slugs match the supplied filters. Empty
+// filters disable that axis. Loads each repo's `.gortex.yaml` first so
+// resolution sees the workspace/project declared there — matching only
+// against `RepoEntry.Workspace` would miss repos that declare their
+// slug in their own config file (the typical case for first-party
+// repos).
+func (mi *MultiIndexer) filterReposByScope(repos []config.RepoEntry, workspaceSlug, projectSlug string) []config.RepoEntry {
+	if workspaceSlug == "" && projectSlug == "" {
+		return repos
+	}
+	out := make([]config.RepoEntry, 0, len(repos))
+	for _, e := range repos {
+		absPath, err := filepath.Abs(e.Path)
+		if err != nil {
+			continue
+		}
+		prefix := config.ResolvePrefix(e)
+		mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
+		cfg := mi.configMgr.GetRepoConfig(prefix)
+		entryCopy := e
+		if workspaceSlug != "" && resolveWorkspaceID(&entryCopy, cfg, prefix) != workspaceSlug {
+			continue
+		}
+		if projectSlug != "" && resolveProjectID(&entryCopy, cfg, prefix) != projectSlug {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // indexSingleRepo indexes a single repo without prefixing for backward compatibility.

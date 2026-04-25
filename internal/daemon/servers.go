@@ -108,6 +108,104 @@ func LoadServersConfig(path string) (*ServersConfig, error) {
 	return cfg, nil
 }
 
+// Save writes the config back to `path` (or ServersConfigPath() when
+// empty) atomically: marshal to TOML, write to a sibling temp file,
+// fsync, rename into place. The parent directory is created with 0700
+// and the file with 0600 — matching the daemon's existing convention
+// for files that can hold auth tokens.
+//
+// Validate is run first; an invalid config is never persisted.
+func (c *ServersConfig) Save(path string) error {
+	if c == nil {
+		return fmt.Errorf("nil ServersConfig")
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if path == "" {
+		path = ServersConfigPath()
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create dir %s: %w", dir, err)
+	}
+	data, err := toml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal servers config: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, "servers-*.toml.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("write temp file %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("fsync %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close %s: %w", tmpPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
+	}
+	return nil
+}
+
+// AddServer appends an entry, rejecting on duplicate slug or any other
+// invariant violation (so callers can rely on Validate succeeding
+// after a successful AddServer). Setting Default=true on an entry
+// when another is already default is rejected here rather than
+// auto-flipping the existing one — the explicit error keeps the
+// "exactly one default" rule visible to the user.
+func (c *ServersConfig) AddServer(entry ServerEntry) error {
+	if c == nil {
+		return fmt.Errorf("nil ServersConfig")
+	}
+	if entry.Slug == "" {
+		return fmt.Errorf("slug is required")
+	}
+	if c.FindBySlug(entry.Slug) != nil {
+		return fmt.Errorf("server %q already exists", entry.Slug)
+	}
+	c.Server = append(c.Server, entry)
+	if err := c.Validate(); err != nil {
+		// Roll back so the in-memory config matches what would have
+		// been persisted.
+		c.Server = c.Server[:len(c.Server)-1]
+		return err
+	}
+	return nil
+}
+
+// RemoveServer drops the entry with the given slug. Returns false
+// (no error) when the slug isn't found — matches the typical CLI
+// idempotency expectation. Returns an error only on a nil receiver.
+func (c *ServersConfig) RemoveServer(slug string) (bool, error) {
+	if c == nil {
+		return false, fmt.Errorf("nil ServersConfig")
+	}
+	for i := range c.Server {
+		if c.Server[i].Slug == slug {
+			c.Server = append(c.Server[:i], c.Server[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Validate enforces the ServersConfig invariants.
 func (c *ServersConfig) Validate() error {
 	if c == nil {
