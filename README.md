@@ -58,6 +58,16 @@ Pre-built binaries are published to [GitHub Releases](https://github.com/zzet/go
 
 **New to Gortex?** After installing, see [docs/onboarding.md](docs/onboarding.md) for the 15-minute walkthrough: `gortex install` (once per machine) → `gortex init` (once per repo) → verify your AI assistant uses graph tools → what to do if it doesn't.
 
+### One-line install (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zzet/gortex/main/scripts/install.sh | sh
+```
+
+Detects OS/arch, downloads the signed release tarball, verifies the SHA256 against `checksums.txt` (and the cosign signature if `cosign` is installed), drops the binary in `$HOME/.local/bin`, and adds that directory to your shell rc (`.zshrc` / `.bashrc` / fish config) inside an idempotent `# >>> gortex installer >>>` block. Re-runs upgrade in place and back up the previous binary as `gortex.previous`. No silent sudo.
+
+Override defaults via env vars: `GORTEX_VERSION=v0.15.0` (pin a version), `GORTEX_INSTALL_DIR=/usr/local/bin` (system-wide; you'll need write permission), `GORTEX_NO_PATH=1` (skip rc edits), `GORTEX_NO_VERIFY=1` (skip checksum + cosign), `GORTEX_FORCE=1` (overwrite without backup). Source: [`scripts/install.sh`](scripts/install.sh).
+
 ### macOS — Homebrew
 
 ```bash
