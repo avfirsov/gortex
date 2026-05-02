@@ -196,6 +196,10 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 	imports := map[string]string{} // alias → importPath
 	tenv := make(typeEnv)
+	// paramsByFunc: enclosing-function ID → (param/receiver name → type).
+	// Function parameters and method receivers shadow file-wide tenv at
+	// call resolution time so each function's locals stay sandboxed.
+	paramsByFunc := map[string]typeEnv{}
 	seenTypeName := map[string]bool{} // dedup when alias + typedef match same name
 
 	var calls []goDeferredCall
@@ -220,10 +224,10 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result)
+			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc)
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result)
+			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc)
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
@@ -373,6 +377,24 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
 
+	// lookupRecvType resolves a receiver-expression name first against
+	// the enclosing function's parameter scope, then the file-wide tenv.
+	// Per-function scope is needed so calls like `func F(reg *Registry)
+	// { reg.Register(...) }` get the right `receiver_type` even when
+	// another function in the same file has a parameter or local named
+	// `reg` with a different type.
+	lookupRecvType := func(callerID, name string) (string, bool) {
+		if callerID != "" {
+			if scope, ok := paramsByFunc[callerID]; ok {
+				if t, ok := scope[name]; ok {
+					return t, true
+				}
+			}
+		}
+		t, ok := tenv[name]
+		return t, ok
+	}
+
 	// --- Calls ---
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
@@ -397,10 +419,23 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			From: callerID, To: "unresolved::*." + c.method,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 		}
-		if recvType, ok := tenv[c.receiver]; ok {
+		if recvType, ok := lookupRecvType(callerID, c.receiver); ok {
 			edge.Meta = map[string]any{"receiver_type": recvType}
 		} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-			if chainType := resolveChainType(c.receiver, tenv, result); chainType != "" {
+			// Chain walk needs both the file-wide tenv and the
+			// enclosing function's parameter scope as one map. Compose
+			// without mutating either.
+			composed := tenv
+			if scope, ok := paramsByFunc[callerID]; ok && len(scope) > 0 {
+				composed = make(typeEnv, len(tenv)+len(scope))
+				for k, v := range tenv {
+					composed[k] = v
+				}
+				for k, v := range scope {
+					composed[k] = v
+				}
+			}
+			if chainType := resolveChainType(c.receiver, composed, result); chainType != "" {
 				edge.Meta = map[string]any{"receiver_type": chainType}
 			}
 		}
@@ -442,7 +477,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			From: callerID, To: "unresolved::*." + v.field,
 			Kind: v.kind, FilePath: filePath, Line: v.line,
 		}
-		if recvType, ok := tenv[v.receiver]; ok {
+		if recvType, ok := lookupRecvType(callerID, v.receiver); ok {
 			edge.Meta = map[string]any{"receiver_type": recvType}
 		}
 		result.Edges = append(result.Edges, edge)
@@ -488,7 +523,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			From: callerID, To: "unresolved::*." + v.field,
 			Kind: v.kind, FilePath: filePath, Line: v.line,
 		}
-		if recvType, ok := tenv[v.receiver]; ok {
+		if recvType, ok := lookupRecvType(callerID, v.receiver); ok {
 			edge.Meta = map[string]any{"receiver_type": recvType}
 		}
 		result.Edges = append(result.Edges, edge)
@@ -508,7 +543,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			From: callerID, To: "unresolved::*." + v.field,
 			Kind: v.kind, FilePath: filePath, Line: v.line,
 		}
-		if recvType, ok := tenv[v.receiver]; ok {
+		if recvType, ok := lookupRecvType(callerID, v.receiver); ok {
 			edge.Meta = map[string]any{"receiver_type": recvType}
 		}
 		result.Edges = append(result.Edges, edge)
@@ -519,7 +554,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 // --- Per-match emit helpers -----------------------------------------
 
-func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv) {
 	name := m.Captures["func.name"].Text
 	def := m.Captures["func.def"]
 	id := filePath + "::" + name
@@ -534,6 +569,11 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 		Meta:      make(map[string]any),
 	}
 	node.Meta["signature"] = buildFuncSignature(name, m.Captures["func.params"], m.Captures["func.result"])
+	if paramsCap, ok := m.Captures["func.params"]; ok && paramsCap != nil {
+		if scope := extractGoParamTypes(paramsCap.Node, src); len(scope) > 0 {
+			paramsByFunc[id] = scope
+		}
+	}
 	if resultCap, ok := m.Captures["func.result"]; ok && resultCap.Text != "" {
 		if rt := normalizeGoTypeName(resultCap.Text); rt != "" {
 			node.Meta["return_type"] = rt
@@ -578,13 +618,25 @@ func goFuncBody(decl *sitter.Node) *sitter.Node {
 	return nil
 }
 
-func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
+func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, paramsByFunc map[string]typeEnv) {
 	name := m.Captures["method.name"].Text
 	def := m.Captures["method.def"]
 	receiverText := m.Captures["method.receiver"].Text
 	receiverType := extractReceiverType(receiverText)
 
 	id := filePath + "::" + receiverType + "." + name
+	scope := typeEnv{}
+	if recvName := extractReceiverName(receiverText); recvName != "" && receiverType != "" {
+		scope[recvName] = receiverType
+	}
+	if paramsCap, ok := m.Captures["method.params"]; ok && paramsCap != nil {
+		for k, v := range extractGoParamTypes(paramsCap.Node, src) {
+			scope[k] = v
+		}
+	}
+	if len(scope) > 0 {
+		paramsByFunc[id] = scope
+	}
 	node := &graph.Node{
 		ID:        id,
 		Kind:      graph.KindMethod,
@@ -1155,6 +1207,71 @@ func findEnclosingFunc(ranges []funcRange, line int) string {
 		}
 	}
 	return ""
+}
+
+// extractReceiverName extracts the receiver name from a Go receiver
+// parameter list. "(s *Server)" -> "s", "(Server)" -> "" (unnamed).
+// Used to seed paramsByFunc so calls like `s.foo()` inside the method
+// body resolve via the receiver's type.
+func extractReceiverName(receiver string) string {
+	receiver = strings.Trim(receiver, "()")
+	parts := strings.Fields(receiver)
+	if len(parts) < 2 {
+		return ""
+	}
+	name := parts[0]
+	if name == "" || name == "_" {
+		return ""
+	}
+	return name
+}
+
+// extractGoParamTypes walks a parameter_list AST node and returns a
+// map from parameter name to its declared (normalized) type. Multi-name
+// declarations like `(a, b *Foo)` produce one entry per name. Unnamed
+// parameters, blank identifiers, and types that normalizeGoTypeName
+// drops (primitives, map/chan/func) are skipped — callers only care
+// about names that point at receiver types we could resolve methods on.
+func extractGoParamTypes(paramList *sitter.Node, src []byte) typeEnv {
+	if paramList == nil {
+		return nil
+	}
+	out := typeEnv{}
+	for i := 0; i < int(paramList.NamedChildCount()); i++ {
+		decl := paramList.NamedChild(i)
+		if decl == nil {
+			continue
+		}
+		t := decl.Type()
+		if t != "parameter_declaration" && t != "variadic_parameter_declaration" {
+			continue
+		}
+		typeNode := decl.ChildByFieldName("type")
+		if typeNode == nil {
+			continue
+		}
+		typeName := normalizeGoTypeName(typeNode.Content(src))
+		if typeName == "" {
+			continue
+		}
+		// Walk all identifier children — Go allows multiple names per
+		// parameter declaration sharing one type. Skip the type node
+		// itself (which may also be reported as a named child).
+		for j := 0; j < int(decl.NamedChildCount()); j++ {
+			c := decl.NamedChild(j)
+			if c == nil || c == typeNode {
+				continue
+			}
+			if c.Type() == "identifier" {
+				name := c.Content(src)
+				if name == "" || name == "_" {
+					continue
+				}
+				out[name] = typeName
+			}
+		}
+	}
+	return out
 }
 
 // extractReceiverType extracts the type name from a Go receiver parameter list.

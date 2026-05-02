@@ -45,6 +45,16 @@ type Resolver struct {
 	// empty-but-non-nil when the graph has no @Module bindings, so
 	// callers can short-circuit with len().
 	providesForIdx map[string]map[string]struct{}
+	// reachableDirsByFile maps caller-file ID → set of directories
+	// reachable from that file (own dir ∪ directories of files reached
+	// via EdgeImports). Populated once at the start of ResolveAll/
+	// ResolveFile; consulted by resolveMethodCall to drop candidates
+	// that live in packages the caller doesn't import. Without this,
+	// the name-only fallback picks an arbitrary alphabetically-first
+	// candidate across the whole graph, which produced bugs like
+	// `RegisterAll` resolving to `OverlayManager.Register` simply
+	// because "OverlayManager" sorts before "Registry".
+	reachableDirsByFile map[string]map[string]struct{}
 	// mu serialises resolution phases against the shared graph.
 	// Pointer so every Resolver built from the same *graph.Graph
 	// locks the same mutex — necessary for MultiIndexer's per-repo
@@ -87,6 +97,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	defer r.clearDirIndexes()
 	r.buildProvidesForIndex()
 	defer r.clearProvidesForIndex()
+	r.buildReachabilityIndex()
+	defer r.clearReachabilityIndex()
 
 	edges := r.graph.AllEdges()
 	// Pre-filter to the unresolved subset so workers don't burn time
@@ -142,6 +154,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 						newTo:      clone.To,
 						crossRepo:  clone.CrossRepo,
 						confidence: clone.Confidence,
+						origin:     clone.Origin,
 						meta:       clone.Meta,
 					})
 				}
@@ -164,6 +177,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			j.edge.To = j.newTo
 			j.edge.CrossRepo = j.crossRepo
 			j.edge.Confidence = j.confidence
+			j.edge.Origin = j.origin
 			j.edge.Meta = j.meta
 			r.graph.ReindexEdge(j.edge, j.oldTo)
 		}
@@ -216,6 +230,8 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	defer r.clearDirIndexes()
 	r.buildProvidesForIndex()
 	defer r.clearProvidesForIndex()
+	r.buildReachabilityIndex()
+	defer r.clearReachabilityIndex()
 
 	stats := &ResolveStats{}
 
@@ -245,14 +261,16 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 // racing with: (a) other workers reading neighbouring edges' fields
 // during bucket maintenance, or (b) the serial post-pass that reads
 // each edge's To via keyOf. Once the worker phase completes, the
-// resolved fields (To, CrossRepo, Confidence, Meta) are copied onto
-// the real edge and graph.ReindexEdge is called — both serially.
+// resolved fields (To, CrossRepo, Confidence, Origin, Meta) are
+// copied onto the real edge and graph.ReindexEdge is called — both
+// serially.
 type reindexJob struct {
 	edge       *graph.Edge
 	oldTo      string
 	newTo      string
 	crossRepo  bool
 	confidence float64
+	origin     string
 	meta       map[string]any
 }
 
@@ -641,14 +659,21 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 }
 
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
-	candidates := r.graph.FindNodesByName(methodName)
-	if len(candidates) == 0 {
+	rawCandidates := r.graph.FindNodesByName(methodName)
+	if len(rawCandidates) == 0 {
 		if r.applyBuiltinIfKnown(e, methodName, stats) {
 			return
 		}
 		stats.Unresolved++
 		return
 	}
+
+	// Pass 0: import-reachability filter. Drop candidates whose package
+	// the caller's file does not import (or sit in). This collapses
+	// most cross-package name collisions before any later pass has to
+	// guess. The filter is conservative — when the index is missing or
+	// would empty the list, the original candidates pass through.
+	candidates := r.filterByReachability(e.FilePath, rawCandidates)
 
 	callerDir := filepath.Dir(e.FilePath)
 	receiverType := edgeReceiverType(e)
@@ -736,36 +761,77 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
-	// Final fallback: name-only heuristic (methods first, then functions for pkg.Func() calls).
+	// Locality fallback (replaces the previous alphabetical name-only
+	// pick). At this point candidates have survived Pass 0 — they all
+	// live in packages reachable from the caller. Prefer in this order:
+	//
+	//   1. Method, same directory  — same package, definitely reachable.
+	//   2. Method, any reachable directory  — exactly one survivor: take it.
+	//   3. Method, any reachable directory  — multiple survivors: see below.
+	//   4. Function, same directory  — pkg.Func() calls land here too.
+	//   5. Function, any reachable directory  — same logic as methods.
+	//
+	// When step 3 finds multiple methods, we prefer the same-package one
+	// (locality bias is stronger than any cross-package signal we have
+	// without LSP). If no candidate is same-package, we still take the
+	// first reachable one — Pass 0 already guaranteed reachability, so
+	// this is no longer an arbitrary alphabetical choice across the
+	// whole graph but a choice within the caller's import closure.
+	var sameDirMethod, sameDirFunc, anyMethod, anyFunc *graph.Node
+	methodCount := 0
 	for _, c := range candidates {
-		if c.Kind == graph.KindMethod && filepath.Dir(c.FilePath) == callerDir {
-			e.To = c.ID
-			stats.Resolved++
-			return
+		switch c.Kind {
+		case graph.KindMethod:
+			methodCount++
+			if filepath.Dir(c.FilePath) == callerDir && sameDirMethod == nil {
+				sameDirMethod = c
+			}
+			if anyMethod == nil {
+				anyMethod = c
+			}
+		case graph.KindFunction:
+			if filepath.Dir(c.FilePath) == callerDir && sameDirFunc == nil {
+				sameDirFunc = c
+			}
+			if anyFunc == nil {
+				anyFunc = c
+			}
 		}
 	}
-	for _, c := range candidates {
-		if c.Kind == graph.KindMethod {
-			e.To = c.ID
-			stats.Resolved++
-			return
+
+	// Interface-dispatch annotation: when the receiver type names a
+	// graph interface and multiple reachable methods of this name
+	// exist, every candidate is a legal runtime target. Mark the edge
+	// so downstream consumers don't treat the picked target as
+	// definitive. Done before the locality picks so it applies whether
+	// the chosen target lands in the same-dir or any-dir bucket.
+	if methodCount > 1 && r.receiverIsInterface(receiverType) {
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
 		}
+		e.Meta["dispatch"] = "interface"
+		e.Origin = graph.OriginLSPDispatch
 	}
-	// Package-qualified function calls (e.g. parser.ParseFile) arrive here
-	// because the extractor sees "pkg.Func()" as a selector call with "*." prefix.
-	for _, c := range candidates {
-		if c.Kind == graph.KindFunction && filepath.Dir(c.FilePath) == callerDir {
-			e.To = c.ID
-			stats.Resolved++
-			return
-		}
+
+	if sameDirMethod != nil {
+		e.To = sameDirMethod.ID
+		stats.Resolved++
+		return
 	}
-	for _, c := range candidates {
-		if c.Kind == graph.KindFunction {
-			e.To = c.ID
-			stats.Resolved++
-			return
-		}
+	if anyMethod != nil {
+		e.To = anyMethod.ID
+		stats.Resolved++
+		return
+	}
+	if sameDirFunc != nil {
+		e.To = sameDirFunc.ID
+		stats.Resolved++
+		return
+	}
+	if anyFunc != nil {
+		e.To = anyFunc.ID
+		stats.Resolved++
+		return
 	}
 
 	// Name matched something, but not in a way we accepted. Give the
@@ -777,6 +843,23 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		return
 	}
 	stats.Unresolved++
+}
+
+// receiverIsInterface returns true when the named receiver type
+// resolves to a graph node of kind interface. Used by the locality
+// fallback to recognise interface-dispatch ambiguity rather than
+// treat it as a single-target resolution. Empty receiver type returns
+// false.
+func (r *Resolver) receiverIsInterface(receiverType string) bool {
+	if receiverType == "" {
+		return false
+	}
+	for _, n := range r.graph.FindNodesByName(receiverType) {
+		if n.Kind == graph.KindInterface {
+			return true
+		}
+	}
+	return false
 }
 
 // applyBuiltinIfKnown routes an unresolvable method call to the
@@ -866,6 +949,99 @@ func (r *Resolver) buildProvidesForIndex() {
 }
 
 func (r *Resolver) clearProvidesForIndex() { r.providesForIdx = nil }
+
+// buildReachabilityIndex walks all EdgeImports edges once and records,
+// for each caller file, the set of directories of imported (indexed)
+// packages. Resolved import edges point at a file node directly;
+// unresolved ones still carry `unresolved::import::<importPath>`,
+// which we look up via the same dirIndex resolveImport uses, so the
+// reachability index is correct even before import resolution races
+// to completion in the parallel pass.
+//
+// Files always include their own directory in the reachable set so
+// same-package calls survive the filter.
+func (r *Resolver) buildReachabilityIndex() {
+	idx := make(map[string]map[string]struct{})
+
+	addDir := func(callerFileID, dir string) {
+		if callerFileID == "" || dir == "" {
+			return
+		}
+		set, ok := idx[callerFileID]
+		if !ok {
+			set = make(map[string]struct{})
+			idx[callerFileID] = set
+		}
+		set[dir] = struct{}{}
+	}
+
+	// Seed with each indexed file's own directory.
+	for _, n := range r.graph.AllNodes() {
+		if n.Kind != graph.KindFile {
+			continue
+		}
+		addDir(n.ID, filepath.Dir(n.FilePath))
+	}
+
+	for _, e := range r.graph.AllEdges() {
+		if e.Kind != graph.EdgeImports {
+			continue
+		}
+		var importedDir string
+		switch {
+		case strings.HasPrefix(e.To, "unresolved::import::"):
+			path := strings.TrimPrefix(e.To, "unresolved::import::")
+			if files := r.dirIndex[path]; len(files) > 0 {
+				importedDir = filepath.Dir(files[0].FilePath)
+			} else if last := lastPathComponent(path); last != "" {
+				if files := r.lastDirIndex[last]; len(files) > 0 {
+					importedDir = filepath.Dir(files[0].FilePath)
+				}
+			}
+		case strings.HasPrefix(e.To, "external::"):
+			// External / unindexed package — nothing to add.
+		default:
+			if n := r.graph.GetNode(e.To); n != nil && n.Kind == graph.KindFile {
+				importedDir = filepath.Dir(n.FilePath)
+			}
+		}
+		if importedDir != "" {
+			addDir(e.From, importedDir)
+		}
+	}
+
+	r.reachableDirsByFile = idx
+}
+
+func (r *Resolver) clearReachabilityIndex() { r.reachableDirsByFile = nil }
+
+// filterByReachability narrows candidates to those whose defining file
+// sits in a package reachable from the caller file. "Reachable" means:
+// (a) same directory as the caller (same package), or (b) directory of
+// a file imported via EdgeImports. Returns the original list when the
+// reachability index is unavailable (e.g. resolveEdge invoked outside
+// a Resolve* pass) or when no candidate is reachable — better to keep
+// candidates and let downstream passes handle them than to drop the
+// edge in cases where the index is incomplete.
+func (r *Resolver) filterByReachability(callerFileID string, candidates []*graph.Node) []*graph.Node {
+	if r.reachableDirsByFile == nil || callerFileID == "" {
+		return candidates
+	}
+	reachable, ok := r.reachableDirsByFile[callerFileID]
+	if !ok || len(reachable) == 0 {
+		return candidates
+	}
+	out := candidates[:0:0]
+	for _, c := range candidates {
+		if _, ok := reachable[filepath.Dir(c.FilePath)]; ok {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return candidates
+	}
+	return out
+}
 
 // boundImplsFor returns the set of concrete class names bound to the
 // abstract type `abstractName` via @Module({ providers: [{ provide: X,

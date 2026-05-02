@@ -130,7 +130,38 @@ func runExport(_ *cobra.Command, args []string) error {
 		exportStats.NodesWritten, exportStats.EdgesWritten, exportStats.BytesWritten,
 		dest, exportDuration.Milliseconds(),
 	)
+
+	// Print load-instructions for the format the user picked. The output
+	// file itself is kept comment-free for portability with Memgraph's
+	// .cypherl loader, so we surface the docs here instead.
+	if exportOut != "" {
+		printLoadInstructions(strings.ToLower(exportFormat), exportOut)
+	}
 	return nil
+}
+
+func printLoadInstructions(format, path string) {
+	w := os.Stderr
+	switch format {
+	case "cypher":
+		fmt.Fprintf(w, "\n[gortex export] To load into Memgraph (recommended for ad-hoc exploration):\n")
+		fmt.Fprintf(w, "    docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform\n")
+		fmt.Fprintf(w, "    # then in Memgraph Lab (http://localhost:3000) → Datasets → Import\n")
+		fmt.Fprintf(w, "    # OR via mgconsole:  cat %s | mgconsole\n", path)
+		fmt.Fprintf(w, "    # First, create an id index for fast edge MATCHes:\n")
+		fmt.Fprintf(w, "    #   CREATE INDEX ON :GortexNode(id);\n")
+		fmt.Fprintf(w, "\n[gortex export] To load into Neo4j:\n")
+		fmt.Fprintf(w, "    cypher-shell -u neo4j -p <pw> -f %s\n", path)
+		fmt.Fprintf(w, "    # First, create the index:\n")
+		fmt.Fprintf(w, "    #   CREATE INDEX FOR (n:GortexNode) ON (n.id);\n")
+		fmt.Fprintf(w, "\n[gortex export] To wipe a previous export before re-loading:\n")
+		fmt.Fprintf(w, "    MATCH (n:GortexNode) DETACH DELETE n;\n")
+	case "graphml":
+		fmt.Fprintf(w, "\n[gortex export] Open %s in:\n", path)
+		fmt.Fprintf(w, "    Gephi:     File → Open\n")
+		fmt.Fprintf(w, "    yEd:       File → Open\n")
+		fmt.Fprintf(w, "    Cytoscape: File → Import → Network from File\n")
+	}
 }
 
 // openOutput returns a writer for path, or os.Stdout when path is empty.

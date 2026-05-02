@@ -77,7 +77,20 @@ func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
 	}
 	if s.multiIndexer != nil {
 		if root, ok := s.multiIndexer.RepoRoot(node.RepoPrefix); ok {
-			return filepath.Clean(filepath.Join(root, node.FilePath)), nil
+			// applyRepoPrefix stamps `<repoPrefix>/` onto node.FilePath
+			// at index time, so a node's FilePath looks like
+			// `gortex/internal/exporter/cypher.go`. RepoRoot returns
+			// the on-disk path that ALREADY corresponds to the repo
+			// (e.g. `/Users/zzet/code/my/gortex/gortex`). Joining as-is
+			// duplicates the prefix segment when the repo's basename
+			// matches the prefix — strip the leading `<prefix>/` from
+			// the file path before joining so the result is the real
+			// on-disk file regardless of basename collision.
+			rel := node.FilePath
+			if node.RepoPrefix != "" {
+				rel = strings.TrimPrefix(rel, node.RepoPrefix+"/")
+			}
+			return filepath.Clean(filepath.Join(root, rel)), nil
 		}
 		return "", fmt.Errorf("could not resolve repo root for node %q (repo_prefix=%q)", node.ID, node.RepoPrefix)
 	}

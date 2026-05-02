@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -374,4 +375,161 @@ func TestResolveFile(t *testing.T) {
 
 	assert.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "b.go::Bar", callEdge.To)
+}
+
+// TestResolveMethodCall_ImportReachabilityFilter exercises Pass 0:
+// when two methods named "Register" exist in different packages and
+// only one of those packages is imported by the caller's file, the
+// resolver must pick the imported package's method — not the
+// alphabetically-first one across the whole graph (which was the
+// original RegisterAll → OverlayManager.Register bug).
+func TestResolveMethodCall_ImportReachabilityFilter(t *testing.T) {
+	g := graph.New()
+
+	// Caller file in pkg/parser/languages/. Imports pkg/parser only.
+	g.AddNode(&graph.Node{ID: "pkg/parser/languages/register.go", Kind: graph.KindFile, Name: "register.go", FilePath: "pkg/parser/languages/register.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/parser/languages/register.go::RegisterAll", Kind: graph.KindFunction, Name: "RegisterAll", FilePath: "pkg/parser/languages/register.go", Language: "go"})
+
+	// Imported package: pkg/parser
+	g.AddNode(&graph.Node{ID: "pkg/parser/registry.go", Kind: graph.KindFile, Name: "registry.go", FilePath: "pkg/parser/registry.go", Language: "go"})
+	g.AddNode(&graph.Node{
+		ID: "pkg/parser/registry.go::Registry.Register", Kind: graph.KindMethod, Name: "Register",
+		FilePath: "pkg/parser/registry.go", Language: "go",
+		Meta:     map[string]any{"receiver": "Registry"},
+	})
+
+	// Unrelated package: pkg/daemon. NOT imported.
+	g.AddNode(&graph.Node{ID: "pkg/daemon/overlay.go", Kind: graph.KindFile, Name: "overlay.go", FilePath: "pkg/daemon/overlay.go", Language: "go"})
+	g.AddNode(&graph.Node{
+		ID: "pkg/daemon/overlay.go::OverlayManager.Register", Kind: graph.KindMethod, Name: "Register",
+		FilePath: "pkg/daemon/overlay.go", Language: "go",
+		Meta:     map[string]any{"receiver": "OverlayManager"},
+	})
+
+	// Import edge: register.go → pkg/parser/registry.go (pre-resolved).
+	g.AddEdge(&graph.Edge{
+		From:     "pkg/parser/languages/register.go",
+		To:       "pkg/parser/registry.go",
+		Kind:     graph.EdgeImports,
+		FilePath: "pkg/parser/languages/register.go", Line: 3,
+	})
+
+	// Unresolved method call without receiver_type — exercises the
+	// fallback path. With Pass 0 in place, only Registry.Register
+	// survives the reachability filter.
+	callEdge := &graph.Edge{
+		From:     "pkg/parser/languages/register.go::RegisterAll",
+		To:       "unresolved::*.Register",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/parser/languages/register.go",
+		Line:     7,
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "pkg/parser/registry.go::Registry.Register", callEdge.To,
+		"reachability filter should pick the imported package's method")
+}
+
+// TestResolveMethodCall_LocalityPrefersSamePackage covers the locality
+// fallback: when two methods named "Do" survive Pass 0 (both packages
+// imported), the same-package method beats any cross-package candidate
+// regardless of name order.
+func TestResolveMethodCall_LocalityPrefersSamePackage(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "pkg/a/main.go", Kind: graph.KindFile, FilePath: "pkg/a/main.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/a/main.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "pkg/a/main.go", Language: "go"})
+
+	// Same-package candidate: pkg/a/helpers.go::Helper.Do
+	g.AddNode(&graph.Node{ID: "pkg/a/helpers.go", Kind: graph.KindFile, FilePath: "pkg/a/helpers.go", Language: "go"})
+	g.AddNode(&graph.Node{
+		ID: "pkg/a/helpers.go::Helper.Do", Kind: graph.KindMethod, Name: "Do",
+		FilePath: "pkg/a/helpers.go", Language: "go",
+		Meta:     map[string]any{"receiver": "Helper"},
+	})
+
+	// Imported but cross-package: pkg/aaa/util.go::AAA.Do (sorts first
+	// alphabetically — the old fallback would pick this).
+	g.AddNode(&graph.Node{ID: "pkg/aaa/util.go", Kind: graph.KindFile, FilePath: "pkg/aaa/util.go", Language: "go"})
+	g.AddNode(&graph.Node{
+		ID: "pkg/aaa/util.go::AAA.Do", Kind: graph.KindMethod, Name: "Do",
+		FilePath: "pkg/aaa/util.go", Language: "go",
+		Meta:     map[string]any{"receiver": "AAA"},
+	})
+
+	// Caller's file imports pkg/aaa, so both packages are reachable.
+	g.AddEdge(&graph.Edge{
+		From:     "pkg/a/main.go",
+		To:       "pkg/aaa/util.go",
+		Kind:     graph.EdgeImports,
+		FilePath: "pkg/a/main.go", Line: 3,
+	})
+
+	callEdge := &graph.Edge{
+		From:     "pkg/a/main.go::Caller",
+		To:       "unresolved::*.Do",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/a/main.go",
+		Line:     10,
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "pkg/a/helpers.go::Helper.Do", callEdge.To,
+		"same-package candidate should win the locality fallback")
+}
+
+// TestResolveMethodCall_InterfaceDispatchFanOut verifies that when the
+// receiver type names a graph interface AND multiple reachable methods
+// of that name exist, the edge is annotated as interface dispatch.
+func TestResolveMethodCall_InterfaceDispatchFanOut(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "pkg/main.go", Kind: graph.KindFile, FilePath: "pkg/main.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/main.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "pkg/main.go", Language: "go"})
+
+	// Interface "Notifier" with method "Notify".
+	g.AddNode(&graph.Node{
+		ID: "pkg/notifier.go::Notifier", Kind: graph.KindInterface, Name: "Notifier",
+		FilePath: "pkg/notifier.go", Language: "go",
+	})
+
+	// Two implementations of Notify in the same package as the caller.
+	g.AddNode(&graph.Node{
+		ID: "pkg/email.go::EmailNotifier.Notify", Kind: graph.KindMethod, Name: "Notify",
+		FilePath: "pkg/email.go", Language: "go",
+		Meta:     map[string]any{"receiver": "EmailNotifier"},
+	})
+	g.AddNode(&graph.Node{
+		ID: "pkg/sms.go::SMSNotifier.Notify", Kind: graph.KindMethod, Name: "Notify",
+		FilePath: "pkg/sms.go", Language: "go",
+		Meta:     map[string]any{"receiver": "SMSNotifier"},
+	})
+
+	// Receiver type is the interface itself — ambiguous dispatch.
+	callEdge := &graph.Edge{
+		From:     "pkg/main.go::Caller",
+		To:       "unresolved::*.Notify",
+		Kind:     graph.EdgeCalls,
+		FilePath: "pkg/main.go",
+		Line:     10,
+		Meta:     map[string]any{"receiver_type": "Notifier"},
+	}
+	g.AddEdge(callEdge)
+
+	r := New(g)
+	stats := r.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	require.NotNil(t, callEdge.Meta)
+	assert.Equal(t, "interface", callEdge.Meta["dispatch"],
+		"edge should be marked as interface dispatch when receiver is an interface and multiple impls exist")
+	assert.Equal(t, graph.OriginLSPDispatch, callEdge.Origin)
 }

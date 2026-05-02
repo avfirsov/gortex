@@ -893,3 +893,118 @@ func Branchy(x int) int {
 		t.Fatalf("Branchy complexity = %d, expected >= 4", c)
 	}
 }
+
+// TestGoExtractor_TypeEnv_FunctionParam covers the case `func F(reg
+// *Registry) { reg.Register(...) }`. Before this test was wired the
+// extractor only learned receiver types from `var` and `:=` decls, so
+// parameter-bound receivers fell through to the resolver's name-only
+// fallback and produced wrong edges (the original RegisterAll →
+// OverlayManager.Register bug).
+func TestGoExtractor_TypeEnv_FunctionParam(t *testing.T) {
+	src := []byte(`package main
+
+type Registry struct{}
+
+func (r *Registry) Register(_ any) {}
+
+func RegisterAll(reg *Registry) {
+	reg.Register(nil)
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("register.go", src)
+	require.NoError(t, err)
+
+	calls := edgesOfKind(result.Edges, graph.EdgeCalls)
+	var registerCall *graph.Edge
+	for _, c := range calls {
+		if strings.HasSuffix(c.To, ".Register") || strings.HasSuffix(c.To, "*.Register") {
+			registerCall = c
+			break
+		}
+	}
+	require.NotNil(t, registerCall, "expected a call edge to Register")
+	require.NotNil(t, registerCall.Meta, "Register call should carry receiver_type Meta from the function parameter")
+	assert.Equal(t, "Registry", registerCall.Meta["receiver_type"])
+}
+
+// TestGoExtractor_TypeEnv_FunctionParam_PerScope verifies that two
+// functions in the same file with the same parameter name but
+// different types each see the right type at their own call sites.
+// File-wide tenv would have collapsed both to a single type, so this
+// guards against accidental loss of per-function scoping.
+func TestGoExtractor_TypeEnv_FunctionParam_PerScope(t *testing.T) {
+	src := []byte(`package main
+
+type Registry struct{}
+type OverlayManager struct{}
+
+func (r *Registry) Register(_ any) {}
+func (m *OverlayManager) Register(_ string) string { return "" }
+
+func RegisterAll(reg *Registry) {
+	reg.Register(nil)
+}
+
+func WireOverlay(reg *OverlayManager) {
+	reg.Register("ws")
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("scopes.go", src)
+	require.NoError(t, err)
+
+	wantByCaller := map[string]string{
+		"scopes.go::RegisterAll":  "Registry",
+		"scopes.go::WireOverlay":  "OverlayManager",
+	}
+
+	got := map[string]string{}
+	for _, e := range edgesOfKind(result.Edges, graph.EdgeCalls) {
+		if !strings.Contains(e.To, "Register") {
+			continue
+		}
+		if e.Meta == nil {
+			continue
+		}
+		if rt, ok := e.Meta["receiver_type"].(string); ok {
+			got[e.From] = rt
+		}
+	}
+
+	for caller, want := range wantByCaller {
+		assert.Equal(t, want, got[caller], "caller %s should have receiver_type=%s", caller, want)
+	}
+}
+
+// TestGoExtractor_TypeEnv_MethodReceiver covers `(s *Server) Foo() {
+// s.client.Do() }` — the method receiver `s` itself is parameter-
+// bound, so its type must enter the per-function scope or chain walks
+// fail. We also need to be sure the receiver name doesn't bleed into
+// other functions (per-scope guarantee).
+func TestGoExtractor_TypeEnv_MethodReceiver(t *testing.T) {
+	src := []byte(`package main
+
+type Inner struct{}
+type Server struct{}
+
+func (i *Inner) Bump() {}
+
+func (s *Server) Process() {
+	var x *Inner
+	x.Bump()
+	_ = s
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("server.go", src)
+	require.NoError(t, err)
+
+	for _, c := range edgesOfKind(result.Edges, graph.EdgeCalls) {
+		if !strings.Contains(c.To, "Bump") {
+			continue
+		}
+		require.NotNil(t, c.Meta)
+		assert.Equal(t, "Inner", c.Meta["receiver_type"])
+	}
+}
