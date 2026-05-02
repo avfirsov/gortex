@@ -13,6 +13,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/audit"
+	"github.com/zzet/gortex/internal/blame"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
@@ -105,8 +106,8 @@ func (s *Server) registerEnhancementTools() {
 	// analyze — unified graph analysis tool (dead_code, hotspots, cycles, would_create_cycle)
 	s.mcpServer.AddTool(
 		mcp.NewTool("analyze",
-			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters."),
-			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos")),
+			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node — blocking, intended as an explicit one-shot enrichment."),
+			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-result text output")),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format, per-kind hand-tuned encoder)")),
 			mcp.WithBoolean("include_variables", mcp.Description("(dead_code) Include variable nodes (default false — usually false positives without data-flow analysis)")),
@@ -601,8 +602,10 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleWouldCreateCycle(ctx, req)
 	case "todos":
 		return s.handleAnalyzeTodos(ctx, req)
+	case "blame":
+		return s.handleAnalyzeBlame(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame)"), nil
 	}
 }
 
@@ -714,6 +717,34 @@ func stringArg(args map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// handleAnalyzeBlame runs `git blame -p` against the indexed
+// repository and stamps meta.last_authored on each function /
+// method / type / interface / field / variable / constant /
+// enum_member node it can map to a real source line. Returns the
+// number of nodes enriched.
+//
+// Blocking — large repos can take seconds — but explicit (the
+// agent invoked it). Repeat invocations re-run blame and overwrite
+// existing meta.last_authored, which is the desired behaviour for
+// post-commit refresh.
+func (s *Server) handleAnalyzeBlame(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if s.indexer == nil {
+		return mcp.NewToolResultError("blame enrichment requires an active indexer"), nil
+	}
+	root := s.indexer.RootPath()
+	if root == "" {
+		return mcp.NewToolResultError("indexer has no root path — was the repo indexed?"), nil
+	}
+	count, err := blame.EnrichGraph(s.graph, root)
+	if err != nil {
+		return mcp.NewToolResultError("blame enrichment failed: " + err.Error()), nil
+	}
+	return mcp.NewToolResultJSON(map[string]any{
+		"enriched": count,
+		"root":     root,
+	})
 }
 
 // ---------------------------------------------------------------------------
