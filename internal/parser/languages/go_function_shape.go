@@ -312,6 +312,45 @@ func walkGoNodes(node *sitter.Node, visit func(*sitter.Node) bool) {
 	}
 }
 
+// isGoroutineSpawn reports whether a call_expression node is the
+// direct child of a go_statement, meaning the call launches a
+// goroutine rather than executing synchronously. The check is a
+// single Parent() hop — Go's grammar wraps `go f()` as
+// `go_statement -> call_expression`, so deeper walks are unnecessary.
+func isGoroutineSpawn(callExpr *sitter.Node) bool {
+	if callExpr == nil {
+		return false
+	}
+	parent := callExpr.Parent()
+	if parent == nil {
+		return false
+	}
+	return parent.Type() == "go_statement"
+}
+
+// emitGoSpawnEdge appends an EdgeSpawns from caller → target when
+// the underlying call was launched via `go`. Emitted in addition to
+// EdgeCalls so synchronous-reachability queries can scope by edge
+// kind (drop spawns) while concurrency analyses can see both. Meta
+// records mode=goroutine so downstream consumers can distinguish
+// from future async/Promise spawn modes.
+func emitGoSpawnEdge(c goDeferredCall, callerID, target, filePath string, result *parser.ExtractionResult) {
+	if !c.spawn {
+		return
+	}
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     callerID,
+		To:       target,
+		Kind:     graph.EdgeSpawns,
+		FilePath: filePath,
+		Line:     c.line,
+		Origin:   graph.OriginASTResolved,
+		Meta: map[string]any{
+			"mode": "goroutine",
+		},
+	})
+}
+
 // canonicalizeGoTypeRef returns a type-name string suitable for use
 // as the target of a typed_as / returns edge. Unlike
 // normalizeGoTypeName it preserves primitives — the agent-facing

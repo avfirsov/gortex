@@ -565,6 +565,26 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 	if !idx.config.Coverage.IsEnabled("constants") {
 		revertConstantsToVariables(result)
 	}
+	if !idx.config.Coverage.IsEnabled("concurrency") {
+		stripConcurrencyEdges(result)
+	}
+}
+
+// stripConcurrencyEdges removes the EdgeSpawns / EdgeSends /
+// EdgeRecvs edges introduced by the concurrency coverage domain.
+// EdgeCalls is left in place — spawns are emitted in addition to
+// the corresponding call edge, so dropping just the spawn edge
+// reverts to the pre-coverage call graph without losing reachability.
+func stripConcurrencyEdges(result *parser.ExtractionResult) {
+	keptEdges := result.Edges[:0]
+	for _, e := range result.Edges {
+		switch e.Kind {
+		case graph.EdgeSpawns, graph.EdgeSends, graph.EdgeRecvs:
+			continue
+		}
+		keptEdges = append(keptEdges, e)
+	}
+	result.Edges = keptEdges
 }
 
 // revertConstantsToVariables re-classifies KindConstant /

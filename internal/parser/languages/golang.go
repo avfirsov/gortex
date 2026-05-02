@@ -151,6 +151,7 @@ type goDeferredCall struct {
 	receiver   string // selector call receiver text
 	line       int    // 1-based line of call_expression
 	isSelector bool
+	spawn      bool // call is launched via `go` — emit EdgeSpawns alongside EdgeCalls
 }
 
 type goDeferredTypeRef struct {
@@ -243,6 +244,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			calls = append(calls, goDeferredCall{
 				callName: m.Captures["call.name"].Text,
 				line:     expr.StartLine + 1,
+				spawn:    isGoroutineSpawn(expr.Node),
 			})
 
 		case m.Captures["callm.expr"] != nil:
@@ -252,6 +254,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				receiver:   m.Captures["callm.receiver"].Text,
 				line:       expr.StartLine + 1,
 				isSelector: true,
+				spawn:      isGoroutineSpawn(expr.Node),
 			})
 
 		case m.Captures["var.def"] != nil:
@@ -401,22 +404,28 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		if callerID == "" {
 			continue
 		}
+		var target string
 		if !c.isSelector {
+			target = "unresolved::" + c.callName
 			result.Edges = append(result.Edges, &graph.Edge{
-				From: callerID, To: "unresolved::" + c.callName,
+				From: callerID, To: target,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			})
+			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
 		}
 		if importPath, ok := imports[c.receiver]; ok {
+			target = "unresolved::extern::" + importPath + "::" + c.method
 			result.Edges = append(result.Edges, &graph.Edge{
-				From: callerID, To: "unresolved::extern::" + importPath + "::" + c.method,
+				From: callerID, To: target,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			})
+			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
 		}
+		target = "unresolved::*." + c.method
 		edge := &graph.Edge{
-			From: callerID, To: "unresolved::*." + c.method,
+			From: callerID, To: target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 		}
 		if recvType, ok := lookupRecvType(callerID, c.receiver); ok {
@@ -440,6 +449,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 		}
 		result.Edges = append(result.Edges, edge)
+		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
 
 	// --- Composite literals (instantiations) ---
