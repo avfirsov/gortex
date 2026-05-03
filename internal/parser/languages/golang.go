@@ -213,6 +213,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	var observabilityEvents []goObservabilityEvent
 	var flagEvents []goFlagEvent
 	var configEvents []goConfigEvent
+	var sqlEvents []goSQLEvent
 	// writes buffers selector LHS of assignment / inc / dec
 	// statements. Emitted in the post-pass once funcRanges and tenv
 	// are settled so each EdgeWrites is attributed to its enclosing
@@ -281,6 +282,13 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					op:     op,
 					method: method,
 					key:    key,
+					line:   expr.StartLine + 1,
+				})
+			}
+			if tables, ok := detectGoSQLCall(expr.Node, method, src); ok {
+				sqlEvents = append(sqlEvents, goSQLEvent{
+					method: method,
+					tables: tables,
 					line:   expr.StartLine + 1,
 				})
 			}
@@ -492,6 +500,11 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 
 	// --- Config keys (viper) ---
 	emitGoConfigKeys(configEvents,
+		func(line int) string { return findEnclosingFunc(funcRanges, line) },
+		filePath, result)
+
+	// --- SQL queries ---
+	emitGoSQLEvents(sqlEvents,
 		func(line int) string { return findEnclosingFunc(funcRanges, line) },
 		filePath, result)
 

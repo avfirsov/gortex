@@ -586,6 +586,40 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 	if !idx.config.Coverage.IsEnabled("configs") {
 		stripConfigArtifacts(result)
 	}
+	if !idx.config.Coverage.IsEnabled("sql") {
+		stripSQLArtifacts(result)
+	}
+}
+
+// stripSQLArtifacts drops KindTable nodes plus EdgeQueries edges
+// when the sql coverage domain is gated off. Mirrors the strip
+// passes for flags / configs / observability — endpoint-aware so
+// any leftover edges to stripped table nodes are pruned. SQL
+// extraction defaults off because string-literal pattern matching
+// against db.Get / db.Query / db.Exec produces false positives
+// when domain code shares method names (cache.Get, etc.).
+func stripSQLArtifacts(result *parser.ExtractionResult) {
+	stripped := make(map[string]struct{})
+	keptNodes := result.Nodes[:0]
+	for _, n := range result.Nodes {
+		if n.Kind == graph.KindTable {
+			stripped[n.ID] = struct{}{}
+			continue
+		}
+		keptNodes = append(keptNodes, n)
+	}
+	result.Nodes = keptNodes
+	keptEdges := result.Edges[:0]
+	for _, e := range result.Edges {
+		if e.Kind == graph.EdgeQueries {
+			continue
+		}
+		if _, ok := stripped[e.To]; ok {
+			continue
+		}
+		keptEdges = append(keptEdges, e)
+	}
+	result.Edges = keptEdges
 }
 
 // stripConfigArtifacts drops KindConfigKey nodes plus
