@@ -269,6 +269,203 @@ func ParsePackageLockJSON(source []byte) []Spec {
 	return specs
 }
 
+// ParseYarnLock walks a yarn classic (v1) lockfile and returns
+// one Spec per resolved dependency. Format is yarn's bespoke
+// pseudo-yaml (key blocks separated by blank lines, each starting
+// with one or more `<name>@<range>` keys followed by `version
+// "X.Y.Z"`). The parser is line-oriented and intentionally
+// minimal — it picks up the resolved version per dependency
+// block and ignores the rest (resolved/integrity/dependencies
+// fields aren't needed for graph identity).
+//
+// Berry (yarn 2+) lockfiles use real YAML and a different shape;
+// they're recognised as a separate dispatch row when needed.
+func ParseYarnLock(source []byte) []Spec {
+	if len(source) == 0 {
+		return nil
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(source))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var (
+		specs        []Spec
+		pendingNames []string
+		seen         = make(map[string]struct{})
+	)
+	for scanner.Scan() {
+		raw := scanner.Text()
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			pendingNames = nil
+			continue
+		}
+		// Block header: a line that ends with `:` and contains
+		// one or more `<name>@<range>` keys joined by `, `.
+		if strings.HasSuffix(line, ":") && !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
+			pendingNames = parseYarnHeaderNames(strings.TrimSuffix(line, ":"))
+			continue
+		}
+		// Inside a block — pick up the version line.
+		if strings.HasPrefix(line, "version ") {
+			version := strings.Trim(strings.TrimPrefix(line, "version "), `"`)
+			if version == "" || len(pendingNames) == 0 {
+				continue
+			}
+			for _, name := range pendingNames {
+				key := name + "@" + version
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				specs = append(specs, Spec{
+					Ecosystem: "npm",
+					Path:      name,
+					Version:   version,
+				})
+			}
+			pendingNames = nil
+		}
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		if specs[i].Path != specs[j].Path {
+			return specs[i].Path < specs[j].Path
+		}
+		return specs[i].Version < specs[j].Version
+	})
+	return specs
+}
+
+// parseYarnHeaderNames extracts the package names from a yarn-
+// classic lockfile block header. Each header consists of one or
+// more "<name>@<range>" entries separated by `, `. The names can
+// be quoted ("@scope/pkg@^1.0.0") or bare. We strip the @range
+// suffix and de-dup so a header like `lodash@^4.0.0, lodash@^4.17.0`
+// yields just one "lodash" name.
+func parseYarnHeaderNames(header string) []string {
+	parts := strings.Split(header, ", ")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.Trim(p, `"`)
+		if p == "" {
+			continue
+		}
+		// Find the @ that introduces the version range, NOT the
+		// scope @ at position 0. Scoped packages start with @ —
+		// we want the second @, or the first when the package
+		// is unscoped.
+		atIdx := -1
+		if strings.HasPrefix(p, "@") {
+			// scoped: skip past the leading @ then find the next
+			// one.
+			atIdx = strings.Index(p[1:], "@")
+			if atIdx >= 0 {
+				atIdx++
+			}
+		} else {
+			atIdx = strings.Index(p, "@")
+		}
+		if atIdx < 0 {
+			continue
+		}
+		name := p[:atIdx]
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+// ParsePnpmLock walks a pnpm v6+ lockfile (real YAML, top-level
+// `packages` map keyed by `/<name>@<version>` paths). Each entry
+// resolves to one Spec with the canonical name+version.
+func ParsePnpmLock(source []byte) []Spec {
+	if len(source) == 0 {
+		return nil
+	}
+	// pnpm-lock.yaml has the shape:
+	//   packages:
+	//     /react@18.2.0:
+	//       resolution: {...}
+	//     /lodash@4.17.21:
+	//       ...
+	// We only need the keys; the per-package metadata is large
+	// (integrity hashes, transitive deps) and not needed for
+	// graph identity. Parsing keys via line-oriented scan stays
+	// independent of the YAML library's behaviour around large
+	// nested structures.
+	scanner := bufio.NewScanner(bytes.NewReader(source))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var (
+		specs       []Spec
+		inPackages  bool
+		seen        = make(map[string]struct{})
+	)
+	for scanner.Scan() {
+		raw := scanner.Text()
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// The top-level `packages:` key marks where the per-pkg
+		// blocks live. A subsequent unindented top-level key
+		// ends the section.
+		if !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
+			inPackages = trimmed == "packages:"
+			continue
+		}
+		if !inPackages {
+			continue
+		}
+		// Per-pkg block headers look like `  /<name>@<version>:`
+		// at exactly two-space indent. Sub-keys are deeper.
+		if !strings.HasPrefix(raw, "  /") {
+			continue
+		}
+		key := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(raw), "/"), ":")
+		key = strings.TrimSuffix(key, "(") // strip peer-suffix start when present
+		// The version is the last `@` segment, accounting for
+		// scoped packages (which start with `@scope/`).
+		atIdx := -1
+		if strings.HasPrefix(key, "@") {
+			atIdx = strings.LastIndex(key, "@")
+		} else {
+			atIdx = strings.Index(key, "@")
+		}
+		if atIdx <= 0 {
+			continue
+		}
+		name := key[:atIdx]
+		version := key[atIdx+1:]
+		// Trim peer-dep suffix (`@types/node@20.11.5_typescript@5.3.3`).
+		if i := strings.Index(version, "_"); i >= 0 {
+			version = version[:i]
+		}
+		if name == "" || version == "" {
+			continue
+		}
+		dedupKey := name + "@" + version
+		if _, ok := seen[dedupKey]; ok {
+			continue
+		}
+		seen[dedupKey] = struct{}{}
+		specs = append(specs, Spec{
+			Ecosystem: "npm",
+			Path:      name,
+			Version:   version,
+		})
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		if specs[i].Path != specs[j].Path {
+			return specs[i].Path < specs[j].Path
+		}
+		return specs[i].Version < specs[j].Version
+	})
+	return specs
+}
+
 // ParsePyProject walks a Python pyproject.toml file's dependency
 // declarations and returns one Spec per declared package. Both
 // PEP 621 (`[project] dependencies = ["pkg>=1.0", ...]`) and

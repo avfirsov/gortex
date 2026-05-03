@@ -2613,6 +2613,16 @@ func (idx *Indexer) extractExternalModules() {
 			ownPathFromSrc: nil, // package-lock has no own-name notion separate from package.json
 		},
 		{
+			path:           "yarn.lock",
+			parse:          modules.ParseYarnLock,
+			ownPathFromSrc: nil,
+		},
+		{
+			path:           "pnpm-lock.yaml",
+			parse:          modules.ParsePnpmLock,
+			ownPathFromSrc: nil,
+		},
+		{
 			path:           "pyproject.toml",
 			parse:          modules.ParsePyProject,
 			ownPathFromSrc: readPyProjectOwnName,
@@ -2698,6 +2708,10 @@ func manifestLanguage(relPath string) string {
 		return "go"
 	case "package.json", "package-lock.json":
 		return "json"
+	case "yarn.lock":
+		return "yarn"
+	case "pnpm-lock.yaml":
+		return "yaml"
 	case "pyproject.toml", "Cargo.toml":
 		return "toml"
 	case "requirements.txt":
