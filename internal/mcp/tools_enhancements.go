@@ -110,7 +110,7 @@ func (s *Server) registerEnhancementTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("analyze",
 			mcp.WithDescription("Unified graph analysis. kind=dead_code: symbols with zero incoming edges. kind=hotspots: high-complexity symbols by fan-in/out. kind=cycles: circular dependency chains. kind=would_create_cycle: check if a new edge would form a cycle (requires from_id, to_id). kind=todos: list KindTodo nodes with optional tag/assignee/ticket/has_assignee filters. kind=blame: run `git blame` against the indexed repo and stamp meta.last_authored on every symbol-level node. kind=coverage: parse a Go cover.out profile (path via `profile` arg) and stamp meta.coverage_pct on every executable symbol. kind=stale_code: list symbols whose meta.last_authored is older than the threshold (requires blame-enriched graph). kind=ownership: group blame metadata by author email — symbol count, files touched, oldest/newest timestamps; supports path_prefix scoping (requires blame-enriched graph). kind=coverage_gaps: list symbols whose meta.coverage_pct falls in [min_pct, max_pct) — sorted ascending so the most undertested code surfaces first (requires coverage-enriched graph)."),
-			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users")),
+			mcp.WithString("kind", mcp.Required(), mcp.Description("Analysis kind: dead_code | hotspots | cycles | would_create_cycle | todos | blame | coverage | stale_code | ownership | coverage_gaps | stale_flags | releases | cgo_users | wasm_users | orphan_tables")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-result text output")),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or gcx (GCX1 compact wire format, per-kind hand-tuned encoder)")),
 			mcp.WithBoolean("include_variables", mcp.Description("(dead_code) Include variable nodes (default false — usually false positives without data-flow analysis)")),
@@ -632,8 +632,10 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeInteropUsers(ctx, req, "uses_cgo", "cgo_users")
 	case "wasm_users":
 		return s.handleAnalyzeInteropUsers(ctx, req, "uses_wasm_bindgen", "wasm_users")
+	case "orphan_tables":
+		return s.handleAnalyzeOrphanTables(ctx, req)
 	default:
-		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users)"), nil
+		return mcp.NewToolResultError("unknown analyze kind: " + kind + " (expected: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables)"), nil
 	}
 }
 
@@ -1329,6 +1331,92 @@ func stringFromMeta(meta map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// handleAnalyzeOrphanTables lists tables that are referenced by
+// at least one EdgeQueries call site but have no incoming
+// EdgeProvides from a migration. Combines the two SQL extraction
+// paths (query-string detection + migration-file declaration)
+// into a single signal: tables likely missing a migration, or
+// pointing at an external/legacy schema the agent should flag.
+//
+// Returns one row per orphan with the canonical id, table name,
+// schema, dialect, and the count of EdgeQueries call sites
+// pointing at it. Sorted by query count descending so the most-
+// used orphans surface first — those are the highest-priority
+// "we should declare this" candidates.
+//
+// Tables reachable via both EdgeProvides AND EdgeQueries are not
+// orphans by definition. Tables with no EdgeQueries either (pure
+// declaration with no users) aren't included either — they're
+// the inverse problem ("orphan migration") which is a separate
+// future analyzer.
+func (s *Server) handleAnalyzeOrphanTables(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	type orphanRow struct {
+		ID         string `json:"id"`
+		Table      string `json:"table"`
+		Schema     string `json:"schema,omitempty"`
+		Dialect    string `json:"dialect"`
+		QueryCount int    `json:"query_count"`
+	}
+	var rows []orphanRow
+	for _, n := range s.graph.AllNodes() {
+		if n.Kind != graph.KindTable {
+			continue
+		}
+		// Walk incoming edges to detect both providers (migrations)
+		// and consumers (query call sites).
+		hasProvider := false
+		queryCount := 0
+		for _, e := range s.graph.GetInEdges(n.ID) {
+			switch e.Kind {
+			case graph.EdgeProvides:
+				hasProvider = true
+			case graph.EdgeQueries:
+				queryCount++
+			}
+		}
+		if hasProvider {
+			continue
+		}
+		if queryCount == 0 {
+			continue
+		}
+		dialect, _ := n.Meta["dialect"].(string)
+		schema, _ := n.Meta["schema"].(string)
+		table, _ := n.Meta["table"].(string)
+		if table == "" {
+			table = n.Name
+		}
+		rows = append(rows, orphanRow{
+			ID:         n.ID,
+			Table:      table,
+			Schema:     schema,
+			Dialect:    dialect,
+			QueryCount: queryCount,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].QueryCount != rows[j].QueryCount {
+			return rows[i].QueryCount > rows[j].QueryCount
+		}
+		return rows[i].ID < rows[j].ID
+	})
+
+	if isCompact(req) {
+		var b strings.Builder
+		for _, r := range rows {
+			fmt.Fprintf(&b, "%-3d  %s\n", r.QueryCount, r.ID)
+		}
+		if len(rows) == 0 {
+			b.WriteString("no orphan tables\n")
+		}
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	return mcp.NewToolResultJSON(map[string]any{
+		"orphans": rows,
+		"total":   len(rows),
+	})
 }
 
 // handleAnalyzeInteropUsers lists every file with the named
