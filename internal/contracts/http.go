@@ -589,7 +589,7 @@ func (h *HTTPExtractor) Extract(filePath string, src []byte, nodes []*graph.Node
 				subtree = true
 			}
 
-			normPath := NormalizeHTTPPath(path)
+			normPath, origNames := NormalizeHTTPPathWithParams(path)
 			contractID := fmt.Sprintf("http::%s::%s", method, normPath)
 
 			symbolID := findEnclosingSymbol(fileNodes, lineNum)
@@ -639,6 +639,15 @@ func (h *HTTPExtractor) Extract(filePath string, src []byte, nodes []*graph.Node
 				"method":    method,
 				"path":      normPath,
 				"framework": pat.framework,
+			}
+			// Preserve the developer-written parameter names alongside
+			// the positional path (e.g. "/v1/sessions/{id}" exposes
+			// path_param_names=["id"] while path stays "{p1}"). The
+			// dashboard shows these for readability; drift detection
+			// uses them to flag mismatches when a provider renames a
+			// slot but consumers haven't picked it up.
+			if len(origNames) > 0 {
+				meta["path_param_names"] = origNames
 			}
 			// Keep the raw handler identifier + the full call-trail
 			// so a later module-wide pass can look handlers up

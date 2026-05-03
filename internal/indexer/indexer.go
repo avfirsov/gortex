@@ -1822,6 +1822,11 @@ func (idx *Indexer) runContractExtractorsForFile(
 	if len(exts) == 0 {
 		return nil
 	}
+	// Contracts from synthetic test/bench fixtures are kept (so drift
+	// checks can flag a stale test pinned to an obsolete production
+	// contract) but tagged with is_test=true and a test_source
+	// category so the dashboard can filter them out by default.
+	testSource := fixtures.TestContractSource(graphPath)
 	var out []contracts.Contract
 	for _, ex := range exts {
 		found := ex.Extract(graphPath, src, fileNodes, fileEdges)
@@ -1837,6 +1842,13 @@ func (idx *Indexer) runContractExtractorsForFile(
 			}
 			if idx.projectID != "" {
 				found[i].ProjectID = idx.projectID
+			}
+			if testSource != "" {
+				if found[i].Meta == nil {
+					found[i].Meta = map[string]any{}
+				}
+				found[i].Meta["is_test"] = true
+				found[i].Meta["test_source"] = testSource
 			}
 		}
 		out = append(out, found...)
@@ -1898,6 +1910,13 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	// fan-in types (a User DTO used by 40 routes) only get parsed
 	// once per index pass.
 	idx.snapshotContractShapes(reg)
+
+	// Fold each type's snapshotted Shape into the envelope rows that
+	// reference it. The dashboard renders these rows as the response
+	// JSON shape (e.g. `{ workspace: { id: string }, repos: [{ name: string }] }`)
+	// instead of the bare type-symbol-ID, which answers nothing about
+	// the wire format.
+	idx.inlineEnvelopeShapes(reg)
 
 	for _, c := range reg.All() {
 		contractNode := &graph.Node{
@@ -1978,6 +1997,36 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		}
 		todo = append(todo, pending{contractID: c.ID, trail: trail, fallback: fallback, repoHint: c.RepoPrefix})
 	}
+	// Always strip the internal handler hints from Meta at the end of
+	// this pass — successful or not. They were only ever intended as
+	// per-pass resolution scratchpad: when the cross-file lookup
+	// succeeds we delete them in the patched-contract loop below; when
+	// it fails (no candidate, ambiguous, etc.) they used to leak to
+	// the dashboard as values like `handler_trail: "/users", listUsers`
+	// — useless to a reader. This cleanup runs unconditionally so
+	// downstream consumers never see internal extractor state.
+	defer func() {
+		for _, c := range reg.All() {
+			if c.Meta == nil {
+				continue
+			}
+			if _, hasIdent := c.Meta["handler_ident"]; !hasIdent {
+				if _, hasTrail := c.Meta["handler_trail"]; !hasTrail {
+					continue
+				}
+			}
+			items := reg.ByID(c.ID)
+			for i := range items {
+				if items[i].Meta == nil {
+					continue
+				}
+				delete(items[i].Meta, "handler_ident")
+				delete(items[i].Meta, "handler_trail")
+			}
+			reg.ReplaceByID(c.ID, items)
+		}
+	}()
+
 	if len(todo) == 0 {
 		return
 	}
@@ -2240,44 +2289,153 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 	resolved := 0
 	handlerBodies := make(map[string]string)
 
+	getBody := func(c contracts.Contract) string {
+		body, ok := handlerBodies[c.SymbolID]
+		if ok {
+			return body
+		}
+		handler := idx.graph.GetNode(c.SymbolID)
+		if handler == nil {
+			handlerBodies[c.SymbolID] = ""
+			return ""
+		}
+		body = idx.readHandlerSource(handler)
+		handlerBodies[c.SymbolID] = body
+		return body
+	}
+
 	for _, c := range reg.All() {
 		if c.Role != contracts.RoleProvider || c.Type != contracts.ContractHTTP {
 			continue
 		}
-		if rt, _ := c.Meta["response_type"].(string); rt != "" {
-			continue
-		}
-		respExpr, _ := c.Meta["response_expr"].(string)
-		if respExpr == "" {
-			continue
-		}
-		// Pull the bound variable name out of the helper call.
-		m := responseHelperCallRe.FindStringSubmatch(respExpr)
-		if len(m) < 2 {
-			continue
-		}
-		varName := m[1]
 
-		handler := idx.graph.GetNode(c.SymbolID)
-		if handler == nil {
+		// Path 1: bare-variable response (`return WriteJSON(w, code, resp)`).
+		// Trace the variable to its binding call's return type — and,
+		// failing that, the literal/builtin shape of its declaration —
+		// then stamp response_type / response_repeated. Accepts
+		// response_expr in two forms:
+		//   - Bare identifier ("result")             — emitted by the
+		//     post-fix Go enricher when the value is a plain var.
+		//   - Full helper call ("WriteJSON(w, …)")   — older
+		//     extraction output, kept compatible by extracting the
+		//     third arg via responseHelperCallRe.
+		if rt, _ := c.Meta["response_type"].(string); rt == "" {
+			respExpr, _ := c.Meta["response_expr"].(string)
+			varName := ""
+			switch {
+			case respExpr == "":
+				// nothing to work with
+			case isLikelyIdentifier(respExpr):
+				varName = respExpr
+			default:
+				if m := responseHelperCallRe.FindStringSubmatch(respExpr); len(m) >= 2 {
+					varName = m[1]
+				}
+			}
+			if varName != "" {
+				if body := getBody(c); body != "" {
+					typeID, repeated, _ := idx.traceVarTypeFromBodyWithShape(body, varName, c.RepoPrefix)
+					if typeID == "" {
+						// Builtin / literal binding — `result := make([]T, …)`,
+						// `data := []Foo{…}`, `id := r.PathValue("id")`,
+						// `n := 42` — none of these are graph nodes the
+						// trace can resolve, but the literal-binder
+						// recognises them.
+						if t, lr := bindLiteralTypeFromBody(body, varName); t != "" {
+							typeID = idx.upgradeBareTypeName(t, c.RepoPrefix)
+							repeated = lr
+						}
+					}
+					if typeID != "" {
+						items := reg.ByID(c.ID)
+						changed := false
+						for i := range items {
+							if items[i].Role != contracts.RoleProvider || items[i].SymbolID != c.SymbolID {
+								continue
+							}
+							if items[i].Meta == nil {
+								items[i].Meta = map[string]any{}
+							}
+							items[i].Meta["response_type"] = typeID
+							if repeated {
+								items[i].Meta["response_repeated"] = true
+							}
+							items[i].Meta["schema_source"] = "extracted"
+							delete(items[i].Meta, "response_expr")
+							changed = true
+						}
+						if changed {
+							reg.ReplaceByID(c.ID, items)
+							resolved++
+						}
+					}
+				}
+			}
+		}
+
+		// Path 2: envelope response (`map[string]any{"workspace": ws,
+		// "repos": repos}`). For each row that didn't resolve a type
+		// syntactically, trace its expression to a binding call's
+		// return type and patch the row in place. Pulled out as a
+		// separate pass so a contract whose top-level response_type
+		// stays unresolvable can still get per-field signal — which is
+		// the whole point of the envelope view.
+		envRaw, ok := c.Meta["response_envelope"].([]map[string]any)
+		if !ok {
 			continue
 		}
-		body, ok := handlerBodies[c.SymbolID]
-		if !ok {
-			body = idx.readHandlerSource(handler)
-			handlerBodies[c.SymbolID] = body
+		if !envelopeNeedsResolution(envRaw) {
+			continue
 		}
+		body := getBody(c)
 		if body == "" {
 			continue
 		}
-
-		typeID := idx.traceVarTypeFromBody(body, varName, c.RepoPrefix)
-		if typeID == "" {
+		envChanged := false
+		for ri := range envRaw {
+			if t, _ := envRaw[ri]["type"].(string); t != "" {
+				continue
+			}
+			expr, _ := envRaw[ri]["expr"].(string)
+			if expr == "" {
+				continue
+			}
+			// Strip a leading `&` / `*` so the binding lookup sees
+			// the underlying identifier.
+			ident := strings.TrimLeft(expr, "&*")
+			if !isLikelyIdentifier(ident) {
+				continue
+			}
+			if typeID, repeated, _ := idx.traceVarTypeFromBodyWithShape(body, ident, c.RepoPrefix); typeID != "" {
+				envRaw[ri]["type"] = typeID
+				if repeated {
+					envRaw[ri]["repeated"] = true
+				}
+				envChanged = true
+				continue
+			}
+			// Graph trace failed (no method call, or unresolvable
+			// receiver). Fall back to recognising common Go literal /
+			// builtin bindings — `r.PathValue("...")`, `make([]T, ...)`,
+			// `[]T{...}`, string/numeric literals — so envelope rows
+			// fed by these stop showing up empty in the dashboard.
+			if t, repeated := bindLiteralTypeFromBody(body, ident); t != "" {
+				envRaw[ri]["type"] = idx.upgradeBareTypeName(t, c.RepoPrefix)
+				if repeated {
+					envRaw[ri]["repeated"] = true
+				}
+				envChanged = true
+			}
+		}
+		if !envChanged {
 			continue
 		}
-		// Patch in place.
+		// Promote schema_source to "extracted" if every row now has a
+		// type (or this is a single-key envelope whose lone field
+		// resolved). Otherwise leave it as "partial" — we have more
+		// info than before but it's not exhaustive.
 		items := reg.ByID(c.ID)
-		changed := false
+		patched := false
 		for i := range items {
 			if items[i].Role != contracts.RoleProvider || items[i].SymbolID != c.SymbolID {
 				continue
@@ -2285,12 +2443,13 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 			if items[i].Meta == nil {
 				items[i].Meta = map[string]any{}
 			}
-			items[i].Meta["response_type"] = typeID
-			items[i].Meta["schema_source"] = "extracted"
-			delete(items[i].Meta, "response_expr")
-			changed = true
+			items[i].Meta["response_envelope"] = envRaw
+			if envelopeFullyTyped(envRaw) {
+				items[i].Meta["schema_source"] = "extracted"
+			}
+			patched = true
 		}
-		if changed {
+		if patched {
 			reg.ReplaceByID(c.ID, items)
 			resolved++
 		}
@@ -2299,6 +2458,197 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 		idx.logger.Info("resolved response types from call signatures",
 			zap.Int("count", resolved))
 	}
+}
+
+func envelopeNeedsResolution(env []map[string]any) bool {
+	for _, row := range env {
+		if t, _ := row["type"].(string); t == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func envelopeFullyTyped(env []map[string]any) bool {
+	if len(env) == 0 {
+		return false
+	}
+	for _, row := range env {
+		if t, _ := row["type"].(string); t == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// bindLiteralTypeFromBody recognises common Go binding shapes that
+// traceVarTypeFromBody can't handle (it requires a method/function
+// call whose return type lives on a graph node):
+//
+//	x := r.PathValue("...")        → "string", false
+//	x := r.URL.Query().Get("...")   → "string", false
+//	x := r.FormValue("...")         → "string", false
+//	x := r.Header.Get("...")        → "string", false
+//	x := make([]Foo, ...)           → "Foo",    true
+//	x := make(map[K]V, ...)         → "map[K]V", false
+//	x := []Foo{...}                 → "Foo",    true
+//	x := Foo{...}                   → "Foo",    false
+//	x := "literal"                  → "string", false
+//	x := 0 / 1 / -5                 → "int",    false
+//	x := 0.5                        → "float64", false
+//	x := true / false               → "bool",   false
+//
+// Returns ("", false) when no shape matches. Repeated is true for
+// list/slice bindings so the dashboard can render the field as an
+// array. Pointer dereference is implicit — `&Foo{}` already gets the
+// `&` stripped by the caller.
+func bindLiteralTypeFromBody(body, varName string) (string, bool) {
+	for _, re := range bindLiteralRegexes {
+		ms := re.pattern.FindAllStringSubmatch(body, -1)
+		for _, m := range ms {
+			if len(m) < 2 || m[1] != varName {
+				continue
+			}
+			var t string
+			switch {
+			case re.replace != nil:
+				t = re.replace(m)
+			case len(m) >= 3:
+				t = m[2]
+			}
+			if t == "" {
+				continue
+			}
+			return t, re.repeated
+		}
+	}
+	return "", false
+}
+
+type bindLiteralRule struct {
+	pattern  *regexp.Regexp
+	repeated bool
+	// replace overrides the captured group when the pattern's group 2
+	// isn't already the bare type text.
+	replace func([]string) string
+}
+
+var bindLiteralRegexes = []bindLiteralRule{
+	// `x := r.PathValue("...")` and friends — every net/http accessor
+	// that returns a bare string. Group 2 is set to the literal "string"
+	// so the caller doesn't need to know about the producer family.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*\w+\.(?:PathValue|FormValue|PostFormValue)\(`),
+		replace: func([]string) string { return "string" },
+	},
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*\w+\.URL\.Query\(\)\.Get\(`),
+		replace: func([]string) string { return "string" },
+	},
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*\w+\.Header\.Get\(`),
+		replace: func([]string) string { return "string" },
+	},
+	// `x := make([]Foo, ...)` — slice. Group 2 captures Foo so the
+	// caller can use it as a type-symbol-ID lookup; repeated=true tells
+	// the dashboard to render `[Foo]` instead of `Foo`.
+	{
+		pattern:  regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*make\(\s*\[\]([A-Za-z_][\w.]*)`),
+		repeated: true,
+	},
+	// `x := make(map[K]V, ...)` — capture the whole map type so the
+	// dashboard can show "map[string]int" verbatim. Not a graph type
+	// reference, just a primitive-shaped string.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*make\(\s*(map\[[^\]]+\][A-Za-z_][\w.]*)`),
+	},
+	// `x := []Foo{ ... }` — composite slice literal.
+	{
+		pattern:  regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*\[\]([A-Za-z_][\w.]*)\s*\{`),
+		repeated: true,
+	},
+	// `x := Foo{ ... }` — composite struct literal. Excludes lowercase
+	// starts so `for x := range m {}` and friends don't false-match.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*([A-Z][\w.]*)\s*\{`),
+	},
+	// `x := "..."` — string literal.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*"`),
+		replace: func([]string) string { return "string" },
+	},
+	// `x := true` / `x := false`.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*(true|false)\b`),
+		replace: func([]string) string { return "bool" },
+	},
+	// `x := 0.5` — float literal (must run before int so `0.5` doesn't
+	// get caught by the int pattern's leading `0`).
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*-?\d+\.\d`),
+		replace: func([]string) string { return "float64" },
+	},
+	// `x := 0` / `x := -42` — int literal.
+	{
+		pattern: regexp.MustCompile(`(?m)^\s*(\w+)\s*:?=\s*-?\d+\b`),
+		replace: func([]string) string { return "int" },
+	},
+}
+
+// upgradeBareTypeName looks up `name` in the graph and returns the
+// matching type node's ID, preferring same-repo matches. Falls back
+// to the input string when no graph type is found, so callers can
+// still surface primitives ("string", "int", "bool") and external
+// types ("map[string]int") that have no graph node. The shape-
+// inlining pass will leave those as-is since lookupShape requires a
+// `::` separator.
+func (idx *Indexer) upgradeBareTypeName(name, repoHint string) string {
+	if name == "" {
+		return name
+	}
+	if strings.Contains(name, "::") {
+		return name // already a graph ID
+	}
+	candidates := idx.graph.FindNodesByName(name)
+	var fallback *graph.Node
+	for _, n := range candidates {
+		if n.Kind != graph.KindType {
+			continue
+		}
+		if repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/") {
+			return n.ID
+		}
+		if fallback == nil {
+			fallback = n
+		}
+	}
+	if fallback != nil {
+		return fallback.ID
+	}
+	return name
+}
+
+// isLikelyIdentifier accepts the bare-identifier and dotted-path
+// forms that traceVarTypeFromBody can match against a binding line.
+// Compound expressions ("len(repos)", "&Foo{}") are out of scope —
+// they'd need a more thorough RHS parser than the regex chain here.
+func isLikelyIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
+			continue
+		case i > 0 && r >= '0' && r <= '9':
+			continue
+		case r == '.' && i > 0:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // readHandlerSource returns the handler function's source lines,
@@ -2332,7 +2682,19 @@ func (idx *Indexer) readHandlerSource(handler *graph.Node) string {
 // traceVarTypeFromBody walks the handler body for `varName`'s
 // declaration, extracts the RHS call, looks up the called method in
 // the graph, and returns the method's first non-error return type as
-// a symbol ID. Empty string when any step fails.
+// a symbol ID. Empty string when any step fails. Convenience wrapper
+// over traceVarTypeFromBodyWithShape that drops the slice/pointer
+// flags — older callers that only need the type ID stay compact.
+func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string {
+	id, _, _ := idx.traceVarTypeFromBodyWithShape(body, varName, repoHint)
+	return id
+}
+
+// traceVarTypeFromBodyWithShape is traceVarTypeFromBody plus the
+// originally-declared slice/pointer flags from the method's return
+// signature. The envelope-rendering pass uses these to set
+// `repeated: true` on list-shaped envelope rows so the dashboard can
+// render `[Foo]` instead of `Foo`.
 //
 // Ambiguity is treated as failure. Common method names like `Update`,
 // `Get`, `List` exist on many stores in a real codebase — picking the
@@ -2343,7 +2705,7 @@ func (idx *Indexer) readHandlerSource(handler *graph.Node) string {
 // filter by receiver type name. When no single candidate survives,
 // we return "" so the UI honestly shows that the type wasn't resolved
 // rather than showing a wrong one.
-func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string {
+func (idx *Indexer) traceVarTypeFromBodyWithShape(body, varName, repoHint string) (string, bool, bool) {
 	bindings := goCallBindRe.FindAllStringSubmatch(body, -1)
 	var callExpr string
 	for _, b := range bindings {
@@ -2353,7 +2715,7 @@ func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string 
 		}
 	}
 	if callExpr == "" {
-		return ""
+		return "", false, false
 	}
 	// Split the call path. `h.tucks.Update` → ["h", "tucks", "Update"].
 	// The last segment is the method name; the penultimate is the
@@ -2362,7 +2724,7 @@ func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string 
 	parts := strings.Split(callExpr, ".")
 	methodName := parts[len(parts)-1]
 	if methodName == "" {
-		return ""
+		return "", false, false
 	}
 	var receiverHint string
 	if len(parts) >= 2 {
@@ -2384,7 +2746,7 @@ func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string 
 		matches = append(matches, n)
 	}
 	if len(matches) == 0 {
-		return ""
+		return "", false, false
 	}
 
 	// Interface + implementation stacks often produce multiple
@@ -2413,12 +2775,18 @@ func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string 
 		if t != retType {
 			// Candidates disagree — can't tell which wins. The
 			// caller sees the raw expression and can drill in.
-			return ""
+			return "", false, false
 		}
 	}
 	if retType == "" {
-		return ""
+		return "", false, false
 	}
+	// Capture slice/pointer flags before stripping so the caller can
+	// render `[Foo]` / `*Foo` correctly. Order matters: a return type
+	// like `[]*Foo` is reported as repeated AND pointer.
+	repeated := strings.HasPrefix(retType, "[]")
+	pointer := strings.HasPrefix(retType, "*") ||
+		(repeated && strings.HasPrefix(retType[2:], "*"))
 	// Strip `*` / `[]` / package qualifier so resolveTypeByName can
 	// match the plain type-node name.
 	retType = strings.TrimLeft(retType, "*[]")
@@ -2441,12 +2809,12 @@ func (idx *Indexer) traceVarTypeFromBody(body, varName, repoHint string) string 
 		}
 	}
 	if bestType != nil {
-		return bestType.ID
+		return bestType.ID, repeated, pointer
 	}
 	// Bare name — downstream UpgradeBareTypeRefs can still upgrade
 	// it later, but we return it as-is so the consumer sees something
 	// real.
-	return retType
+	return retType, repeated, pointer
 }
 
 func parseFirstNonErrorReturnType(sig string) string {
@@ -2595,6 +2963,19 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 			}
 			symbols[v] = struct{}{}
 		}
+		// Envelope rows reference types the dashboard wants expanded
+		// just as much as the top-level response_type does — without
+		// snapshotting them here, the inlineEnvelopeShapes pass below
+		// finds no shape to fold into the row.
+		if env, ok := c.Meta["response_envelope"].([]map[string]any); ok {
+			for _, row := range env {
+				v, _ := row["type"].(string)
+				if v == "" || !strings.Contains(v, "::") {
+					continue
+				}
+				symbols[v] = struct{}{}
+			}
+		}
 	}
 	if len(symbols) == 0 {
 		return
@@ -2644,6 +3025,114 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 			zap.Int("types", attached),
 			zap.Int("examined", len(symbols)))
 	}
+}
+
+// inlineEnvelopeShapes folds each type node's snapshotted shape onto
+// every response_envelope row that references it. After this pass an
+// envelope row carries the full JSON-rendering data:
+//
+//	{
+//	  "name":  "repos",
+//	  "expr":  "repos",
+//	  "type":  "<repo>/service.go::Repo",
+//	  "shape": { "kind": "struct", "fields": [...] }
+//	}
+//
+// so the dashboard can render the actual response shape instead of a
+// bare type-symbol-ID. Idempotent: rows that already carry "shape"
+// are skipped, which lets cross-pass calls (re-extraction, snapshot
+// restore) re-run cheaply.
+//
+// Also handles the top-level response_type / request_type: the
+// referenced type's shape is mirrored onto Meta["response_shape"] /
+// Meta["request_shape"] so plain-typed responses (no map envelope)
+// also expose their JSON object shape on the dashboard.
+func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
+	inlined := 0
+	for _, c := range reg.All() {
+		changed := false
+
+		// Envelope rows.
+		if env, ok := c.Meta["response_envelope"].([]map[string]any); ok && len(env) > 0 {
+			for ri, row := range env {
+				if _, has := row["shape"]; has {
+					continue
+				}
+				if shape := idx.lookupShape(row["type"]); shape != nil {
+					env[ri]["shape"] = shape
+					changed = true
+				}
+			}
+			if changed {
+				items := reg.ByID(c.ID)
+				for i := range items {
+					if items[i].Role != contracts.RoleProvider || items[i].SymbolID != c.SymbolID {
+						continue
+					}
+					if items[i].Meta == nil {
+						items[i].Meta = map[string]any{}
+					}
+					items[i].Meta["response_envelope"] = env
+				}
+				reg.ReplaceByID(c.ID, items)
+			}
+		}
+
+		// Top-level request/response shapes — same idea, applied to a
+		// plain `response_type: "<id>::Foo"` so the schema view can
+		// render the JSON object even when there's no envelope wrapper.
+		topChanged := false
+		for metaKey, shapeKey := range map[string]string{
+			"response_type": "response_shape",
+			"request_type":  "request_shape",
+		} {
+			if _, has := c.Meta[shapeKey]; has {
+				continue
+			}
+			if shape := idx.lookupShape(c.Meta[metaKey]); shape != nil {
+				items := reg.ByID(c.ID)
+				for i := range items {
+					if items[i].Role != contracts.RoleProvider || items[i].SymbolID != c.SymbolID {
+						continue
+					}
+					if items[i].Meta == nil {
+						items[i].Meta = map[string]any{}
+					}
+					items[i].Meta[shapeKey] = shape
+				}
+				reg.ReplaceByID(c.ID, items)
+				topChanged = true
+			}
+		}
+
+		if changed || topChanged {
+			inlined++
+		}
+	}
+	if inlined > 0 {
+		idx.logger.Info("response envelopes hydrated with shapes",
+			zap.Int("contracts", inlined))
+	}
+}
+
+// lookupShape resolves a Meta type reference to the snapshotted shape
+// stored on its graph node. Accepts string IDs (the only form used in
+// today's pipeline); other shapes pass through as nil so callers can
+// chain without type-asserting upstream.
+func (idx *Indexer) lookupShape(raw any) any {
+	id, ok := raw.(string)
+	if !ok || id == "" || !strings.Contains(id, "::") {
+		return nil
+	}
+	node := idx.graph.GetNode(id)
+	if node == nil || node.Meta == nil {
+		return nil
+	}
+	shape, ok := node.Meta["shape"]
+	if !ok || shape == nil {
+		return nil
+	}
+	return shape
 }
 
 // extractExternalModules parses the repo's go.mod once and writes

@@ -78,7 +78,16 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract
 					if method == "" {
 						method = "GET"
 					}
-					path := NormalizeHTTPPath(arg.Value)
+					path, origNames := NormalizeHTTPPathWithParams(arg.Value)
+					meta := map[string]any{
+						"method":    method,
+						"path":      path,
+						"framework": "inlined-wrapper",
+						"wrapper":   w.SymbolID,
+					}
+					if len(origNames) > 0 {
+						meta["path_param_names"] = origNames
+					}
 					c := Contract{
 						ID:         fmt.Sprintf("http::%s::%s", method, path),
 						Type:       ContractHTTP,
@@ -95,13 +104,8 @@ func InlineWrappers(reg *Registry, g *graph.Graph, read SourceReader) []Contract
 						// provider.
 						WorkspaceID: caller.WorkspaceID,
 						ProjectID:   caller.ProjectID,
-						Meta: map[string]any{
-							"method":    method,
-							"path":      path,
-							"framework": "inlined-wrapper",
-							"wrapper":   w.SymbolID,
-						},
-						Confidence: 0.8,
+						Meta:        meta,
+						Confidence:  0.8,
 					}
 					reg.Add(c)
 					commitInlinedContractToGraph(g, c)

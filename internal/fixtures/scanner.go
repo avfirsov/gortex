@@ -74,6 +74,42 @@ func BuildGraphArtifacts(filePath, language string) []*graph.Node {
 	}}
 }
 
+// TestContractSource reports the test-fixture category of the given
+// path, or "" if the path is production code. Used by the contracts
+// pipeline to tag — not drop — contracts emitted from synthetic
+// fixtures so the dashboard can filter them out by default while
+// still keeping them in the graph for drift checks (e.g. a test
+// pinned to an old API contract that production has since changed).
+//
+// Categories:
+//   - "testdata"       — paths under testdata/ (Go convention)
+//   - "bench_fixtures" — paths under bench/fixtures/ (gortex bench corpus)
+//   - "js_fixtures"    — paths under __fixtures__/ (TS/JS convention)
+//
+// The path may be repo-prefixed (e.g. "gortex/bench/fixtures/...");
+// we match the segment regardless of leading prefix. Path-only — does
+// not consult the filesystem.
+func TestContractSource(filePath string) string {
+	if IsFixturePath(filePath) {
+		return "testdata"
+	}
+	p := filepath.ToSlash(filePath)
+	if p == "" {
+		return ""
+	}
+	for _, c := range []struct {
+		seg, label string
+	}{
+		{"bench/fixtures/", "bench_fixtures"},
+		{"__fixtures__/", "js_fixtures"},
+	} {
+		if strings.HasPrefix(p, c.seg) || strings.Contains(p, "/"+c.seg) {
+			return c.label
+		}
+	}
+	return ""
+}
+
 // ReclassifyFileToFixture rewrites an existing KindFile node to
 // KindFixture when its path qualifies. Used by the indexer's
 // per-file coverage step so the language extractor's emitted file

@@ -808,6 +808,64 @@ func TestHTTPExtractor_Go_Fiber_NoMatchOnVerbInsideStringLiteral(t *testing.T) {
 	}
 }
 
+// TestHTTPExtractor_PathParamNames asserts that the developer-written
+// parameter names are preserved on Meta["path_param_names"] alongside
+// the positional Meta["path_params"]. The contract ID stays positional
+// (so cross-repo matching is naming-agnostic) but the source-side
+// names are surfaced for display, OpenAPI export, and drift detection.
+func TestHTTPExtractor_PathParamNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		src       string
+		filePath  string
+		wantPath  string
+		wantNames []string
+	}{
+		{
+			name:      "go net/http stdlib mux",
+			src:       `mux.HandleFunc("DELETE /v1/overlay/sessions/{id}", h)`,
+			filePath:  "main.go",
+			wantPath:  "/v1/overlay/sessions/{p1}",
+			wantNames: []string{"id"},
+		},
+		{
+			name:      "go gin colon style multi-param",
+			src:       `r.GET("/users/:userID/posts/:postID", h)`,
+			filePath:  "main.go",
+			wantPath:  "/users/{p1}/posts/{p2}",
+			wantNames: []string{"userID", "postID"},
+		},
+		{
+			name:      "express colon style",
+			src:       `app.get('/api/products/:id', h)`,
+			filePath:  "routes.ts",
+			wantPath:  "/api/products/{p1}",
+			wantNames: []string{"id"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := (&HTTPExtractor{}).Extract(tc.filePath, []byte(tc.src), nil, nil)
+			if len(out) == 0 {
+				t.Fatalf("no contracts extracted from %q", tc.src)
+			}
+			c := out[0]
+			if got, _ := c.Meta["path"].(string); got != tc.wantPath {
+				t.Errorf("path = %q, want %q", got, tc.wantPath)
+			}
+			gotNames, _ := c.Meta["path_param_names"].([]string)
+			if len(gotNames) != len(tc.wantNames) {
+				t.Fatalf("path_param_names = %v, want %v", gotNames, tc.wantNames)
+			}
+			for i := range tc.wantNames {
+				if gotNames[i] != tc.wantNames[i] {
+					t.Errorf("path_param_names[%d] = %q, want %q", i, gotNames[i], tc.wantNames[i])
+				}
+			}
+		})
+	}
+}
+
 // And the positive case: a real fiber registration still produces a contract.
 func TestHTTPExtractor_Go_Fiber_RealRoute(t *testing.T) {
 	src := []byte("package main\n" +

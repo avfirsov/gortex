@@ -26,6 +26,38 @@ func TestIsFixturePath(t *testing.T) {
 	}
 }
 
+func TestTestContractSource(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		// testdata category — Go convention, delegated to IsFixturePath.
+		{"pkg/testdata/foo.json", "testdata"},
+		{"testdata/x.go", "testdata"},
+
+		// bench_fixtures: top-level and nested under repo prefix.
+		{"bench/fixtures/di/laravel/routes/web.php", "bench_fixtures"},
+		{"gortex/bench/fixtures/di/laravel/routes/web.php", "bench_fixtures"},
+
+		// js_fixtures: __fixtures__ convention.
+		{"src/__fixtures__/users.ts", "js_fixtures"},
+		{"__fixtures__/users.ts", "js_fixtures"},
+
+		// Production paths return "" (no tag).
+		{"src/parser.go", ""},
+		{"internal/contracts/http.go", ""},
+		{"bench/runner.go", ""},                     // not bench/fixtures/
+		{"app/fixtures/seed.sql", ""},               // bare fixtures/, not bench-prefixed
+		{"src/__fixturesx__/foo.ts", ""},            // not a whole segment
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := TestContractSource(tc.path); got != tc.want {
+			t.Errorf("TestContractSource(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestBuildGraphArtifacts(t *testing.T) {
 	t.Run("under testdata", func(t *testing.T) {
 		nodes := BuildGraphArtifacts("pkg/testdata/foo.json", "json")

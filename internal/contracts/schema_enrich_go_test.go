@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -167,6 +168,113 @@ func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
 	assertMetaString(t, c, "response_type", "pkg/api.go::Workspace")
 	assertMetaInts(t, c, "status_codes", []int{200})
 	assertMetaString(t, c, "schema_source", "extracted")
+}
+
+// Multi-key envelope: every key surfaces on response_envelope, with
+// the source expression preserved per row. The keys whose values
+// resolve to a typed binding get a "type"; the rest carry just the
+// expression, which is still vastly more useful than the raw
+// WriteJSON call previously stamped onto response_expr.
+// Regression: a value like `[]any{evt1, evt2}` used to be captured
+// by the multi-key envelope regex as `[]any{` (truncated at the
+// first inner `}`), producing a malformed expr field in the
+// dashboard. The brace/bracket-balanced splitter keeps the value
+// expression intact and recognises the slice composite literal.
+func TestHTTPEnrich_Go_EnvelopeValueIsNestedSliceLiteral(t *testing.T) {
+	src := []byte(`package api
+
+import "net/http"
+
+type Event struct{ Name string }
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/activity", logActivity)
+}
+
+func logActivity(w http.ResponseWriter, r *http.Request) {
+	WriteJSON(w, http.StatusOK, map[string]any{"events": []any{Event{}, Event{}}})
+}
+
+func WriteJSON(w http.ResponseWriter, code int, body any) {}
+`)
+	nodes := []*graph.Node{
+		{ID: "pkg/api.go::register", Name: "register", Kind: graph.KindFunction, FilePath: "pkg/api.go", StartLine: 7, EndLine: 9},
+		{ID: "pkg/api.go::logActivity", Name: "logActivity", Kind: graph.KindFunction, FilePath: "pkg/api.go", StartLine: 11, EndLine: 13},
+		{ID: "pkg/api.go::Event", Name: "Event", Kind: graph.KindType, FilePath: "pkg/api.go", StartLine: 5, EndLine: 5},
+	}
+	cs := (&HTTPExtractor{}).Extract("pkg/api.go", src, nodes, nil)
+	c := findContract(t, cs, "http::GET::/v1/activity", RoleProvider)
+
+	env, ok := c.Meta["response_envelope"].([]map[string]any)
+	if !ok || len(env) != 1 {
+		t.Fatalf("response_envelope = %#v, want one row", c.Meta["response_envelope"])
+	}
+	row := env[0]
+	expr, _ := row["expr"].(string)
+	if expr == "" || strings.HasSuffix(expr, "{") {
+		t.Errorf("expr is truncated: %q", expr)
+	}
+	if !strings.Contains(expr, "[]any{") || !strings.HasSuffix(expr, "}") {
+		t.Errorf("expr missing the full literal; got %q", expr)
+	}
+	if got, _ := row["type"].(string); got == "" {
+		t.Errorf("type empty for inline slice literal; want a recognised element type")
+	}
+	if r, _ := row["repeated"].(bool); !r {
+		t.Errorf("repeated=false; want true for []any{...}")
+	}
+}
+
+func TestHTTPEnrich_Go_RespondJSONEnvelope_MultiKey(t *testing.T) {
+	src := []byte(`package api
+
+import "net/http"
+
+type FileEntry struct{ Path string }
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/overlay/sessions/{id}/files", h.handleOverlayList)
+}
+
+func (h *Handler) handleOverlayList(w http.ResponseWriter, r *http.Request) {
+	out := []FileEntry{}
+	total := 0
+	WriteJSON(w, http.StatusOK, map[string]any{"files": out, "total": total})
+}
+`)
+	nodes := []*graph.Node{
+		{ID: "pkg/api.go::register", Name: "register", Kind: graph.KindFunction, FilePath: "pkg/api.go", StartLine: 7, EndLine: 9},
+		{ID: "pkg/api.go::Handler.handleOverlayList", Name: "handleOverlayList", Kind: graph.KindMethod, FilePath: "pkg/api.go", StartLine: 11, EndLine: 15},
+		{ID: "pkg/api.go::FileEntry", Name: "FileEntry", Kind: graph.KindType, FilePath: "pkg/api.go", StartLine: 5, EndLine: 5},
+	}
+	cs := (&HTTPExtractor{}).Extract("pkg/api.go", src, nodes, nil)
+	c := findContract(t, cs, "http::GET::/v1/overlay/sessions/{p1}/files", RoleProvider)
+
+	env, ok := c.Meta["response_envelope"].([]map[string]any)
+	if !ok || len(env) != 2 {
+		t.Fatalf("response_envelope = %#v, want 2 rows", c.Meta["response_envelope"])
+	}
+	byName := map[string]map[string]any{}
+	for _, row := range env {
+		name, _ := row["name"].(string)
+		byName[name] = row
+	}
+	if files := byName["files"]; files == nil {
+		t.Errorf("envelope missing 'files' row; got %v", byName)
+	} else if expr, _ := files["expr"].(string); expr != "out" {
+		t.Errorf("envelope['files'].expr = %q, want \"out\"", expr)
+	}
+	if total := byName["total"]; total == nil {
+		t.Errorf("envelope missing 'total' row; got %v", byName)
+	} else if expr, _ := total["expr"].(string); expr != "total" {
+		t.Errorf("envelope['total'].expr = %q, want \"total\"", expr)
+	}
+	// The previous behavior stamped the entire WriteJSON(...) call
+	// as response_expr. With the envelope present we keep just the
+	// value literal so the raw view is short.
+	if got, _ := c.Meta["response_expr"].(string); strings.HasPrefix(got, "WriteJSON(") {
+		t.Errorf("response_expr leaks the full WriteJSON wrapper: %q", got)
+	}
 }
 
 func TestHTTPEnrich_Go_PathParams_AlwaysPresent(t *testing.T) {

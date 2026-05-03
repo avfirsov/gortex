@@ -104,6 +104,21 @@ var tplInlineParam = regexp.MustCompile(`\$\{([^}]+)\}|\$([a-zA-Z_][a-zA-Z0-9_]*
 //	/${TUCK_API_URL}/users -> /users
 //	/users/${id}           -> /users/{id}
 func NormalizeHTTPPath(path string) string {
+	out, _ := NormalizeHTTPPathWithParams(path)
+	return out
+}
+
+// NormalizeHTTPPathWithParams is NormalizeHTTPPath plus the *original*
+// parameter names in declaration order — one entry per "{p1}", "{p2}", …
+// in the returned canonical path. The canonical path stays positional
+// so cross-repo Contract.ID matching is naming-agnostic; callers
+// preserve the source-side names separately (Meta["path_param_names"])
+// for display, drift detection, and OpenAPI export.
+//
+// Example:
+//
+//	/v1/workspaces/{wid}/tags/:id  ->  ("/v1/workspaces/{p1}/tags/{p2}", []string{"wid", "id"})
+func NormalizeHTTPPathWithParams(path string) (string, []string) {
 	// Strip leading/trailing whitespace and quotes.
 	path = strings.Trim(path, " \t\"'`")
 
@@ -146,10 +161,30 @@ func NormalizeHTTPPath(path string) string {
 	// cross-repo matching (`contracts check` / `validate`) to work.
 	// Keeping the user-written name in the ID is a common source of
 	// false orphans across services whose provider and consumer teams
-	// chose different names for the same slot.
+	// chose different names for the same slot. We capture the original
+	// name on the way through so callers that want to show the
+	// developer-written identifier (dashboard, OpenAPI) can.
 	var paramCounter int
+	var origNames []string
 	path = paramPatterns.ReplaceAllStringFunc(path, func(m string) string {
 		paramCounter++
+		// paramPatterns has three alternatives — :name, <int:name>, {name}
+		// — each in its own capture group. Pick the first non-empty one.
+		sub := paramPatterns.FindStringSubmatch(m)
+		var name string
+		for i := 1; i < len(sub); i++ {
+			if sub[i] != "" {
+				name = sub[i]
+				break
+			}
+		}
+		// Strip a leading "type:" qualifier from the Django/Flask style
+		// (<int:id>, <slug:title>) — we want the bare name, not the
+		// converter prefix.
+		if idx := strings.Index(name, ":"); idx >= 0 {
+			name = name[idx+1:]
+		}
+		origNames = append(origNames, name)
 		return fmt.Sprintf("{p%d}", paramCounter)
 	})
 
@@ -163,5 +198,5 @@ func NormalizeHTTPPath(path string) string {
 		path = strings.TrimRight(path, "/")
 	}
 
-	return path
+	return path, origNames
 }

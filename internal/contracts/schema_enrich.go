@@ -28,9 +28,29 @@ type schemaHints struct {
 
 	ResponseType string
 	ResponseExpr string
+	// ResponseEnvelope is the structured form of an inline map response
+	// like `map[string]any{"files": out, "total": count}`. Each field
+	// records the JSON key, the source expression that fed it, and
+	// (when resolvable) the inferred type. The dashboard prefers this
+	// over ResponseExpr when present so the schema view shows a real
+	// shape instead of the raw response-helper call.
+	ResponseEnvelope []envelopeField
 
 	QueryParams []string
 	StatusCodes []int
+}
+
+// envelopeField is one key in an inline JSON envelope literal. Type
+// is best-effort — empty when the value couldn't be traced to a
+// concrete declaration; Expr is always the trimmed source expression.
+// Repeated is true when the value's declared type was a slice
+// (`[]Foo` or `make([]Foo, …)`), so the dashboard can render the
+// field as an array.
+type envelopeField struct {
+	Name     string
+	Expr     string
+	Type     string
+	Repeated bool
 }
 
 func (h *schemaHints) isEmpty() bool {
@@ -38,6 +58,7 @@ func (h *schemaHints) isEmpty() bool {
 		h.RequestExpr == "" &&
 		h.ResponseType == "" &&
 		h.ResponseExpr == "" &&
+		len(h.ResponseEnvelope) == 0 &&
 		len(h.QueryParams) == 0 &&
 		len(h.StatusCodes) == 0
 }
@@ -54,6 +75,9 @@ func (h *schemaHints) merge(o schemaHints) {
 	}
 	if h.ResponseExpr == "" {
 		h.ResponseExpr = o.ResponseExpr
+	}
+	if len(h.ResponseEnvelope) == 0 {
+		h.ResponseEnvelope = o.ResponseEnvelope
 	}
 	h.QueryParams = append(h.QueryParams, o.QueryParams...)
 	h.StatusCodes = append(h.StatusCodes, o.StatusCodes...)
@@ -212,6 +236,23 @@ func applyHints(c *Contract, h schemaHints, matched bool) {
 	}
 	if h.ResponseExpr != "" {
 		c.Meta["response_expr"] = h.ResponseExpr
+	}
+	if len(h.ResponseEnvelope) > 0 {
+		arr := make([]map[string]any, 0, len(h.ResponseEnvelope))
+		for _, f := range h.ResponseEnvelope {
+			row := map[string]any{"name": f.Name}
+			if f.Type != "" {
+				row["type"] = f.Type
+			}
+			if f.Expr != "" {
+				row["expr"] = f.Expr
+			}
+			if f.Repeated {
+				row["repeated"] = true
+			}
+			arr = append(arr, row)
+		}
+		c.Meta["response_envelope"] = arr
 	}
 	if qs := uniqStrings(h.QueryParams); len(qs) > 0 {
 		c.Meta["query_params"] = qs

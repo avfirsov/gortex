@@ -510,6 +510,18 @@ type contractEntry struct {
 	Last      string             `json:"last"`
 	Locations []contractLocation `json:"locations"`
 
+	// IsTestOnly is true when every location of this contract was
+	// extracted from a synthetic test/bench fixture (testdata/,
+	// bench/fixtures/, __fixtures__/). The UI uses this as a single
+	// boolean to hide synthetic rows from the production view by
+	// default, while still allowing a "show tests" toggle so drift
+	// checks (test pinned to a stale provider contract) stay visible.
+	// Mixed contracts — at least one production location plus one
+	// test location — keep IsTestOnly=false so they remain in the
+	// production view; the per-location Meta carries the granular
+	// is_test flag for callers that want to render badges per row.
+	IsTestOnly bool `json:"is_test_only,omitempty"`
+
 	// Schema-shape fields promoted from the primary location's meta so
 	// the UI can render a structured schema card instead of the raw
 	// per-location JSON. Populated from the provider when present,
@@ -527,16 +539,58 @@ type contractEntry struct {
 // the extractor and post-pass could pin down. `Source` is one of
 // "extracted" | "partial" | "none".
 type contractSchema struct {
-	RequestType    string   `json:"request_type,omitempty"`
-	ResponseType   string   `json:"response_type,omitempty"`
-	RequestExpr    string   `json:"request_expr,omitempty"`
-	ResponseExpr   string   `json:"response_expr,omitempty"`
-	RequestStream  bool     `json:"request_stream,omitempty"`
-	ResponseStream bool     `json:"response_stream,omitempty"`
-	PathParams     []string `json:"path_params,omitempty"`
+	RequestType    string `json:"request_type,omitempty"`
+	ResponseType   string `json:"response_type,omitempty"`
+	RequestExpr    string `json:"request_expr,omitempty"`
+	ResponseExpr   string `json:"response_expr,omitempty"`
+	RequestStream  bool   `json:"request_stream,omitempty"`
+	ResponseStream bool   `json:"response_stream,omitempty"`
+	// ResponseRepeated is true when the response value's declared
+	// type was a slice (e.g. `[]Foo` from `make([]Foo, …)`). The UI
+	// renders the response as `[Foo]` instead of `Foo`.
+	ResponseRepeated bool `json:"response_repeated,omitempty"`
+	// ResponseShape and RequestShape are the snapshotted struct
+	// definitions of ResponseType / RequestType — fields, JSON tags,
+	// types — so the UI can render the body as an actual JSON
+	// object instead of a bare type-symbol-ID. Empty when the type
+	// isn't a graph-known struct (primitives, external types).
+	ResponseShape map[string]any `json:"response_shape,omitempty"`
+	RequestShape  map[string]any `json:"request_shape,omitempty"`
+	// ResponseEnvelope is the structured form of an inline map
+	// response like `map[string]any{"files": out}`. When present,
+	// the UI prefers it over ResponseExpr so the schema view shows
+	// the JSON shape (a list of {name, type, expr} fields) instead
+	// of the raw helper-call text.
+	ResponseEnvelope []envelopeFieldDTO `json:"response_envelope,omitempty"`
+	PathParams       []string           `json:"path_params,omitempty"`
+	// PathParamNames preserves the developer-written parameter names
+	// in the same positional order as PathParams. Contract IDs use
+	// positional p1/p2/... so cross-repo matching is naming-agnostic;
+	// this field surfaces the actual source-side names (e.g. ["id"])
+	// for display, drift detection, and OpenAPI export.
+	PathParamNames []string `json:"path_param_names,omitempty"`
 	QueryParams    []string `json:"query_params,omitempty"`
 	StatusCodes    []int    `json:"status_codes,omitempty"`
 	Source         string   `json:"source,omitempty"`
+}
+
+// envelopeFieldDTO mirrors one entry of contracts.envelopeField on the
+// HTTP wire. Type is best-effort and may be empty when the source
+// expression couldn't be traced to a typed binding; Expr is always
+// the trimmed source expression that fed the JSON key. Shape is the
+// snapshotted struct definition for Type — fields, JSON tags, etc. —
+// so the UI can render the response as an actual JSON object instead
+// of a bare type-symbol-ID. Empty when the type couldn't be expanded
+// (external types, untyped expressions).
+type envelopeFieldDTO struct {
+	Name string `json:"name"`
+	Type string `json:"type,omitempty"`
+	Expr string `json:"expr,omitempty"`
+	// Repeated is true when the originally-declared type was a slice
+	// (e.g. `[]Repo` or `make([]string, …)`). The UI renders the field
+	// as an array — `repos: [Repo]` instead of `repos: Repo`.
+	Repeated bool           `json:"repeated,omitempty"`
+	Shape    map[string]any `json:"shape,omitempty"`
 }
 
 // contractLocation is a single on-disk occurrence of a contract —
@@ -643,6 +697,7 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 		e.Schema = promoteSchemaFromLocations(e.Locations)
 		e.ProviderSchema = promoteSchemaForRole(e.Locations, "provider")
 		e.ConsumerSchema = promoteSchemaForRole(e.Locations, "consumer")
+		e.IsTestOnly = locationsAllTagged(e.Locations, "is_test")
 		out = append(out, *e)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -725,14 +780,19 @@ func promoteSchemaForRole(locs []contractLocation, role string) *contractSchema 
 		return nil
 	}
 	s := &contractSchema{
-		RequestType:  metaString(primary.Meta, "request_type"),
-		ResponseType: metaString(primary.Meta, "response_type"),
-		RequestExpr:  metaString(primary.Meta, "request_expr"),
-		ResponseExpr: metaString(primary.Meta, "response_expr"),
-		Source:       metaString(primary.Meta, "schema_source"),
-		PathParams:   metaStrings(primary.Meta, "path_params"),
-		QueryParams:  metaStrings(primary.Meta, "query_params"),
-		StatusCodes:  metaInts(primary.Meta, "status_codes"),
+		RequestType:      metaString(primary.Meta, "request_type"),
+		ResponseType:     metaString(primary.Meta, "response_type"),
+		RequestExpr:      metaString(primary.Meta, "request_expr"),
+		ResponseExpr:     metaString(primary.Meta, "response_expr"),
+		ResponseRepeated: metaBool(primary.Meta, "response_repeated"),
+		ResponseShape:    normaliseShape(primary.Meta["response_shape"]),
+		RequestShape:     normaliseShape(primary.Meta["request_shape"]),
+		ResponseEnvelope: metaEnvelope(primary.Meta, "response_envelope"),
+		Source:           metaString(primary.Meta, "schema_source"),
+		PathParams:       metaStrings(primary.Meta, "path_params"),
+		PathParamNames:   metaStrings(primary.Meta, "path_param_names"),
+		QueryParams:      metaStrings(primary.Meta, "query_params"),
+		StatusCodes:      metaInts(primary.Meta, "status_codes"),
 	}
 	if v, _ := primary.Meta["request_stream"].(bool); v {
 		s.RequestStream = true
@@ -758,11 +818,31 @@ func promoteSchemaForRole(locs []contractLocation, role string) *contractSchema 
 		if len(s.QueryParams) == 0 {
 			s.QueryParams = metaStrings(l.Meta, "query_params")
 		}
+		if len(s.ResponseEnvelope) == 0 {
+			s.ResponseEnvelope = metaEnvelope(l.Meta, "response_envelope")
+		}
 	}
 	if schemaIsEmpty(s) {
 		return nil
 	}
 	return s
+}
+
+// locationsAllTagged reports whether every location carries the named
+// boolean meta flag (e.g. "is_test"). Empty location list returns
+// false — there's nothing to be uniformly tagged. Used to roll up the
+// per-location is_test stamp into a single is_test_only contractEntry
+// flag.
+func locationsAllTagged(locs []contractLocation, key string) bool {
+	if len(locs) == 0 {
+		return false
+	}
+	for _, l := range locs {
+		if v, _ := l.Meta[key].(bool); !v {
+			return false
+		}
+	}
+	return true
 }
 
 // promoteSchemaFromLocations folds schema-shape meta from the primary
@@ -787,14 +867,19 @@ func promoteSchemaFromLocations(locs []contractLocation) *contractSchema {
 		return nil
 	}
 	s := &contractSchema{
-		RequestType:  metaString(primary.Meta, "request_type"),
-		ResponseType: metaString(primary.Meta, "response_type"),
-		RequestExpr:  metaString(primary.Meta, "request_expr"),
-		ResponseExpr: metaString(primary.Meta, "response_expr"),
-		Source:       metaString(primary.Meta, "schema_source"),
-		PathParams:   metaStrings(primary.Meta, "path_params"),
-		QueryParams:  metaStrings(primary.Meta, "query_params"),
-		StatusCodes:  metaInts(primary.Meta, "status_codes"),
+		RequestType:      metaString(primary.Meta, "request_type"),
+		ResponseType:     metaString(primary.Meta, "response_type"),
+		RequestExpr:      metaString(primary.Meta, "request_expr"),
+		ResponseExpr:     metaString(primary.Meta, "response_expr"),
+		ResponseRepeated: metaBool(primary.Meta, "response_repeated"),
+		ResponseShape:    normaliseShape(primary.Meta["response_shape"]),
+		RequestShape:     normaliseShape(primary.Meta["request_shape"]),
+		ResponseEnvelope: metaEnvelope(primary.Meta, "response_envelope"),
+		Source:           metaString(primary.Meta, "schema_source"),
+		PathParams:       metaStrings(primary.Meta, "path_params"),
+		PathParamNames:   metaStrings(primary.Meta, "path_param_names"),
+		QueryParams:      metaStrings(primary.Meta, "query_params"),
+		StatusCodes:      metaInts(primary.Meta, "status_codes"),
 	}
 	if v, _ := primary.Meta["request_stream"].(bool); v {
 		s.RequestStream = true
@@ -822,6 +907,9 @@ func promoteSchemaFromLocations(locs []contractLocation) *contractSchema {
 		if len(s.QueryParams) == 0 {
 			s.QueryParams = metaStrings(l.Meta, "query_params")
 		}
+		if len(s.ResponseEnvelope) == 0 {
+			s.ResponseEnvelope = metaEnvelope(l.Meta, "response_envelope")
+		}
 	}
 	if schemaIsEmpty(s) {
 		return nil
@@ -834,8 +922,85 @@ func schemaIsEmpty(s *contractSchema) bool {
 		return true
 	}
 	return s.RequestType == "" && s.ResponseType == "" && s.RequestExpr == "" && s.ResponseExpr == "" &&
+		len(s.ResponseEnvelope) == 0 &&
+		len(s.ResponseShape) == 0 && len(s.RequestShape) == 0 &&
 		len(s.PathParams) == 0 && len(s.QueryParams) == 0 && len(s.StatusCodes) == 0 &&
-		!s.RequestStream && !s.ResponseStream
+		!s.RequestStream && !s.ResponseStream && !s.ResponseRepeated
+}
+
+// metaEnvelope decodes the upstream "response_envelope" meta entry —
+// emitted by the contract enrichers as a []map[string]any with name /
+// type / expr keys per row. The intermediate JSON pass between
+// daemon and dashboard turns the slice into []any of map[string]any,
+// so we accept both shapes.
+func metaEnvelope(m map[string]any, key string) []envelopeFieldDTO {
+	raw := m[key]
+	if raw == nil {
+		return nil
+	}
+	var rows []map[string]any
+	switch v := raw.(type) {
+	case []map[string]any:
+		rows = v
+	case []any:
+		rows = make([]map[string]any, 0, len(v))
+		for _, x := range v {
+			if row, ok := x.(map[string]any); ok {
+				rows = append(rows, row)
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]envelopeFieldDTO, 0, len(rows))
+	for _, row := range rows {
+		f := envelopeFieldDTO{}
+		if s, ok := row["name"].(string); ok {
+			f.Name = s
+		}
+		if s, ok := row["type"].(string); ok {
+			f.Type = s
+		}
+		if s, ok := row["expr"].(string); ok {
+			f.Expr = s
+		}
+		if v, ok := row["repeated"].(bool); ok {
+			f.Repeated = v
+		}
+		// Shape arrives either as a *contracts.Shape (in-process call)
+		// or as map[string]any (post-JSON-roundtrip on the wire). The
+		// dashboard re-emits it as JSON either way, so we normalise to
+		// map[string]any here.
+		f.Shape = normaliseShape(row["shape"])
+		if f.Name != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// normaliseShape coerces whatever the contracts MCP tool emitted for
+// a "shape" Meta value into a plain map[string]any so the dashboard
+// can re-emit it as JSON. Already-decoded JSON arrives as
+// map[string]any; gob-decoded paths produce *contracts.Shape (or its
+// equivalent struct) which we marshal+unmarshal once.
+func normaliseShape(raw any) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	if m, ok := raw.(map[string]any); ok {
+		return m
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if json.Unmarshal(b, &out) != nil {
+		return nil
+	}
+	return out
 }
 
 func metaString(m map[string]any, key string) string {
@@ -843,6 +1008,13 @@ func metaString(m map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+func metaBool(m map[string]any, key string) bool {
+	if v, ok := m[key].(bool); ok {
+		return v
+	}
+	return false
 }
 
 func metaStrings(m map[string]any, key string) []string {
