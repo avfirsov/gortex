@@ -318,6 +318,12 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	}
 	reporter := progress.FromContext(ctx)
 
+	// Materialise dep::<module> contract nodes from go.mod BEFORE
+	// ResolveAll so the resolver's import bridge can re-target Go
+	// imports of declared modules to their dep contract node instead
+	// of producing an `external::` stub.
+	idx.extractGoModContracts(idx.pendingContractReg)
+
 	reporter.Report("resolving references", 0, 0)
 	idx.resolver.ResolveAll()
 
@@ -345,7 +351,8 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	}
 
 	reporter.Report("extracting contracts", 0, 0)
-	idx.extractGoModContracts(idx.pendingContractReg)
+	// extractGoModContracts already ran (see above) so dep nodes
+	// were available during ResolveAll's import-bridge pass.
 	idx.extractExternalModules()
 	idx.extractDIContracts(idx.pendingContractReg)
 	idx.commitContracts(idx.pendingContractReg)
@@ -1161,6 +1168,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 		// pass walking AllEdges. See SetDeferResolve.
 		idx.pendingContractReg = contractReg
 	} else {
+		// Materialise dep::<module> contract nodes from go.mod BEFORE
+		// ResolveAll so the resolver's import bridge can re-target Go
+		// imports of declared modules to their dep contract node.
+		idx.extractGoModContracts(contractReg)
+
 		reporter.Report("resolving references", 0, 0)
 		// Resolve cross-file references.
 		idx.resolver.ResolveAll()
@@ -1197,11 +1209,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 
 	if !idx.deferResolve {
 		// Contracts were already extracted inline during parse (per file,
-		// per worker). Here we just finish up: run the go.mod extractor
-		// (not associated with any file node) and commit contract nodes /
-		// provides/consumes edges from the merged registry.
+		// per worker). Here we just finish up. extractGoModContracts
+		// already ran (see the !deferResolve branch above) so dep
+		// nodes were available during ResolveAll's import-bridge pass;
+		// commitContracts is idempotent for those.
 		reporter.Report("extracting contracts", 0, 0)
-		idx.extractGoModContracts(contractReg)
 		idx.extractExternalModules()
 		idx.extractDIContracts(contractReg)
 		idx.commitContracts(contractReg)
@@ -2810,6 +2822,14 @@ func readGoModModulePath(src []byte) string {
 // extractGoModContracts runs the go.mod-specific extractor once against
 // the repo root (go.mod isn't represented as a file node in the graph).
 // Results are added to reg. Safe to call when no go.mod exists.
+//
+// Also materialises the dep::<module> contracts as graph nodes
+// immediately, so the resolver's import-bridge (Resolver.lookupDepModule)
+// can find them during ResolveAll. commitContracts later AddNode is
+// idempotent — it skips nodes that already exist — so this doesn't
+// double-emit. We only do this for type=dependency; everything else
+// goes through the normal commit path which depends on a resolved
+// graph (UpgradeBareTypeRefs, resolveProviderHandlers).
 func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	goModPath := filepath.Join(idx.rootPath, "go.mod")
 	goModSrc, err := os.ReadFile(goModPath)
@@ -2823,6 +2843,25 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	}
 	found := goModExtractor.Extract(goModFilePath, goModSrc, nil, nil)
 	reg.AddAllScoped(found, idx.repoPrefix, idx.workspaceID, idx.projectID)
+
+	for i := range found {
+		c := found[i]
+		if c.Type != contracts.ContractDependency {
+			continue
+		}
+		if idx.graph.GetNode(c.ID) != nil {
+			continue
+		}
+		idx.graph.AddNode(&graph.Node{
+			ID:         c.ID,
+			Kind:       graph.KindContract,
+			Name:       c.ID,
+			FilePath:   c.FilePath,
+			Language:   "contract",
+			RepoPrefix: idx.repoPrefix,
+			Meta:       map[string]any{"type": string(c.Type), "role": string(c.Role)},
+		})
+	}
 }
 
 // extractContracts scans all file nodes in the graph and runs contract

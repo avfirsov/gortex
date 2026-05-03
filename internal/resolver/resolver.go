@@ -3,6 +3,7 @@ package resolver
 import (
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -55,6 +56,17 @@ type Resolver struct {
 	// `RegisterAll` resolving to `OverlayManager.Register` simply
 	// because "OverlayManager" sorts before "Registry".
 	reachableDirsByFile map[string]map[string]struct{}
+	// depModuleIndex bridges Go imports to dep::<module> contract
+	// nodes emitted from go.mod. Keyed by RepoPrefix (the dep node's
+	// owning repo) so we never link an import in repo A to a dep
+	// declared by repo B's go.mod. Each entry list is sorted by
+	// modulePath length descending so longest-prefix wins when
+	// modules nest (e.g. aws-sdk-go-v2 vs aws-sdk-go-v2/service/s3).
+	// Without this index, every dep::* contract node sits in the
+	// graph with zero incoming edges — go.mod records the dependency
+	// but no edge points consumers at it. Built once per Resolve*
+	// pass, torn down at the end.
+	depModuleIndex map[string][]depModuleEntry
 	// mu serialises resolution phases against the shared graph.
 	// Pointer so every Resolver built from the same *graph.Graph
 	// locks the same mutex — necessary for MultiIndexer's per-repo
@@ -63,6 +75,14 @@ type Resolver struct {
 	// edge mutations (resolveImport writes e.To while another
 	// goroutine iterates via graph.AllEdges()).
 	mu *sync.Mutex
+}
+
+// depModuleEntry pairs a Go module path (parsed from a dep:: contract
+// node ID) with the node itself, so import-path prefix matches can
+// jump straight to the target.
+type depModuleEntry struct {
+	modulePath string
+	node       *graph.Node
 }
 
 // New creates a Resolver for the given graph. The returned Resolver
@@ -95,6 +115,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 
 	r.buildDirIndexes()
 	defer r.clearDirIndexes()
+	r.buildDepModuleIndex()
+	defer r.clearDepModuleIndex()
 	r.buildProvidesForIndex()
 	defer r.clearProvidesForIndex()
 	r.buildReachabilityIndex()
@@ -221,6 +243,62 @@ func (r *Resolver) clearDirIndexes() {
 	r.lastDirIndex = nil
 }
 
+// buildDepModuleIndex collects every dep::<module-path> contract node
+// (one per non-indirect `require` line in a tracked go.mod) and groups
+// them by the owning repo's prefix so resolveImport can bridge a Go
+// import to the dep node it satisfies. Entries are sorted by
+// modulePath length descending, which keeps longest-prefix-wins for
+// nested modules (e.g. importing "github.com/aws/aws-sdk-go-v2/service/s3"
+// must hit the s3 dep, not the parent aws-sdk-go-v2 dep).
+//
+// Skips dep IDs of the form `dep::<repoName>::<shortName>`, which
+// GoModExtractor emits when the dependency is itself a tracked sibling
+// repo — those resolve through the cross-repo file graph instead and
+// have no module path embedded in the ID.
+func (r *Resolver) buildDepModuleIndex() {
+	nodes := r.graph.AllNodes()
+	by := make(map[string][]depModuleEntry)
+	for _, n := range nodes {
+		if n.Kind != graph.KindContract {
+			continue
+		}
+		if !strings.HasPrefix(n.ID, "dep::") {
+			continue
+		}
+		mp := strings.TrimPrefix(n.ID, "dep::")
+		if mp == "" || strings.Contains(mp, "::") {
+			continue
+		}
+		by[n.RepoPrefix] = append(by[n.RepoPrefix], depModuleEntry{
+			modulePath: mp,
+			node:       n,
+		})
+	}
+	for k := range by {
+		entries := by[k]
+		sort.Slice(entries, func(i, j int) bool {
+			return len(entries[i].modulePath) > len(entries[j].modulePath)
+		})
+	}
+	r.depModuleIndex = by
+}
+
+func (r *Resolver) clearDepModuleIndex() {
+	r.depModuleIndex = nil
+}
+
+// lookupDepModule returns the dep::<module> contract node whose
+// module path is a prefix of importPath, scoped to the caller's repo.
+// Returns nil if no dep declaration covers this import.
+func (r *Resolver) lookupDepModule(callerRepo, importPath string) *graph.Node {
+	for _, entry := range r.depModuleIndex[callerRepo] {
+		if importPath == entry.modulePath || strings.HasPrefix(importPath, entry.modulePath+"/") {
+			return entry.node
+		}
+	}
+	return nil
+}
+
 // ResolveFile resolves unresolved edges originating from a specific file.
 func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.mu.Lock()
@@ -228,6 +306,8 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 
 	r.buildDirIndexes()
 	defer r.clearDirIndexes()
+	r.buildDepModuleIndex()
+	defer r.clearDepModuleIndex()
 	r.buildProvidesForIndex()
 	defer r.clearProvidesForIndex()
 	r.buildReachabilityIndex()
@@ -489,6 +569,17 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		if callerRepo != "" && crossRepoNode.RepoPrefix != "" && crossRepoNode.RepoPrefix != callerRepo {
 			e.CrossRepo = true
 		}
+		stats.Resolved++
+		return
+	}
+
+	// No same- or cross-repo file matched. Before falling back to an
+	// `external::` stub, try the dep::<module> contract nodes from the
+	// caller's go.mod — that bridge is what gives third-party imports
+	// like "github.com/foo/bar/sub/pkg" an incoming edge on the
+	// dep::github.com/foo/bar node.
+	if depNode := r.lookupDepModule(callerRepo, importPath); depNode != nil {
+		e.To = depNode.ID
 		stats.Resolved++
 		return
 	}

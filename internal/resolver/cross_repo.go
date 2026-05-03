@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -61,9 +62,16 @@ type CrossWorkspaceDepLookup func(sourceWorkspaceID string) []CrossWorkspaceDepR
 // the target workspace via `cross_workspace_deps` AND, for import
 // edges, the import path has a declared-module prefix.
 type CrossRepoResolver struct {
-	graph                *graph.Graph
-	dirIndex             map[string][]*graph.Node
-	lastDirIndex         map[string][]*graph.Node
+	graph        *graph.Graph
+	dirIndex     map[string][]*graph.Node
+	lastDirIndex map[string][]*graph.Node
+	// depModuleIndex bridges Go imports to dep::<module> contract
+	// nodes from the caller's go.mod. Same shape and rationale as
+	// the field of the same name on Resolver — see resolver.go for
+	// the full doc. Cross-repo always scopes by callerRepo, so a
+	// dep declared by repo A's go.mod never satisfies an import in
+	// repo B even if the module path matches.
+	depModuleIndex       map[string][]depModuleEntry
 	mu                   *sync.Mutex
 	crossWorkspaceLookup CrossWorkspaceDepLookup
 }
@@ -151,6 +159,8 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 
 	cr.buildDirIndexes()
 	defer cr.clearDirIndexes()
+	cr.buildDepModuleIndex()
+	defer cr.clearDepModuleIndex()
 
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 
@@ -172,6 +182,8 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 
 	cr.buildDirIndexes()
 	defer cr.clearDirIndexes()
+	cr.buildDepModuleIndex()
+	defer cr.clearDepModuleIndex()
 
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 
@@ -215,6 +227,53 @@ func (cr *CrossRepoResolver) buildDirIndexes() {
 			cr.lastDirIndex[last] = append(cr.lastDirIndex[last], n)
 		}
 	}
+}
+
+// buildDepModuleIndex mirrors Resolver.buildDepModuleIndex — see that
+// method for the full rationale. Cross-repo always scopes the lookup
+// by callerRepo, so the same dep node reachable here is the one in the
+// importing file's own go.mod.
+func (cr *CrossRepoResolver) buildDepModuleIndex() {
+	nodes := cr.graph.AllNodes()
+	by := make(map[string][]depModuleEntry)
+	for _, n := range nodes {
+		if n.Kind != graph.KindContract {
+			continue
+		}
+		if !strings.HasPrefix(n.ID, "dep::") {
+			continue
+		}
+		mp := strings.TrimPrefix(n.ID, "dep::")
+		if mp == "" || strings.Contains(mp, "::") {
+			continue
+		}
+		by[n.RepoPrefix] = append(by[n.RepoPrefix], depModuleEntry{
+			modulePath: mp,
+			node:       n,
+		})
+	}
+	for k := range by {
+		entries := by[k]
+		sort.Slice(entries, func(i, j int) bool {
+			return len(entries[i].modulePath) > len(entries[j].modulePath)
+		})
+	}
+	cr.depModuleIndex = by
+}
+
+func (cr *CrossRepoResolver) clearDepModuleIndex() {
+	cr.depModuleIndex = nil
+}
+
+// lookupDepModule returns the dep::<module> contract node whose
+// module path is a prefix of importPath, scoped to callerRepo.
+func (cr *CrossRepoResolver) lookupDepModule(callerRepo, importPath string) *graph.Node {
+	for _, entry := range cr.depModuleIndex[callerRepo] {
+		if importPath == entry.modulePath || strings.HasPrefix(importPath, entry.modulePath+"/") {
+			return entry.node
+		}
+	}
+	return nil
 }
 
 func (cr *CrossRepoResolver) clearDirIndexes() {
@@ -391,6 +450,15 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		stats.Resolved++
 		stats.CrossRepoEdges++
 		stats.ByRepo[crossRepo.RepoPrefix]++
+		return
+	}
+
+	// No file node matched. Try the dep::<module> contract from the
+	// caller's go.mod before giving up. The dep node lives in the
+	// caller's own repo, so this is a same-repo edge.
+	if depNode := cr.lookupDepModule(callerRepo, importPath); depNode != nil {
+		e.To = depNode.ID
+		stats.Resolved++
 		return
 	}
 
