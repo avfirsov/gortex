@@ -29,8 +29,9 @@ curl -fsSL https://get.gortex.dev | sh
 
 For Homebrew, package managers (`.deb` / `.rpm` / `.apk`), direct binary download, supply-chain verification (cosign + SLSA-3 + VirusTotal), and from-source builds — see [docs/installation.md](docs/installation.md).
 
-**New to Gortex?** After installing, see [docs/onboarding.md](docs/onboarding.md) for the 15-minute walkthrough: `gortex install` (once per machine) → `gortex init` (once per repo) → verify your AI assistant uses graph tools → what to do if it doesn't.
-
+**New to Gortex?** After installing, see [docs/onboarding.md](docs/onboarding.md) for the 15-minute walkthrough: 
+`gortex install` (once per machine) → `gortex daemon start --detach` → `gortex track <path to repo>` → your AI assistant uses graph tools
+   
 ## Features
 
 - **Knowledge graph** — every file, symbol, import, call chain, and type relationship in one queryable structure
