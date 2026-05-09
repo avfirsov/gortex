@@ -123,6 +123,20 @@ const qGoAll = `
     (selector_expression
       operand: (_) @decsel.receiver
       field: (field_identifier) @decsel.field)) @decsel.def
+
+  ; Return-statement value-side reads. "return s.port, s.addr" reads
+  ; both fields. We capture each selector in the return expression
+  ; list so the schema's "every value use is a read" rule covers
+  ; functions whose only output is the read.
+  (return_statement
+    (expression_list
+      (selector_expression
+        operand: (_) @retsel.receiver
+        field: (field_identifier) @retsel.field)) @retsel.list)
+
+  (return_statement
+    (expression_list
+      (identifier) @retident.name) @retident.list)
 ]
 `
 
@@ -316,11 +330,12 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					line:   expr.StartLine + 1,
 				})
 			}
-			if tables, ok := detectGoSQLCall(expr.Node, method, src); ok {
+			if tables, cols, ok := detectGoSQLCall(expr.Node, method, src); ok {
 				sqlEvents = append(sqlEvents, goSQLEvent{
-					method: method,
-					tables: tables,
-					line:   expr.StartLine + 1,
+					method:  method,
+					tables:  tables,
+					columns: cols,
+					line:    expr.StartLine + 1,
 				})
 			}
 
@@ -388,7 +403,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				field:    m.Captures["selarg.field"].Text,
 				receiver: m.Captures["selarg.receiver"].Text,
 				line:     list.StartLine + 1,
-				kind:     graph.EdgeReferences,
+				kind:     graph.EdgeReads,
 			})
 
 		case m.Captures["identarg.list"] != nil:
@@ -438,7 +453,23 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				field:    m.Captures["fieldsel.method"].Text,
 				receiver: m.Captures["fieldsel.receiver"].Text,
 				line:     elem.StartLine + 1,
-				kind:     graph.EdgeReferences,
+				kind:     graph.EdgeReads,
+			})
+
+		case m.Captures["retsel.list"] != nil:
+			list := m.Captures["retsel.list"]
+			valueSels = append(valueSels, goDeferredValueSel{
+				field:    m.Captures["retsel.field"].Text,
+				receiver: m.Captures["retsel.receiver"].Text,
+				line:     list.StartLine + 1,
+				kind:     graph.EdgeReads,
+			})
+
+		case m.Captures["retident.list"] != nil:
+			list := m.Captures["retident.list"]
+			valueIdents = append(valueIdents, goDeferredValueIdent{
+				name: m.Captures["retident.name"].Text,
+				line: list.StartLine + 1,
 			})
 		}
 	})
@@ -600,7 +631,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: "unresolved::" + v.name,
-			Kind: graph.EdgeReferences, FilePath: filePath, Line: v.line,
+			Kind: graph.EdgeReads, FilePath: filePath, Line: v.line,
 		})
 	}
 
@@ -615,7 +646,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: callerID, To: "unresolved::" + v.name,
-			Kind: graph.EdgeReferences, FilePath: filePath, Line: v.line,
+			Kind: graph.EdgeReads, FilePath: filePath, Line: v.line,
 		})
 	}
 

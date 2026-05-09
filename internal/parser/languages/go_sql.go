@@ -50,25 +50,26 @@ var goSQLExecMethods = map[string]struct{}{
 // Mirrors the goObservabilityEvent / goFlagEvent shape so the
 // post-pass emit step can match the same patterns.
 type goSQLEvent struct {
-	method string
-	tables []sql.TableRef
-	line   int
+	method  string
+	tables  []sql.TableRef
+	columns []sql.ColumnRef
+	line    int
 }
 
 // detectGoSQLCall returns the table refs extracted from a callm.expr
 // capture when the method name matches the SQL exec set and the
 // call's first argument is a string literal. ok=false on any other
 // shape — non-SQL methods, dynamic queries, no string argument.
-func detectGoSQLCall(callExpr *sitter.Node, method string, src []byte) ([]sql.TableRef, bool) {
+func detectGoSQLCall(callExpr *sitter.Node, method string, src []byte) ([]sql.TableRef, []sql.ColumnRef, bool) {
 	if callExpr == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	if _, hit := goSQLExecMethods[method]; !hit {
-		return nil, false
+		return nil, nil, false
 	}
 	args := callExpr.ChildByFieldName("arguments")
 	if args == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	for i := 0; i < int(args.NamedChildCount()); i++ {
 		c := args.NamedChild(i)
@@ -82,11 +83,12 @@ func detectGoSQLCall(callExpr *sitter.Node, method string, src []byte) ([]sql.Ta
 		query := strings.Trim(c.Content(src), "\"`")
 		refs := sql.ExtractTables(query)
 		if len(refs) == 0 {
-			return nil, false
+			return nil, nil, false
 		}
-		return refs, true
+		cols := sql.ExtractColumns(query)
+		return refs, cols, true
 	}
-	return nil, false
+	return nil, nil, false
 }
 
 // goSQLDriverDialects maps Go SQL driver import paths to the
@@ -209,6 +211,46 @@ func emitGoSQLEvents(events []goSQLEvent, dialect string, callerLookup func(line
 				Origin:   graph.OriginTextMatched,
 				Meta: map[string]any{
 					"op":     ref.Op,
+					"method": e.method,
+				},
+			})
+		}
+		// Column-level reads/writes — same call, finer granularity.
+		// One KindColumn node per (table, column) tuple, one
+		// EdgeReadsCol or EdgeWritesCol per call site.
+		for _, col := range e.columns {
+			colID := sql.ColumnNodeID(dialect, col.Schema, col.Table, col.Column)
+			if _, ok := seenNodes[colID]; !ok {
+				seenNodes[colID] = struct{}{}
+				meta := map[string]any{
+					"table":   col.Table,
+					"column":  col.Column,
+					"dialect": dialect,
+				}
+				if col.Schema != "" {
+					meta["schema"] = col.Schema
+				}
+				result.Nodes = append(result.Nodes, &graph.Node{
+					ID:       colID,
+					Kind:     graph.KindColumn,
+					Name:     col.Column,
+					FilePath: filePath,
+					Language: "go",
+					Meta:     meta,
+				})
+			}
+			edgeKind := graph.EdgeReadsCol
+			if col.Op == "write" {
+				edgeKind = graph.EdgeWritesCol
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     callerID,
+				To:       colID,
+				Kind:     edgeKind,
+				FilePath: filePath,
+				Line:     e.line,
+				Origin:   graph.OriginTextMatched,
+				Meta: map[string]any{
 					"method": e.method,
 				},
 			})

@@ -42,6 +42,81 @@ func Run(db *DB) {
 	}
 }
 
+func TestGoSQL_EmitsColumnReadsAndWrites(t *testing.T) {
+	src := `package foo
+
+type DB struct{}
+func (d *DB) Query(q string, args ...any) (any, error) { return nil, nil }
+func (d *DB) Exec(q string, args ...any) (any, error)  { return nil, nil }
+
+func Run(db *DB) {
+	_, _ = db.Query("SELECT id, email FROM users WHERE id = $1")
+	_, _ = db.Exec("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2")
+	_, _ = db.Exec("INSERT INTO sessions (user_id, token) VALUES ($1, $2)")
+}
+`
+	fix := runGoExtract(t, src)
+
+	cols := fix.nodesByKind[graph.KindColumn]
+	if len(cols) == 0 {
+		t.Fatalf("expected KindColumn nodes; got none")
+	}
+	wantCols := map[string]bool{
+		"col::generic::users.id":          false,
+		"col::generic::users.email":       false,
+		"col::generic::users.updated_at":  false,
+		"col::generic::sessions.user_id":  false,
+		"col::generic::sessions.token":    false,
+	}
+	for _, n := range cols {
+		if _, ok := wantCols[n.ID]; ok {
+			wantCols[n.ID] = true
+		}
+	}
+	for id, found := range wantCols {
+		if !found {
+			t.Errorf("expected KindColumn %s; got %v", id, nodeIDs(cols))
+		}
+	}
+
+	reads := fix.edgesByKind[graph.EdgeReadsCol]
+	hasIDRead := false
+	for _, e := range reads {
+		if e.To == "col::generic::users.id" {
+			hasIDRead = true
+		}
+	}
+	if !hasIDRead {
+		t.Errorf("expected EdgeReadsCol → users.id; got %v", edgeTargets(reads))
+	}
+
+	writes := fix.edgesByKind[graph.EdgeWritesCol]
+	hasEmailWrite := false
+	hasTokenWrite := false
+	for _, e := range writes {
+		if e.To == "col::generic::users.email" {
+			hasEmailWrite = true
+		}
+		if e.To == "col::generic::sessions.token" {
+			hasTokenWrite = true
+		}
+	}
+	if !hasEmailWrite {
+		t.Errorf("expected EdgeWritesCol → users.email; got %v", edgeTargets(writes))
+	}
+	if !hasTokenWrite {
+		t.Errorf("expected EdgeWritesCol → sessions.token; got %v", edgeTargets(writes))
+	}
+}
+
+func nodeIDs(nodes []*graph.Node) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.ID)
+	}
+	return out
+}
+
 func TestGoSQL_DynamicQuerySkipped(t *testing.T) {
 	src := `package foo
 

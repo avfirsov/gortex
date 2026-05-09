@@ -17,11 +17,11 @@ func TestParse_PorcelainBasic(t *testing.T) {
 	// porcelain emits `\t` even for blank source.
 	out := []byte("1234567890abcdef1234567890abcdef12345678 1 1 3\n" +
 		"author Alice\n" +
-		"author-mail <alice@example.com>\n" +
+		"author-mail <test@example.com>\n" +
 		"author-time 1700000000\n" +
 		"author-tz +0000\n" +
 		"committer Alice\n" +
-		"committer-mail <alice@example.com>\n" +
+		"committer-mail <test@example.com>\n" +
 		"committer-time 1700000000\n" +
 		"committer-tz +0000\n" +
 		"summary first\n" +
@@ -33,11 +33,11 @@ func TestParse_PorcelainBasic(t *testing.T) {
 		"\tfunc Hello() {}\n" +
 		"abcdef0123456789abcdef0123456789abcdef01 4 4 1\n" +
 		"author Bob\n" +
-		"author-mail <bob@example.com>\n" +
+		"author-mail <test@example.com>\n" +
 		"author-time 1710000000\n" +
 		"author-tz +0000\n" +
 		"committer Bob\n" +
-		"committer-mail <bob@example.com>\n" +
+		"committer-mail <test@example.com>\n" +
 		"committer-time 1710000000\n" +
 		"committer-tz +0000\n" +
 		"summary edit\n" +
@@ -50,19 +50,19 @@ func TestParse_PorcelainBasic(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("expected 4 lines, got %d: %+v", len(got), got)
 	}
-	if got[1].Email != "alice@example.com" {
+	if got[1].Email != "test@example.com" {
 		t.Errorf("line 1 email = %q", got[1].Email)
 	}
 	if got[1].Timestamp.Unix() != 1700000000 {
 		t.Errorf("line 1 timestamp = %v", got[1].Timestamp)
 	}
-	if got[4].Email != "bob@example.com" {
+	if got[4].Email != "test@example.com" {
 		t.Errorf("line 4 email = %q", got[4].Email)
 	}
-	if got[2].Email != "alice@example.com" {
+	if got[2].Email != "test@example.com" {
 		t.Errorf("line 2 email = %q (should reuse cached header)", got[2].Email)
 	}
-	if got[3].Email != "alice@example.com" {
+	if got[3].Email != "test@example.com" {
 		t.Errorf("line 3 email = %q", got[3].Email)
 	}
 }
@@ -169,6 +169,144 @@ func TestEnrichGraph_StampsLastAuthored(t *testing.T) {
 	}
 	if _, ok := la["timestamp"].(int64); !ok {
 		t.Errorf("timestamp not int64: %T %v", la["timestamp"], la["timestamp"])
+	}
+}
+
+func TestEnrichGraph_EmitsAuthoredEdgeAndPersonNode(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir := t.TempDir()
+	if err := runCmd(t, repoDir, "git", "init", "-q"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "config", "user.email", "test@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "config", "user.name", "Alice"); err != nil {
+		t.Fatal(err)
+	}
+	source := "package main\n\nfunc Hello() {}\n"
+	if err := writeFile(filepath.Join(repoDir, "main.go"), source); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "add", "main.go"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "commit", "-q", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:        "main.go::Hello",
+		Kind:      graph.KindFunction,
+		Name:      "Hello",
+		FilePath:  "main.go",
+		StartLine: 3,
+		EndLine:   3,
+	})
+
+	if _, err := EnrichGraph(g, repoDir); err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	personID := PersonNodeID("test@example.com")
+	person := g.GetNode(personID)
+	if person == nil {
+		t.Fatalf("person node %q not added", personID)
+	}
+	if person.Kind != graph.KindTeam {
+		t.Errorf("person.Kind = %v, want KindTeam", person.Kind)
+	}
+	if person.Meta["kind"] != "person" {
+		t.Errorf("person.Meta.kind = %v, want \"person\"", person.Meta["kind"])
+	}
+
+	edges := g.GetOutEdges(personID)
+	var authored *graph.Edge
+	for _, e := range edges {
+		if e.Kind == graph.EdgeAuthored && e.To == "main.go::Hello" {
+			authored = e
+			break
+		}
+	}
+	if authored == nil {
+		t.Fatalf("EdgeAuthored from %s to main.go::Hello missing; out-edges = %+v", personID, edges)
+	}
+	if authored.Origin != graph.OriginASTResolved {
+		t.Errorf("authored.Origin = %q, want ast_resolved", authored.Origin)
+	}
+	if _, ok := authored.Meta["commit"].(string); !ok {
+		t.Errorf("authored.Meta.commit not a string: %v", authored.Meta["commit"])
+	}
+	if _, ok := authored.Meta["timestamp"].(int64); !ok {
+		t.Errorf("authored.Meta.timestamp not int64: %T", authored.Meta["timestamp"])
+	}
+}
+
+func TestEnrichGraph_PersonNodeRepoScoped(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir := t.TempDir()
+	if err := runCmd(t, repoDir, "git", "init", "-q"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "config", "user.email", "test@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "config", "user.name", "Bob"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(repoDir, "lib.go"), "package main\n\nfunc Foo() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "add", "lib.go"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(t, repoDir, "git", "commit", "-q", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:         "myrepo/lib.go::Foo",
+		Kind:       graph.KindFunction,
+		Name:       "Foo",
+		FilePath:   "myrepo/lib.go",
+		StartLine:  3,
+		EndLine:    3,
+		RepoPrefix: "myrepo",
+	})
+
+	if _, err := EnrichGraph(g, repoDir); err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	scopedID := "myrepo/" + PersonNodeID("test@example.com")
+	if g.GetNode(scopedID) == nil {
+		t.Fatalf("repo-scoped person node %q missing", scopedID)
+	}
+	if g.GetNode(PersonNodeID("test@example.com")) != nil {
+		t.Errorf("unscoped person node leaked into multi-repo graph")
+	}
+}
+
+func TestPersonNodeID(t *testing.T) {
+	cases := []struct {
+		in, out string
+	}{
+		{"Alice@Example.com", "team::alice@example.com"},
+		{"  bob@example.com  ", "team::bob@example.com"},
+		{"", "team::"},
+	}
+	for _, c := range cases {
+		if got := PersonNodeID(c.in); got != c.out {
+			t.Errorf("PersonNodeID(%q) = %q, want %q", c.in, got, c.out)
+		}
 	}
 }
 

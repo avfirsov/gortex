@@ -351,6 +351,7 @@ func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 		From: fileID, To: id, Kind: graph.EdgeDefines,
 		FilePath: filePath, Line: def.StartLine + 1,
 	})
+	emitTSFunctionShape(id, def.Node, src, filePath, def.StartLine+1, result)
 }
 
 // tsFunctionBody returns the statement_block child of a function or
@@ -391,6 +392,10 @@ func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		From: fileID, To: id, Kind: graph.EdgeDefines,
 		FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Function-shape (params/returns/generics) on the arrow's body.
+	if body := m.Captures["arrow.body"]; body != nil && body.Node != nil {
+		emitTSFunctionShape(id, body.Node, src, filePath, def.StartLine+1, result)
+	}
 	return name
 }
 
@@ -515,6 +520,8 @@ func (e *TypeScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 		// module factory providers are dispatched from walkClassMembers
 		// in the post-pass.
 		emitModuleBindings(def.Node, src, id, filePath, result)
+		// Generic <T extends Y> on the class declaration.
+		emitTSGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 	}
 	return id
 }
@@ -747,6 +754,8 @@ func (e *TypeScriptExtractor) emitMethod(m parser.QueryResult, filePath string, 
 		From: id, To: classID, Kind: graph.EdgeMemberOf,
 		FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Function shape (params, return type, generics) for the method.
+	emitTSFunctionShape(id, def.Node, src, filePath, def.StartLine+1, result)
 	// NestJS-style dispatch decorators (@UseGuards/@UseInterceptors/...)
 	// are SIBLINGS of method_definition inside class_body — walk backward.
 	// Each decorator also produces an EdgeAnnotated → annotation node so

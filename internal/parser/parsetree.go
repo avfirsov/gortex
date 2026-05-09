@@ -90,3 +90,48 @@ func (pt *ParseTree) Release() {
 func (pt *ParseTree) Close() {
 	pt.Release()
 }
+
+// HasParseErrors reports whether the underlying tree contains any
+// ERROR or MISSING nodes. Returns false for a nil ParseTree so
+// language extractors that drop their tree (most non-Go languages)
+// don't appear to have parse errors when the signal isn't available.
+func (pt *ParseTree) HasParseErrors() bool {
+	if pt == nil || pt.tree == nil {
+		return false
+	}
+	root := pt.tree.RootNode()
+	if root == nil {
+		return false
+	}
+	return root.HasError()
+}
+
+// CountParseErrors returns the number of ERROR or MISSING nodes in
+// the tree. Useful for stamping a quantitative parse_errors metric
+// on a KindFile node so index_health can rank the worst offenders.
+// Returns 0 when the ParseTree is nil.
+func (pt *ParseTree) CountParseErrors() int {
+	if pt == nil || pt.tree == nil {
+		return 0
+	}
+	root := pt.tree.RootNode()
+	if root == nil {
+		return 0
+	}
+	count := 0
+	walkParseErrors(root, &count)
+	return count
+}
+
+func walkParseErrors(n *sitter.Node, count *int) {
+	if n == nil {
+		return
+	}
+	if n.Type() == "ERROR" || n.IsMissing() {
+		*count++
+	}
+	childCount := int(n.ChildCount())
+	for i := 0; i < childCount; i++ {
+		walkParseErrors(n.Child(i), count)
+	}
+}

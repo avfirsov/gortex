@@ -242,6 +242,99 @@ func TestMigrationNodeID(t *testing.T) {
 	}
 }
 
+func TestExtractColumns_InsertWrites(t *testing.T) {
+	got := ExtractColumns("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)")
+	wantCols := map[string]bool{"id": false, "email": false, "name": false}
+	for _, c := range got {
+		if c.Op != "write" {
+			t.Errorf("expected write op, got %q for %q", c.Op, c.Column)
+		}
+		if c.Table != "users" {
+			t.Errorf("expected table users, got %q", c.Table)
+		}
+		if _, ok := wantCols[c.Column]; ok {
+			wantCols[c.Column] = true
+		}
+	}
+	for col, found := range wantCols {
+		if !found {
+			t.Errorf("expected column %q in result, got %v", col, got)
+		}
+	}
+}
+
+func TestExtractColumns_UpdateWrites(t *testing.T) {
+	got := ExtractColumns("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2")
+	wantCols := map[string]bool{"email": false, "updated_at": false}
+	for _, c := range got {
+		if c.Op != "write" {
+			continue
+		}
+		if _, ok := wantCols[c.Column]; ok {
+			wantCols[c.Column] = true
+		}
+	}
+	for col, found := range wantCols {
+		if !found {
+			t.Errorf("expected SET column %q to surface as write; got %v", col, got)
+		}
+	}
+}
+
+func TestExtractColumns_SingleTableSelectReads(t *testing.T) {
+	got := ExtractColumns("SELECT id, email, name FROM users WHERE id = $1")
+	want := map[string]bool{"id": false, "email": false, "name": false}
+	for _, c := range got {
+		if c.Op != "read" {
+			continue
+		}
+		if c.Table != "users" {
+			continue
+		}
+		if _, ok := want[c.Column]; ok {
+			want[c.Column] = true
+		}
+	}
+	for col, found := range want {
+		if !found {
+			t.Errorf("expected read column %q; got %v", col, got)
+		}
+	}
+}
+
+func TestExtractColumns_StarSelectNoColumns(t *testing.T) {
+	got := ExtractColumns("SELECT * FROM users")
+	for _, c := range got {
+		if c.Op == "read" {
+			t.Errorf("SELECT * should not produce read columns; got %v", got)
+		}
+	}
+}
+
+func TestExtractColumns_JoinSelectReturnsNoColumns(t *testing.T) {
+	got := ExtractColumns("SELECT u.id, o.id FROM users u JOIN orders o ON o.user_id = u.id")
+	for _, c := range got {
+		if c.Op == "read" {
+			t.Errorf("multi-table SELECT should not emit columns in v1; got %v", got)
+		}
+	}
+}
+
+func TestColumnNodeID(t *testing.T) {
+	cases := []struct {
+		dialect, schema, table, column, want string
+	}{
+		{"postgres", "public", "users", "email", "col::postgres::public.users.email"},
+		{"", "", "users", "email", "col::generic::users.email"},
+	}
+	for _, c := range cases {
+		if got := ColumnNodeID(c.dialect, c.schema, c.table, c.column); got != c.want {
+			t.Errorf("ColumnNodeID(%q,%q,%q,%q) = %q, want %q",
+				c.dialect, c.schema, c.table, c.column, got, c.want)
+		}
+	}
+}
+
 func TestTableNodeID(t *testing.T) {
 	cases := []struct {
 		dialect, schema, table, want string

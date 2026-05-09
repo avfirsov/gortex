@@ -178,6 +178,17 @@ func isHeaderLine(line string) bool {
 // package nodes (no symbol-level authorship signal there) and the
 // synthetic kinds (todo, license, team, …) which by construction
 // have no per-line author.
+
+// PersonNodeID returns the canonical KindTeam node ID for a blame
+// author email. Mirrors codeowners.TeamNodeID but keys on email so a
+// person who is not yet a CODEOWNERS owner still gets a stable ID.
+// Repo-scoping (the leading "<prefix>/" in multi-repo mode) is
+// applied by the caller, since blame.EnrichGraph reads RepoPrefix
+// off existing graph nodes.
+func PersonNodeID(email string) string {
+	return "team::" + strings.ToLower(strings.TrimSpace(email))
+}
+
 func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 	if g == nil || repoRoot == "" {
 		return 0, nil
@@ -201,6 +212,11 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 	}
 
 	enriched := 0
+	// Person nodes are deduplicated within this enrichment pass.
+	// IDs are repo-scoped: in multi-repo mode the same email touching
+	// two repos becomes two distinct KindTeam nodes so per-repo
+	// queries stay scoped. The dedup key matches the final node ID.
+	personNodes := make(map[string]*graph.Node)
 	for path, nodes := range byPath {
 		lines, err := Run(repoRoot, path)
 		if err != nil || len(lines) == 0 {
@@ -220,6 +236,45 @@ func EnrichGraph(g *graph.Graph, repoRoot string) (int, error) {
 				"timestamp": latest.Timestamp.Unix(),
 			}
 			enriched++
+
+			if latest.Email == "" {
+				continue
+			}
+			personID := PersonNodeID(latest.Email)
+			if n.RepoPrefix != "" {
+				personID = n.RepoPrefix + "/" + personID
+			}
+			if _, ok := personNodes[personID]; !ok {
+				node := &graph.Node{
+					ID:          personID,
+					Kind:        graph.KindTeam,
+					Name:        latest.Email,
+					FilePath:    n.FilePath, // first sighting; not authoritative
+					Language:    n.Language,
+					RepoPrefix:  n.RepoPrefix,
+					WorkspaceID: n.WorkspaceID,
+					ProjectID:   n.ProjectID,
+					Meta: map[string]any{
+						"kind":  "person",
+						"email": latest.Email,
+					},
+				}
+				g.AddNode(node)
+				personNodes[personID] = node
+			}
+			edge := &graph.Edge{
+				From:     personID,
+				To:       n.ID,
+				Kind:     graph.EdgeAuthored,
+				FilePath: n.FilePath,
+				Line:     n.StartLine,
+				Origin:   graph.OriginASTResolved,
+				Meta: map[string]any{
+					"commit":    latest.Commit,
+					"timestamp": latest.Timestamp.Unix(),
+				},
+			}
+			g.AddEdge(edge)
 		}
 	}
 	return enriched, nil

@@ -25,6 +25,13 @@ type Provider struct {
 	logger      *zap.Logger
 
 	client *Client
+
+	// sourceCache holds file contents read by openDocument so the
+	// per-symbol column-resolution lookups don't reread the file
+	// for every hover / references / implementation query. Keyed
+	// by absolute path. Eviction is not implemented — the cache
+	// lives only for the duration of one Enrich pass.
+	sourceCache map[string][]byte
 }
 
 // NewProvider creates an LSP provider.
@@ -154,7 +161,8 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 			openedFiles[n.FilePath] = true
 		}
 
-		hoverResult, err := p.hover(absRoot, n.FilePath, n.StartLine-1, 0)
+		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
+		hoverResult, err := p.hover(absRoot, n.FilePath, n.StartLine-1, col)
 		if err != nil || hoverResult == nil {
 			continue
 		}
@@ -186,7 +194,8 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 			continue
 		}
 
-		impls, err := p.findImplementations(absRoot, n.FilePath, n.StartLine-1, 0)
+		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
+		impls, err := p.findImplementations(absRoot, n.FilePath, n.StartLine-1, col)
 		if err != nil || len(impls) == 0 {
 			continue
 		}
@@ -215,6 +224,19 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 		}
 	}
 
+	// Call hierarchy: ask gopls/jdtls/rust-analyzer/... for
+	// outgoing calls per indexed function and use them to promote
+	// existing call edges to lsp_resolved (or add edges that AST
+	// extraction missed when the callee is in another file).
+	p.enrichCallHierarchy(g, absRoot, result)
+
+	// Type hierarchy: ask the server for super- and sub-types of
+	// each indexed type/interface and emit EdgeExtends /
+	// EdgeImplements / EdgeComposes — the single biggest non-Go
+	// win because the AST extractor handles interface and type
+	// inheritance with very low fidelity outside Go.
+	p.enrichTypeHierarchy(g, absRoot, result)
+
 	// Query references for AMBIGUOUS edges to confirm/refute.
 	for _, t := range targets {
 		toNode := g.GetNode(t.edge.To)
@@ -222,7 +244,8 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 			continue
 		}
 
-		refs, err := p.findReferences(absRoot, toNode.FilePath, toNode.StartLine-1, 0)
+		col := identifierColumn(p.getSource(absRoot, toNode.FilePath), toNode.StartLine, toNode.Name)
+		refs, err := p.findReferences(absRoot, toNode.FilePath, toNode.StartLine-1, col)
 		if err != nil || len(refs) == 0 {
 			continue
 		}
@@ -280,6 +303,8 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 				References:     &ReferencesCapability{DynamicRegistration: true},
 				Definition:     &DefinitionCapability{DynamicRegistration: true},
 				Hover:          &HoverCapability{ContentFormat: []string{"plaintext"}},
+				CallHierarchy:  &CallHierarchyCapability{DynamicRegistration: true},
+				TypeHierarchy:  &TypeHierarchyCapability{DynamicRegistration: true},
 			},
 		},
 	}
@@ -307,6 +332,10 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 	if err != nil {
 		return err
 	}
+	if p.sourceCache == nil {
+		p.sourceCache = map[string][]byte{}
+	}
+	p.sourceCache[absPath] = content
 
 	langID := "go" // default
 	if len(p.languages) > 0 {
@@ -321,6 +350,16 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 			Text:       string(content),
 		},
 	})
+}
+
+// getSource returns cached file content from the most recent
+// openDocument call. Returns nil when not cached — callers fall
+// back to col=0 then.
+func (p *Provider) getSource(repoRoot, relPath string) []byte {
+	if p.sourceCache == nil {
+		return nil
+	}
+	return p.sourceCache[filepath.Join(repoRoot, relPath)]
 }
 
 // hover queries hover info for a position.
@@ -378,6 +417,214 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 	return locations, nil
 }
 
+// enrichCallHierarchy walks every function/method node in p.languages
+// and uses callHierarchy/{prepare, outgoingCalls} to either promote a
+// matching ast_inferred / text_matched EdgeCalls to lsp_resolved, or
+// add a fresh EdgeCalls when the AST extractor missed the link
+// (cross-file calls in languages without compile-unit info).
+func (p *Provider) enrichCallHierarchy(g *graph.Graph, absRoot string, result *semantic.EnrichResult) {
+	for _, n := range g.AllNodes() {
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		if !p.languageMatches(n.Language) {
+			continue
+		}
+		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
+		items, err := p.prepareCallHierarchy(absRoot, n.FilePath, n.StartLine-1, col)
+		if err != nil || len(items) == 0 {
+			continue
+		}
+		for _, item := range items {
+			calls, err := p.outgoingCalls(item)
+			if err != nil {
+				continue
+			}
+			for _, c := range calls {
+				toPath := uriToPath(c.To.URI, absRoot)
+				if toPath == "" {
+					continue
+				}
+				toNode := semantic.MatchNodeByFileLine(g, toPath,
+					c.To.SelectionRange.Start.Line+1)
+				if toNode == nil {
+					continue
+				}
+				existing := semantic.FindMatchingEdge(g, n.ID, toNode.ID, graph.EdgeCalls)
+				if existing != nil {
+					if graph.OriginRank(existing.Origin) < graph.OriginRank(graph.OriginLSPResolved) {
+						semantic.ConfirmEdge(existing, p.Name())
+						existing.Origin = graph.OriginLSPResolved
+						result.EdgesConfirmed++
+					}
+					continue
+				}
+				semantic.AddSemanticEdge(g, n.ID, toNode.ID, graph.EdgeCalls,
+					n.FilePath, n.StartLine, p.Name())
+				result.EdgesAdded++
+			}
+		}
+	}
+}
+
+// enrichTypeHierarchy walks every type / interface node and uses
+// typeHierarchy/{prepare, supertypes, subtypes} to fill EdgeExtends
+// / EdgeImplements / EdgeComposes for non-Go languages where AST
+// extraction can't follow `extends X` / `implements I` across files.
+//
+//   - supertypes(T) = the parents T extends/implements. Emits
+//     EdgeExtends T → super for class hierarchy and EdgeImplements
+//     T → super when the super is an interface kind.
+//   - subtypes(T) = the children of T. Emits EdgeImplements child
+//     → T when T is an interface; EdgeExtends otherwise.
+func (p *Provider) enrichTypeHierarchy(g *graph.Graph, absRoot string, result *semantic.EnrichResult) {
+	for _, n := range g.AllNodes() {
+		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
+			continue
+		}
+		if !p.languageMatches(n.Language) {
+			continue
+		}
+		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
+		items, err := p.prepareTypeHierarchy(absRoot, n.FilePath, n.StartLine-1, col)
+		if err != nil || len(items) == 0 {
+			continue
+		}
+		for _, item := range items {
+			supers, _ := p.supertypes(item)
+			for _, s := range supers {
+				p.linkTypeHierarchy(g, absRoot, n, s, true, result)
+			}
+			subs, _ := p.subtypes(item)
+			for _, s := range subs {
+				p.linkTypeHierarchy(g, absRoot, n, s, false, result)
+			}
+		}
+	}
+}
+
+// linkTypeHierarchy emits the right edge kind for one super/subtype
+// hop. When asSupertype=true, the hop is `cur → other` (cur extends
+// or implements other). When false, the hop is `other → cur`.
+func (p *Provider) linkTypeHierarchy(g *graph.Graph, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
+	otherPath := uriToPath(other.URI, absRoot)
+	if otherPath == "" {
+		return
+	}
+	otherNode := semantic.MatchNodeByFileLine(g, otherPath, other.SelectionRange.Start.Line+1)
+	if otherNode == nil {
+		return
+	}
+	from, to := cur, otherNode
+	if !asSupertype {
+		from, to = otherNode, cur
+	}
+	kind := graph.EdgeExtends
+	if to.Kind == graph.KindInterface {
+		kind = graph.EdgeImplements
+	}
+	if from.ID == to.ID {
+		return
+	}
+	existing := semantic.FindMatchingEdge(g, from.ID, to.ID, kind)
+	if existing != nil {
+		if graph.OriginRank(existing.Origin) < graph.OriginRank(graph.OriginLSPResolved) {
+			semantic.ConfirmEdge(existing, p.Name())
+			existing.Origin = graph.OriginLSPResolved
+			result.EdgesConfirmed++
+		}
+		return
+	}
+	semantic.AddSemanticEdge(g, from.ID, to.ID, kind, from.FilePath, from.StartLine, p.Name())
+	result.EdgesAdded++
+}
+
+// languageMatches returns true when n.Language is one of the
+// languages this provider serves.
+func (p *Provider) languageMatches(lang string) bool {
+	for _, l := range p.languages {
+		if l == lang {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareCallHierarchy queries textDocument/prepareCallHierarchy and
+// returns the items the server resolved at the given position. Empty
+// (and nil error) means the server doesn't recognise a function-like
+// symbol at that location.
+func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int) ([]CallHierarchyItem, error) {
+	absPath := filepath.Join(repoRoot, relPath)
+	params := CallHierarchyPrepareParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
+			Position:     Position{Line: line, Character: col},
+		},
+	}
+	var items []CallHierarchyItem
+	if err := p.client.Call("textDocument/prepareCallHierarchy", params, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// outgoingCalls queries callHierarchy/outgoingCalls for one item.
+func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoingCall, error) {
+	var calls []CallHierarchyOutgoingCall
+	if err := p.client.Call("callHierarchy/outgoingCalls",
+		CallHierarchyOutgoingCallsParams{Item: item}, &calls); err != nil {
+		return nil, err
+	}
+	return calls, nil
+}
+
+// incomingCalls queries callHierarchy/incomingCalls for one item.
+func (p *Provider) incomingCalls(item CallHierarchyItem) ([]CallHierarchyIncomingCall, error) {
+	var calls []CallHierarchyIncomingCall
+	if err := p.client.Call("callHierarchy/incomingCalls",
+		CallHierarchyIncomingCallsParams{Item: item}, &calls); err != nil {
+		return nil, err
+	}
+	return calls, nil
+}
+
+// prepareTypeHierarchy queries textDocument/prepareTypeHierarchy.
+func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int) ([]TypeHierarchyItem, error) {
+	absPath := filepath.Join(repoRoot, relPath)
+	params := TypeHierarchyPrepareParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
+			Position:     Position{Line: line, Character: col},
+		},
+	}
+	var items []TypeHierarchyItem
+	if err := p.client.Call("textDocument/prepareTypeHierarchy", params, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// supertypes queries typeHierarchy/supertypes.
+func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	var items []TypeHierarchyItem
+	if err := p.client.Call("typeHierarchy/supertypes",
+		TypeHierarchySupertypesParams{Item: item}, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// subtypes queries typeHierarchy/subtypes.
+func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	var items []TypeHierarchyItem
+	if err := p.client.Call("typeHierarchy/subtypes",
+		TypeHierarchySubtypesParams{Item: item}, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 // pathToURI converts a file path to a file:// URI.
 func pathToURI(path string) string {
 	absPath, _ := filepath.Abs(path)
@@ -399,6 +646,49 @@ func uriToPath(uri, repoRoot string) string {
 		return ""
 	}
 	return filepath.ToSlash(rel)
+}
+
+// identifierColumn returns the 0-based column of the first
+// occurrence of name on the given 1-based line of src. Returns 0
+// when the source doesn't have the line, the name isn't found on
+// it, or name is empty — col=0 was the previous unconditional
+// default and remains a safe fallback for those edge cases.
+//
+// Why this matters: most LSP servers (gopls, jdtls, rust-analyzer,
+// kotlin-ls, omnisharp, pyright) require the position cursor to be
+// _on_ the identifier for textDocument/references and
+// textDocument/implementation. Pinning to col=0 silently empty-resulted
+// every method declaration in indented contexts (`func (f *Foo) Bar()`
+// — col=0 is the `func` keyword, not `Bar`). Resolving to the actual
+// identifier column unblocks the bulk of cross-file edge promotion.
+func identifierColumn(src []byte, oneBasedLine int, name string) int {
+	if name == "" || oneBasedLine <= 0 || len(src) == 0 {
+		return 0
+	}
+	// Walk to the start of the requested line.
+	target := oneBasedLine - 1
+	lineStart := 0
+	cur := 0
+	for cur < len(src) && target > 0 {
+		if src[cur] == '\n' {
+			target--
+			lineStart = cur + 1
+		}
+		cur++
+	}
+	if target > 0 {
+		return 0
+	}
+	lineEnd := lineStart
+	for lineEnd < len(src) && src[lineEnd] != '\n' {
+		lineEnd++
+	}
+	line := string(src[lineStart:lineEnd])
+	idx := strings.Index(line, name)
+	if idx < 0 {
+		return 0
+	}
+	return idx
 }
 
 // extractTypeFromHover extracts type information from hover text.

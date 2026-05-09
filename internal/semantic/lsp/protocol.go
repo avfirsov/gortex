@@ -21,6 +21,18 @@ type TextDocumentClientCapabilities struct {
 	References     *ReferencesCapability     `json:"references,omitempty"`
 	Definition     *DefinitionCapability     `json:"definition,omitempty"`
 	Hover          *HoverCapability          `json:"hover,omitempty"`
+	CallHierarchy  *CallHierarchyCapability  `json:"callHierarchy,omitempty"`
+	TypeHierarchy  *TypeHierarchyCapability  `json:"typeHierarchy,omitempty"`
+}
+
+// CallHierarchyCapability declares callHierarchy/* request support.
+type CallHierarchyCapability struct {
+	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
+}
+
+// TypeHierarchyCapability declares typeHierarchy/* request support.
+type TypeHierarchyCapability struct {
+	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
 }
 
 // ImplementationCapability declares implementation request support.
@@ -168,4 +180,28 @@ type CallHierarchyOutgoingCallsParams struct {
 type CallHierarchyOutgoingCall struct {
 	To         CallHierarchyItem `json:"to"`
 	FromRanges []Range           `json:"fromRanges"`
+}
+
+// TypeHierarchyPrepareParams is the params for textDocument/prepareTypeHierarchy.
+type TypeHierarchyPrepareParams struct {
+	TextDocumentPositionParams
+}
+
+// TypeHierarchyItem represents an item in the type hierarchy.
+type TypeHierarchyItem struct {
+	Name           string `json:"name"`
+	Kind           int    `json:"kind"`
+	URI            string `json:"uri"`
+	Range          Range  `json:"range"`
+	SelectionRange Range  `json:"selectionRange"`
+}
+
+// TypeHierarchySupertypesParams is the params for typeHierarchy/supertypes.
+type TypeHierarchySupertypesParams struct {
+	Item TypeHierarchyItem `json:"item"`
+}
+
+// TypeHierarchySubtypesParams is the params for typeHierarchy/subtypes.
+type TypeHierarchySubtypesParams struct {
+	Item TypeHierarchyItem `json:"item"`
 }

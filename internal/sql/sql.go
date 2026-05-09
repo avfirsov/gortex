@@ -233,6 +233,251 @@ func ExtractCreateTables(source string) []TableRef {
 	return refs
 }
 
+// ColumnRef is a single resolved column reference. Op is "read" for
+// columns appearing in SELECT projections, WHERE clauses, ORDER BY,
+// or GROUP BY; "write" for columns in INSERT INTO (col-list) and
+// UPDATE … SET col = … assignments. Table identifies the table the
+// column belongs to; multi-table queries (joins) are restricted to
+// the first table reference because column-table association would
+// otherwise require a real SQL parser.
+type ColumnRef struct {
+	Schema string
+	Table  string
+	Column string
+	Op     string // "read" | "write"
+}
+
+// insertColsRe matches `INSERT INTO tbl (col1, col2, …)` with
+// optional schema-qualified table.
+var insertColsRe = regexp.MustCompile(`(?is)\bINSERT\s+INTO\s+([a-zA-Z_"\x60\[][a-zA-Z0-9_."\x60\]]*)\s*\(([^)]*)\)`)
+
+// updateSetRe matches `UPDATE tbl SET col = …, col2 = …` capturing
+// the table name and the SET clause's content (greedy until WHERE
+// or end of statement).
+var updateSetRe = regexp.MustCompile(`(?is)\bUPDATE\s+([a-zA-Z_"\x60\[][a-zA-Z0-9_."\x60\]]*)\s+SET\s+(.+?)(?:\bWHERE\b|\bRETURNING\b|;|$)`)
+
+// selectFromRe matches `SELECT cols FROM tbl` for single-table
+// queries (no JOIN). Multi-table SELECTs return no column edges
+// because v1 can't disambiguate which table each column lives on.
+var selectFromRe = regexp.MustCompile(`(?is)\bSELECT\s+(.+?)\s+FROM\s+([a-zA-Z_"\x60\[][a-zA-Z0-9_."\x60\]]*)\b`)
+
+// joinDetectRe is used to suppress SELECT column extraction when
+// the query has any kind of JOIN — preserves correctness over
+// completeness in v1.
+var joinDetectRe = regexp.MustCompile(`(?i)\bJOIN\b`)
+
+// ExtractColumns walks a query string and returns the column
+// references it touches. The "Op" field distinguishes reads from
+// writes so the caller can emit EdgeReadsCol vs EdgeWritesCol.
+//
+// Limitations (intentional for v1):
+//   - SELECT * does not produce edges (wildcard).
+//   - Multi-table SELECTs (with JOIN) produce no column edges.
+//   - Functions, expressions, and CASE statements degrade to no edge
+//     for that particular projection slot.
+//   - WHERE-clause column reads are extracted only when the value-side
+//     reference is a bare identifier.
+func ExtractColumns(query string) []ColumnRef {
+	if query == "" {
+		return nil
+	}
+	out := []ColumnRef{}
+	seen := map[string]struct{}{}
+	add := func(c ColumnRef) {
+		key := c.Op + "::" + c.Schema + "::" + c.Table + "::" + c.Column
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, c)
+	}
+
+	// INSERT INTO tbl (col1, col2, …) → writes.
+	for _, m := range insertColsRe.FindAllStringSubmatch(query, -1) {
+		schema, table := splitSchemaTable(stripQuoting(m[1]))
+		if table == "" {
+			continue
+		}
+		for _, c := range splitColumnList(m[2]) {
+			add(ColumnRef{Schema: schema, Table: table, Column: c, Op: "write"})
+		}
+	}
+
+	// UPDATE tbl SET col = …, col2 = … → writes.
+	for _, m := range updateSetRe.FindAllStringSubmatch(query, -1) {
+		schema, table := splitSchemaTable(stripQuoting(m[1]))
+		if table == "" {
+			continue
+		}
+		for _, c := range splitSetAssignments(m[2]) {
+			add(ColumnRef{Schema: schema, Table: table, Column: c, Op: "write"})
+		}
+	}
+
+	// SELECT col1, col2 FROM tbl (single-table) → reads.
+	if !joinDetectRe.MatchString(query) {
+		for _, m := range selectFromRe.FindAllStringSubmatch(query, -1) {
+			projection := strings.TrimSpace(m[1])
+			schema, table := splitSchemaTable(stripQuoting(m[2]))
+			if table == "" {
+				continue
+			}
+			if projection == "*" || projection == "" {
+				continue
+			}
+			for _, c := range splitColumnList(projection) {
+				add(ColumnRef{Schema: schema, Table: table, Column: c, Op: "read"})
+			}
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Op != out[j].Op {
+			return out[i].Op < out[j].Op
+		}
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		if out[i].Table != out[j].Table {
+			return out[i].Table < out[j].Table
+		}
+		return out[i].Column < out[j].Column
+	})
+	return out
+}
+
+// splitColumnList parses a comma-separated column list (used for
+// INSERT and SELECT projections), returning bare column identifiers.
+// Aliases (`col AS alias`) collapse to the source column. Function
+// calls and expressions return "" and are dropped.
+func splitColumnList(list string) []string {
+	out := []string{}
+	depth := 0
+	cur := strings.Builder{}
+	flush := func() {
+		s := strings.TrimSpace(cur.String())
+		cur.Reset()
+		if s == "" {
+			return
+		}
+		// Strip trailing AS alias.
+		if idx := strings.LastIndex(strings.ToUpper(s), " AS "); idx >= 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+		// Strip table prefix `tbl.col` → `col`.
+		if idx := strings.LastIndex(s, "."); idx >= 0 {
+			s = s[idx+1:]
+		}
+		s = strings.TrimSpace(stripQuoting(s))
+		// Reject bare expressions (function calls, arithmetic, *).
+		if s == "" || s == "*" || !isPlainSQLIdent(s) {
+			return
+		}
+		out = append(out, s)
+	}
+	for i := 0; i < len(list); i++ {
+		c := list[i]
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				flush()
+				continue
+			}
+		}
+		cur.WriteByte(c)
+	}
+	flush()
+	return out
+}
+
+// splitSetAssignments parses a SET clause body (`col = ?, col2 =
+// fn(x)`) and returns the column names being written. The right-
+// hand expressions are skipped; column refs deeper than `tbl.col` are
+// reduced to `col`.
+func splitSetAssignments(set string) []string {
+	out := []string{}
+	depth := 0
+	cur := strings.Builder{}
+	flush := func() {
+		seg := strings.TrimSpace(cur.String())
+		cur.Reset()
+		if seg == "" {
+			return
+		}
+		eq := strings.Index(seg, "=")
+		if eq < 0 {
+			return
+		}
+		name := strings.TrimSpace(seg[:eq])
+		if idx := strings.LastIndex(name, "."); idx >= 0 {
+			name = name[idx+1:]
+		}
+		name = strings.TrimSpace(stripQuoting(name))
+		if name != "" && isPlainSQLIdent(name) {
+			out = append(out, name)
+		}
+	}
+	for i := 0; i < len(set); i++ {
+		c := set[i]
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				flush()
+				continue
+			}
+		}
+		cur.WriteByte(c)
+	}
+	flush()
+	return out
+}
+
+// isPlainSQLIdent returns true when s is a single bare identifier
+// (letter/underscore start, alphanum/underscore body). Filters out
+// function-call shells (`fn(`), wildcards, arithmetic, and the like.
+func isPlainSQLIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 {
+			if !isAlpha {
+				return false
+			}
+		} else if !isAlpha && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+// ColumnNodeID returns the canonical synthetic ID for a column.
+func ColumnNodeID(dialect, schema, table, column string) string {
+	if dialect == "" {
+		dialect = "generic"
+	}
+	prefix := "col::" + dialect + "::"
+	if schema == "" {
+		return prefix + table + "." + column
+	}
+	return prefix + schema + "." + table + "." + column
+}
+
 // MigrationNodeID is the canonical synthetic ID for a migration
 // node. The path component lets agents reach the originating file
 // in one step; the prefix matches the synthetic-ID convention

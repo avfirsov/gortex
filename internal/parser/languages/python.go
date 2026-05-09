@@ -290,6 +290,7 @@ func (e *PythonExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 		})
 		emitPyAnnotationEdges(decorators, id, filePath, src, result, annotationSeen)
 		emitPyThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+		emitPyFunctionShape(id, def.Node, src, filePath, startLine1, result)
 		return
 	}
 
@@ -319,6 +320,7 @@ func (e *PythonExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 	})
 	emitPyAnnotationEdges(decorators, id, filePath, src, result, annotationSeen)
 	emitPyThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+	emitPyFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
 // emitPyThrowsEdges walks a function/method body for raise_statement

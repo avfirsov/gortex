@@ -456,6 +456,9 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 		From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
+	if body := csharpFunctionBody(def.Node); body != nil {
+		emitCSharpAsyncSpawns(id, body, src, filePath, result)
+	}
 }
 
 func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {

@@ -200,12 +200,45 @@ func EnrichGraph(g *graph.Graph, segments []Segment, modulePath string) int {
 		if n.Meta == nil {
 			n.Meta = map[string]any{}
 		}
-		n.Meta["coverage_pct"] = roundTwo(stats.Percent())
+		pct := roundTwo(stats.Percent())
+		n.Meta["coverage_pct"] = pct
 		n.Meta["coverage"] = map[string]any{
 			"num_stmt": stats.NumStmt,
 			"hit":      stats.Hit,
 		}
 		enriched++
+
+		// EdgeCoveredBy: invert each EdgeTests pointing at this
+		// node so agents can ask "which tests cover X" with the
+		// coverage metric attached, without re-deriving it from
+		// meta.coverage_pct + a second EdgeTests walk. Skip when
+		// pct == 0 — uncovered code has no test relation worth
+		// advertising. Dedup on the test ID because the same test
+		// may call the subject multiple times.
+		if pct == 0 {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, in := range g.GetInEdges(n.ID) {
+			if in == nil || in.Kind != graph.EdgeTests {
+				continue
+			}
+			if seen[in.From] {
+				continue
+			}
+			seen[in.From] = true
+			g.AddEdge(&graph.Edge{
+				From:     n.ID,
+				To:       in.From,
+				Kind:     graph.EdgeCoveredBy,
+				FilePath: n.FilePath,
+				Line:     n.StartLine,
+				Origin:   graph.OriginASTInferred,
+				Meta: map[string]any{
+					"coverage_pct": pct,
+				},
+			})
+		}
 	}
 	return enriched
 }

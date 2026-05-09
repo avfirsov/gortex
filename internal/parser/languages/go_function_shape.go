@@ -392,12 +392,255 @@ func emitGoClosureNodes(ownerID string, body *sitter.Node, src []byte, filePath 
 				},
 			})
 		}
+		// EdgeCaptures: every bare identifier the closure references
+		// without locally declaring/binding is a capture of an outer
+		// scope binding. The resolver later lands the unresolved::
+		// targets on the actual variable / function node.
+		emitGoClosureCaptures(closureID, n, src, filePath, result)
 		// Don't recurse into nested func_literals — they belong to
 		// the inner closure, not the outer one. The outer walker will
 		// pick them up when (if) closures-within-closures are
 		// supported. For Phase 1 the flat enumeration is sufficient.
 		return false
 	})
+}
+
+// emitGoClosureCaptures walks a func_literal and emits one
+// EdgeCaptures per free variable. "Free" means: the identifier is
+// used as a value somewhere in the closure body but isn't bound by
+// a parameter, short-var-decl, var-spec, or const-spec inside the
+// closure. Locally re-declared shadowing names suppress the capture
+// (matches Go scoping rules).
+//
+// v1 limitations:
+//   - We don't recurse into nested closures; a nested closure's
+//     captures emit against the nested closure node when its own
+//     emitGoClosureNodes pass runs.
+//   - Selector RHS (`x.field`) only captures the operand `x`; the
+//     `.field` part is a field reference, not a free variable.
+//   - Identifiers in type position (e.g. `MyType` in `var x MyType`)
+//     count as captures — Go closures do close over file-scope type
+//     names, and the resolver can land them on the type node.
+func emitGoClosureCaptures(closureID string, funcLit *sitter.Node, src []byte, filePath string, result *parser.ExtractionResult) {
+	if funcLit == nil {
+		return
+	}
+	body := funcLit.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	locals := map[string]bool{}
+	collectGoClosureLocals(funcLit, src, locals)
+
+	seen := map[string]bool{}
+	walkGoNodes(body, func(n *sitter.Node) bool {
+		// Skip nested closures — they own their own captures.
+		if n.Type() == "func_literal" {
+			return false
+		}
+		if n.Type() != "identifier" {
+			return true
+		}
+		// Filter out identifiers that aren't actually a value-side
+		// reference: the LHS of a short-var-decl, the name on a var
+		// or const spec, the parameter name in a function decl, the
+		// field portion of a selector — none of these are captures.
+		if !isGoClosureValueRef(n) {
+			return true
+		}
+		name := n.Content(src)
+		if name == "" || name == "_" || locals[name] || isGoBuiltinOrKeyword(name) {
+			return true
+		}
+		if seen[name] {
+			return true
+		}
+		seen[name] = true
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     closureID,
+			To:       "unresolved::" + name,
+			Kind:     graph.EdgeCaptures,
+			FilePath: filePath,
+			Line:     int(n.StartPoint().Row) + 1,
+			Origin:   graph.OriginASTInferred,
+			Meta: map[string]any{
+				"name": name,
+			},
+		})
+		return true
+	})
+}
+
+// collectGoClosureLocals records every name declared inside the
+// closure (parameters, return-named results, var/const/short-var
+// decls). Mutates locals in place.
+func collectGoClosureLocals(funcLit *sitter.Node, src []byte, locals map[string]bool) {
+	if funcLit == nil {
+		return
+	}
+	addIdentNames := func(root *sitter.Node) {
+		if root == nil {
+			return
+		}
+		walkGoNodes(root, func(n *sitter.Node) bool {
+			if n.Type() == "func_literal" {
+				return false
+			}
+			if n.Type() == "identifier" {
+				locals[n.Content(src)] = true
+			}
+			return true
+		})
+	}
+	if params := funcLit.ChildByFieldName("parameters"); params != nil {
+		// Parameter names live under parameter_declaration → name.
+		walkGoNodes(params, func(n *sitter.Node) bool {
+			if n.Type() == "func_literal" {
+				return false
+			}
+			if n.Type() == "parameter_declaration" {
+				if name := n.ChildByFieldName("name"); name != nil {
+					addIdentNames(name)
+				}
+			}
+			return true
+		})
+	}
+	if res := funcLit.ChildByFieldName("result"); res != nil {
+		walkGoNodes(res, func(n *sitter.Node) bool {
+			if n.Type() == "func_literal" {
+				return false
+			}
+			if n.Type() == "parameter_declaration" {
+				if name := n.ChildByFieldName("name"); name != nil {
+					addIdentNames(name)
+				}
+			}
+			return true
+		})
+	}
+	body := funcLit.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	walkGoNodes(body, func(n *sitter.Node) bool {
+		if n.Type() == "func_literal" {
+			return false
+		}
+		switch n.Type() {
+		case "short_var_declaration":
+			if left := n.ChildByFieldName("left"); left != nil {
+				addIdentNames(left)
+			}
+		case "var_spec", "const_spec":
+			if name := n.ChildByFieldName("name"); name != nil {
+				addIdentNames(name)
+			}
+		case "range_clause":
+			// `for k, v := range x { … }` — k, v are loop locals.
+			if left := n.ChildByFieldName("left"); left != nil {
+				addIdentNames(left)
+			}
+		case "for_statement":
+			// Init clause locals (not common in Go but possible).
+			if init := n.ChildByFieldName("initializer"); init != nil {
+				addIdentNames(init)
+			}
+		case "type_switch_statement":
+			// `switch v := x.(type)` — v is a local.
+			walkGoNodes(n, func(c *sitter.Node) bool {
+				if c.Type() == "expression_list" {
+					addIdentNames(c)
+					return false
+				}
+				return true
+			})
+		}
+		return true
+	})
+}
+
+// isGoClosureValueRef reports whether an identifier node is used as
+// a value-side reference rather than a binding-site declaration.
+// Returns false for the LHS of a short-var-decl, parameter names,
+// variable/const declaration names, and the .field portion of a
+// selector expression.
+func isGoClosureValueRef(n *sitter.Node) bool {
+	parent := n.Parent()
+	if parent == nil {
+		return true
+	}
+	switch parent.Type() {
+	case "selector_expression":
+		// We capture the operand (LHS), not the field name (RHS).
+		if field := parent.ChildByFieldName("field"); field != nil && field.Equal(n) {
+			return false
+		}
+	case "parameter_declaration":
+		if name := parent.ChildByFieldName("name"); name != nil {
+			declared := false
+			walkGoNodes(name, func(c *sitter.Node) bool {
+				if c.Equal(n) {
+					declared = true
+					return false
+				}
+				return true
+			})
+			if declared {
+				return false
+			}
+		}
+	case "var_spec", "const_spec":
+		if name := parent.ChildByFieldName("name"); name != nil {
+			declared := false
+			walkGoNodes(name, func(c *sitter.Node) bool {
+				if c.Equal(n) {
+					declared = true
+					return false
+				}
+				return true
+			})
+			if declared {
+				return false
+			}
+		}
+	case "short_var_declaration":
+		if left := parent.ChildByFieldName("left"); left != nil {
+			declared := false
+			walkGoNodes(left, func(c *sitter.Node) bool {
+				if c.Equal(n) {
+					declared = true
+					return false
+				}
+				return true
+			})
+			if declared {
+				return false
+			}
+		}
+	case "range_clause":
+		if left := parent.ChildByFieldName("left"); left != nil {
+			declared := false
+			walkGoNodes(left, func(c *sitter.Node) bool {
+				if c.Equal(n) {
+					declared = true
+					return false
+				}
+				return true
+			})
+			if declared {
+				return false
+			}
+		}
+	case "function_declaration", "method_declaration":
+		// The function/method's own name isn't a free var inside
+		// its closure children — but closures can't be at this
+		// scope, so this is mostly defensive.
+		return false
+	case "field_identifier":
+		return false
+	}
+	return true
 }
 
 // isGoroutineSpawnedClosure reports whether a func_literal node is

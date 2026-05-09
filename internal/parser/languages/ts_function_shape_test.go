@@ -1,0 +1,270 @@
+package languages
+
+import (
+	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+func runTSExtract(t *testing.T, path, src string) ([]*graph.Node, []*graph.Edge) {
+	t.Helper()
+	ext := NewTypeScriptExtractor()
+	result, err := ext.Extract(path, []byte(src))
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	return result.Nodes, result.Edges
+}
+
+func TestTSFunctionShape_FunctionParamsAndReturn(t *testing.T) {
+	src := `function greet(name: string, age: number): User {
+	return { name, age };
+}
+`
+	_, edges := runTSExtract(t, "src/a.ts", src)
+
+	// EdgeParamOf for both params.
+	paramEdges := edgesByKind(edges, graph.EdgeParamOf)
+	if len(paramEdges) != 2 {
+		t.Fatalf("expected 2 EdgeParamOf, got %d", len(paramEdges))
+	}
+	for _, e := range paramEdges {
+		if e.To != "src/a.ts::greet" {
+			t.Errorf("ParamOf target = %q, want greet", e.To)
+		}
+	}
+
+	// EdgeTypedAs is omitted for primitives (string, number).
+	// We only emit the named-type bindings — verifying behaviour
+	// consistent with Promise / Array unwrapping below.
+
+	// EdgeReturns to User.
+	returns := edgesByKind(edges, graph.EdgeReturns)
+	hasUser := false
+	for _, e := range returns {
+		if e.To == "unresolved::User" {
+			hasUser = true
+		}
+	}
+	if !hasUser {
+		t.Errorf("expected EdgeReturns → unresolved::User; got %v", edgeTargets(returns))
+	}
+}
+
+func TestTSFunctionShape_GenericTypeParam(t *testing.T) {
+	src := `function identity<T>(x: T): T { return x; }
+`
+	nodes, edges := runTSExtract(t, "src/g.ts", src)
+
+	// KindGenericParam node for T, EdgeMemberOf back to function.
+	var gpID string
+	for _, n := range nodes {
+		if n.Kind == graph.KindGenericParam && n.Name == "T" {
+			gpID = n.ID
+		}
+	}
+	if gpID == "" {
+		t.Fatalf("KindGenericParam T missing")
+	}
+	hasMember := false
+	for _, e := range edges {
+		if e.Kind == graph.EdgeMemberOf && e.From == gpID && e.To == "src/g.ts::identity" {
+			hasMember = true
+		}
+	}
+	if !hasMember {
+		t.Errorf("KindGenericParam → identity EdgeMemberOf missing")
+	}
+}
+
+func TestTSFunctionShape_ClassMethod(t *testing.T) {
+	src := `class UserService {
+	getById(id: number): User | null { return null; }
+}
+`
+	_, edges := runTSExtract(t, "src/svc.ts", src)
+
+	params := edgesByKind(edges, graph.EdgeParamOf)
+	hasGetById := false
+	for _, e := range params {
+		if e.To == "src/svc.ts::UserService.getById" {
+			hasGetById = true
+		}
+	}
+	if !hasGetById {
+		t.Errorf("expected EdgeParamOf → UserService.getById; targets=%v", edgeTargets(params))
+	}
+
+	// Union return type emits one edge per non-primitive branch:
+	// "User | null" → EdgeReturns → unresolved::User (null is primitive).
+	returns := edgesByKind(edges, graph.EdgeReturns)
+	hasUser := false
+	for _, e := range returns {
+		if e.To == "unresolved::User" {
+			hasUser = true
+		}
+	}
+	if !hasUser {
+		t.Errorf("expected EdgeReturns → unresolved::User from union; got %v", edgeTargets(returns))
+	}
+}
+
+func TestTSFunctionShape_VariadicAndOptional(t *testing.T) {
+	src := `function fn(a: string, b?: number, ...rest: string[]) {}
+`
+	nodes, _ := runTSExtract(t, "src/v.ts", src)
+	params := nodesOfKind(nodes, graph.KindParam)
+	if len(params) != 3 {
+		t.Fatalf("expected 3 params, got %d", len(params))
+	}
+	var rest *graph.Node
+	for _, p := range params {
+		if p.Name == "rest" {
+			rest = p
+		}
+	}
+	if rest == nil {
+		t.Fatalf("rest param missing")
+	}
+	if v, _ := rest.Meta["variadic"].(bool); !v {
+		t.Errorf("rest.Meta.variadic = false; want true")
+	}
+}
+
+func TestTSFunctionShape_ArrayAndPromiseReturnUnwrapped(t *testing.T) {
+	src := `function loadAll(): Promise<User[]> { return null as any; }
+`
+	_, edges := runTSExtract(t, "src/p.ts", src)
+	returns := edgesByKind(edges, graph.EdgeReturns)
+	hasUser := false
+	for _, e := range returns {
+		if e.To == "unresolved::User" {
+			hasUser = true
+		}
+	}
+	if !hasUser {
+		t.Errorf("expected unwrapped EdgeReturns → unresolved::User; got %v", edgeTargets(returns))
+	}
+}
+
+func TestTSAsyncSpawns_AwaitedCall(t *testing.T) {
+	src := `async function load(id: string) {
+	const u = await fetchUser(id);
+	const r = await this.repo.find(id);
+	return u;
+}
+`
+	_, edges := runTSExtract(t, "src/a.ts", src)
+
+	spawns := edgesByKind(edges, graph.EdgeSpawns)
+	wantTargets := map[string]bool{"unresolved::fetchUser": false, "unresolved::find": false}
+	for _, e := range spawns {
+		if mode, _ := e.Meta["mode"].(string); mode != "async" {
+			continue
+		}
+		if _, ok := wantTargets[e.To]; ok {
+			wantTargets[e.To] = true
+		}
+	}
+	for tgt, found := range wantTargets {
+		if !found {
+			t.Errorf("expected EdgeSpawns mode=async → %s; got %v", tgt, edgeTargets(spawns))
+		}
+	}
+}
+
+func TestTSAsyncSpawns_PromiseAll(t *testing.T) {
+	src := `async function loadAll() {
+	return await Promise.all([loadA(), loadB()]);
+}
+`
+	_, edges := runTSExtract(t, "src/p.ts", src)
+
+	spawns := edgesByKind(edges, graph.EdgeSpawns)
+	hasPromiseAll := false
+	for _, e := range spawns {
+		if e.To == "unresolved::Promise.all" {
+			hasPromiseAll = true
+		}
+	}
+	if !hasPromiseAll {
+		t.Errorf("expected EdgeSpawns → Promise.all; got %v", edgeTargets(spawns))
+	}
+}
+
+func TestTSAsyncSpawns_NestedFunctionScopeRespected(t *testing.T) {
+	src := `function outer() {
+	function inner() {
+		return foo();
+	}
+	return inner;
+}
+`
+	_, edges := runTSExtract(t, "src/n.ts", src)
+	// `foo` is called by inner, NOT awaited, so no spawn edge.
+	for _, e := range edgesByKind(edges, graph.EdgeSpawns) {
+		t.Errorf("unexpected EdgeSpawns %v", e.To)
+	}
+}
+
+func TestCanonicalizeTSTypeRef(t *testing.T) {
+	cases := []struct {
+		in, out string
+	}{
+		{"User", "User"},
+		{"User[]", "User"},
+		{"Promise<User>", "User"},
+		{"Promise<User[]>", "User"},
+		{"ReadonlyArray<string>", "string"},
+		{"readonly User[]", "User"},
+		{"(User)", "User"},
+	}
+	for _, c := range cases {
+		if got := canonicalizeTSTypeRef(c.in); got != c.out {
+			t.Errorf("canonicalizeTSTypeRef(%q) = %q, want %q", c.in, got, c.out)
+		}
+	}
+}
+
+func TestSplitTSUnionType(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"User", []string{"User"}},
+		{"User | null", []string{"User", "null"}},
+		{": User | null | undefined", []string{"User", "null", "undefined"}},
+		{"Map<string, User | null>", []string{"Map<string, User | null>"}}, // top-level only
+		{"Promise<User> | Error", []string{"Promise<User>", "Error"}},
+	}
+	for _, c := range cases {
+		got := splitTSUnionType(c.in)
+		if !sliceEq(got, c.want) {
+			t.Errorf("splitTSUnionType(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func sliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// nodesOfKind / edgesByKind helpers used by extractor tests are in
+// other test files; we redeclare nothing here.
+func edgesByKind(edges []*graph.Edge, kind graph.EdgeKind) []*graph.Edge {
+	var out []*graph.Edge
+	for _, e := range edges {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}

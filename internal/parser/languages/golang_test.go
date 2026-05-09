@@ -677,6 +677,90 @@ func (s *Server) SetPort(p int) {
 	}
 }
 
+func TestGoExtractor_FieldReads_SelectorValue(t *testing.T) {
+	// Selector used as a value (passed to a call, not on LHS) should
+	// emit EdgeReads — schema reserves EdgeReferences for type refs.
+	src := []byte(`package main
+
+type Server struct {
+	port int
+	addr string
+}
+
+func (s *Server) Snapshot() (int, string) {
+	return s.port, s.addr
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("server.go", src)
+	require.NoError(t, err)
+
+	reads := edgesOfKind(result.Edges, graph.EdgeReads)
+	hasPort, hasAddr := false, false
+	for _, r := range reads {
+		if r.To == "unresolved::*.port" {
+			hasPort = true
+		}
+		if r.To == "unresolved::*.addr" {
+			hasAddr = true
+		}
+	}
+	if !hasPort {
+		t.Errorf("expected EdgeReads → unresolved::*.port; got reads=%v",
+			edgeTargets(reads))
+	}
+	if !hasAddr {
+		t.Errorf("expected EdgeReads → unresolved::*.addr; got reads=%v",
+			edgeTargets(reads))
+	}
+
+	// Same identifiers should NOT also have surfaced as EdgeReferences,
+	// otherwise the resolver double-counts.
+	for _, e := range result.Edges {
+		if e.Kind == graph.EdgeReferences && (e.To == "unresolved::*.port" || e.To == "unresolved::*.addr") {
+			t.Errorf("EdgeReferences leaked for value-side field %s — should be EdgeReads", e.To)
+		}
+	}
+}
+
+func TestGoExtractor_FieldReads_StructLiteralFieldValue(t *testing.T) {
+	src := []byte(`package main
+
+type Cfg struct {
+	Handler func() string
+}
+
+func runClean() string { return "ok" }
+
+func newCfg() *Cfg {
+	return &Cfg{Handler: runClean}
+}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("cfg.go", src)
+	require.NoError(t, err)
+
+	reads := edgesOfKind(result.Edges, graph.EdgeReads)
+	found := false
+	for _, r := range reads {
+		if r.To == "unresolved::runClean" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected EdgeReads → unresolved::runClean for struct-literal field value; reads=%v",
+			edgeTargets(reads))
+	}
+}
+
+func edgeTargets(edges []*graph.Edge) []string {
+	out := make([]string, 0, len(edges))
+	for _, e := range edges {
+		out = append(out, e.To)
+	}
+	return out
+}
+
 func TestGoExtractor_FieldWrites_TrackedReceiver(t *testing.T) {
 	src := []byte(`package main
 

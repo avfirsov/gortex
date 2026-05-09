@@ -1092,6 +1092,8 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 					continue
 				}
 
+				stampParseErrors(result)
+
 				// Append coverage artifacts (todos / licenses /
 				// ownership) before applyRepoPrefix so they get the
 				// same multi-repo namespacing treatment as
@@ -1364,6 +1366,8 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	if err != nil {
 		return err
 	}
+
+	stampParseErrors(result)
 
 	// Coverage extractors (todos, licenses, ownership). Same call
 	// site exists in the bulk IndexCtx worker pool — see

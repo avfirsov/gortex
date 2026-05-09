@@ -418,6 +418,9 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 			From: id, To: ownerID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine1,
 		})
 		emitKotlinAnnotationEdges(kotlinCollectAnnotations(def.Node, src), id, filePath, result, annotationSeen)
+		if body := kotlinFunctionBody(def.Node); body != nil {
+			emitKotlinAsyncSpawns(id, body, src, filePath, result)
+		}
 		return
 	}
 
@@ -444,6 +447,9 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 	})
 	emitKotlinAnnotationEdges(kotlinCollectAnnotations(def.Node, src), id, filePath, result, annotationSeen)
+	if body := kotlinFunctionBody(def.Node); body != nil {
+		emitKotlinAsyncSpawns(id, body, src, filePath, result)
+	}
 }
 
 // kotlinCollectAnnotations walks a Kotlin declaration's modifiers

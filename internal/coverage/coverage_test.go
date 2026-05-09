@@ -113,6 +113,77 @@ func TestEnrichGraph_StampsMetaCoveragePct(t *testing.T) {
 	}
 }
 
+func TestEnrichGraph_EmitsCoveredByForExistingTestEdges(t *testing.T) {
+	g := graph.New()
+	subj := &graph.Node{
+		ID: "pkg/a.go::Foo", Kind: graph.KindFunction,
+		FilePath: "pkg/a.go", StartLine: 1, EndLine: 20,
+	}
+	test := &graph.Node{
+		ID: "pkg/a_test.go::TestFoo", Kind: graph.KindFunction,
+		FilePath: "pkg/a_test.go", StartLine: 1, EndLine: 5,
+		Meta: map[string]any{"is_test": true},
+	}
+	g.AddNode(subj)
+	g.AddNode(test)
+	g.AddEdge(&graph.Edge{
+		From: test.ID, To: subj.ID, Kind: graph.EdgeTests,
+		FilePath: test.FilePath, Line: 2, Origin: graph.OriginASTInferred,
+	})
+
+	segs := []Segment{
+		{File: "pkg/a.go", StartLine: 5, EndLine: 8, NumStmt: 4, Count: 1},
+	}
+	if got := EnrichGraph(g, segs, ""); got != 1 {
+		t.Fatalf("expected 1 enriched, got %d", got)
+	}
+
+	var coveredBy *graph.Edge
+	for _, e := range g.GetOutEdges(subj.ID) {
+		if e.Kind == graph.EdgeCoveredBy && e.To == test.ID {
+			coveredBy = e
+			break
+		}
+	}
+	if coveredBy == nil {
+		t.Fatalf("EdgeCoveredBy from %s to %s not emitted", subj.ID, test.ID)
+	}
+	if pct, _ := coveredBy.Meta["coverage_pct"].(float64); pct != 100 {
+		t.Errorf("coveredBy.Meta.coverage_pct = %v, want 100", pct)
+	}
+}
+
+func TestEnrichGraph_SkipsCoveredByWhenZeroPct(t *testing.T) {
+	g := graph.New()
+	subj := &graph.Node{
+		ID: "pkg/a.go::Foo", Kind: graph.KindFunction,
+		FilePath: "pkg/a.go", StartLine: 1, EndLine: 20,
+	}
+	test := &graph.Node{
+		ID: "pkg/a_test.go::TestFoo", Kind: graph.KindFunction,
+		FilePath: "pkg/a_test.go", StartLine: 1, EndLine: 5,
+		Meta: map[string]any{"is_test": true},
+	}
+	g.AddNode(subj)
+	g.AddNode(test)
+	g.AddEdge(&graph.Edge{
+		From: test.ID, To: subj.ID, Kind: graph.EdgeTests,
+		FilePath: test.FilePath, Line: 2, Origin: graph.OriginASTInferred,
+	})
+
+	// All segments missed.
+	segs := []Segment{
+		{File: "pkg/a.go", StartLine: 5, EndLine: 8, NumStmt: 4, Count: 0},
+	}
+	EnrichGraph(g, segs, "")
+
+	for _, e := range g.GetOutEdges(subj.ID) {
+		if e.Kind == graph.EdgeCoveredBy {
+			t.Fatalf("EdgeCoveredBy unexpectedly emitted for 0%%-covered subject")
+		}
+	}
+}
+
 func TestEnrichGraph_SkipsNonExecutable(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{

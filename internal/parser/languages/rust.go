@@ -348,6 +348,7 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 		})
 		emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 		emitRustThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+		emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
 		return
 	}
 
@@ -381,6 +382,7 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 	})
 	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 	emitRustThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+	emitRustFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
 // rustTypeParams reads the `type_parameters` child of a Rust item

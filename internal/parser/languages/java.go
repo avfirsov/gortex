@@ -489,6 +489,7 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 		}
 		emitJavaAnnotationEdges(javaCollectAnnotations(def.Node, src), id, filePath, result, annotationSeen)
 		emitJavaThrowsEdges(def.Node, src, id, filePath, startLine1, result)
+		emitJavaFunctionShape(id, def.Node, src, filePath, startLine1, result)
 		return
 	}
 
@@ -520,6 +521,7 @@ func (e *JavaExtractor) emitMethod(m parser.QueryResult, filePath, fileID string
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine1,
 	})
 	emitJavaAnnotationEdges(javaCollectAnnotations(def.Node, src), id, filePath, result, annotationSeen)
+	emitJavaFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
 func (e *JavaExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {

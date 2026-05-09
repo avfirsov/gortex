@@ -128,6 +128,85 @@ func Map[T any, U comparable](in []T) []U {
 	}
 }
 
+func TestGoFunctionShape_ClosureCaptures(t *testing.T) {
+	src := `package foo
+
+func Run(prefix string) func(string) string {
+	count := 0
+	return func(s string) string {
+		count++
+		return prefix + s
+	}
+}
+`
+	fix := runGoExtract(t, src)
+
+	captures := fix.edgesByKind[graph.EdgeCaptures]
+	captured := map[string]bool{}
+	for _, e := range captures {
+		if name, _ := e.Meta["name"].(string); name != "" {
+			captured[name] = true
+		}
+	}
+	if !captured["count"] {
+		t.Errorf("EdgeCaptures missing for 'count'; got %v", captured)
+	}
+	if !captured["prefix"] {
+		t.Errorf("EdgeCaptures missing for 'prefix'; got %v", captured)
+	}
+	// 's' is a parameter of the closure, not a capture.
+	if captured["s"] {
+		t.Errorf("'s' is a closure parameter, should not be captured")
+	}
+}
+
+func TestGoFunctionShape_ClosureLocalsShadowOuter(t *testing.T) {
+	src := `package foo
+
+func Outer() {
+	v := 1
+	go func() {
+		v := 99
+		_ = v
+	}()
+}
+`
+	fix := runGoExtract(t, src)
+
+	captures := fix.edgesByKind[graph.EdgeCaptures]
+	for _, e := range captures {
+		if name, _ := e.Meta["name"].(string); name == "v" {
+			// The closure re-declares v with `:=`. Inside the
+			// closure body, `v` resolves to the inner binding,
+			// so EdgeCaptures should NOT be emitted for v.
+			t.Errorf("EdgeCaptures emitted for shadowed local 'v'")
+		}
+	}
+}
+
+func TestGoFunctionShape_ClosureNoCaptureWithoutOuterRefs(t *testing.T) {
+	src := `package foo
+
+func Run() {
+	go func() {
+		x := 1
+		_ = x
+	}()
+}
+`
+	fix := runGoExtract(t, src)
+
+	captures := fix.edgesByKind[graph.EdgeCaptures]
+	if len(captures) != 0 {
+		names := []string{}
+		for _, e := range captures {
+			n, _ := e.Meta["name"].(string)
+			names = append(names, n)
+		}
+		t.Errorf("expected no EdgeCaptures; got %v", names)
+	}
+}
+
 func TestGoFunctionShape_Closure(t *testing.T) {
 	src := `package foo
 
