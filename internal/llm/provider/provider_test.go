@@ -25,7 +25,7 @@ func TestNew_AnthropicOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	if p.Name() != "anthropic" {
 		t.Errorf("Name()=%q want anthropic", p.Name())
 	}
@@ -37,7 +37,7 @@ func TestNew_OpenAIOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	if p.Name() != "openai" {
 		t.Errorf("Name()=%q want openai", p.Name())
 	}
@@ -55,7 +55,7 @@ func TestNew_OllamaOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	if p.Name() != "ollama" {
 		t.Errorf("Name()=%q want ollama", p.Name())
 	}

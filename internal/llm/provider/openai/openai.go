@@ -120,7 +120,7 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	if err != nil {
 		return llm.CompletionResponse{}, fmt.Errorf("openai: request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return llm.CompletionResponse{}, fmt.Errorf("openai: read response: %w", err)

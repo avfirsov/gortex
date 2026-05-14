@@ -49,7 +49,7 @@ func TestComplete_StructuredUsesForcedTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -90,7 +90,7 @@ func TestComplete_FreeformNoTools(t *testing.T) {
 
 	t.Setenv("ANTHROPIC_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -118,7 +118,7 @@ func TestComplete_ToolResultBecomesUserTurn(t *testing.T) {
 
 	t.Setenv("ANTHROPIC_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -150,7 +150,7 @@ func TestComplete_APIError(t *testing.T) {
 
 	t.Setenv("ANTHROPIC_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
