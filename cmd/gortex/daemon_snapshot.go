@@ -583,6 +583,55 @@ validate:
 	for _, cs := range result.Contracts {
 		totalContracts += len(cs)
 	}
+	// If the load shed any stale records, discard the snapshot entirely
+	// and fall through to a clean from-scratch index. Dropped edges
+	// signal that the persisted resolution state is corrupt — and we've
+	// learned the hard way that mixing partial snapshot state with
+	// incremental re-extraction silently leaves the graph in a worse
+	// state than starting fresh (observed: per-repo TrackRepoCtx on top
+	// of a half-loaded graph produced 47k nodes instead of the expected
+	// 146k, and most methods ended up with zero callers despite
+	// obviously having dozens). One full re-index per partial-load
+	// detection is the right tax — it converges in 1-2 minutes and the
+	// next snapshot writes from a known-good state.
+	// Distinguish two skip causes that look similar in the counters:
+	//   - skippedNodes accompanied by their dependent edges: that's the
+	//     intentional stale-abs-path cleanup (a few nodes, a few edges).
+	//   - a large number of edges whose targets vanished WITHOUT a
+	//     matching node-drop wave: that's persisted-resolution
+	//     corruption — the snapshot has resolved edges pointing at
+	//     node IDs that no longer exist, which means the resolver
+	//     state in this snapshot is no longer trustworthy.
+	//
+	// 5% is the threshold: empirically the abs-path cleanup sheds a
+	// handful of edges; real corruption sheds tens of thousands. The
+	// gap is wide enough that 5% comfortably separates them.
+	corruptDetected := header.EdgeCount > 100 && skippedEdges*20 > header.EdgeCount
+	if corruptDetected {
+		// Wipe the partial graph the per-record loop populated above so
+		// the caller's `g` is empty when we return Loaded=false. Without
+		// this the daemon would warmup with a half-graph plus a from-
+		// scratch index running over the same node IDs — exactly the
+		// duplicate-edges failure mode this whole resilience layer was
+		// built to avoid. EvictRepo per discovered repo prefix is the
+		// most surgical wipe available (Graph has no `Reset()`).
+		for _, prefix := range g.RepoPrefixes() {
+			g.EvictRepo(prefix)
+		}
+		// Also delete the snapshot file so a subsequent restart (e.g.
+		// `gortex daemon restart` immediately after) doesn't re-encounter
+		// the same partial-load loop. The next save will write a fresh,
+		// clean snapshot.
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			logger.Warn("snapshot: could not delete partial snapshot file",
+				zap.String("path", path), zap.Error(rmErr))
+		}
+		logger.Info("snapshot: discarded due to partial load — forcing fresh index",
+			zap.String("path", path),
+			zap.Int("stale_nodes_dropped", skippedNodes),
+			zap.Int("stale_edges_dropped", skippedEdges))
+		return snapshotLoadResult{Loaded: false}, nil
+	}
 	logger.Info("snapshot: loaded",
 		zap.String("path", path),
 		zap.Int("nodes", header.NodeCount-skippedNodes-corruptNodes),

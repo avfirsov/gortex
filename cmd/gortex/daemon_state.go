@@ -53,6 +53,16 @@ type daemonState struct {
 	// nil for every quiescent repo, so `contracts` / `contracts check`
 	// return empty results even though the graph holds the nodes.
 	snapshotContracts map[string][]contracts.Contract
+	// snapshotPartial reports that the load shed stale records (dropped
+	// nodes / dropped edges whose target vanished). When true, warmup
+	// forces a full per-repo ResolveAll across every indexer instead of
+	// the incremental "only files whose mtime changed" path. Without
+	// this, edges that the loader dropped never come back — every
+	// restart erodes the graph further until exported methods like
+	// (*Node).Type show zero callers despite having dozens of real
+	// callers in source. The IncrementalReindex path never re-resolves
+	// unchanged files, so the lost edges are invisible to it.
+	snapshotPartial bool
 	// MultiWatcher is built by warmupDaemonState (after tracked repos
 	// have been re-indexed) and handed to realController via
 	// AttachWatcher — it isn't held on daemonState because no caller
@@ -426,6 +436,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		mcpServer:           srv,
 		snapshotRepos:       loadResult.Repos,
 		snapshotContracts:   loadResult.Contracts,
+		snapshotPartial:     loadResult.Partial,
 		resolverLSPRegistry: resolverLSPRegistry,
 		lspRouter:           lspRouterOut,
 	}, nil
@@ -564,7 +575,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 	logger.Info("daemon: warmup phase start",
 		zap.String("phase", "parallel_parse"),
 		zap.Int("repos", len(repos)),
-		zap.Int("workers", workers))
+		zap.Int("workers", workers),
+		zap.Bool("snapshot_partial_forces_full_walk", state.snapshotPartial))
 	publishReadinessPhase(state, "parallel_parse", false, map[string]any{
 		"tracked_repos": len(repos),
 		"workers":       workers,
@@ -587,8 +599,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger) *indexer.MultiWat
 				// full walk. Both paths end with the repo registered on
 				// the MultiIndexer; contract reconciliation is deferred
 				// to the single RunGlobalResolve call below.
+				//
+				// snapshotPartial == true forces the full-walk path even
+				// when prior mtimes exist: the partial-load signal means
+				// the persisted resolution state is no longer trustworthy
+				// (stale edges were dropped because their targets vanished),
+				// and the incremental path only re-resolves files whose
+				// mtime changed — so the dropped edges would never come
+				// back. Without this override every restart progressively
+				// erodes the graph until exported methods show zero
+				// callers despite having dozens of real call sites.
 				repoStart := time.Now()
 				priorMtimes := priorMtimesForEntry(state.snapshotRepos, entry)
+				if state.snapshotPartial {
+					priorMtimes = nil
+				}
 				pathFn := "track"
 				if priorMtimes != nil {
 					pathFn = "reconcile"

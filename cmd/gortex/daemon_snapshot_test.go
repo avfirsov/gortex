@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -310,6 +311,82 @@ func TestLoadSnapshot_SameBinaryVersion_Loads(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Loaded)
 	assert.Equal(t, 1, g.NodeCount())
+}
+
+// Regression: when a snapshot's persisted resolution state is corrupt
+// (lots of edges point at node IDs that no longer exist), the loader
+// must discard it entirely instead of returning a half-graph that the
+// daemon then layers incremental indexing on top of. We saw this in
+// the wild — `(*Node).Type` and `WriteIfNotExists` ended up with zero
+// callers in the daemon's graph despite obviously having dozens in
+// source, because consecutive restarts kept loading and re-saving an
+// increasingly degraded snapshot.
+func TestLoadSnapshot_CorruptionDetected_ForcesFreshIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "corrupt.gob.gz")
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", path)
+
+	// Build a snapshot with 200 nodes and 200 edges pointing at IDs
+	// that don't exist. >5% drop ratio + EdgeCount > 100 → corrupt path.
+	orig := graph.New()
+	for i := 0; i < 200; i++ {
+		orig.AddNode(&graph.Node{
+			ID: fmt.Sprintf("repo/a.go::Sym%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("Sym%d", i), FilePath: "repo/a.go", Language: "go",
+			RepoPrefix: "repo", // real graphs always set this; tests must too
+		})
+		orig.AddEdge(&graph.Edge{
+			From: fmt.Sprintf("repo/a.go::Sym%d", i),
+			To:   fmt.Sprintf("ghost.go::Ghost%d", i), // target node never exists
+			Kind: graph.EdgeCalls,
+		})
+	}
+	require.NoError(t, saveSnapshotTo(orig, nil, nil, version, path, zap.NewNop()))
+
+	g := graph.New()
+	result, err := loadSnapshot(g, zap.NewNop())
+	require.NoError(t, err)
+	assert.False(t, result.Loaded, "corruption-detected snapshot must NOT be reported as loaded")
+	assert.Equal(t, 0, g.NodeCount(), "graph must be empty so warmup re-indexes from source")
+
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr),
+		"corrupt snapshot file must be deleted so a daemon restart doesn't loop on it")
+}
+
+// Regression guard for the abs-path cleanup case: a small number of
+// stale-edge drops accompanied by a node-drop wave (the intentional
+// pre-v1 abs-path cleanup) must NOT be flagged as corruption.
+func TestLoadSnapshot_SmallStaleEdgeDrops_StaysLoaded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "absclean.gob.gz")
+	t.Setenv("GORTEX_DAEMON_SNAPSHOT", path)
+
+	// 200 healthy entries plus 5 abs-path stale ones (under 5% drop).
+	orig := graph.New()
+	for i := 0; i < 200; i++ {
+		orig.AddNode(&graph.Node{
+			ID: fmt.Sprintf("a.go::S%d", i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("S%d", i), FilePath: "a.go", Language: "go",
+		})
+	}
+	for i := 0; i < 5; i++ {
+		orig.AddNode(&graph.Node{
+			ID:   fmt.Sprintf("/abs/a.go::S%d", i), // stale abs-path: dropped on load
+			Kind: graph.KindFunction, Name: fmt.Sprintf("S%d", i),
+			FilePath: fmt.Sprintf("/abs/a.go"),
+		})
+		orig.AddEdge(&graph.Edge{
+			From: "a.go::S0", To: fmt.Sprintf("/abs/a.go::S%d", i), Kind: graph.EdgeCalls,
+		})
+	}
+	require.NoError(t, saveSnapshotTo(orig, nil, nil, version, path, zap.NewNop()))
+
+	g := graph.New()
+	result, err := loadSnapshot(g, zap.NewNop())
+	require.NoError(t, err)
+	assert.True(t, result.Loaded, "small drop ratio must still load (abs-path cleanup is normal)")
+	assert.GreaterOrEqual(t, g.NodeCount(), 200)
 }
 
 func TestLoadSnapshot_CorruptFile_ReportsError(t *testing.T) {
