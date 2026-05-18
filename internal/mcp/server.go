@@ -635,6 +635,7 @@ func NewServer(engine *query.Engine, g *graph.Graph, idx *indexer.Indexer, watch
 	s.registerNotesTools()
 	s.registerMemoriesTools()
 	s.registerCitationTools()
+	s.registerKnowledgeGapsTool()
 	s.registerWikiTools()
 	s.registerResources()
 	s.registerPrompts()
