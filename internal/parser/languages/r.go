@@ -94,6 +94,11 @@ func (e *RExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRes
 		})
 	}
 
+	// Databricks source-format `.R` / `.r` notebooks: emit cell-level
+	// nodes alongside the regular R symbol nodes. No-op for ordinary
+	// R scripts.
+	MaybeEnrichDatabricks(filePath, filePath, src, res)
+
 	return res, nil
 }
 

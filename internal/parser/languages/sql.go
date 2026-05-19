@@ -36,6 +36,12 @@ func (e *SQLExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	}
 	result.Nodes = append(result.Nodes, fileNode)
 
+	// Databricks source-format notebooks are plain `.sql` files with
+	// `-- COMMAND ----------` separators; emit cell nodes alongside
+	// any DDL-shaped nodes the regular walk produces. No-op for
+	// non-Databricks SQL files.
+	MaybeEnrichDatabricks(filePath, fileNode.ID, src, result)
+
 	// Specialised SQL dispatch: dbt and SQLMesh models are `.sql`
 	// files but carry their own model/column/lineage graph shape, so
 	// they short-circuit the generic DDL walk below.

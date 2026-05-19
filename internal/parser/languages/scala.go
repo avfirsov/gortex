@@ -45,6 +45,8 @@ func (e *ScalaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// Walk the AST manually to extract all constructs.
 	e.extractAll(root, src, filePath, fileNode, result, seen, annotationSeen)
 
+	MaybeEnrichDatabricks(filePath, fileNode.ID, src, result)
+
 	return result, nil
 }
 

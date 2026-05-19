@@ -109,6 +109,9 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewGroovyExtractor())
 	reg.Register(NewJSONExtractor())
 
+	// Notebooks
+	reg.Register(NewJupyterExtractor())
+
 	// Forest-backed (alexaandru/go-sitter-forest) — signature-only.
 	// Each registration adds a brand-new language not covered by the
 	// hand-written extractors above. The forest framework reads the

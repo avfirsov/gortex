@@ -262,6 +262,8 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		func(line int) string { return findEnclosingFunc(funcRanges, line) },
 		filePath, "python", result)
 
+	MaybeEnrichDatabricks(filePath, fileID, src, result)
+
 	return result, nil
 }
 
