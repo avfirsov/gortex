@@ -399,6 +399,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	srv.InitFeedback("", "")
 	srv.InitNotes("", "")
 	srv.InitMemories("", "")
+	srv.InitNotebook("")
 	srv.InitCombo("", "", gortexmcp.ModeAI)
 	srv.InitFrecency("", "", gortexmcp.ModeAI)
 
