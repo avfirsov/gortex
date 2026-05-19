@@ -798,6 +798,12 @@ func (idx *Indexer) applyCoverageDomains(relPath, lang string, src []byte, resul
 			}
 			result.Edges = append(result.Edges, codegen.BuildGraphArtifacts(relPath, marker)...)
 		}
+		// Annotation-driven codegen: Lombok / MapStruct / Kotlin
+		// compiler plugins generate members that never appear in
+		// source. Flag the annotated symbols so they stay visible.
+		if extra, st := codegen.MarkAnnotatedGenerated(result.Nodes, result.Edges); st.NodesMarked > 0 {
+			result.Edges = append(result.Edges, extra...)
+		}
 	}
 	if !idx.config.Coverage.IsEnabled("function_shape") {
 		stripFunctionShape(result)
