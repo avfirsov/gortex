@@ -19,6 +19,14 @@ builds:
       # Version (see internal/version). Commit lands in the +build slot so
       # `gortex version` output round-trips as canonical semver.
       - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+      # Statically link the mingw-w64 C/C++ runtime (libstdc++, libgcc,
+      # winpthread) into the Windows binary. CGO is on for tree-sitter and
+      # some grammar scanners ship C++; without -static the released
+      # gortex.exe dynamically links libstdc++-6.dll et al., which are not
+      # present on a stock Windows box — the binary fails to start with a
+      # missing-DLL error. No-op on linux/darwin, which keep their normal
+      # dynamic libc/libc++.
+      - '{{ if eq .Os "windows" }}-extldflags "-static"{{ end }}'
     env:
       - CGO_ENABLED=1
     goos:

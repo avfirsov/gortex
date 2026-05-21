@@ -2,6 +2,7 @@
 ./gortex
 /gortex
 /gortex-linux
+/specs/
 
 # Go
 *.exe
