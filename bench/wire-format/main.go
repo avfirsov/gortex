@@ -149,14 +149,14 @@ func parseTokenizerMode(s string) (tokenizerMode, error) {
 // no cache file is configured.
 func buildOpus47Counter(cachePath, model string, useAPI bool) (opus47Counter, *cachedCounter, error) {
 	if cachePath == "" {
-		// No cache configured → scalar-only, fast path.
-		return scalarCounter{}, nil, nil
+		// No cache configured → in-process model counter, fast path.
+		return newModelCounter(model), nil, nil
 	}
 	c, err := loadOpus47Cache(cachePath)
 	if err != nil {
 		return nil, nil, err
 	}
-	cached := newCachedCounter(c)
+	cached := newCachedCounter(c, model)
 	if !useAPI {
 		return cached, cached, nil
 	}
@@ -266,7 +266,7 @@ func gzipLen(b []byte) int {
 // the original single-table layout; `opus47` swaps in the Opus 4.7
 // columns; `both` stacks them, cl100k first then opus47, sharing the
 // same case rows. A footnote distinguishes exact (API/cache) and
-// estimated (×1.35 scalar) opus47 counts.
+// estimated (in-process per-model tokenizer) opus47 counts.
 func renderScorecard(rows []metrics, mode tokenizerMode) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, "# GCX1 wire-format benchmark scorecard")
@@ -293,7 +293,7 @@ func renderScorecard(rows []metrics, mode tokenizerMode) string {
 			fmt.Fprintln(&b)
 		}
 		exactAll := allExactOpus47(rows)
-		label := "estimated (×1.35 scalar over cl100k_base)"
+		label := "estimated (in-process per-model tokenizer)"
 		if exactAll {
 			label = "exact (Anthropic count_tokens / cached)"
 		} else if anyExactOpus47(rows) {
@@ -421,11 +421,10 @@ func summaryLineOpus47(rows []metrics) string {
 			exactRows++
 		}
 	}
-	return fmt.Sprintf("**Summary (Opus 4.7):** %d/%d cases. Median token savings: %s. Exact rows: %d/%d (rest estimated via ×%.2f scalar).",
+	return fmt.Sprintf("**Summary (Opus 4.7):** %d/%d cases. Median token savings: %s. Exact rows: %d/%d (rest estimated by the in-process per-model tokenizer).",
 		len(rows), len(rows),
 		medianPct(tokensJ, tokensG),
 		exactRows, len(rows),
-		opus47InflationFactor,
 	)
 }
 

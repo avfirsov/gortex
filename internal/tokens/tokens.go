@@ -7,47 +7,28 @@
 // this package, so any future tokenizer swap happens in one spot.
 package tokens
 
-import (
-	"sync"
-
-	"github.com/pkoukk/tiktoken-go"
-	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
-)
-
 const (
 	// charsPerTokenFallback is the heuristic used when the real encoder fails
 	// to initialize. Kept close to the old behaviour so metrics don't spike.
 	charsPerTokenFallback = 4
 )
 
-var (
-	encoder     *tiktoken.Tiktoken
-	encoderErr  error
-	encoderOnce sync.Once
-)
-
-// initEncoder loads cl100k_base with the offline BPE loader so we never need
-// network access at runtime — important for sealed environments and single-
-// binary distribution.
-func initEncoder() {
-	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
-	encoder, encoderErr = tiktoken.GetEncoding("cl100k_base")
-}
-
-// Count returns the number of tokens in s as counted by cl100k_base. If the
+// Count returns the number of tokens in s as counted by cl100k_base — the
+// provider-neutral "how much content is this" measure. For a per-model
+// estimate that picks the right tokenizer family, use CountFor. If the
 // encoder failed to initialize for any reason, falls back to the legacy
 // chars/4 heuristic rather than panicking — metrics stay usable.
 func Count(s string) int {
 	if s == "" {
 		return 0
 	}
-	encoderOnce.Do(initEncoder)
-	if encoderErr != nil || encoder == nil {
+	enc, err := encoderFor(encodingCL100K)
+	if err != nil || enc == nil {
 		return fallbackCount(s)
 	}
 	// EncodeOrdinary skips special-token handling — we're measuring raw content
 	// tokens, not chat-formatted messages.
-	return len(encoder.EncodeOrdinary(s))
+	return len(enc.EncodeOrdinary(s))
 }
 
 // CountInt64 is a convenience wrapper for call sites that store counts as int64
@@ -94,8 +75,8 @@ func EstimateFromSample(totalChars int, sample string) int {
 // EncoderReady reports whether the tokenizer is loaded. Useful for tests and
 // for surfacing fallback mode in telemetry.
 func EncoderReady() bool {
-	encoderOnce.Do(initEncoder)
-	return encoderErr == nil && encoder != nil
+	enc, err := encoderFor(encodingCL100K)
+	return err == nil && enc != nil
 }
 
 // fallbackCount is the chars/4 heuristic used only when tiktoken fails.

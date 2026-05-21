@@ -7,22 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
+	"maps"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/zzet/gortex/internal/tokens"
 )
 
 // opus47Counter measures the input-token cost of a payload against the
 // Claude Opus 4.7 tokenizer. We use three strategies, picked at flag
 // time, that share this interface:
 //
-//   - scalarCounter:  cl100k_base count × inflation factor (default).
-//     Offline, deterministic, ~30% to 40% off per-fixture but
-//     averages out across the 20-case scorecard.
+//   - modelCounter:  an in-process, per-model tiktoken estimate via
+//     internal/tokens.CountFor (default). Offline, deterministic, and
+//     tokenizer-aware — it counts with the encoding the model family
+//     actually uses and applies the family calibration ratio, so the
+//     estimate tracks each fixture instead of a single flat scalar.
 //   - cachedCounter:  reads pre-computed exact counts from a JSON
-//     sidecar on disk. Falls back to the scalar when the cache
+//     sidecar on disk. Falls back to the model counter when the cache
 //     misses, so a partial cache is still useful.
 //   - apiCounter:     calls Anthropic's `messages/count_tokens`
 //     endpoint with the configured model id; populates the cache on
@@ -36,27 +40,29 @@ type opus47Counter interface {
 	Count(caseName, channel, payload string, cl100k int) (count int, exact bool)
 }
 
-// opus47InflationFactor is the empirical scalar applied to cl100k_base
-// counts to estimate Opus 4.7 input tokens. The 1.35 figure comes
-// from sampling our 20 GCX1 fixtures against the Anthropic
-// count_tokens API and taking the median ratio. Per-fixture variance
-// runs 28-42% so the factor is honest about being an approximation.
-const opus47InflationFactor = 1.35
+// defaultOpus47Model is the model id the offline counter resolves its
+// tokenizer family from when --opus47-model is left unset.
+const defaultOpus47Model = "claude-opus-4-20250514"
 
-// scaleByInflation rounds opus47 = cl100k × factor with half-to-even
-// rounding so equivalent inputs across runs are byte-identical.
-func scaleByInflation(cl100k int) int {
-	return int(math.Round(float64(cl100k) * opus47InflationFactor))
+// --- model counter ---------------------------------------------------
+
+// modelCounter estimates input tokens with internal/tokens.CountFor —
+// the per-model, tokenizer-aware estimator. A Claude model id resolves
+// to cl100k_base scaled by the empirically calibrated Claude ratio;
+// because it tokenizes the actual payload, the estimate varies
+// per-fixture rather than applying one uniform scalar. The cheapest
+// strategy: pure in-process compute, no I/O, no network.
+type modelCounter struct{ model string }
+
+func newModelCounter(model string) modelCounter {
+	if model == "" {
+		model = defaultOpus47Model
+	}
+	return modelCounter{model: model}
 }
 
-// --- scalar counter --------------------------------------------------
-
-// scalarCounter applies the inflation factor uniformly. The cheapest
-// strategy: pure arithmetic, no I/O, no network.
-type scalarCounter struct{}
-
-func (scalarCounter) Count(_, _, _ string, cl100k int) (int, bool) {
-	return scaleByInflation(cl100k), false
+func (c modelCounter) Count(_, _, payload string, _ int) (int, bool) {
+	return tokens.CountFor(c.model, payload), false
 }
 
 // --- cached counter --------------------------------------------------
@@ -71,7 +77,7 @@ type opus47CacheEntry struct {
 
 // opus47Cache is the on-disk shape of `opus47-counts.json` — a map
 // keyed by case name. Missing entries are tolerated: the cached
-// counter falls through to the scalar strategy and the API counter
+// counter falls through to the model counter and the API counter
 // fills the gap on the next `--use-api` run.
 type opus47Cache map[string]opus47CacheEntry
 
@@ -110,22 +116,23 @@ func saveOpus47Cache(path string, c opus47Cache) error {
 	return os.Rename(tmp, path)
 }
 
-// cachedCounter consults the cache first, falls through to the scalar
-// strategy on miss. Concurrent reads are safe; concurrent writes (via
+// cachedCounter consults the cache first, falls through to the model
+// counter on miss. Concurrent reads are safe; concurrent writes (via
 // the API counter) are serialized through the mutex.
 type cachedCounter struct {
-	mu    sync.RWMutex
-	cache opus47Cache
+	mu       sync.RWMutex
+	cache    opus47Cache
+	fallback modelCounter
 }
 
-func newCachedCounter(c opus47Cache) *cachedCounter {
+func newCachedCounter(c opus47Cache, model string) *cachedCounter {
 	if c == nil {
 		c = opus47Cache{}
 	}
-	return &cachedCounter{cache: c}
+	return &cachedCounter{cache: c, fallback: newModelCounter(model)}
 }
 
-func (c *cachedCounter) Count(caseName, channel, _ string, cl100k int) (int, bool) {
+func (c *cachedCounter) Count(caseName, channel, payload string, cl100k int) (int, bool) {
 	c.mu.RLock()
 	entry, ok := c.cache[caseName]
 	c.mu.RUnlock()
@@ -141,16 +148,14 @@ func (c *cachedCounter) Count(caseName, channel, _ string, cl100k int) (int, boo
 			}
 		}
 	}
-	return scaleByInflation(cl100k), false
+	return c.fallback.Count(caseName, channel, payload, cl100k)
 }
 
 func (c *cachedCounter) snapshot() opus47Cache {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make(opus47Cache, len(c.cache))
-	for k, v := range c.cache {
-		out[k] = v
-	}
+	maps.Copy(out, c.cache)
 	return out
 }
 
@@ -171,8 +176,8 @@ func (c *cachedCounter) store(caseName, channel string, count int) {
 
 // apiCounter wraps a cachedCounter and falls through to Anthropic's
 // `messages/count_tokens` endpoint on cache miss, then stores the
-// result for future runs. Network failures degrade to the scalar
-// strategy with a warning on stderr — the harness must keep running
+// result for future runs. Network failures degrade to the model
+// counter with a warning on stderr — the harness must keep running
 // when the user is offline.
 type apiCounter struct {
 	cached  *cachedCounter
@@ -197,7 +202,7 @@ func newAPICounter(cached *cachedCounter, model string) (*apiCounter, error) {
 		return nil, errors.New("--use-api requires ANTHROPIC_API_KEY in environment")
 	}
 	if model == "" {
-		model = "claude-opus-4-20250514"
+		model = defaultOpus47Model
 	}
 	return &apiCounter{
 		cached:  cached,
@@ -214,11 +219,11 @@ func (a *apiCounter) Count(caseName, channel, payload string, cl100k int) (int, 
 	}
 	count, err := a.callAPI(payload)
 	if err != nil {
-		// Fail soft: warn once, keep ticking with the scalar.
+		// Fail soft: warn once, keep ticking with the model counter.
 		a.warned.Do(func() {
-			fmt.Fprintf(os.Stderr, "wire-bench: opus47 API counter degraded to scalar after first error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "wire-bench: opus47 API counter degraded to in-process model counter after first error: %v\n", err)
 		})
-		return scaleByInflation(cl100k), false
+		return a.cached.fallback.Count(caseName, channel, payload, cl100k)
 	}
 	a.cached.store(caseName, channel, count)
 	return count, true
