@@ -133,6 +133,15 @@ func (idx *Indexer) extractFile(
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
+	// Bundled / minified build artifacts are synthetic source — a
+	// minified bundle or a sourcemap has no meaningful symbols and
+	// only pollutes the graph. Detect by content and skip with
+	// telemetry, unless the user opted into indexing them.
+	if !idx.config.IndexMinified {
+		if reason := minifiedArtifactReason(lang, src); reason != "" {
+			return minifiedSkipResult(relPath, lang, reason), true, nil
+		}
+	}
 	if pool == nil {
 		r, eerr := idx.extractWithTimeout(ext, relPath, src)
 		if errors.Is(eerr, errExtractTimeout) {

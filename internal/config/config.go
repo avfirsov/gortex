@@ -404,6 +404,13 @@ type IndexConfig struct {
 	// that drops real symbols silently is a worse default than a
 	// slightly slower full index.
 	MaxFileSize int64 `mapstructure:"max_file_size" yaml:"max_file_size,omitempty"`
+	// IndexMinified controls whether bundled / minified build
+	// artifacts are indexed. Off by default: a minified bundle or a
+	// sourcemap is synthetic source — it has no meaningful symbols and
+	// only pollutes the graph and search results — so it is detected by
+	// content and skipped with a synthetic telemetry node. Set true to
+	// index such files anyway. Configured under `index.index_minified`.
+	IndexMinified bool `mapstructure:"index_minified" yaml:"index_minified,omitempty"`
 	// CrashIsolation runs tree-sitter extraction in worker
 	// subprocesses so a grammar SIGSEGV / OOM / hang on one
 	// pathological file is contained: the bad file is quarantined

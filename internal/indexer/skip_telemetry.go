@@ -75,6 +75,26 @@ func timeoutSkipResult(relPath, lang string, budgetMS int) *parser.ExtractionRes
 	}
 }
 
+// minifiedSkipResult builds a synthetic single-node result for a build
+// artifact (a minified bundle or a sourcemap) detected by content and
+// skipped, so it stays visible in the graph with the skip reason
+// attached instead of polluting it with mangled symbols.
+func minifiedSkipResult(relPath, lang, reason string) *parser.ExtractionResult {
+	return &parser.ExtractionResult{
+		Nodes: []*graph.Node{{
+			ID:       relPath,
+			Kind:     graph.KindFile,
+			Name:     filepath.Base(relPath),
+			FilePath: relPath,
+			Language: lang,
+			Meta: map[string]any{
+				"skipped_due_to_minified": true,
+				"minified_reason":         reason,
+			},
+		}},
+	}
+}
+
 // sizeSkipNode builds a synthetic file node for a file dropped by the
 // size cap.
 func sizeSkipNode(sf skippedFile, maxSize int64) *graph.Node {

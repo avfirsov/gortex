@@ -1542,6 +1542,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 	var processed int64
 	var fileCount int64
 	var skippedByTimeout int64
+	var skippedByMinified int64
 
 	var wg sync.WaitGroup
 	for range workers {
@@ -1587,6 +1588,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				if skipped && len(result.Nodes) > 0 {
 					if _, ok := result.Nodes[0].Meta["skipped_due_to_timeout"]; ok {
 						atomic.AddInt64(&skippedByTimeout, 1)
+					}
+					if _, ok := result.Nodes[0].Meta["skipped_due_to_minified"]; ok {
+						atomic.AddInt64(&skippedByMinified, 1)
 					}
 				}
 
@@ -1880,7 +1884,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 		EdgeCount:        edges,
 		FileCount:        int(fileCount),
 		QuarantinedFiles: quarantine.Len(),
-		SkippedFiles:     len(skippedBySize) + int(skippedByTimeout),
+		SkippedFiles:     len(skippedBySize) + int(skippedByTimeout) + int(skippedByMinified),
 		DurationMs:       time.Since(start).Milliseconds(),
 		Errors:           errors,
 	}
