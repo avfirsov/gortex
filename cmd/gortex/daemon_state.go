@@ -96,19 +96,6 @@ type daemonState struct {
 //
 // Any previously-tracked repos (from ~/.config/gortex/config.yaml) are
 // loaded on startup so the daemon restarts pick up where it left off.
-// isTruthyEnv returns true for the usual "yes" env-var spellings,
-// case-insensitively: "1", "true", "yes", "on", "y". Anything else —
-// including empty, "0", "false", "no", "off" — returns false.
-func isTruthyEnv(name string) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
-	switch v {
-	case "1", "true", "yes", "on", "y":
-		return true
-	default:
-		return false
-	}
-}
-
 // isFalsyEnv returns true when the env var is explicitly set to one
 // of the "no" spellings: "0", "false", "no", "off", "n". An unset or
 // empty env returns false (default-on semantics for opt-out flags).
