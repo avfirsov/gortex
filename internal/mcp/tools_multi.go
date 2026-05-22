@@ -49,6 +49,21 @@ func (s *Server) registerMultiRepoTools() {
 		),
 		s.handleGetActiveProject,
 	)
+
+	s.addTool(
+		mcp.NewTool("query_project",
+			mcp.WithDescription("Search symbols in another project or repository without switching the "+
+				"active project. A read-only, one-shot cross-project lookup: it resolves the named "+
+				"project (or a bare tracked-repo prefix), searches it, and returns — the active project "+
+				"and the session scope are left unchanged. Use this instead of set_active_project for a "+
+				"quick look into another project."),
+			mcp.WithString("project", mcp.Required(),
+				mcp.Description("Project name, per-repo project tag, or tracked-repo prefix to search")),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Symbol search query")),
+			mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
+		),
+		s.handleQueryProject,
+	)
 }
 
 // handleTrackRepository validates the path, indexes the repo, and persists to GlobalConfig.
