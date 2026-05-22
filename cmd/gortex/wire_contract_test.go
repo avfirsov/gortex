@@ -134,11 +134,12 @@ func describeFields(t reflect.Type) string {
 func wireContractGolden(name string) string {
 	switch name {
 	case "graph.Node":
-		// Bumped when WorkspaceID and ProjectID were added. Additive —
-		// gob decodes unknown fields as zero, so older snapshots still
-		// load with both new fields blank; daemon warmup backfills them
-		// from config.
-		return "5783f7ad776535db819402df2b60328dcb8f813d8999b97554e6a484d25db792"
+		// Bumped when AbsoluteFilePath was added — a per-response
+		// decoration (empty on the canonical node, populated only on the
+		// copies MCP result encoders serialise). Additive: gob decodes
+		// unknown fields as zero, so older snapshots still load with it
+		// blank. Previously bumped when WorkspaceID / ProjectID were added.
+		return "b04bc4f58977e8220d31fdbf3fdab66867ab76790d6724bdabaf80b87958a7a4"
 	case "graph.Edge":
 		// Bumped when Tier was added — the coarse provenance label
 		// (ast / lsp / heuristic) derived from Origin and surfaced to
