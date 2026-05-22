@@ -317,7 +317,7 @@ After `gortex install` (once per machine) and `gortex init` (once per repo), Cla
 - **Sub-agents (2):** installed to `~/.claude/agents/` by `gortex install`. Claude Code auto-routes matching prompts to them; each runs in a fresh context window and returns a single summary, keeping the parent's context clean. Tool allowlists are pinned to gortex graph tools only — Bash / Grep / Glob are unavailable to the sub-agent by construction.
   - `gortex-search` — locate code, trace call paths, explore architecture
   - `gortex-impact` — assess blast radius before editing (`verify_change`, `simulate_chain`, `check_guards`, `get_test_targets`)
-- **PreToolUse hook:** automatic graph context + graph-tool suggestions on Read/Grep/Glob
+- **PreToolUse hook:** automatic graph context + graph-tool suggestions on Read/Grep/Glob. The posture is selectable via `gortex install --hook-mode` — `deny` (default), `enrich`, `consult-unlock` (deny fallback reads only until the graph has been queried once this session), or `nudge` (a rate-limited soft reminder instead of a hard deny). Gortex's own MCP tools are auto-approved under the host's permissive permission modes
 - **PreCompact hook:** condensed orientation snapshot injected before context compaction so the agent resumes without re-exploring
 - **Stop hook:** post-task diagnostics — tests to run, guard violations, dead code, and contract issues on the changed symbols — injected as context before the agent hands off
 - **CLAUDE.md:** per-repo codebase overview (via `--analyze`) plus a marker-guarded community routing block written by `gortex init --skills`
@@ -410,7 +410,7 @@ gortex query stats                      Show graph statistics
 
 All query commands support `--format text|json|dot` (DOT output for Graphviz visualization).
 
-## MCP Tools (95+, lazy-loaded)
+## MCP Tools (100+, lazy-loaded)
 
 ### Tool surface — lazy discovery (N50)
 
@@ -455,7 +455,7 @@ the result body is never mutated. Disable with `GORTEX_MCP_SANITIZE=0`.
 | Tool | Description |
 |------|-------------|
 | `graph_stats` | Node/edge counts by kind, language, per-repo stats, session token savings, and an `edge_identity_revisions` counter (edges re-keyed when their provenance changed) |
-| `search_symbols` | Find symbols by name (replaces Grep). Inline `kind:`/`lang:`/`path:` field clauses + `query_class` / `max_per_file` tuning; accepts `repo`, `project`, `ref` params |
+| `search_symbols` | Find symbols by name (replaces Grep). Inline `kind:`/`lang:`/`path:` field clauses + `query_class` / `max_per_file` tuning; accepts `repo`, `project`, `ref`, `scope` params |
 | `search_text` | Trigram-accelerated literal code search across the repo — the alt grep backbone. Returns file/line/text rows |
 | `winnow_symbols` | Structured constraint-chain retrieval — `kind`, `language`, `community`, `path_prefix`, `min_fan_in`, `min_fan_out`, `min_churn`, `text_match` with per-axis score contributions |
 | `get_symbol` | Symbol location and signature (replaces Read). Accepts `repo`, `project`, `ref` params |
@@ -524,6 +524,8 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 | `edit_file` | Edit any file (markdown, config, spec, template, source) by exact string replacement — accepts absolute paths or repo-rooted paths. Kills the Read-before-Edit stall on files not in the graph |
 | `write_file` | Create or overwrite any file with given content — atomic temp+rename, re-indexes on write |
 | `rename_symbol` | Coordinated multi-file rename with all references |
+| `set_planning_mode` | Switch the session between a guaranteed no-writes planning phase (every editing tool removed from the surface and hard-blocked) and editing mode |
+| `workflow` | Drive a phase-enforcement state machine (explore → implement → verify) — editing tools are gated until the implement phase; `block` mode refuses an out-of-phase call with a structured error, `warn` mode auto-advances the phase |
 
 ### Agent-Optimized (token efficiency)
 | Tool | Description |
@@ -581,6 +583,10 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 | `get_active_project` | Return current project name and its member repositories |
 | `list_repos` | List every project/repo in the active workspace |
 | `workspace_info` | Workspace identity — bind mode, root directory, marker contents, discovered member set |
+| `query_project` | Search symbols in another project or repo without a `set_active_project` switch — a read-only cross-project lookup that leaves the active project and session scope unchanged |
+| `save_scope` | Save a named, reusable set of repository prefixes — a persisted slice of a multi-repo workspace that `search_symbols` / `smart_context` accept via a `scope` argument |
+| `list_scopes` | List every saved repository scope |
+| `delete_scope` | Delete a saved repository scope by name |
 
 ### Live Editor Buffers (Shadow-Graph Overlay Sessions)
 Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex composes a per-request **shadow view** on top of the immutable base graph and threads it through the tool dispatch context — every subsequent `tools/call` from the same MCP session reads through the shadow. Graph-walking tools (`find_usages`, `get_call_chain`, `analyze`, …) and source-reading tools (`get_symbol_source`, `get_editing_context`, …) all see the editor-buffer state without per-tool changes.
