@@ -57,6 +57,8 @@ var hotEagerTools = map[string]bool{
 	"edit_symbol":   true,
 	"rename_symbol": true,
 	"batch_edit":    true,
+	"move_symbol":   true,
+	"inline_symbol": true,
 }
 
 // LazyToolsSearchName is the well-known name of the discovery tool the

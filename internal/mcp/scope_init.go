@@ -89,6 +89,8 @@ var defaultToolScopes = map[string]ToolScope{
 	"scaffold":        ScopeRepo,
 	"suggest_pattern": ScopeRepo,
 	"batch_edit":      ScopeRepo,
+	"move_symbol":     ScopeRepo,
+	"inline_symbol":   ScopeRepo,
 
 	// Planning / impact / change support.
 	"smart_context":         ScopeRepo,
