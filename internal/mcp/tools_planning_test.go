@@ -116,6 +116,40 @@ func TestPlanTurn_NoCandidates_StillEmitsFallbacks(t *testing.T) {
 	assert.True(t, sawSearch, "expected search_symbols fallback when no BM25 candidates")
 }
 
+// TestPlanTurn_ExactNameMatchLeadsCandidates pins the regression where
+// a task naming a real graph symbol (e.g. "find every caller of
+// renderToolsSearchResult") used to surface unrelated BM25 results
+// (ts_lex from tree-sitter parser tables) because engine.SearchSymbols
+// runs without the MCP search_symbols rerank pipeline. The fix
+// prepends FindNodesByName hits for identifier-shape keywords so the
+// user's actual target leads the candidate list.
+func TestPlanTurn_ExactNameMatchLeadsCandidates(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	// setupTestServer fixture already provides a `helper` function;
+	// add a clearly-named identifier the keyword extractor will
+	// classify as identifier-shape (camelCase) and the graph's name
+	// index will find directly.
+	srv.graph.AddNode(&graph.Node{
+		ID:       "fake.go::renderToolsSearchResult",
+		Name:     "renderToolsSearchResult",
+		Kind:     graph.KindFunction,
+		FilePath: "fake.go",
+	})
+
+	result := callTool(t, srv, "plan_turn", map[string]any{
+		"task": "find every caller of renderToolsSearchResult",
+	})
+	require.False(t, result.IsError)
+
+	var resp struct {
+		TopCandidates []string `json:"top_candidates"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(result.Content[0].(mcplib.TextContent).Text), &resp))
+	require.NotEmpty(t, resp.TopCandidates)
+	require.Equal(t, "fake.go::renderToolsSearchResult", resp.TopCandidates[0],
+		"exact-name match must lead the candidate list; got %v", resp.TopCandidates)
+}
+
 // TestExtractKeywords_PrioritisesIdentifierShape pins the regression
 // where `find every caller of renderToolsSearchResult` produced
 // recommendations centred on unrelated `findLocked` / `findDeclaration`

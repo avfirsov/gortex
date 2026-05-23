@@ -39,9 +39,33 @@ func (s *Server) handlePlanTurn(ctx context.Context, req mcp.CallToolRequest) (*
 
 	keywords := extractKeywords(task)
 
-	// BM25 search per keyword; dedup + filter out files/imports.
 	seen := make(map[string]bool)
 	var candidates []*graph.Node
+
+	// Exact-name match first. extractKeywords already prioritises
+	// identifier-shape tokens; if the user actually typed the symbol
+	// they care about (`renderToolsSearchResult`), the graph's name
+	// index has the answer directly. engine.SearchSymbols is plain
+	// BM25 — without a rerank pipeline it ranks ts_lex / set_contains
+	// above a single exact-name match because parser tables saturate
+	// the token corpus. The exact-name shortcut puts the user's
+	// identifier at position 0; BM25 still fills the rest.
+	for _, kw := range keywords {
+		if len(kw) < 3 || !hasIdentifierShape(kw) {
+			continue
+		}
+		for _, m := range s.scopedNodeSlice(ctx, s.graph.FindNodesByName(kw)) {
+			if m.Kind == graph.KindFile || m.Kind == graph.KindImport {
+				continue
+			}
+			if !seen[m.ID] {
+				seen[m.ID] = true
+				candidates = append(candidates, m)
+			}
+		}
+	}
+
+	// BM25 search per keyword; dedup + filter out files/imports.
 	for _, kw := range keywords {
 		if len(kw) < 3 {
 			continue
