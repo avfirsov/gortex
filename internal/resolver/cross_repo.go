@@ -188,11 +188,18 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 
 	edges := cr.graph.AllEdges()
+	// Accumulate every re-bind across the pass and flush in one
+	// batched call so disk backends commit in chunks instead of one
+	// transaction per resolved edge.
+	var reindexBatch []graph.EdgeReindex
 	for _, e := range edges {
 		if !strings.HasPrefix(e.To, unresolvedPrefix) {
 			continue
 		}
-		cr.resolveEdge(e, stats)
+		cr.resolveEdge(e, stats, &reindexBatch)
+	}
+	if len(reindexBatch) > 0 {
+		cr.graph.ReindexEdges(reindexBatch)
 	}
 	// Materialise the cross_repo_* edge layer over the freshly lifted
 	// calls / implements / extends edges.
@@ -215,6 +222,7 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 
+	var reindexBatch []graph.EdgeReindex
 	nodes := cr.graph.GetRepoNodes(repoPrefix)
 	for _, n := range nodes {
 		edges := cr.graph.GetOutEdges(n.ID)
@@ -222,8 +230,11 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 			if !strings.HasPrefix(e.To, unresolvedPrefix) {
 				continue
 			}
-			cr.resolveEdge(e, stats)
+			cr.resolveEdge(e, stats, &reindexBatch)
 		}
+	}
+	if len(reindexBatch) > 0 {
+		cr.graph.ReindexEdges(reindexBatch)
 	}
 	// Materialise the cross_repo_* edge layer. The pass is graph-wide
 	// (cheap relative to a resolve pass) so an edge into repoPrefix
@@ -387,7 +398,13 @@ func (cr *CrossRepoResolver) callerFileID(e *graph.Edge) string {
 	return e.FilePath
 }
 
-func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats) {
+// resolveEdge dispatches one unresolved edge through the cross-repo
+// resolution paths and, when the resolution lifted the To target,
+// appends a re-bind job to batch instead of committing a per-edge
+// ReindexEdge transaction. The caller flushes the accumulated batch
+// after the whole pass via ReindexEdges so disk backends amortise
+// the commit cost.
+func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
 	oldTo := e.To
 	target := strings.TrimPrefix(e.To, unresolvedPrefix)
 
@@ -410,7 +427,7 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats) {
 	}
 
 	if e.To != oldTo {
-		cr.graph.ReindexEdge(e, oldTo)
+		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
 }
 

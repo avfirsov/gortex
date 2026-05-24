@@ -237,6 +237,18 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// the race entirely; it costs ~5% of resolver wall time on a
 	// 12k-edge vscode pass and buys a clean -race run plus simpler
 	// reasoning.
+	// Collect every mutation across all workers into one slice and hand
+	// the whole batch to ReindexEdges. Disk-backed stores commit per
+	// chunk inside the implementation; the in-memory store loops
+	// through the existing per-edge code. Per-edge ReindexEdge was the
+	// resolver's bottleneck against bbolt (10k+ ACID round-trips); the
+	// batch form folds it to ≤(N/5000) commits without changing any
+	// observable semantics.
+	totalJobs := 0
+	for i := range perWorkerJobs {
+		totalJobs += len(perWorkerJobs[i])
+	}
+	reindexBatch := make([]graph.EdgeReindex, 0, totalJobs)
 	for i := range perWorkerJobs {
 		for _, j := range perWorkerJobs[i] {
 			j.edge.To = j.newTo
@@ -245,9 +257,10 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			j.edge.Confidence = j.confidence
 			j.edge.Origin = j.origin
 			j.edge.Meta = j.meta
-			r.graph.ReindexEdge(j.edge, j.oldTo)
+			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo})
 		}
 	}
+	r.graph.ReindexEdges(reindexBatch)
 
 	// Cross-package name-match guard. The heuristic fallbacks above can
 	// resolve a call by name alone to a candidate in a package the
@@ -396,10 +409,14 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	stats := &ResolveStats{}
 
 	// Get all nodes in the file, then check their outgoing edges.
-	// Single-threaded path — apply ReindexEdge inline as before.
-	// Resolved edges are also recorded as jobs so the cross-package
-	// guard can re-check (and, if needed, revert) the weak-tier ones.
+	// Single-threaded path — collect mutations into a batch and flush
+	// in one ReindexEdges call after the file's edges are walked, so a
+	// per-file ResolveFile pass produces one Tx commit on disk
+	// backends instead of one per resolved edge. Resolved edges are
+	// also recorded as jobs so the cross-package guard can re-check
+	// (and, if needed, revert) the weak-tier ones.
 	var jobs []reindexJob
+	var reindexBatch []graph.EdgeReindex
 	nodes := r.graph.GetFileNodes(filePath)
 	for _, n := range nodes {
 		edges := r.graph.GetOutEdges(n.ID)
@@ -409,7 +426,7 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 			}
 			oldTo, changed := r.resolveEdge(e, stats)
 			if changed {
-				r.graph.ReindexEdge(e, oldTo)
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 				jobs = append(jobs, reindexJob{
 					edge:       e,
 					oldTo:      oldTo,
@@ -420,6 +437,9 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 				})
 			}
 		}
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
 	}
 
 	// Cross-package name-match guard — same contract as in ResolveAll.
@@ -1796,6 +1816,7 @@ func (r *Resolver) InferOverrides() int {
 	}
 
 	added := 0
+	var provBatch []graph.EdgeProvenanceUpdate
 	for _, p := range pending {
 		// Skip when the edge already exists.
 		dup := false
@@ -1803,11 +1824,13 @@ func (r *Resolver) InferOverrides() int {
 			if existing.Kind == graph.EdgeOverrides && existing.To == p.to.ID {
 				dup = true
 				// Upgrade the provenance of the existing override edge
-				// through SetEdgeProvenance so the identity change is
-				// counted — a bare existing.Origin write would bypass
-				// the revision counter.
+				// through SetEdgeProvenanceBatch so the identity change
+				// is counted — a bare existing.Origin write would
+				// bypass the revision counter. Batched so a large
+				// hierarchy pass commits its provenance bumps in
+				// chunks on disk backends.
 				if graph.OriginRank(existing.Origin) < graph.OriginRank(p.origin) {
-					r.graph.SetEdgeProvenance(existing, p.origin)
+					provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: existing, NewOrigin: p.origin})
 				}
 				break
 			}
@@ -1826,6 +1849,9 @@ func (r *Resolver) InferOverrides() int {
 			Origin:          p.origin,
 		})
 		added++
+	}
+	if len(provBatch) > 0 {
+		r.graph.SetEdgeProvenanceBatch(provBatch)
 	}
 	return added
 }

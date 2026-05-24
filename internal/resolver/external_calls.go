@@ -81,6 +81,7 @@ func SynthesizeExternalCalls(g graph.Store, enabled bool) int {
 	defer mu.Unlock()
 
 	synthesized := 0
+	var reindexBatch []graph.EdgeReindex
 	for _, e := range g.AllEdges() {
 		if e == nil || !isCallLikeEdge(e.Kind) {
 			continue
@@ -124,8 +125,11 @@ func SynthesizeExternalCalls(g graph.Store, enabled bool) int {
 			e.Meta = map[string]any{}
 		}
 		e.Meta["external_call"] = true
-		g.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		synthesized++
+	}
+	if len(reindexBatch) > 0 {
+		g.ReindexEdges(reindexBatch)
 	}
 	return synthesized
 }

@@ -80,13 +80,14 @@ func (r *Resolver) attributeNonGoModuleImports() {
 		r.graph.AddNode(buildNonGoModuleNode(seed))
 	}
 
-	// Rewrite each EdgeImports target and re-bucket via
-	// ReindexEdge so find_usages on the new module sees the
-	// caller file.
+	// Rewrite each EdgeImports target and collect the re-bucket
+	// jobs into one batch so disk backends commit in chunks rather
+	// than once per import rewrite.
+	reindexBatch := make([]graph.EdgeReindex, 0, len(rewrites))
 	for _, p := range rewrites {
 		p.edge.To = p.moduleID
 		p.edge.Origin = graph.OriginASTResolved
-		r.graph.ReindexEdge(p.edge, p.oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: p.edge, OldTo: p.oldTo})
 
 		set, ok := dependsSeen[p.edge.From]
 		if !ok {
@@ -113,6 +114,9 @@ func (r *Resolver) attributeNonGoModuleImports() {
 			ConfidenceLabel: "EXTRACTED",
 			Origin:          graph.OriginASTResolved,
 		})
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
 	}
 }
 

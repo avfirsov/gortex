@@ -44,7 +44,13 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	if len(jobs) == 0 {
 		return 0
 	}
-	reverted := 0
+	// Collect both mutation lists across the whole pass and apply them
+	// via the batched Store methods at the end. Per-edge
+	// SetEdgeProvenance + ReindexEdge in the body would otherwise pay
+	// two ACID round-trips per reverted edge against disk backends —
+	// catastrophic on a 30k-job pass.
+	var provBatch []graph.EdgeProvenanceUpdate
+	var reindexBatch []graph.EdgeReindex
 	for i := range jobs {
 		j := &jobs[i]
 		if !isCallLikeEdge(j.kind) {
@@ -80,19 +86,24 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		}
 		// Not reachable — revert to the unresolved placeholder and
 		// re-index against the resolved target we are abandoning.
-		// Drop the resolution provenance through SetEdgeProvenance so
-		// the reverted edge's identity change is counted; the logical
-		// key still carries the resolved target at this point, which
-		// is fine — SetEdgeProvenance keys the revision on Origin
-		// alone. The target revert + re-bucket follows.
+		// SetEdgeProvenance("") drops the resolution provenance so
+		// the reverted edge's identity change is counted; the target
+		// revert + re-bucket follows. Both go in their respective
+		// batches so the whole pass commits in two chunks instead of
+		// 2×N per-edge transactions.
 		oldResolved := j.edge.To
-		r.graph.SetEdgeProvenance(j.edge, "")
+		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
-		r.graph.ReindexEdge(j.edge, oldResolved)
-		reverted++
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 	}
-	return reverted
+	if len(provBatch) > 0 {
+		r.graph.SetEdgeProvenanceBatch(provBatch)
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
+	}
+	return len(reindexBatch)
 }
 
 // isBareNameCallTarget reports whether an unresolved edge target is a

@@ -87,6 +87,7 @@ func ResolveTemporalCalls(g graph.Store) int {
 	defer mu.Unlock()
 	idx := buildTemporalIndex(g)
 	resolved := 0
+	var reindexBatch []graph.EdgeReindex
 	for _, e := range g.AllEdges() {
 		if e == nil || e.Kind != graph.EdgeCalls || e.Meta == nil {
 			continue
@@ -131,7 +132,10 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.ConfidenceLabel = ""
 			delete(e.Meta, "temporal_resolution")
 		}
-		g.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+	}
+	if len(reindexBatch) > 0 {
+		g.ReindexEdges(reindexBatch)
 	}
 	return resolved
 }

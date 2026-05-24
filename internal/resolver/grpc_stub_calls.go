@@ -57,6 +57,7 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 
 	idx := buildGRPCHandlerIndex(g)
 	resolved := 0
+	var reindexBatch []graph.EdgeReindex
 	for _, e := range g.AllEdges() {
 		if e == nil || e.Kind != graph.EdgeCalls || e.Meta == nil {
 			continue
@@ -104,7 +105,10 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 			e.ConfidenceLabel = ""
 			delete(e.Meta, "grpc_resolution")
 		}
-		g.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+	}
+	if len(reindexBatch) > 0 {
+		g.ReindexEdges(reindexBatch)
 	}
 	return resolved
 }

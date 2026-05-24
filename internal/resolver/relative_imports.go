@@ -22,6 +22,7 @@ import (
 // module-attribution pass can decide what to do with them.
 func (r *Resolver) resolveRelativeImports() {
 	fileLang := r.collectFileLanguages()
+	var reindexBatch []graph.EdgeReindex
 	for _, e := range r.graph.AllEdges() {
 		if e.Kind != graph.EdgeImports {
 			continue
@@ -62,14 +63,17 @@ func (r *Resolver) resolveRelativeImports() {
 			if strings.HasPrefix(e.To, "unresolved::pyrel::") {
 				oldTo := e.To
 				e.To = "external::" + path
-				r.graph.ReindexEdge(e, oldTo)
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 			}
 			continue
 		}
 		oldTo := e.To
 		e.To = resolved
 		e.Origin = graph.OriginASTResolved
-		r.graph.ReindexEdge(e, oldTo)
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+	}
+	if len(reindexBatch) > 0 {
+		r.graph.ReindexEdges(reindexBatch)
 	}
 }
 
