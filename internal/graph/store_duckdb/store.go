@@ -112,6 +112,16 @@ type Store struct {
 	stmtSelectRepoNodeIDs *sql.Stmt
 	stmtDeleteNodeByFile  *sql.Stmt
 	stmtDeleteNodeByRepo  *sql.Stmt
+
+	// Bulk-load fast path (see BeginBulkLoad). When active, AddBatch
+	// buffers rows in memory instead of opening an Appender per call;
+	// FlushBulk dedupes the buffers and streams everything through a
+	// single Appender pass — skipping the per-batch DELETE pre-pass,
+	// per-batch transaction commit, and per-batch Appender open/close.
+	bulkMu     sync.Mutex
+	bulkActive bool
+	bulkNodes  []*graph.Node
+	bulkEdges  []*graph.Edge
 }
 
 // Compile-time assertion: *Store satisfies graph.Store.
@@ -430,6 +440,19 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
+	// Bulk-load fast path: buffer in memory, defer Appender to
+	// FlushBulk. The buffer lock is held briefly only across the slice
+	// append — the indexer's parse workers can hammer AddBatch in
+	// parallel with minimal contention.
+	s.bulkMu.Lock()
+	if s.bulkActive {
+		s.bulkNodes = append(s.bulkNodes, nodes...)
+		s.bulkEdges = append(s.bulkEdges, edges...)
+		s.bulkMu.Unlock()
+		return
+	}
+	s.bulkMu.Unlock()
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -1385,4 +1408,90 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 		}
 	}
 	return out
+}
+
+// -- BulkLoader implementation -------------------------------------------
+
+// Compile-time assertion: *Store satisfies graph.BulkLoader.
+var _ graph.BulkLoader = (*Store)(nil)
+
+// BeginBulkLoad enters buffer-mode write. Subsequent AddBatch calls
+// append into in-memory slices instead of opening an Appender per
+// call. FlushBulk dedupes the buffers globally and streams everything
+// through a single Appender pass — skipping the per-batch DELETE
+// pre-pass (the table starts empty, so no collisions can exist),
+// per-batch transaction commit, and per-batch Appender open/close.
+func (s *Store) BeginBulkLoad() {
+	s.bulkMu.Lock()
+	defer s.bulkMu.Unlock()
+	if s.bulkActive {
+		panic("store_duckdb: BeginBulkLoad called twice without FlushBulk")
+	}
+	s.bulkActive = true
+}
+
+// FlushBulk dedupes the bulk buffers and streams everything through
+// a single Appender pass per table.
+func (s *Store) FlushBulk() error {
+	s.bulkMu.Lock()
+	if !s.bulkActive {
+		s.bulkMu.Unlock()
+		return fmt.Errorf("store_duckdb: FlushBulk without BeginBulkLoad")
+	}
+	nodes := s.bulkNodes
+	edges := s.bulkEdges
+	s.bulkNodes = nil
+	s.bulkEdges = nil
+	s.bulkActive = false
+	s.bulkMu.Unlock()
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Dedup nodes by ID (last write wins). Mirrors the per-batch
+	// within-batch dedup that AddBatch already does, just applied
+	// across all buffered batches at once.
+	seenNodeIDs := make(map[string]int, len(nodes))
+	validNodes := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		if idx, ok := seenNodeIDs[n.ID]; ok {
+			validNodes[idx] = n
+			continue
+		}
+		seenNodeIDs[n.ID] = len(validNodes)
+		validNodes = append(validNodes, n)
+	}
+	type edgeKey struct {
+		from, to, kind, file string
+		line                 int
+	}
+	seenEdgeKeys := make(map[edgeKey]int, len(edges))
+	validEdges := make([]*graph.Edge, 0, len(edges))
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		k := edgeKey{e.From, e.To, string(e.Kind), e.FilePath, e.Line}
+		if idx, ok := seenEdgeKeys[k]; ok {
+			validEdges[idx] = e
+			continue
+		}
+		seenEdgeKeys[k] = len(validEdges)
+		validEdges = append(validEdges, e)
+	}
+	if len(validNodes) == 0 && len(validEdges) == 0 {
+		return nil
+	}
+
+	// Single Appender pass — no pre-DELETE because the table is empty
+	// (BeginBulkLoad's contract requires NodeCount == 0 at bracket
+	// entry), and the buffers are deduped above so no collisions can
+	// arise from within the bulk window either.
+	if err := s.appendNodesAndEdges(validNodes, validEdges); err != nil {
+		return fmt.Errorf("bulk appender: %w", err)
+	}
+	return nil
 }
