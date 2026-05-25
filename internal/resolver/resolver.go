@@ -376,6 +376,13 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// bind to.
 	r.bindBareNameScopeRefs()
 
+	// Bind in-body references to a function's own generic type
+	// parameters (`var x T`, `func F[T any]() T { ... }`) onto the
+	// pre-existing KindGenericParam nodes — without this pass they
+	// stayed as `unresolved::T` even though the parser had already
+	// materialised the tparam node.
+	r.bindGenericParamRefs()
+
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
 	// mis-mapped to a phantom pypi/pub package.
