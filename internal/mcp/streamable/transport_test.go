@@ -16,6 +16,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/zzet/gortex/internal/daemon"
+	"go.uber.org/zap"
 )
 
 // newTestMCPServer mints an mcp-go server pre-loaded with an `echo`
@@ -710,6 +712,91 @@ func TestMCPServerDispatcherNilFailsCleanly(t *testing.T) {
 	_, err := d.Dispatch(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"x"}`))
 	if err == nil {
 		t.Error("Dispatch(nil server) returned nil error")
+	}
+}
+
+// TestRouterPreservesFullArguments pins the regression fix: when the
+// streamable transport routes a tools/call through a daemon.Router
+// whose local executor unmarshals to a map, the executor must see the
+// caller's ORIGINAL arguments — not a stripped {workspace,cwd} peek.
+//
+// A previous version of tryRouteToolCall re-marshalled only the typed
+// peek struct (workspace+cwd) and dropped every other key on the
+// floor, breaking every real MCP usage with "X is required" because
+// the args map was effectively empty. This test fails on that bug
+// and passes on the fix.
+func TestRouterPreservesFullArguments(t *testing.T) {
+	var seenBody []byte
+	router := daemon.NewRouter(daemon.RouterConfig{
+		LocalExecute: func(_ context.Context, _ string, body []byte) ([]byte, int, error) {
+			seenBody = append([]byte(nil), body...)
+			// Mirror the production local executor: unwrap
+			// `{"arguments": {...}}` then assert every caller key
+			// survived the round-trip.
+			var nested struct {
+				Arguments map[string]any `json:"arguments"`
+			}
+			if err := json.Unmarshal(body, &nested); err != nil {
+				return nil, 500, err
+			}
+			if nested.Arguments == nil {
+				return []byte(`{"error":"no arguments"}`), 200, nil
+			}
+			out, _ := json.Marshal(map[string]any{"ok": true, "args": nested.Arguments})
+			return out, 200, nil
+		},
+		Logger: zap.NewNop(),
+	})
+
+	store := NewMemoryStore(time.Minute)
+	defer store.Close()
+	tr := New(Config{
+		Dispatcher: MCPServerDispatcher{Server: newTestMCPServer()},
+		Store:      store,
+		Router:     router,
+	})
+
+	// Seed an initialized session so the transport accepts the call.
+	sid, err := store.Create(SessionState{Initialized: true, ClientName: "test"})
+	if err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	callBody := jsonRPC(7, "tools/call", map[string]any{
+		"name": "search_symbols",
+		"arguments": map[string]any{
+			"query": "NewServer",
+			"limit": 10,
+		},
+	})
+	rec := doPOST(t, tr, callBody, map[string]string{HeaderSessionID: sid})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 1) The local executor must have seen the original args.
+	var nested struct {
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := json.Unmarshal(seenBody, &nested); err != nil {
+		t.Fatalf("local executor body not JSON: %v\nbody=%s", err, string(seenBody))
+	}
+	if nested.Arguments == nil {
+		t.Fatalf("local executor saw nil arguments — args were stripped. body=%s", string(seenBody))
+	}
+	if got, _ := nested.Arguments["query"].(string); got != "NewServer" {
+		t.Errorf("query = %q, want %q (args stripped before reaching executor). body=%s",
+			got, "NewServer", string(seenBody))
+	}
+	// JSON numbers decode to float64 in interface{}; compare as such.
+	if got, _ := nested.Arguments["limit"].(float64); got != 10 {
+		t.Errorf("limit = %v, want 10 (args stripped before reaching executor). body=%s",
+			got, string(seenBody))
+	}
+
+	// 2) The wrapped tool result must reach the client too.
+	if !strings.Contains(rec.Body.String(), "NewServer") {
+		t.Errorf("client response missing forwarded args: %s", rec.Body.String())
 	}
 }
 

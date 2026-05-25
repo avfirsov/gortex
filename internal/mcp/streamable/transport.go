@@ -438,14 +438,20 @@ func (t *Transport) localDispatch(r *http.Request, state SessionState, frame []b
 // roster, and proxy the call there. A return value of (_, _, false)
 // means "fall through to local dispatch".
 func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame []byte) ([]byte, int, bool) {
+	// Decode the JSON-RPC envelope keeping the inbound `arguments`
+	// object as raw bytes — we MUST forward every caller-supplied key
+	// (e.g. `query`, `limit`, etc.) to the downstream executor, not
+	// just the workspace+cwd peek fields. A previous version
+	// re-marshalled only the typed peek struct, which silently
+	// stripped every other argument and made every router-routed tool
+	// call see an empty args map ("X is required" failures). Mirror
+	// the daemon dispatcher's tryProxyToolCall: peek workspace+cwd
+	// without dropping the rest.
 	var envelope struct {
 		ID     json.RawMessage `json:"id"`
 		Params struct {
-			Name      string `json:"name"`
-			Arguments struct {
-				Workspace string `json:"workspace"`
-				Cwd       string `json:"cwd"`
-			} `json:"arguments"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(frame, &envelope); err != nil {
@@ -454,23 +460,39 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	if envelope.Params.Name == "" {
 		return nil, 0, false
 	}
-	scope := envelope.Params.Arguments.Workspace
+	// Second decode is only used to peek the routing hints.
+	var peek struct {
+		Workspace string `json:"workspace"`
+		Cwd       string `json:"cwd"`
+	}
+	if len(envelope.Params.Arguments) > 0 {
+		_ = json.Unmarshal(envelope.Params.Arguments, &peek)
+	}
+	scope := peek.Workspace
 	if scope == "" {
 		scope = state.Workspace
 	}
-	cwd := envelope.Params.Arguments.Cwd
+	cwd := peek.Cwd
 	if cwd == "" {
 		cwd = state.CWD
 	}
 	if cwd == "" {
 		cwd = strings.TrimSpace(r.Header.Get("X-Gortex-Cwd"))
 	}
-	argsJSON, err := json.Marshal(envelope.Params.Arguments)
+	// Wrap the original raw arguments under `{"arguments": {...}}` so
+	// the local executor's nested-arguments unmarshal path (see
+	// cmd/gortex/server_router.go newLocalToolExecutor) finds them.
+	// This matches cmd/gortex/daemon_mcp.go:tryProxyToolCall exactly.
+	rawArgs := envelope.Params.Arguments
+	if len(rawArgs) == 0 {
+		rawArgs = json.RawMessage(`{}`)
+	}
+	body, err := json.Marshal(map[string]json.RawMessage{"arguments": rawArgs})
 	if err != nil {
 		return nil, 0, false
 	}
 	out, status, rerr := t.router.RouteToolCall(r.Context(),
-		envelope.Params.Name, argsJSON, daemon.RouteContext{
+		envelope.Params.Name, body, daemon.RouteContext{
 			ScopeOverride: scope,
 			Cwd:           cwd,
 		})
