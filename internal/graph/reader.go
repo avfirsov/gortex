@@ -22,6 +22,15 @@ type Reader interface {
 	GetNodeByQualName(qualName string) *Node
 	FindNodesByName(name string) []*Node
 
+	// GetNodesByIDs is the batched sibling of GetNode. Disk-backed
+	// stores (Ladybug) collapse N individual point lookups into a
+	// single bulk query — critical on the search hot path where one
+	// query materialises 60+ candidate IDs. The in-memory backend
+	// forwards to per-id GetNode, so the cost matches an inline loop
+	// there. Missing IDs are simply absent from the map (no nil
+	// values); duplicates dedupe naturally.
+	GetNodesByIDs(ids []string) map[string]*Node
+
 	// File / repo scopes.
 	GetFileNodes(filePath string) []*Node
 	GetRepoNodes(repoPrefix string) []*Node
