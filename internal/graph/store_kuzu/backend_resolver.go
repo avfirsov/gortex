@@ -90,7 +90,55 @@ CREATE (caller)-[newE:Edge {
 RETURN count(newE) AS resolved`
 	return s.runResolverQueryLocked(q, "ResolveSamePackage")
 }
-func (s *Store) ResolveImportAware() (int, error)           { return 0, nil }
+// ResolveImportAware drains the "imported-symbol" case: caller's
+// file_path is the FROM of an EdgeImports to an imported file, and
+// a Node with the unresolved name lives in that imported file.
+// When exactly one such candidate exists across all the caller's
+// imports, rewrite the edge to point at it.
+//
+// This is the highest-coverage rule for Python / JS / Rust-style
+// `import X` semantics where the target is in a different file but
+// reachable via the import set. Joins against the existing
+// EdgeImports adjacency (which the parser populates).
+func (s *Store) ResolveImportAware() (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	const q = `
+MATCH (caller:Node)-[e:Edge]->(stub:Node)
+WHERE stub.id STARTS WITH 'unresolved::' AND caller.file_path <> ''
+WITH e, caller, stub, substring(stub.id, 13, size(stub.id) - 12) AS name
+MATCH (callerFile:Node {file_path: caller.file_path})
+WHERE callerFile.kind = 'file'
+MATCH (callerFile)-[imp:Edge {kind: 'imports'}]->(importedFile:Node)
+WHERE importedFile.kind = 'file'
+  AND NOT (importedFile.id STARTS WITH 'external::')
+  AND NOT (importedFile.id STARTS WITH 'unresolved::')
+OPTIONAL MATCH (cnd:Node {name: name})
+WHERE cnd.file_path = importedFile.file_path
+  AND cnd.id <> stub.id
+WITH e, caller, stub, name, count(DISTINCT cnd) AS cnt
+WHERE cnt = 1
+MATCH (callerFile2:Node {file_path: caller.file_path})
+WHERE callerFile2.kind = 'file'
+MATCH (callerFile2)-[:Edge {kind: 'imports'}]->(importedFile2:Node)
+MATCH (target:Node {name: name})
+WHERE target.file_path = importedFile2.file_path
+  AND target.id <> stub.id
+DELETE e
+CREATE (caller)-[newE:Edge {
+    kind: e.kind,
+    file_path: e.file_path,
+    line: e.line,
+    confidence: e.confidence,
+    confidence_label: e.confidence_label,
+    origin: 'ast_resolved',
+    tier: 'ast_resolved',
+    cross_repo: e.cross_repo,
+    meta: e.meta
+}]->(target)
+RETURN count(newE) AS resolved`
+	return s.runResolverQueryLocked(q, "ResolveImportAware")
+}
 func (s *Store) ResolveRelativeImports(string) (int, error) { return 0, nil }
 func (s *Store) ResolveCrossRepo() (int, error)             { return 0, nil }
 func (s *Store) ResolveExternalCallStubs() (int, error)     { return 0, nil }

@@ -64,7 +64,40 @@ FROM unique_candidates u
 WHERE edges.edge_id = u.edge_id`
 	return s.runResolverUpdateLocked(q, "ResolveSamePackage")
 }
-func (s *Store) ResolveImportAware() (int, error)           { return 0, nil }
+// ResolveImportAware drains the "imported-symbol" case in DuckDB.
+// Multi-JOIN: caller's file_path → KindFile node → EdgeImports →
+// imported file_path → candidate Node with the unresolved name.
+// Unique candidate across the caller's import set wins.
+func (s *Store) ResolveImportAware() (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	const q = `
+WITH unique_candidates AS (
+    SELECT e.edge_id, MIN(t.id) AS target_id
+    FROM edges e
+    JOIN nodes c          ON c.id = e.from_id
+    JOIN nodes cf         ON cf.file_path = c.file_path AND cf.kind = 'file'
+    JOIN edges ie         ON ie.from_id = cf.id AND ie.kind = 'imports'
+    JOIN nodes imf        ON imf.id = ie.to_id
+                          AND imf.kind = 'file'
+                          AND imf.id NOT LIKE 'external::%'
+                          AND imf.id NOT LIKE 'unresolved::%'
+    JOIN nodes t          ON t.file_path = imf.file_path
+                          AND t.name = substring(e.to_id, 13)
+                          AND t.id <> e.to_id
+    WHERE e.to_id LIKE 'unresolved::%'
+      AND c.file_path <> ''
+    GROUP BY e.edge_id
+    HAVING COUNT(DISTINCT t.id) = 1
+)
+UPDATE edges
+SET to_id  = u.target_id,
+    origin = 'ast_resolved',
+    tier   = 'ast_resolved'
+FROM unique_candidates u
+WHERE edges.edge_id = u.edge_id`
+	return s.runResolverUpdateLocked(q, "ResolveImportAware")
+}
 func (s *Store) ResolveRelativeImports(string) (int, error) { return 0, nil }
 func (s *Store) ResolveCrossRepo() (int, error)             { return 0, nil }
 func (s *Store) ResolveExternalCallStubs() (int, error)     { return 0, nil }
