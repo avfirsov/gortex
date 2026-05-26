@@ -176,31 +176,55 @@ func topCommunitiesSummary(comms []analysis.Community) []map[string]any {
 // "here's where the gravity lives" signal for newcomers.
 // inScope, when non-nil, bounds the ranking to imports whose target
 // node is inside the session's workspace.
+//
+// Picks the FileImportAggregator capability when the backend
+// implements it (one Cypher GROUP BY ships back the per-file count
+// instead of materialising every edge over cgo just to bucket).
+// Falls back to the AllEdges-driven loop on backends that don't.
 func mostImportedFiles(g graph.Store, inScope map[string]bool, topN int) []map[string]any {
 	type fileCount struct {
 		path  string
 		count int
 	}
 	counts := make(map[string]int)
-	for _, e := range g.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
+	if ag, ok := g.(graph.FileImportAggregator); ok {
+		var scope []string
+		if inScope != nil {
+			scope = make([]string, 0, len(inScope))
+			for id := range inScope {
+				scope = append(scope, id)
+			}
+			// An empty inScope means "nothing matches" — the
+			// aggregator contract maps that to nil so we never
+			// fire a whole-graph Cypher scan on a bound session.
+			if len(scope) == 0 {
+				scope = []string{}
+			}
 		}
-		target := g.GetNode(e.To)
-		if target == nil {
-			continue
+		for _, r := range ag.FileImportCounts(scope) {
+			counts[r.FilePath] = r.Count
 		}
-		if inScope != nil && !inScope[target.ID] {
-			continue
+	} else {
+		for _, e := range g.AllEdges() {
+			if e.Kind != graph.EdgeImports {
+				continue
+			}
+			target := g.GetNode(e.To)
+			if target == nil {
+				continue
+			}
+			if inScope != nil && !inScope[target.ID] {
+				continue
+			}
+			// Aggregate at the file level. For Import-kind nodes the node's
+			// FilePath is the file being imported; for File-kind nodes the
+			// ID is already the path.
+			path := target.FilePath
+			if path == "" {
+				path = target.ID
+			}
+			counts[path]++
 		}
-		// Aggregate at the file level. For Import-kind nodes the node's
-		// FilePath is the file being imported; for File-kind nodes the
-		// ID is already the path.
-		path := target.FilePath
-		if path == "" {
-			path = target.ID
-		}
-		counts[path]++
 	}
 
 	var ranked []fileCount

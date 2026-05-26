@@ -69,19 +69,43 @@ func (s *Server) handleGetSurprisingConnections(ctx context.Context, req mcp.Cal
 		scopedSet[n.ID] = n
 	}
 
-	allEdges := s.graph.AllEdges()
-	inDegree := make(map[string]int, len(scopedSet))
+	// Kind tally — short-circuit the AllEdges scan when the backend
+	// implements EdgeKindCounter (returns one row per distinct kind,
+	// not one per edge — a few-dozen-row response replaces a ~286k
+	// edge round-trip on Ladybug). The total edge count then comes
+	// from the per-kind sum so we don't need a second backend call.
 	kindCounts := make(map[graph.EdgeKind]int, 16)
+	totalEdges := 0
+	var allEdges []*graph.Edge
+	if counter, ok := s.graph.(graph.EdgeKindCounter); ok {
+		for k, c := range counter.EdgeKindCounts() {
+			kindCounts[k] = c
+			totalEdges += c
+		}
+	} else {
+		allEdges = s.graph.AllEdges()
+		for _, e := range allEdges {
+			kindCounts[e.Kind]++
+		}
+		totalEdges = len(allEdges)
+	}
+
+	// In-degree still walks edges Go-side — it depends on the per-
+	// session scopedSet which is not visible to the storage layer.
+	// Lazily materialise AllEdges here only if the capability path
+	// above skipped it. Either way the loop fires exactly once.
+	if allEdges == nil {
+		allEdges = s.graph.AllEdges()
+	}
+	inDegree := make(map[string]int, len(scopedSet))
 	for _, e := range allEdges {
 		if _, ok := scopedSet[e.To]; ok {
 			inDegree[e.To]++
 		}
-		kindCounts[e.Kind]++
 	}
 
 	// Determine which edge kinds are "unusual" — share of total
 	// edges is at or below rare_kind_pct. Recomputed once per call.
-	totalEdges := len(allEdges)
 	rareKinds := make(map[graph.EdgeKind]bool, len(kindCounts))
 	if totalEdges > 0 {
 		thresholdFrac := rareKindPct / 100.0

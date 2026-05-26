@@ -361,22 +361,34 @@ func architectureProcesses(pr *analysis.ProcessResult, inScope map[string]*graph
 // architectureCrossRepo bundles every cross_repo_* edge into a
 // (from_repo, to_repo, kind) → count rollup. Empty list when no
 // cross-repo edges exist (single-repo mode).
+//
+// Picks the CrossRepoEdgeAggregator capability when the backend
+// implements it (one Cypher GROUP BY replaces the AllEdges +
+// per-edge GetNode pair — typically ~286k cgo edge rows + thousands
+// of GetNode round-trips on Ladybug for <100 rows of output). Falls
+// back to the AllEdges-driven loop on backends that don't.
 func architectureCrossRepo(g graph.Store) []crossRepoRow {
 	type key struct {
 		kind, fromRepo, toRepo string
 	}
 	counts := map[key]int{}
-	for _, e := range g.AllEdges() {
-		if _, isCross := graph.BaseKindForCrossRepo(e.Kind); !isCross {
-			continue
+	if ag, ok := g.(graph.CrossRepoEdgeAggregator); ok {
+		for _, r := range ag.CrossRepoEdgeCounts() {
+			counts[key{kind: string(r.Kind), fromRepo: r.FromRepo, toRepo: r.ToRepo}] = r.Count
 		}
-		from := g.GetNode(e.From)
-		to := g.GetNode(e.To)
-		if from == nil || to == nil {
-			continue
+	} else {
+		for _, e := range g.AllEdges() {
+			if _, isCross := graph.BaseKindForCrossRepo(e.Kind); !isCross {
+				continue
+			}
+			from := g.GetNode(e.From)
+			to := g.GetNode(e.To)
+			if from == nil || to == nil {
+				continue
+			}
+			k := key{kind: string(e.Kind), fromRepo: from.RepoPrefix, toRepo: to.RepoPrefix}
+			counts[k]++
 		}
-		k := key{kind: string(e.Kind), fromRepo: from.RepoPrefix, toRepo: to.RepoPrefix}
-		counts[k]++
 	}
 	rows := make([]crossRepoRow, 0, len(counts))
 	for k, c := range counts {
