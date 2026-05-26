@@ -173,39 +173,13 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
-	// Importing-files scan — every node whose FilePath imports the
-	// target's FilePath. Today the graph encodes file-level imports
-	// via EdgeImports between file/import nodes; we walk those to
-	// answer "is the home package consumed at all?".
-	importingFiles := []string{}
-	if target != nil && target.FilePath != "" {
-		seen := map[string]bool{}
-		for _, e := range s.graph.AllEdges() {
-			if e.Kind != graph.EdgeImports {
-				continue
-			}
-			toNode := s.graph.GetNode(e.To)
-			if toNode == nil {
-				continue
-			}
-			if toNode.FilePath != target.FilePath && toNode.ID != target.FilePath {
-				continue
-			}
-			fromNode := s.graph.GetNode(e.From)
-			if fromNode == nil {
-				continue
-			}
-			if excludeTests && isTestPath(fromNode.FilePath) {
-				continue
-			}
-			if seen[fromNode.FilePath] {
-				continue
-			}
-			seen[fromNode.FilePath] = true
-			importingFiles = append(importingFiles, fromNode.FilePath)
-		}
-		sort.Strings(importingFiles)
-	}
+	// Importing-files scan — every file whose nodes carry an
+	// EdgeImports edge into the target's FilePath. Backends that
+	// implement graph.FileImporters serve this from one Cypher join
+	// (no AllEdges() materialisation, no per-edge GetNode round-
+	// trip). The legacy AllEdges + per-edge GetNode loop stays as
+	// the fallback for backends that don't ship the capability.
+	importingFiles := s.collectImportingFiles(target, excludeTests)
 
 	referenced := totalEdges > 0 || len(sameName) > 0 || len(importingFiles) > 0
 
@@ -221,6 +195,67 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 		"name":                name,
 		"excluded_tests":      excludeTests,
 	})
+}
+
+// collectImportingFiles answers "which files import the file that
+// holds target?". Prefers the graph.FileImporters capability when
+// the backend implements it — that path runs one Cypher join
+// instead of an AllEdges() scan plus 2× per-edge GetNode round-trip.
+// Returns a sorted, deduplicated, optionally test-filtered slice
+// of file paths.
+//
+// When target is nil or has no FilePath the question is undefined;
+// returns an empty slice (consistent with the legacy behaviour).
+func (s *Server) collectImportingFiles(target *graph.Node, excludeTests bool) []string {
+	importingFiles := []string{}
+	if target == nil || target.FilePath == "" {
+		return importingFiles
+	}
+	seen := map[string]bool{}
+	add := func(fromFile string) {
+		if fromFile == "" {
+			return
+		}
+		if excludeTests && isTestPath(fromFile) {
+			return
+		}
+		if seen[fromFile] {
+			return
+		}
+		seen[fromFile] = true
+		importingFiles = append(importingFiles, fromFile)
+	}
+
+	if fi, ok := s.graph.(graph.FileImporters); ok {
+		for _, row := range fi.FileImporters(target.FilePath) {
+			add(row.FromFile)
+		}
+		sort.Strings(importingFiles)
+		return importingFiles
+	}
+
+	// Fallback: pull every edge and filter Go-side. Identical
+	// pre-capability behaviour — only the cgo-heavy backend ever
+	// reaches this path.
+	for _, e := range s.graph.AllEdges() {
+		if e.Kind != graph.EdgeImports {
+			continue
+		}
+		toNode := s.graph.GetNode(e.To)
+		if toNode == nil {
+			continue
+		}
+		if toNode.FilePath != target.FilePath && toNode.ID != target.FilePath {
+			continue
+		}
+		fromNode := s.graph.GetNode(e.From)
+		if fromNode == nil {
+			continue
+		}
+		add(fromNode.FilePath)
+	}
+	sort.Strings(importingFiles)
+	return importingFiles
 }
 
 // isCheckRefEdge identifies edges that mean "this symbol is being
