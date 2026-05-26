@@ -176,6 +176,84 @@ func TestFetchAndMergeBM25_DedupesAcrossTerms(t *testing.T) {
 	assert.Equal(t, idsOf(primary), idsOf(merged))
 }
 
+// TestFetchAndMergeBM25_CombinedQueryUnionIsSuperset is the load-bearing
+// guard for the "combine expansion terms into one BM25 query"
+// optimisation. The merged result MUST contain at least every node
+// that a per-term fan-out would have returned — otherwise switching
+// from N BM25 calls to (primary + combined) drops candidates the
+// rerank pipeline used to see. Exact-name rescue (the per-fragment
+// FindNodesByNames step) is what makes this hold for tokenisation
+// edge cases like PascalCase concatenated names that BM25 misses.
+func TestFetchAndMergeBM25_CombinedQueryUnionIsSuperset(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	scope := query.QueryOptions{}
+
+	// Per-term fan-out (the OLD behaviour). For each fragment, run
+	// the engine search separately and collect every distinct node ID
+	// it surfaces — this is the worst-case "no candidate may be
+	// dropped by collapsing into one query" set.
+	terms := []string{"helper", "main"}
+	unionExpected := map[string]bool{}
+	for _, t := range terms {
+		for _, n := range srv.engine.SearchSymbolsScoped(t, 20, scope) {
+			unionExpected[n.ID] = true
+		}
+	}
+	require.NotEmpty(t, unionExpected, "per-term fan-out produced nothing — test corpus drifted")
+
+	// New behaviour: primary + combined-OR + per-fragment exact-name
+	// rescue, all driven by fetchAndMergeBM25.
+	merged, _ := fetchAndMergeBM25(srv.engine, terms[0], terms[1:], 20, scope)
+	mergedSet := map[string]bool{}
+	for _, n := range merged {
+		mergedSet[n.ID] = true
+	}
+
+	for id := range unionExpected {
+		require.True(t, mergedSet[id], "merged result missing per-term hit %q", id)
+	}
+}
+
+// TestFetchAndMergeBM25_ExactNameRescuePreserved is the regression
+// guard for the soup-mode + PascalCase fragment case that per-term
+// fan-out used to handle implicitly. When BM25 tokenisation misses
+// a fragment ("BillingInvoice" tokenises to one term `billinginvoice`
+// which the camelCase-split index doesn't carry), the per-fragment
+// FindNodesByNames rescue MUST still surface its exact-name node.
+// This mirrors the failure mode TestSearchSymbols_PathScoping caught
+// when soup-split fragments first went through the combined query
+// path.
+func TestFetchAndMergeBM25_ExactNameRescuePreserved(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	// The test corpus carries no PascalCase-concatenated names by
+	// default, so add three synthetic ones — these never reach BM25
+	// (we don't re-index it for the test) but they are what the
+	// rescue step has to surface.
+	for path, name := range map[string]string{
+		"svc/billing/Invoice.go": "BillingInvoice",
+		"svc/auth/Login.go":      "AuthLogin",
+		"libs/money/Amount.go":   "MoneyAmount",
+	} {
+		id := path + "::" + name
+		srv.graph.AddNode(&graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: name,
+			FilePath: path, StartLine: 1, EndLine: 5, Language: "go",
+		})
+	}
+
+	terms := []string{"BillingInvoice", "AuthLogin", "MoneyAmount"}
+	merged, _ := fetchAndMergeBM25(srv.engine, terms[0], terms[1:], 20, query.QueryOptions{})
+
+	mergedNames := map[string]bool{}
+	for _, n := range merged {
+		mergedNames[n.Name] = true
+	}
+	for _, want := range terms {
+		require.True(t, mergedNames[want], "exact-name rescue dropped %q from merged result", want)
+	}
+}
+
 // TestFetchAndMergeBM25_AppendsNewMatches verifies that expansion
 // terms bring in additional candidates the primary term missed.
 func TestFetchAndMergeBM25_AppendsNewMatches(t *testing.T) {

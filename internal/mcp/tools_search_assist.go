@@ -150,17 +150,32 @@ func expandSearchTerms(ctx context.Context, s *Server, query string) []string {
 	return res.Terms
 }
 
-// fetchAndMergeBM25 runs BM25 once per term (original + expansions),
-// then folds the results into a single deduplicated slice. The
-// original query's hits win position; expansion hits append in their
-// own BM25 order with duplicates skipped.
+// fetchAndMergeBM25 fires (at most) two BM25 calls — one for the
+// primary query alone (so we can attribute primaryCount honestly for
+// the debug surface) and one for the combined OR-merge of every
+// expansion term — then folds the results into a single deduplicated
+// slice. The original query's hits win position; the combined-
+// expansion hits append in their own BM25 order with duplicates
+// skipped.
 //
-// fetchLimit is the per-term over-fetch budget. Bounded by the caller
-// so a wide expansion can't blow up the candidate pool.
+// Both BM25 backends (BM25Backend and Ladybug's FTS via
+// QUERY_FTS_INDEX) treat a multi-token query as an OR-style union
+// with a single global BM25 score, so one combined call replaces
+// the prior N per-term fan-out (the N+1 round-trip pattern dominated
+// the search hot path on disk backends).
+//
+// A per-fragment exact-name rescue runs after the combined call —
+// one batched FindNodesByNames on the engine's reader. This
+// preserves the per-term behaviour where a fragment like
+// "BillingInvoice" finds its exact-name node even when BM25
+// tokenisation drops the PascalCase concatenation.
+//
+// fetchLimit caps each call so a wide expansion can't blow up the
+// candidate pool.
 //
 // primaryCount is the size of the original-query BM25 result before
-// merging; useful for diagnostic / debug surfaces that want to show
-// how many candidates expansion contributed.
+// merging — surfaced on the assist debug field so callers can see how
+// much expansion contributed.
 func fetchAndMergeBM25(eng *query.Engine, original string, expanded []string, fetchLimit int, scope query.QueryOptions) (merged []*graph.Node, primaryCount int) {
 	return fetchAndMergeBM25Timed(eng, original, expanded, fetchLimit, scope, nil)
 }
@@ -168,7 +183,7 @@ func fetchAndMergeBM25(eng *query.Engine, original string, expanded []string, fe
 // fetchAndMergeBM25Timed is fetchAndMergeBM25 with per-phase wall-clock
 // breakdowns. The MCP handler hands a fresh SearchTimings struct so
 // the resulting Debug log line attributes BM25 time honestly across
-// the primary call and the per-term expansion calls. Pass nil to skip
+// the primary call and the combined-expansion call. Pass nil to skip
 // instrumentation (e.g. unit tests that don't care).
 func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []string, fetchLimit int, scope query.QueryOptions, timings *query.SearchTimings) (merged []*graph.Node, primaryCount int) {
 	primaryStart := time.Now()
@@ -177,11 +192,22 @@ func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []strin
 	if timings != nil {
 		timings.BM25PrimaryMS += time.Since(primaryStart).Milliseconds()
 	}
-	if len(expanded) == 0 {
+
+	// Trim and de-empty the expansion list. When nothing useful
+	// survives we skip the combined call entirely.
+	cleanedExpansion := make([]string, 0, len(expanded))
+	for _, t := range expanded {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			cleanedExpansion = append(cleanedExpansion, t)
+		}
+	}
+	if len(cleanedExpansion) == 0 {
 		return primary, primaryCount
 	}
-	seen := make(map[string]bool, len(primary))
-	merged = make([]*graph.Node, 0, len(primary))
+
+	seen := make(map[string]bool, len(primary)+fetchLimit)
+	merged = make([]*graph.Node, 0, len(primary)+fetchLimit)
 	for _, n := range primary {
 		if seen[n.ID] {
 			continue
@@ -189,25 +215,71 @@ func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []strin
 		seen[n.ID] = true
 		merged = append(merged, n)
 	}
-	for _, term := range expanded {
-		term = strings.TrimSpace(term)
-		if term == "" {
+
+	// Combined OR-merge: pass every expansion term — concatenated by
+	// whitespace — as ONE BM25 call. Tokenisation + IDF scoring run
+	// once across the whole bag of terms instead of N times.
+	combined := strings.Join(cleanedExpansion, " ")
+	expansionStart := time.Now()
+	extra := eng.SearchSymbolsScoped(combined, fetchLimit, scope)
+	if timings != nil {
+		timings.BM25ExpansionMS += time.Since(expansionStart).Milliseconds()
+	}
+	for _, n := range extra {
+		if seen[n.ID] {
 			continue
 		}
-		expansionStart := time.Now()
-		extra := eng.SearchSymbolsScoped(term, fetchLimit, scope)
-		if timings != nil {
-			timings.BM25ExpansionMS += time.Since(expansionStart).Milliseconds()
-		}
-		for _, n := range extra {
-			if seen[n.ID] {
-				continue
+		seen[n.ID] = true
+		merged = append(merged, n)
+	}
+
+	// Per-fragment exact-name union — cheap (one name-bucket lookup
+	// per term on in-memory, a single `WHERE name IN $names` Cypher
+	// round-trip on Ladybug via FindNodesByNames). Preserves the
+	// per-term behaviour where a fragment like "BillingInvoice"
+	// finds its exact-name node even when BM25 tokenisation misses
+	// the PascalCase concatenated token. Without this rescue,
+	// soup-split mode silently dropped exact matches that the
+	// per-term loop used to surface via the engine's FindNodesByName
+	// fallback.
+	if rdr, ok := graphReaderFromEngine(eng); ok {
+		nameMap := rdr.FindNodesByNames(cleanedExpansion)
+		for _, term := range cleanedExpansion {
+			for _, n := range nameMap[term] {
+				if n == nil || seen[n.ID] {
+					continue
+				}
+				if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+					continue
+				}
+				if scope.WorkspaceID != "" && !scope.ScopeAllows(n) {
+					continue
+				}
+				seen[n.ID] = true
+				merged = append(merged, n)
 			}
-			seen[n.ID] = true
-			merged = append(merged, n)
 		}
 	}
 	return merged, primaryCount
+}
+
+// graphReaderFromEngine returns the engine's underlying graph reader
+// if it also exposes the batched FindNodesByNames method (every
+// production backend does — in-memory, Ladybug, and OverlaidView via
+// the layered base). Falls back to (nil, false) when an embedded
+// test engine wires a stripped-down reader — the rescue step is then
+// skipped, matching the contract that callers without a names-batch
+// reader simply get the BM25-only result.
+type namesReader interface {
+	FindNodesByNames(names []string) map[string][]*graph.Node
+}
+
+func graphReaderFromEngine(eng *query.Engine) (namesReader, bool) {
+	if eng == nil {
+		return nil, false
+	}
+	r, ok := eng.Reader().(namesReader)
+	return r, ok
 }
 
 // rerankCap bounds how many candidates the rerank pass sees. The
