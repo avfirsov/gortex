@@ -170,3 +170,43 @@ func (s *Server) symbolNamesInFile(filePath string) []string {
 	sort.Strings(names)
 	return names
 }
+
+// symbolNamesByFiles is the batched sibling of symbolNamesInFile.
+// Returns a map filePath → sorted distinct names for every input
+// path in one backend round-trip when the store implements
+// FileSymbolNamesByPaths; falls back to the per-file loop otherwise.
+// Used by find_co_changing_symbols and analyze fixes_history where
+// the row count after truncation is bounded but each per-row name
+// lookup was a separate Cypher query before — multiple thousand
+// query-engine entry points per call on Ladybug.
+func (s *Server) symbolNamesByFiles(paths []string) map[string][]string {
+	if len(paths) == 0 {
+		return nil
+	}
+	kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface}
+	out := make(map[string][]string, len(paths))
+	if scanner, ok := s.graph.(graph.FileSymbolNamesByPaths); ok {
+		rows := scanner.FileSymbolNamesByPaths(paths, kinds)
+		seenPerFile := make(map[string]map[string]bool, len(paths))
+		for _, r := range rows {
+			seen := seenPerFile[r.FilePath]
+			if seen == nil {
+				seen = make(map[string]bool)
+				seenPerFile[r.FilePath] = seen
+			}
+			if r.Name == "" || seen[r.Name] {
+				continue
+			}
+			seen[r.Name] = true
+			out[r.FilePath] = append(out[r.FilePath], r.Name)
+		}
+		for f := range out {
+			sort.Strings(out[f])
+		}
+		return out
+	}
+	for _, p := range paths {
+		out[p] = s.symbolNamesInFile(p)
+	}
+	return out
+}

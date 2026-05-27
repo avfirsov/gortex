@@ -63,28 +63,48 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	scores := s.coChangeScores(targetFile)
 	counts := s.coChangeCounts(targetFile)
 
-	rows := make([]coChangeRow, 0, len(scores))
+	// Two-phase build: first collect (file, score, count) tuples that
+	// survive the minScore gate, then sort + truncate to the requested
+	// limit, then batch-resolve the per-file symbol names. The Symbols
+	// lookup is the only graph-touching work in this handler — pulling
+	// it through one capability call instead of N GetFileNodes round-
+	// trips is the entire ladybug win.
+	type pending struct {
+		file  string
+		score float64
+		count int
+	}
+	pendings := make([]pending, 0, len(scores))
 	for file, score := range scores {
 		if score < minScore {
 			continue
 		}
-		rows = append(rows, coChangeRow{
-			File:    file,
-			Score:   roundScore(score),
-			Count:   counts[file],
-			Symbols: s.symbolNamesInFile(file),
-		})
+		pendings = append(pendings, pending{file: file, score: score, count: counts[file]})
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Score != rows[j].Score {
-			return rows[i].Score > rows[j].Score
+	sort.Slice(pendings, func(i, j int) bool {
+		if pendings[i].score != pendings[j].score {
+			return pendings[i].score > pendings[j].score
 		}
-		return rows[i].File < rows[j].File
+		return pendings[i].file < pendings[j].file
 	})
 	truncated := false
-	if len(rows) > limit {
-		rows = rows[:limit]
+	if len(pendings) > limit {
+		pendings = pendings[:limit]
 		truncated = true
+	}
+	keepFiles := make([]string, 0, len(pendings))
+	for _, p := range pendings {
+		keepFiles = append(keepFiles, p.file)
+	}
+	symbolsByFile := s.symbolNamesByFiles(keepFiles)
+	rows := make([]coChangeRow, 0, len(pendings))
+	for _, p := range pendings {
+		rows = append(rows, coChangeRow{
+			File:    p.file,
+			Score:   roundScore(p.score),
+			Count:   p.count,
+			Symbols: symbolsByFile[p.file],
+		})
 	}
 
 	result := map[string]any{
