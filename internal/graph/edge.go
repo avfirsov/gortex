@@ -480,6 +480,15 @@ func BaseKindForCrossRepo(cr EdgeKind) (EdgeKind, bool) {
 	return "", false
 }
 
+// BaseKindsForCrossRepo returns the set of base edge kinds that have a
+// parallel cross_repo_* variant. The slice is the single source of
+// truth for callers (DetectCrossRepoEdges, the CrossRepoCandidates
+// storage capability) that need the kind list without iterating
+// CrossRepoKindFor over every edge.
+func BaseKindsForCrossRepo() []EdgeKind {
+	return []EdgeKind{EdgeCalls, EdgeImplements, EdgeExtends}
+}
+
 type Edge struct {
 	From     string   `json:"from"`
 	To       string   `json:"to"`

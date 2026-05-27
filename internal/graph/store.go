@@ -1182,3 +1182,107 @@ type ThrowerErrorRow struct {
 type ThrowerErrorSurfacer interface {
 	ThrowerErrorSurface(pathPrefix string) []ThrowerErrorRow
 }
+
+// MemberMethodInfo is one row of the MemberMethodsByType projection.
+// MethodID is the method node's id; Name is its name (the key the
+// InferImplements method-set check compares against); FilePath /
+// StartLine are the source coordinates InferOverrides stamps on the
+// EdgeOverrides edge it emits.
+type MemberMethodInfo struct {
+	MethodID  string
+	Name      string
+	FilePath  string
+	StartLine int
+}
+
+// MemberMethodsByType is an optional capability backends MAY implement
+// to return the typeID → []MemberMethodInfo projection of every
+// EdgeMemberOf edge whose source is a KindMethod node, in one backend
+// round-trip. Replaces the InferImplements / InferOverrides Pass 1
+// pattern of EdgesByKind(EdgeMemberOf) followed by per-edge
+// GetNode(e.From) to filter on Kind == KindMethod and read the
+// method's columns. On Ladybug that loop is N+1 cgo: each method
+// GetNode pulls ~10 string columns + the Meta blob over cgo just to
+// read four scalar fields. The capability runs a single Cypher join,
+// server-side, and ships only the four method columns the resolver
+// actually consumes.
+//
+// Empty graph returns nil; types with no method members are absent
+// from the result. The returned slice's elements are unique per
+// MethodID — duplicated (typeID, methodID) pairs (a method
+// member-of'd twice) collapse to one row.
+//
+// Optional capability — InferImplements / InferOverrides fall back to
+// the per-edge GetNode walk when the backend doesn't implement it.
+type MemberMethodsByType interface {
+	MemberMethodsByType() map[string][]MemberMethodInfo
+}
+
+// StructuralParentEdgeRow is one tuple returned by StructuralParentEdges.
+// FromID / ToID are the child / parent node IDs verbatim. FromKind /
+// ToKind let the consumer apply the (Type | Interface) gate without a
+// follow-up GetNode. Origin is the edge's resolution-tier label, which
+// drives override-edge origin selection in InferOverrides.
+type StructuralParentEdgeRow struct {
+	FromID   string
+	ToID     string
+	FromKind NodeKind
+	ToKind   NodeKind
+	Origin   string
+}
+
+// StructuralParentEdges is an optional capability backends MAY
+// implement to return every EdgeExtends / EdgeImplements / EdgeComposes
+// edge whose endpoints are both KindType / KindInterface, projected as
+// (FromID, ToID, FromKind, ToKind, Origin) in one backend round-trip.
+// Replaces the InferOverrides Pass 2 pattern of g.AllEdges() followed
+// by per-edge GetNode(e.From) + GetNode(e.To) to apply the kind gate.
+// On Ladybug the AllEdges scan materialises every edge over cgo (~286k
+// on the gortex workspace) plus issues two per-edge node lookups; the
+// capability runs one Cypher join with kind filters on both sides and
+// ships only the surviving rows back (typically a small fraction of
+// the edge table).
+//
+// Empty graph returns nil. Rows from extends/implements/composes edges
+// whose endpoints aren't both type/interface are filtered server-side
+// — the consumer never has to gate them again.
+//
+// Optional capability — InferOverrides falls back to the AllEdges +
+// per-edge GetNode walk when the backend doesn't implement it.
+type StructuralParentEdges interface {
+	StructuralParentEdges() []StructuralParentEdgeRow
+}
+
+// CrossRepoCandidateRow is one tuple returned by CrossRepoCandidates.
+// Edge is the underlying base-kind edge verbatim — the consumer
+// rewrites Edge.CrossRepo on it and emits a parallel cross_repo_* edge.
+// FromRepo / ToRepo are the (already-distinct) source and target
+// RepoPrefix values projected from the endpoint nodes.
+type CrossRepoCandidateRow struct {
+	Edge     *Edge
+	FromRepo string
+	ToRepo   string
+}
+
+// CrossRepoCandidates is an optional capability backends MAY implement
+// to return every edge whose Kind has a parallel cross_repo_* kind AND
+// whose endpoints carry two different non-empty RepoPrefix values, in
+// one backend round-trip. Replaces the DetectCrossRepoEdges pattern of
+// g.AllEdges() + per-edge GetNode(e.From) + GetNode(e.To) to extract
+// the RepoPrefix pair. On Ladybug the AllEdges scan ships every edge
+// in the graph over cgo plus issues two GetNode lookups per surviving
+// row; the capability filters by edge kind + the repo-prefix mismatch
+// server-side and ships only the surviving rows (typically a small
+// fraction of the edge table on a multi-repo workspace).
+//
+// baseKinds is the set of edge kinds for which a CrossRepoKindFor
+// mapping exists — the caller passes the list and the implementation
+// MUST use exactly that set in the IN-list, so a single-repo graph
+// (or a graph whose nodes carry no RepoPrefix) returns no rows.
+//
+// Optional capability — DetectCrossRepoEdges falls back to the
+// AllEdges + per-edge GetNode loop when the backend doesn't implement
+// it.
+type CrossRepoCandidates interface {
+	CrossRepoCandidates(baseKinds []EdgeKind) []CrossRepoCandidateRow
+}

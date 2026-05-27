@@ -90,6 +90,9 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("EdgeAdjacencyForKinds", func(t *testing.T) { testEdgeAdjacencyForKinds(t, factory) })
 	t.Run("CommunityCrossingsByKind", func(t *testing.T) { testCommunityCrossingsByKind(t, factory) })
 	t.Run("NodeIDsByKinds", func(t *testing.T) { testNodeIDsByKinds(t, factory) })
+	t.Run("MemberMethodsByType", func(t *testing.T) { testMemberMethodsByType(t, factory) })
+	t.Run("StructuralParentEdges", func(t *testing.T) { testStructuralParentEdges(t, factory) })
+	t.Run("CrossRepoCandidates", func(t *testing.T) { testCrossRepoCandidates(t, factory) })
 }
 
 // -- fixture helpers ---------------------------------------------------
@@ -2688,5 +2691,192 @@ func testNodeIDsByKinds(t *testing.T, factory Factory) {
 	miss := scan.NodeIDsByKinds([]graph.NodeKind{graph.KindInterface})
 	if len(miss) != 0 {
 		t.Fatalf("NodeIDsByKinds(Interface) = %v, want empty", miss)
+	}
+}
+
+// testMemberMethodsByType exercises the optional
+// graph.MemberMethodsByType capability. Seeds a graph with multiple
+// types, their methods, and a non-method EdgeMemberOf edge to verify
+// the kind gate.
+func testMemberMethodsByType(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.MemberMethodsByType)
+	if !ok {
+		t.Skip("backend does not implement graph.MemberMethodsByType")
+	}
+
+	// Two types with method members + a noise field.
+	s.AddNode(mkNode("T1", "T1", "a.go", graph.KindType))
+	s.AddNode(mkNode("T2", "T2", "b.go", graph.KindType))
+	s.AddNode(mkNode("M1", "Foo", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("M2", "Bar", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("M3", "Foo", "b.go", graph.KindMethod))
+	s.AddNode(mkNode("F1", "Field1", "a.go", graph.KindField))
+
+	s.AddEdge(mkEdge("M1", "T1", graph.EdgeMemberOf))
+	s.AddEdge(mkEdge("M2", "T1", graph.EdgeMemberOf))
+	s.AddEdge(mkEdge("M3", "T2", graph.EdgeMemberOf))
+	// Non-method source — must NOT appear.
+	s.AddEdge(mkEdge("F1", "T1", graph.EdgeMemberOf))
+
+	got := scan.MemberMethodsByType()
+	t1Names := map[string]bool{}
+	for _, m := range got["T1"] {
+		t1Names[m.Name] = true
+	}
+	if !t1Names["Foo"] || !t1Names["Bar"] {
+		t.Fatalf("MemberMethodsByType T1 = %v, want {Foo, Bar}", got["T1"])
+	}
+	if len(got["T1"]) != 2 {
+		t.Fatalf("MemberMethodsByType T1 size = %d, want 2", len(got["T1"]))
+	}
+	t2Names := map[string]bool{}
+	for _, m := range got["T2"] {
+		t2Names[m.Name] = true
+	}
+	if !t2Names["Foo"] || len(got["T2"]) != 1 {
+		t.Fatalf("MemberMethodsByType T2 = %v, want {Foo}", got["T2"])
+	}
+	// Verify FilePath / StartLine columns are projected.
+	for _, m := range got["T1"] {
+		if m.MethodID == "" || m.FilePath == "" {
+			t.Fatalf("MemberMethodsByType T1 row missing columns: %+v", m)
+		}
+	}
+
+	// Empty store returns nil.
+	empty := factory(t)
+	if r := empty.(graph.MemberMethodsByType).MemberMethodsByType(); r != nil {
+		t.Fatalf("MemberMethodsByType(empty) = %v, want nil", r)
+	}
+}
+
+// testStructuralParentEdges exercises the optional
+// graph.StructuralParentEdges capability. Seeds a mix of extends /
+// implements / composes edges with varying endpoint kinds.
+func testStructuralParentEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.StructuralParentEdges)
+	if !ok {
+		t.Skip("backend does not implement graph.StructuralParentEdges")
+	}
+
+	// Types / interfaces (in-set endpoints).
+	s.AddNode(mkNode("C1", "Child", "a.go", graph.KindType))
+	s.AddNode(mkNode("P1", "Parent", "a.go", graph.KindType))
+	s.AddNode(mkNode("I1", "Iface", "a.go", graph.KindInterface))
+	// A method (NOT in-set).
+	s.AddNode(mkNode("M1", "Foo", "a.go", graph.KindMethod))
+
+	// In-set: type → type extends.
+	e1 := mkEdge("C1", "P1", graph.EdgeExtends)
+	e1.Line = 1
+	e1.Origin = graph.OriginASTResolved
+	// In-set: type → interface implements.
+	e2 := mkEdge("C1", "I1", graph.EdgeImplements)
+	e2.Line = 2
+	e2.Origin = graph.OriginASTInferred
+	// In-set: type → type composes.
+	e3 := mkEdge("C1", "P1", graph.EdgeComposes)
+	e3.Line = 3
+	// OUT: extends with a method on one side.
+	e4 := mkEdge("M1", "P1", graph.EdgeExtends)
+	e4.Line = 4
+	// OUT: irrelevant kind.
+	e5 := mkEdge("C1", "P1", graph.EdgeCalls)
+	e5.Line = 5
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5} {
+		s.AddEdge(e)
+	}
+
+	rows := scan.StructuralParentEdges()
+	if len(rows) != 3 {
+		t.Fatalf("StructuralParentEdges len = %d, want 3 (rows=%v)", len(rows), rows)
+	}
+	// Verify origin propagation on the ast_resolved row.
+	var sawResolved, sawInferred bool
+	for _, r := range rows {
+		if r.FromID != "C1" {
+			t.Fatalf("unexpected FromID %q in row %v", r.FromID, r)
+		}
+		if r.FromKind != graph.KindType {
+			t.Fatalf("unexpected FromKind %q in row %v", r.FromKind, r)
+		}
+		if r.Origin == graph.OriginASTResolved {
+			sawResolved = true
+		}
+		if r.Origin == graph.OriginASTInferred {
+			sawInferred = true
+		}
+	}
+	if !sawResolved || !sawInferred {
+		t.Fatalf("origin not propagated: resolved=%v inferred=%v", sawResolved, sawInferred)
+	}
+
+	// Empty graph returns nil/empty.
+	empty := factory(t)
+	if r := empty.(graph.StructuralParentEdges).StructuralParentEdges(); len(r) != 0 {
+		t.Fatalf("StructuralParentEdges(empty) = %v, want empty", r)
+	}
+}
+
+// testCrossRepoCandidates exercises the optional
+// graph.CrossRepoCandidates capability. Seeds same-repo and
+// cross-repo edges and asserts only the distinct, non-empty
+// repo-prefix pairs survive.
+func testCrossRepoCandidates(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.CrossRepoCandidates)
+	if !ok {
+		t.Skip("backend does not implement graph.CrossRepoCandidates")
+	}
+
+	// Repo A.
+	s.AddNode(mkRepoNode("A1", "fnA1", "a.go", "repoA", graph.KindFunction))
+	s.AddNode(mkRepoNode("A2", "fnA2", "a.go", "repoA", graph.KindFunction))
+	// Repo B.
+	s.AddNode(mkRepoNode("B1", "fnB1", "b.go", "repoB", graph.KindFunction))
+	// No repo.
+	s.AddNode(mkNode("X1", "fnX1", "x.go", graph.KindFunction))
+
+	// Same-repo calls — must NOT appear.
+	e1 := mkEdge("A1", "A2", graph.EdgeCalls)
+	e1.Line = 1
+	// Cross-repo call — in.
+	e2 := mkEdge("A1", "B1", graph.EdgeCalls)
+	e2.Line = 2
+	// Cross-repo implements — in.
+	e3 := mkEdge("A1", "B1", graph.EdgeImplements)
+	e3.Line = 3
+	// Cross-repo edge but kind not in baseKinds — out.
+	e4 := mkEdge("A1", "B1", graph.EdgeReferences)
+	e4.Line = 4
+	// Either endpoint missing repo — out.
+	e5 := mkEdge("A1", "X1", graph.EdgeCalls)
+	e5.Line = 5
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5} {
+		s.AddEdge(e)
+	}
+
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeImplements, graph.EdgeExtends}
+	rows := scan.CrossRepoCandidates(kinds)
+	if len(rows) != 2 {
+		t.Fatalf("CrossRepoCandidates len = %d, want 2 (rows=%v)", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.FromRepo != "repoA" || r.ToRepo != "repoB" {
+			t.Fatalf("unexpected repos in row %v", r)
+		}
+		if r.Edge == nil || r.Edge.From != "A1" || r.Edge.To != "B1" {
+			t.Fatalf("unexpected edge in row %v", r)
+		}
+	}
+
+	// Empty kinds returns nil — never a whole-table scan.
+	if r := scan.CrossRepoCandidates(nil); r != nil {
+		t.Fatalf("CrossRepoCandidates(nil) = %v, want nil", r)
 	}
 }

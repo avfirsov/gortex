@@ -2692,3 +2692,137 @@ func (g *Graph) ThrowerErrorSurface(pathPrefix string) []ThrowerErrorRow {
 	}
 	return out
 }
+
+// MemberMethodsByType is the in-memory reference implementation of the
+// MemberMethodsByType capability. One EdgesByKind(EdgeMemberOf) walk
+// joined with the in-memory node table to filter Kind == KindMethod
+// and project the four columns the resolver consumes — the exact
+// loop the resolver runs today, just exposed as a single method call
+// so disk backends can fold the join into one Cypher.
+//
+// Empty graph returns nil. Per-type method lists are deduplicated by
+// MethodID so a method that appears twice in the EdgeMemberOf bucket
+// (defensive against double-insertion) yields a single row.
+func (g *Graph) MemberMethodsByType() map[string][]MemberMethodInfo {
+	out := map[string][]MemberMethodInfo{}
+	seen := map[string]map[string]struct{}{}
+	for e := range g.EdgesByKind(EdgeMemberOf) {
+		if e == nil {
+			continue
+		}
+		m := g.GetNode(e.From)
+		if m == nil || m.Kind != KindMethod {
+			continue
+		}
+		typeID := e.To
+		dedup := seen[typeID]
+		if dedup == nil {
+			dedup = make(map[string]struct{})
+			seen[typeID] = dedup
+		}
+		if _, ok := dedup[m.ID]; ok {
+			continue
+		}
+		dedup[m.ID] = struct{}{}
+		out[typeID] = append(out[typeID], MemberMethodInfo{
+			MethodID:  m.ID,
+			Name:      m.Name,
+			FilePath:  m.FilePath,
+			StartLine: m.StartLine,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// StructuralParentEdges is the in-memory reference implementation of
+// the StructuralParentEdges capability. Single AllEdges scan with the
+// (Extends | Implements | Composes) kind gate and the
+// (Type | Interface) endpoint-kind gate applied per edge.
+//
+// Empty graph or no matching edges returns nil.
+func (g *Graph) StructuralParentEdges() []StructuralParentEdgeRow {
+	var out []StructuralParentEdgeRow
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		switch e.Kind {
+		case EdgeExtends, EdgeImplements, EdgeComposes:
+		default:
+			continue
+		}
+		from := g.GetNode(e.From)
+		to := g.GetNode(e.To)
+		if from == nil || to == nil {
+			continue
+		}
+		if from.Kind != KindType && from.Kind != KindInterface {
+			continue
+		}
+		if to.Kind != KindType && to.Kind != KindInterface {
+			continue
+		}
+		out = append(out, StructuralParentEdgeRow{
+			FromID:   from.ID,
+			ToID:     to.ID,
+			FromKind: from.Kind,
+			ToKind:   to.Kind,
+			Origin:   e.Origin,
+		})
+	}
+	return out
+}
+
+// CrossRepoCandidates is the in-memory reference implementation of the
+// CrossRepoCandidates capability. Single AllEdges scan with the
+// edge-kind gate + the (non-empty, distinct) repo-prefix gate. Returns
+// one row per surviving edge carrying the underlying Edge pointer plus
+// the two RepoPrefix values projected from the endpoints.
+//
+// Empty baseKinds returns nil — matches the disk-backend contract.
+// Single-repo graphs (or graphs whose nodes carry no RepoPrefix)
+// return no rows because the prefix gate filters them out.
+func (g *Graph) CrossRepoCandidates(baseKinds []EdgeKind) []CrossRepoCandidateRow {
+	if len(baseKinds) == 0 {
+		return nil
+	}
+	kset := make(map[EdgeKind]struct{}, len(baseKinds))
+	for _, k := range baseKinds {
+		if k == "" {
+			continue
+		}
+		kset[k] = struct{}{}
+	}
+	if len(kset) == 0 {
+		return nil
+	}
+	var out []CrossRepoCandidateRow
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		if _, ok := kset[e.Kind]; !ok {
+			continue
+		}
+		from := g.GetNode(e.From)
+		to := g.GetNode(e.To)
+		if from == nil || to == nil {
+			continue
+		}
+		if from.RepoPrefix == "" || to.RepoPrefix == "" {
+			continue
+		}
+		if from.RepoPrefix == to.RepoPrefix {
+			continue
+		}
+		out = append(out, CrossRepoCandidateRow{
+			Edge:     e,
+			FromRepo: from.RepoPrefix,
+			ToRepo:   to.RepoPrefix,
+		})
+	}
+	return out
+}
