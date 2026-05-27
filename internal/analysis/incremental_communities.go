@@ -166,6 +166,18 @@ type LeidenPartitionCache struct {
 	edgeIdentityRevisions int
 }
 
+// PackageFingerprints returns the cached per-package fingerprint map.
+// Callers MUST treat the returned value as read-only — it is the live
+// map the cache reuses on the next call. Used by the MCP server to
+// report total_packages from a cache hit without re-running the
+// fingerprint pass.
+func (c *LeidenPartitionCache) PackageFingerprints() map[string]uint64 {
+	if c == nil {
+		return nil
+	}
+	return c.pkgFingerprint
+}
+
 // IncrementalCommunityStats reports what the incremental path did on
 // a single call — useful for tests and for surfacing on the wire.
 type IncrementalCommunityStats struct {

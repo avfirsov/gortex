@@ -118,6 +118,14 @@ type Server struct {
 	// of the whole graph. nil until the first clusters request;
 	// guarded by analysisMu.
 	leidenCache *analysis.LeidenPartitionCache
+	// communitiesToken snapshots the graph identity that backed
+	// s.communities — (NodeCount, EdgeCount, EdgeIdentityRevisions).
+	// handleAnalyzeClusters reads this before calling the incremental
+	// detector: if the token still matches the live graph, the cached
+	// communities are reused without scanning AllNodes / AllEdges to
+	// fingerprint packages. On Ladybug the fingerprint scan alone is
+	// ~140s; the cache check is three scalar reads.
+	communitiesToken communityCacheToken
 	// hotspots is the default-threshold (mean + 2*stddev) hotspot
 	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
 	// the wall clock of get_repo_outline / get_architecture /
@@ -1452,6 +1460,25 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, s.bind, repo)
 }
 
+// communityCacheToken is the per-graph identity tuple
+// handleAnalyzeClusters checks before re-running the incremental
+// detector. EdgeIdentity moves on any structural mutation; NodeCount
+// and EdgeCount cover pure additions / removals that leave the
+// identity counter alone. A zero token is "never populated".
+type communityCacheToken struct {
+	edgeIdentity int
+	nodeCount    int
+	edgeCount    int
+}
+
+func (s *Server) currentCommunityToken() communityCacheToken {
+	return communityCacheToken{
+		edgeIdentity: s.graph.EdgeIdentityRevisions(),
+		nodeCount:    s.graph.NodeCount(),
+		edgeCount:    s.graph.EdgeCount(),
+	}
+}
+
 // RunAnalysis performs community detection and process discovery on
 // the current graph, then pushes a `notifications/resources/updated`
 // for every bootstrap resource so subscribed clients can refresh
@@ -1466,6 +1493,7 @@ func (s *Server) RunAnalysis() {
 	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
 	s.communities = communities
 	s.leidenCache = cache
+	s.communitiesToken = s.currentCommunityToken()
 	s.processes = analysis.DiscoverProcesses(s.graph)
 	s.pageRank = analysis.ComputePageRank(s.graph)
 	// Auto-concept vocabulary: mine domain phrases from symbol names
@@ -1505,11 +1533,31 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 // packages. The cache it returns is stored back under analysisMu so
 // the next clusters request can build on it. The accompanying stats
 // describe whether the fast path or a full recompute ran.
+//
+// Short-circuits when the cached communities are still valid for the
+// live graph: the (NodeCount, EdgeCount, EdgeIdentityRevisions) token
+// captured by the last detector run is compared against the current
+// graph identity in three scalar reads. On Ladybug a match skips the
+// AllNodes / AllEdges fingerprint scan that otherwise dominates the
+// call (~140s on a fresh daemon) and serves the existing partition
+// straight from the cache. The reported stats describe a no-op
+// incremental run (no changed packages, no repartitioned nodes) so
+// callers see the cache hit on the wire.
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
+	cur := s.currentCommunityToken()
+	if s.communities != nil && s.leidenCache != nil && s.communitiesToken == cur {
+		stats := analysis.IncrementalCommunityStats{
+			Incremental:   true,
+			TotalPackages: len(s.leidenCache.PackageFingerprints()),
+		}
+		return s.communities, stats
+	}
 	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.communities = result
 	s.leidenCache = cache
+	s.communitiesToken = cur
 	return result, stats
 }
 

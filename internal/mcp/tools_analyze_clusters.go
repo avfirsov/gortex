@@ -63,12 +63,6 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		})
 	}
 
-	scoped := s.scopedNodes(ctx)
-	scopedSet := make(map[string]*graph.Node, len(scoped))
-	for _, n := range scoped {
-		scopedSet[n.ID] = n
-	}
-
 	type clusterRow struct {
 		ID           string         `json:"id"`
 		Label        string         `json:"label"`
@@ -82,8 +76,18 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		MemberSample []string       `json:"member_sample,omitempty"`
 	}
 
-	rows := make([]clusterRow, 0, len(cr.Communities))
-	for _, c := range cr.Communities {
+	// First pass: keep only the clusters that survive size + path-prefix
+	// gates, then sort + truncate to the requested limit. The density,
+	// language-mix, and top-files work below is bounded by the truncated
+	// row count instead of every community in the partition — important
+	// on Ladybug where each member touches the graph store.
+	type pending struct {
+		c   *analysis.Community
+		row clusterRow
+	}
+	survivors := make([]pending, 0, len(cr.Communities))
+	for i := range cr.Communities {
+		c := &cr.Communities[i]
 		if c.Size < minSize {
 			continue
 		}
@@ -99,30 +103,55 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 				continue
 			}
 		}
-
 		row := clusterRow{
 			ID: c.ID, Label: c.Label, Hub: c.Hub, Size: c.Size,
 			Files:     len(c.Files),
 			Languages: map[string]int{},
 		}
-
-		// File-spread = files-per-member; 1.0 means every member
-		// lives in its own file (boundary-heavy), close to 0 means
-		// many members per file (file-bound cluster).
 		if c.Size > 0 {
 			row.FileSpread = roundScore(float64(len(c.Files)) / float64(c.Size))
 		}
+		survivors = append(survivors, pending{c: c, row: row})
+	}
+	sort.Slice(survivors, func(i, j int) bool {
+		if survivors[i].c.Size != survivors[j].c.Size {
+			return survivors[i].c.Size > survivors[j].c.Size
+		}
+		return survivors[i].c.ID < survivors[j].c.ID
+	})
+	truncated := false
+	if len(survivors) > limit {
+		survivors = survivors[:limit]
+		truncated = true
+	}
 
-		// Density requires the intra-cluster edge count. Use the
-		// member set + graph in-place; cheap on cluster-sized
-		// node lists.
+	// Batch every surviving cluster's member ids and pull their nodes +
+	// outgoing edges in two calls — one Cypher round-trip each on
+	// Ladybug, against the per-member GetNode / GetOutEdges loop the
+	// previous shape ran (N members × 2 cgo trips). Members from
+	// communities that didn't survive the truncate above never reach
+	// the store.
+	allMemberIDs := make([]string, 0)
+	for _, p := range survivors {
+		allMemberIDs = append(allMemberIDs, p.c.Members...)
+	}
+	memberNodes := s.graph.GetNodesByIDs(allMemberIDs)
+	memberOutEdges := s.graph.GetOutEdgesByNodeIDs(allMemberIDs)
+
+	rows := make([]clusterRow, 0, len(survivors))
+	for _, p := range survivors {
+		c := p.c
+		row := p.row
+
+		// Density requires the intra-cluster edge count, restricted to
+		// the call / reference kinds the clusterer cares about.
 		memberSet := make(map[string]bool, len(c.Members))
 		for _, m := range c.Members {
 			memberSet[m] = true
 		}
 		intra := 0
 		for _, m := range c.Members {
-			for _, e := range s.graph.GetOutEdges(m) {
+			for _, e := range memberOutEdges[m] {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 					continue
 				}
@@ -131,16 +160,14 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 				}
 			}
 		}
-		// Density = intra-edges / possible-directed-pairs.
 		if c.Size > 1 {
 			possible := c.Size * (c.Size - 1)
 			row.Density = roundScore(float64(intra) / float64(possible))
 		}
 
-		// Language mix + top files.
 		fileCounts := map[string]int{}
 		for _, m := range c.Members {
-			n := scopedSet[m]
+			n := memberNodes[m]
 			if n == nil {
 				continue
 			}
@@ -155,17 +182,6 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		row.MemberSample = sliceFirstN(c.Members, 5)
 
 		rows = append(rows, row)
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Size != rows[j].Size {
-			return rows[i].Size > rows[j].Size
-		}
-		return rows[i].ID < rows[j].ID
-	})
-	truncated := false
-	if len(rows) > limit {
-		rows = rows[:limit]
-		truncated = true
 	}
 
 	resp := map[string]any{
