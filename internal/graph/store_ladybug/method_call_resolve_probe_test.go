@@ -21,12 +21,15 @@ func TestResolveMethodCalls_UniqueBinds(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Caller method + the unique target method, same repo.
-	s.AddNode(&graph.Node{ID: "pkg/a.go::Store.GetNode", Name: "Store.GetNode", Kind: graph.KindMethod, FilePath: "pkg/a.go", RepoPrefix: "gortex"})
-	s.AddNode(&graph.Node{ID: "pkg/b.go::Store.querySelect", Name: "Store.querySelect", Kind: graph.KindMethod, FilePath: "pkg/b.go", RepoPrefix: "gortex", Meta: map[string]any{"receiver": "Store"}})
+	// Caller method + the unique target method, same repo. Method nodes
+	// store the BARE method name in `name` (the receiver lives in
+	// meta.receiver / enclosing) — mirror that exactly, since the
+	// qualified-name assumption is what masked the original bug.
+	s.AddNode(&graph.Node{ID: "pkg/a.go::Store.GetNode", Name: "GetNode", Kind: graph.KindMethod, FilePath: "pkg/a.go", RepoPrefix: "gortex", Meta: map[string]any{"receiver": "Store"}})
+	s.AddNode(&graph.Node{ID: "pkg/b.go::Store.querySelect", Name: "querySelect", Kind: graph.KindMethod, FilePath: "pkg/b.go", RepoPrefix: "gortex", Meta: map[string]any{"receiver": "Store"}})
 	// Ambiguous: two types both define Close — must stay unresolved.
-	s.AddNode(&graph.Node{ID: "pkg/b.go::Store.Close", Name: "Store.Close", Kind: graph.KindMethod, FilePath: "pkg/b.go", RepoPrefix: "gortex"})
-	s.AddNode(&graph.Node{ID: "pkg/c.go::Conn.Close", Name: "Conn.Close", Kind: graph.KindMethod, FilePath: "pkg/c.go", RepoPrefix: "gortex"})
+	s.AddNode(&graph.Node{ID: "pkg/b.go::Store.Close", Name: "Close", Kind: graph.KindMethod, FilePath: "pkg/b.go", RepoPrefix: "gortex", Meta: map[string]any{"receiver": "Store"}})
+	s.AddNode(&graph.Node{ID: "pkg/c.go::Conn.Close", Name: "Close", Kind: graph.KindMethod, FilePath: "pkg/c.go", RepoPrefix: "gortex", Meta: map[string]any{"receiver": "Conn"}})
 
 	// Method-call edges in the pre-resolve stub form (the COPY rewrite
 	// prefixes the repo; emulate the prefixed form the daemon sees).

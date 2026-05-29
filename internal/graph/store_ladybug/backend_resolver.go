@@ -293,12 +293,15 @@ RETURN count(newE) AS resolved`
 // get_callers entirely.
 //
 // We bind the stub to a concrete method node when EXACTLY ONE method
-// in the caller's repo carries that method name (the segment after the
-// last "." of its qualified `<Recv>.<method>` Name). The uniqueness
-// guard means no false edges: an ambiguous method name (String / Close
-// / Get, defined on several types) is left unresolved for a future
-// receiver-type-aware pass (the edge carries a `receiver_type` meta
-// hint) rather than bound to an arbitrary type.
+// in the caller's repo carries that name. Method nodes store the BARE
+// method name in the `name` column (e.g. "querySelect"; the receiver
+// lives in meta.receiver / enclosing), so once the `*.` is stripped
+// the stub name equals the method node name exactly — an indexed
+// equality match, no suffix scan. The uniqueness guard means no false
+// edges: an ambiguous method name (String / Close / Get, defined on
+// several types) is left unresolved for a future receiver-type-aware
+// pass (the edge carries a `receiver_type` meta hint) rather than
+// bound to an arbitrary type.
 func (s *Store) ResolveMethodCalls() (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -311,13 +314,13 @@ OPTIONAL MATCH (cnd:Node)
 WHERE cnd.kind = 'method'
   AND cnd.repo_prefix = caller.repo_prefix
   AND cnd.id <> stub.id
-  AND cnd.name ENDS WITH concat('.', mname)
+  AND cnd.name = mname
 WITH e, caller, stub, mname, count(cnd) AS cnt
 WHERE cnt = 1
 MATCH (target:Node)
 WHERE target.kind = 'method'
   AND target.repo_prefix = caller.repo_prefix
-  AND target.name ENDS WITH concat('.', mname)
+  AND target.name = mname
 DELETE e
 CREATE (caller)-[newE:Edge {
     kind: e.kind,
