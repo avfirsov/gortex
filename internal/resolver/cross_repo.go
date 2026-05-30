@@ -617,7 +617,17 @@ func (cr *CrossRepoResolver) cachedGetNodeByQualName(qualName string) *graph.Nod
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
 	oldTo := e.To
-	target := strings.TrimPrefix(e.To, unresolvedPrefix)
+	// UnresolvedName handles BOTH the bare `unresolved::X` and the
+	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
+	// strips the bare form, leaving prefixed stubs (which fix-1's widened
+	// EdgesWithUnresolvedTarget now feeds this pass) with target=full-id —
+	// so the lookup key matched no node and missed the per-pass name cache,
+	// turning every prefixed stub into a futile per-edge FindNodesByName
+	// scan. Mirrors the master Resolver.resolveEdge.
+	target := graph.UnresolvedName(e.To)
+	if target == "" {
+		target = strings.TrimPrefix(e.To, unresolvedPrefix)
+	}
 
 	switch {
 	case strings.HasPrefix(target, "import::"):
