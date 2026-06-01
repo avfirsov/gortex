@@ -20,7 +20,7 @@ embedding:
 | Provider | Quality | Offline | Native deps | Notes |
 |---|---|---|---|---|
 | `static` (default) | Good for identifier-shaped queries | Yes | None | Baked GloVe-50d table, CPU-only, zero setup |
-| `local` (Hugot MiniLM-L6-v2) | Better for NL queries | After first run | None | Auto-downloads ~90 MB to `~/.cache/gortex/models/` |
+| `local` (Hugot MiniLM-L6-v2) | Better for NL queries | After first run | None | Auto-downloads ~90 MB to `~/.gortex/models/` |
 | `api` (Ollama / OpenAI) | Best | No | None | Bounded concurrent worker pool — tune via `api_concurrency` |
 
 ## AST sub-chunking

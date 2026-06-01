@@ -30,7 +30,7 @@ import (
 // Auth: prefer AuthTokenEnv (an env-var name the daemon resolves at
 // connect time) over AuthToken (a literal value). Putting raw
 // secrets in `servers.toml` is allowed for parity with how
-// `~/.config/gortex/config.yaml` already gets written by `gortex
+// `~/.gortex/config.yaml` already gets written by `gortex
 // track`, but the env-var form is the recommended path.
 //
 // Workspaces is the optional pre-declared roster: when set, the
@@ -61,11 +61,10 @@ type ServersConfig struct {
 //  1. $GORTEX_DAEMON_SERVERS — explicit override (tests, custom
 //     deployments).
 //  2. $HOME/.gortex/servers.toml — the canonical user-level file.
-//     Note this is NOT under `~/.config/gortex/` (where global.yaml
-//     lives) — `~/.gortex/` is the daemon-control directory and is
-//     the same place tracking scripts and `gortex daemon` already
-//     write to. An absolute $XDG_CONFIG_HOME relocates this to
-//     <XDG_CONFIG_HOME>/gortex/servers.toml.
+//     It lives in the unified `~/.gortex/` tree alongside the global
+//     `config.yaml`, the same place tracking scripts and `gortex
+//     daemon` already write to. An absolute $XDG_CONFIG_HOME relocates
+//     this to <XDG_CONFIG_HOME>/gortex/servers.toml.
 //  3. $TEMPDIR/gortex-servers.toml — last-resort fallback so the
 //     daemon can still come up in an environment with no $HOME.
 func ServersConfigPath() string {

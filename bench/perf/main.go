@@ -32,7 +32,7 @@ var benchCacheDir string
 func main() {
 	repos := flag.String("repos", "gin,nestjs,react", "comma-separated repo set. Forms: preset slug (gin/nestjs/react/linux), owner/repo, https URL, or local:/path")
 	includeLinux := flag.Bool("include-linux", false, "include the linux kernel preset (multi-GB clone; skipped by default)")
-	cacheDir := flag.String("cache-dir", "", "cache directory for clones (default ~/.cache/gortex/bench)")
+	cacheDir := flag.String("cache-dir", "", "cache directory for clones (default ~/.gortex/cache/bench)")
 	queriesPath := flag.String("queries", "bench/perf/queries.json", "JSON file with the search-bench query set")
 	out := flag.String("out", "", "output table path (default stdout)")
 	format := flag.String("format", "markdown", "markdown | csv | json")

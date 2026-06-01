@@ -32,7 +32,7 @@ type hookDecision struct {
 }
 
 // hookDecisionsPath returns the telemetry file path. Respects GORTEX_HOOK_LOG
-// so tests can redirect writes. Defaults to ~/.cache/gortex (or the
+// so tests can redirect writes. Defaults to ~/.gortex/cache (or the
 // $XDG_CACHE_HOME equivalent when that variable is set).
 func hookDecisionsPath() string {
 	if p := os.Getenv("GORTEX_HOOK_LOG"); p != "" {

@@ -96,7 +96,7 @@ type daemonState struct {
 // stdio transport wiring — the daemon hands frames to MCPServer.HandleMessage
 // via the mcpDispatcher rather than going through server.ServeStdio.
 //
-// Any previously-tracked repos (from ~/.config/gortex/config.yaml) are
+// Any previously-tracked repos (from ~/.gortex/config.yaml) are
 // loaded on startup so the daemon restarts pick up where it left off.
 // isFalsyEnv returns true when the env var is explicitly set to one
 // of the "no" spellings: "0", "false", "no", "off", "n". An unset or
@@ -514,7 +514,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	}
 
 	// LLM service (opt-in via the `.gortex.yaml` `llm:` block,
-	// `~/.config/gortex/config.yaml::llm:`, or GORTEX_LLM_* env vars).
+	// `~/.gortex/config.yaml::llm:`, or GORTEX_LLM_* env vars).
 	// Repo-local config wins per non-zero field; the global config
 	// fills the rest; env overrides land last inside SetupLLM via
 	// MergeEnv. The active provider is chosen by `llm.provider`

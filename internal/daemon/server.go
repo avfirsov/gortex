@@ -131,7 +131,7 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 // Listen creates the socket, writes the PID file, and installs the
 // shutdown-signal handlers for graceful shutdown. The socket permissions
 // are 0o600 on Unix — the daemon is user-local and nothing else on the
-// machine should reach it; on Windows, %LocalAppData% ACLs scope it to
+// machine should reach it; on Windows, %USERPROFILE% ACLs scope it to
 // the user instead.
 func (s *Server) Listen() error {
 	if err := EnsureParentDir(s.SocketPath); err != nil {
@@ -152,7 +152,7 @@ func (s *Server) Listen() error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	// chmod the socket to user-only on Unix. Windows has no POSIX mode
-	// bits — the socket inherits the ACLs of %LocalAppData%, which is
+	// bits — the socket inherits the ACLs of %USERPROFILE%, which is
 	// already user-scoped — so skip it there.
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(s.SocketPath, 0o600); err != nil {

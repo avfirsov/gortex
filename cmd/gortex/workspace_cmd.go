@@ -55,7 +55,7 @@ the cwd. Project defaults to the workspace slug when omitted.
 
 Without --global the value is written to the repo's .gortex.yaml.
 With --global the value is written to
-~/.config/gortex/config.yaml (your user-level config), which is
+~/.gortex/config.yaml (your user-level config), which is
 the right choice for OSS / read-only repos where you don't want
 to leave any artifact in the repo. Global overrides win over
 .gortex.yaml at resolution time, so you can also use --global to
@@ -80,7 +80,7 @@ By default the command prints the planned changes and asks for
 confirmation. Pass --yes to skip the prompt (CI / scripted use).
 --root <path> restricts the bulk update to repos under that prefix
 (e.g. only your "work" repos). --global writes to
-~/.config/gortex/config.yaml instead of touching each repo's
+~/.gortex/config.yaml instead of touching each repo's
 .gortex.yaml — the OSS-friendly path.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runWorkspaceSetAll,
@@ -91,14 +91,14 @@ func init() {
 	workspaceCmd.AddCommand(workspaceSetCmd)
 	workspaceCmd.AddCommand(workspaceSetAllCmd)
 	workspaceListCmd.Flags().BoolVar(&workspaceListJSON, "json", false, "emit machine-readable JSON instead of a table")
-	workspaceSetCmd.Flags().BoolVar(&workspaceSetGlobal, "global", false, "write to ~/.config/gortex/config.yaml instead of the repo's .gortex.yaml (OSS-friendly)")
+	workspaceSetCmd.Flags().BoolVar(&workspaceSetGlobal, "global", false, "write to ~/.gortex/config.yaml instead of the repo's .gortex.yaml (OSS-friendly)")
 	workspaceSetAllCmd.Flags().BoolVarP(&workspaceSetAll, "yes", "y", false, "skip interactive confirmation")
 	workspaceSetAllCmd.Flags().StringVar(&workspaceSetRoot, "root", "", "only stamp repos whose path starts with this prefix")
-	workspaceSetAllCmd.Flags().BoolVar(&workspaceSetGlobal, "global", false, "write to ~/.config/gortex/config.yaml instead of each repo's .gortex.yaml")
+	workspaceSetAllCmd.Flags().BoolVar(&workspaceSetGlobal, "global", false, "write to ~/.gortex/config.yaml instead of each repo's .gortex.yaml")
 	rootCmd.AddCommand(workspaceCmd)
 }
 
-// loadGlobalRepos reads the global config (~/.config/gortex/config.yaml
+// loadGlobalRepos reads the global config (~/.gortex/config.yaml
 // by default, or whatever --config points at) and returns the tracked
 // repo entries. Failure to read the config returns an error rather
 // than an empty list — silently doing nothing on a typo'd config
@@ -436,7 +436,7 @@ func stampWorkspace(repoPath, workspace, project string) error {
 }
 
 // stampWorkspaceGlobal writes the workspace/project override onto
-// the matching RepoEntry in `~/.config/gortex/config.yaml`. Returns
+// the matching RepoEntry in `~/.gortex/config.yaml`. Returns
 // the path of the file modified for the user-facing message. Used
 // when the user passes --global — the OSS-friendly path that
 // leaves no trace in the repo itself.

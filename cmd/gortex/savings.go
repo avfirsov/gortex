@@ -36,8 +36,8 @@ the tokens avoided (priced against popular models).
 
 Savings accumulate every time a source-reading MCP tool (get_symbol_source,
 batch_symbols, smart_context) returns a symbol or compressed view instead of
-a full-file read. Cumulative totals live at ~/.cache/gortex/savings.json and
-per-call events at the sibling ~/.cache/gortex/savings.jsonl — Today / 7-day
+a full-file read. Cumulative totals live at ~/.gortex/cache/savings.json and
+per-call events at the sibling ~/.gortex/cache/savings.jsonl — Today / 7-day
 buckets come from the JSONL log, All time from the cumulative file.
 
 Override the cache dir with --cache-dir, override pricing by exporting

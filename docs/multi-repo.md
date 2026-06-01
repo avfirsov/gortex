@@ -8,7 +8,7 @@ Every node and contract is keyed on a **workspace slug**, which is the hard grap
 
 Slug resolution precedence (first match wins):
 
-1. `RepoEntry.workspace` in `~/.config/gortex/config.yaml` — overrides everything, ideal for OSS / read-only repos where you don't want to leave an artifact in the tree
+1. `RepoEntry.workspace` in `~/.gortex/config.yaml` — overrides everything, ideal for OSS / read-only repos where you don't want to leave an artifact in the tree
 2. `workspace:` in the repo's own `.gortex.yaml` — the default for first-party repos
 3. The repo prefix — fallback when neither is set, so each unconfigured repo gets its own isolated workspace
 
@@ -18,13 +18,13 @@ The same chain applies to the optional `project:` slug (a sub-bucket inside a wo
 
 Two-tier config hierarchy:
 
-- **Global config** (`~/.config/gortex/config.yaml`) — projects, repo lists, active project, reference tags
+- **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags
 - **Workspace config** (`.gortex.yaml` per repo) — guards, excludes, local overrides
 
 Excludes are layered — builtin → repo's own `.gitignore` → global → per-repo entry → workspace — with gitignore semantics. The repo's `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include something an earlier layer excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
 
 ```yaml
-# ~/.config/gortex/config.yaml
+# ~/.gortex/config.yaml
 active_project: my-saas
 
 exclude:                            # Applies to every tracked repo
@@ -58,7 +58,7 @@ projects:
 The daemon's defaults handle typical workflows without configuration. These knobs exist for monorepos, branch-heavy workflows, or filesystems without fsnotify support.
 
 ```yaml
-# ~/.config/gortex/config.yaml (or per-repo .gortex.yaml)
+# ~/.gortex/config.yaml (or per-repo .gortex.yaml)
 watch:
   debounce_ms: 150            # per-file patch debounce (default 150)
 
@@ -94,13 +94,13 @@ gortex repos --json                 # Same, machine-readable (for scripts / CI)
 gortex workspace list                                       # Show what each tracked repo currently declares
 gortex workspace list --json                                # Same, machine-readable
 gortex workspace set backend api                            # Write workspace=api to backend's .gortex.yaml
-gortex workspace set upstream-lib api --global              # OSS-friendly: pin to api in ~/.config/gortex/config.yaml
+gortex workspace set upstream-lib api --global              # OSS-friendly: pin to api in ~/.gortex/config.yaml
 gortex workspace set-all api --root ~/projects/work --yes   # Bulk: stamp every tracked repo under a prefix
 
 # Manage the effective ignore list used by indexing + watching
 gortex config exclude list                          # Show all layers (builtin, global, repo entry, workspace)
 gortex config exclude add pkg/generated             # Default target: workspace .gortex.yaml
-gortex config exclude add '**/*.bak' --global       # Write to ~/.config/gortex/config.yaml
+gortex config exclude add '**/*.bak' --global       # Write to ~/.gortex/config.yaml
 gortex config exclude add testdata/ --repo backend  # Write to a RepoEntry
 gortex config exclude remove pkg/generated          # Remove from the same target
 ```

@@ -337,7 +337,7 @@ func newRecallLogger() *zap.Logger {
 
 // chooseEmbedder honours --embeddings-url > --embedder > --embeddings > off.
 // Default with --embeddings is the best local provider (Hugot MiniLM-L6-v2
-// auto-downloads to ~/.cache/gortex/models/ on first use). Users can force
+// auto-downloads to ~/.gortex/models/ on first use). Users can force
 // static GloVe with --embedder static.
 func chooseEmbedder() embedding.Provider {
 	if evalRecallEmbeddingsURL != "" {

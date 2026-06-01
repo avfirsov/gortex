@@ -41,7 +41,7 @@ type DiskCache struct {
 }
 
 // DefaultTokenCacheDir returns the default cache location:
-// ~/.cache/gortex/token-counts (or the $XDG_CACHE_HOME equivalent).
+// ~/.gortex/cache/token-counts (or the $XDG_CACHE_HOME equivalent).
 func DefaultTokenCacheDir() string {
 	return filepath.Join(platform.CacheDir(), "token-counts")
 }

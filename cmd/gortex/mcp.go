@@ -74,7 +74,7 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpCORSOrigin, "cors-origin", "*", "allowed CORS origin for server API")
 	mcpCmd.Flags().StringSliceVar(&mcpTrack, "track", nil, "additional repository paths to track")
 	mcpCmd.Flags().StringVar(&mcpProject, "project", "", "active project name")
-	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
+	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "graph cache directory (default ~/.gortex/cache/)")
 	mcpCmd.Flags().BoolVar(&mcpNoCache, "no-cache", false, "disable graph caching")
 	mcpCmd.Flags().BoolVar(&mcpEmbeddings, "embeddings", false, "enable semantic search (built-in word vectors or transformer if compiled in)")
 	mcpCmd.Flags().StringVar(&mcpEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
@@ -435,7 +435,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	srv.InitFrecency(mcpCacheDir, mcpIndex, gortexmcp.ModeAI)
 
 	// Initialize cumulative token-savings persistence. Path defaults to
-	// ~/.cache/gortex/savings.json; the store operates in-memory when the
+	// ~/.gortex/cache/savings.json; the store operates in-memory when the
 	// cache dir is unavailable.
 	savingsPath := savings.DefaultPath()
 	if mcpCacheDir != "" {
@@ -451,7 +451,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 
 	// LLM service — same wiring as the daemon path: repo config wins
-	// per non-zero field, global ~/.config/gortex/config.yaml fills the
+	// per non-zero field, global ~/.gortex/config.yaml fills the
 	// rest, env vars override last inside SetupLLM. The active provider
 	// is chosen by `llm.provider` (local / anthropic / openai / ollama /
 	// claudecli / gemini / bedrock / deepseek).

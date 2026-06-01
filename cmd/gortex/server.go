@@ -91,7 +91,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverProject, "project", "", "active project name (GlobalConfig group of repos)")
 	serverCmd.Flags().StringVar(&serverWorkspace, "workspace", "", "workspace slug — restricts BOTH indexing and queries to repos whose resolved workspace matches (RepoEntry override → .gortex.yaml::workspace → repo prefix). Empty means all workspaces.")
 	serverCmd.Flags().StringVar(&serverScopeProject, "scope-project", "", "project slug — narrows further inside --workspace (also gates indexing). No effect without --workspace.")
-	serverCmd.Flags().StringVar(&serverCacheDir, "cache-dir", "", "graph cache directory (default ~/.cache/gortex/)")
+	serverCmd.Flags().StringVar(&serverCacheDir, "cache-dir", "", "graph cache directory (default ~/.gortex/cache/)")
 	serverCmd.Flags().BoolVar(&serverNoCache, "no-cache", false, "disable graph caching")
 	serverCmd.Flags().BoolVar(&serverEmbeddings, "embeddings", false, "enable semantic search")
 	serverCmd.Flags().StringVar(&serverEmbeddingsURL, "embeddings-url", "", "embedding API URL (e.g. http://localhost:11434 for Ollama)")
@@ -103,7 +103,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverBackend, "backend", "memory", "storage backend: memory (in-process, default — fastest, no persistence) | sqlite (pure-Go embedded SQL — persists to --backend-path, cold-loads from disk)")
 	serverCmd.Flags().Uint64Var(&serverBackendBufferPoolMB, "backend-buffer-pool-mb", 0,
 		"advisory page-cache cap (MiB) for on-disk backends. 0 lets the backend choose its own default; backends that manage their own cache (e.g. sqlite) ignore it")
-	serverCmd.Flags().StringVar(&serverBackendPath, "backend-path", "", "directory where the on-disk backend persists its store. Required when --backend != memory. Default: ~/.gortex/<backend>.store")
+	serverCmd.Flags().StringVar(&serverBackendPath, "backend-path", "", "directory where the on-disk backend persists its store. Required when --backend != memory. Default: ~/.gortex/store/<backend>.store")
 	rootCmd.AddCommand(serverCmd)
 }
 
@@ -757,7 +757,7 @@ func isLocalhostBind(bind string) bool {
 
 // resolveServerID loads or creates the per-machine server id. When
 // cacheDir is empty the id lives alongside other gortex cache files
-// (~/.cache/gortex/server.id); otherwise cacheDir/server.id.
+// (~/.gortex/cache/server.id); otherwise cacheDir/server.id.
 func resolveServerID(cacheDir string) (string, error) {
 	path := filepath.Join(cacheDir, "server.id")
 	if cacheDir == "" {

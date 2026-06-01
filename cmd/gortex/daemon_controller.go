@@ -78,7 +78,7 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
-	// who need project scoping can edit ~/.config/gortex/config.yaml and
+	// who need project scoping can edit ~/.gortex/config.yaml and
 	// run `gortex daemon reload`; track from the daemon-v1 surface just
 	// adds to the top-level repo list.
 

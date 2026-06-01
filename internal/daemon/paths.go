@@ -15,8 +15,8 @@ import (
 // unset the location stays at the historical default so an existing
 // daemon state directory is not orphaned:
 //
-//   - Windows: %LocalAppData%\gortex (via os.UserCacheDir).
-//   - macOS / Linux: $HOME/.cache/gortex.
+//   - Windows: %USERPROFILE%\.gortex\cache (via os.UserCacheDir).
+//   - macOS / Linux: $HOME/.gortex/cache.
 //
 // The boolean is false when the home / cache directory can't be
 // resolved at all, in which case callers fall back to the temp dir.
@@ -45,8 +45,8 @@ func stateDir() (string, bool) {
 //  1. $GORTEX_DAEMON_SOCKET — explicit override (tests, custom deployments).
 //  2. $XDG_RUNTIME_DIR/gortex.sock — Linux standard for user runtime files.
 //     This path is cleaned automatically on logout and has sensible perms.
-//  3. The per-user state dir — $HOME/.cache/gortex on macOS/Linux,
-//     %LocalAppData%\gortex on Windows.
+//  3. The per-user state dir — $HOME/.gortex/cache on macOS/Linux,
+//     %USERPROFILE%\.gortex\cache on Windows.
 //
 // AF_UNIX socket paths have a length limit (~104 bytes on macOS, 108 on
 // Linux and Windows). We don't enforce that here — the listener fails
@@ -157,7 +157,7 @@ func normalizeBackendTag(backend string) string {
 // EnsureParentDir creates the parent directory of path with permissions
 // 0o700 (user only). Daemon state files live under the user's cache dir
 // and should not be world-readable. The mode is advisory on Windows,
-// where filesystem ACLs already scope %LocalAppData% to the user.
+// where filesystem ACLs already scope %USERPROFILE% to the user.
 func EnsureParentDir(path string) error {
 	dir := filepath.Dir(path)
 	return os.MkdirAll(dir, 0o700)

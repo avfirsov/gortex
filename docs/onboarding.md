@@ -91,7 +91,7 @@ Two ways — pick whichever fits your workflow.
 gortex mcp --index . --watch
 ```
 
-`--watch` re-indexes changed files live via fsnotify. `--cache-dir ~/.cache/gortex` (default) saves snapshots between restarts so subsequent starts are ~200ms instead of 3-5s.
+`--watch` re-indexes changed files live via fsnotify. `--cache-dir ~/.gortex/cache` (default) saves snapshots between restarts so subsequent starts are ~200ms instead of 3-5s.
 
 To also get the HTTP server API (the UI is a separate Next.js app in `web/` that talks to it over HTTP):
 
@@ -169,7 +169,7 @@ The index is empty. Either `gortex mcp` isn't watching the right directory, or `
 First-time index of a 100k-symbol repo is ~20-30 seconds. On restart, it's ~200ms because the snapshot gets restored and only changed files re-index. Make sure `--cache-dir` isn't being deleted between runs.
 
 **Semantic search isn't working.**
-On first use, Gortex downloads the MiniLM-L6-v2 model (~90 MB) to `~/.cache/gortex/models/`. Needs network the first time; after that, fully offline. Check `~/.cache/gortex/models/sentence-transformers_all-MiniLM-L6-v2/` exists.
+On first use, Gortex downloads the MiniLM-L6-v2 model (~90 MB) to `~/.gortex/models/`. Needs network the first time; after that, fully offline. Check `~/.gortex/models/sentence-transformers_all-MiniLM-L6-v2/` exists.
 
 **"Cannot be opened because Apple cannot check it for malicious software" on macOS.**
 You bypassed the curl installer and downloaded the binary by hand — `curl -fsSL https://get.gortex.dev | sh` strips the quarantine xattr automatically (and on macOS routes through Homebrew when `brew` is on PATH). To fix an existing manual install, re-run the installer, reinstall via Homebrew (`brew install zzet/tap/gortex`), or run once: `xattr -d com.apple.quarantine /usr/local/bin/gortex`.
@@ -239,9 +239,9 @@ On macOS the unit lands at `~/Library/LaunchAgents/com.zzet.gortex.plist`; on Li
 
 - `gortex mcp` (what Claude Code spawns via `.mcp.json`) auto-detects the daemon. If reachable, it acts as a thin stdio ↔ socket proxy (~5 MB per client). If not, it falls back to the embedded server — global mode is never "required."
 - Every tracked repo gets its own fsnotify watcher so edits on disk flow into the graph live; no manual reload needed. `gortex track` attaches a watcher as part of the track operation; `gortex untrack` detaches it before evicting nodes.
-- Graph state is snapshotted to `~/.cache/gortex/daemon.gob.gz` on shutdown and every 10 minutes. Daemon restarts load it back and re-index only changed files.
+- Graph state is snapshotted to `~/.gortex/cache/daemon.gob.gz` on shutdown and every 10 minutes. Daemon restarts load it back and re-index only changed files.
 - Opening Claude Code in an untracked directory returns a structured `repo_not_tracked` error on every tool call. The agent surfaces it; you run `gortex track .` to include it.
-- Per-session state is isolated by a handshake-assigned session ID — two Claude Code windows see their own recent-activity and token-savings counters, not a merged view. Cumulative savings in `~/.cache/gortex/savings.json` are still shared.
+- Per-session state is isolated by a handshake-assigned session ID — two Claude Code windows see their own recent-activity and token-savings counters, not a merged view. Cumulative savings in `~/.gortex/cache/savings.json` are still shared.
 
 ### Fallback rules
 
@@ -279,7 +279,7 @@ gortex workspace set backend my-saas                        # write workspace=my
 gortex workspace set-all my-saas --root ~/work --yes        # bulk-stamp every repo under ~/work
 ```
 
-For OSS / read-only repos where you don't want a `.gortex.yaml` artifact in the tree, pass `--global` to record the slug in `~/.config/gortex/config.yaml` instead.
+For OSS / read-only repos where you don't want a `.gortex.yaml` artifact in the tree, pass `--global` to record the slug in `~/.gortex/config.yaml` instead.
 
 ### Projects (optional sub-buckets) and active scope
 

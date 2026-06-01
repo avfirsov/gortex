@@ -421,7 +421,7 @@ func ensureProjectMarker(root string, w io.Writer) error {
 	return nil
 }
 
-// ensureGlobalConfig adds this repo to ~/.config/gortex/config.yaml
+// ensureGlobalConfig adds this repo to ~/.gortex/config.yaml
 // so the daemon picks it up on its next restart. Skipped in --dry-run.
 func ensureGlobalConfig(root string) error {
 	gc, err := config.LoadGlobal()

@@ -300,7 +300,7 @@ type TrackedRepoStatus struct {
 	Path   string `json:"path"`
 	Name   string `json:"name,omitempty"`
 	// Project is the GlobalConfig active-project slug — a named
-	// grouping of repos in `~/.config/gortex/config.yaml::projects`.
+	// grouping of repos in `~/.gortex/config.yaml::projects`.
 	// Distinct from `WorkspaceProject` below, which is the project
 	// slug from `.gortex.yaml::project`. Kept here for backwards
 	// compatibility with older daemon clients that read the field.

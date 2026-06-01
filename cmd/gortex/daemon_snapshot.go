@@ -677,7 +677,7 @@ func loadSnapshotFrom(g graph.Store, path string, logger *zap.Logger) (snapshotL
 	// rewrites edges whose source file's mtime changed, and most files
 	// stay untouched across daemon restarts). Bumping any resolver
 	// behaviour without bumping snapshotSchemaVersion silently degrades
-	// query quality until the user thinks to wipe ~/.cache/gortex.
+	// query quality until the user thinks to wipe ~/.gortex/cache.
 	//
 	// Cheap fix: if the binary that wrote the snapshot has a different
 	// version string than the binary loading it, discard. Cost is one

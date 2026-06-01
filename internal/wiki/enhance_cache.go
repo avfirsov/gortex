@@ -29,7 +29,7 @@ func NewEnhanceCache(root string) *EnhanceCache {
 }
 
 // DefaultEnhanceCacheDir returns the default cache location:
-// ~/.cache/gortex/wiki-enhance (or $XDG_CACHE_HOME equivalent).
+// ~/.gortex/cache/wiki-enhance (or $XDG_CACHE_HOME equivalent).
 func DefaultEnhanceCacheDir() string {
 	return filepath.Join(platform.CacheDir(), "wiki-enhance")
 }

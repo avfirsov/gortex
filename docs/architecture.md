@@ -54,7 +54,7 @@ gortex binary
 Gortex snapshots the graph to disk on shutdown and restores it on startup, with incremental re-indexing of only changed files:
 
 ```bash
-# Default cache directory: ~/.cache/gortex/
+# Default cache directory: ~/.gortex/cache/
 gortex mcp --index /path/to/repo
 
 # Custom cache directory

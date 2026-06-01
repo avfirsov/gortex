@@ -36,7 +36,7 @@ type FileStore struct {
 }
 
 // NewFileStore creates a file-based persistence store.
-// If dir is empty, defaults to the Gortex cache dir (~/.cache/gortex/,
+// If dir is empty, defaults to the Gortex cache dir (~/.gortex/cache/,
 // or the $XDG_CACHE_HOME equivalent when that variable is set).
 func NewFileStore(dir, version string) (*FileStore, error) {
 	if dir == "" {

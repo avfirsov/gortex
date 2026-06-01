@@ -23,10 +23,10 @@ The backend is chosen by the `llm.provider` key. Eight of the nine providers are
 
 ## Configuration
 
-The `llm:` block goes in `~/.config/gortex/config.yaml` or a per-repo `.gortex.yaml` (repo-local wins per field, global fills the rest). Configure only the provider you use:
+The `llm:` block goes in `~/.gortex/config.yaml` or a per-repo `.gortex.yaml` (repo-local wins per field, global fills the rest). Configure only the provider you use:
 
 ```yaml
-# ~/.config/gortex/config.yaml (or per-repo .gortex.yaml)
+# ~/.gortex/config.yaml (or per-repo .gortex.yaml)
 llm:
   provider: local            # local | anthropic | openai | ollama | claudecli | codex | gemini | bedrock | deepseek
   max_steps: 16              # agent tool-loop cap (provider-agnostic)

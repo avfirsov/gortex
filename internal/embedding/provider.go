@@ -100,7 +100,7 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 func NewLocalProvider() (Provider, error) {
 	// Opt-in transformer backends (compiled in via build tags), then the
 	// default Hugot pure-Go ONNX runtime which auto-downloads MiniLM-L6-v2
-	// to ~/.cache/gortex/models/ on first use.
+	// to ~/.gortex/models/ on first use.
 	factories := []func() (Provider, error){
 		newONNXProvider,
 		newGoMLXProvider,

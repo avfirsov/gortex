@@ -191,7 +191,7 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 //  1. Builtin baseline (excludes.Builtin)
 //  2. Repo's own `.gitignore` (read from disk; opt out with
 //     `respect_gitignore: false` in `.gortex.yaml`)
-//  3. Global Exclude from ~/.config/gortex/config.yaml
+//  3. Global Exclude from ~/.gortex/config.yaml
 //  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
 //  5. Workspace .gortex.yaml top-level Exclude
 //  6. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)

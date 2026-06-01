@@ -338,7 +338,7 @@ claim as a budget gate; --strict turns gate violations into a
 non-zero exit so CI catches regressions.
 
 Default behavior:
-  - Clones each repo to ~/.cache/gortex/bench/<slug>/ on first run
+  - Clones each repo to ~/.gortex/cache/bench/<slug>/ on first run
   - Reuses the clone on subsequent runs (rm -rf <slug> to refresh)
   - Honors --out-dir (artifacts land at <dir>/perf.{md,json,csv})
 

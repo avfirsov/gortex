@@ -21,7 +21,7 @@ var reposJSON bool
 
 // reposCacheDir is the persistence-store directory `gortex repos`
 // inspects for index freshness. Empty resolves to the default
-// (~/.cache/gortex/) — the same slot `gortex server` / `gortex mcp`
+// (~/.gortex/cache/) — the same slot `gortex server` / `gortex mcp`
 // persist to. Overridable so tests can point at a temp store.
 var reposCacheDir string
 
@@ -29,7 +29,7 @@ var reposCmd = &cobra.Command{
 	Use:   "repos",
 	Short: "List every tracked repository with its git head and index freshness",
 	Long: `Lists the repositories registered in the global config
-(~/.config/gortex/config.yaml).
+(~/.gortex/config.yaml).
 
 For each repo the command reports the current git HEAD commit and an
 index-freshness indicator: when the persisted index was last built and
@@ -88,7 +88,7 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 
 	// The persistence store is read-only here — we only inspect what
 	// `gortex server` / `gortex mcp` already persisted. An empty
-	// cache dir resolves to the default (~/.cache/gortex/), the same
+	// cache dir resolves to the default (~/.gortex/cache/), the same
 	// slot those commands write to.
 	store, err := persistence.NewFileStore(reposCacheDir, version)
 	if err != nil {

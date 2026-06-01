@@ -15,7 +15,7 @@ import (
 // daemon config). They don't fit the Adapter interface because they
 // touch the daemon's RPC protocol, not on-disk agent config.
 
-// ensureGlobalConfigExists creates an empty ~/.config/gortex/config.yaml
+// ensureGlobalConfigExists creates an empty ~/.gortex/config.yaml
 // when none is present. The daemon needs a writable path on first
 // Track; creating it now surfaces any permission problems at install
 // time instead of on the first use.

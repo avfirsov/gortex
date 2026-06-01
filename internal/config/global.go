@@ -48,7 +48,7 @@ type ProjectConfig struct {
 	Repos []RepoEntry `mapstructure:"repos" yaml:"repos"`
 }
 
-// GlobalConfig is the user-level config at ~/.config/gortex/config.yaml.
+// GlobalConfig is the user-level config at ~/.gortex/config.yaml.
 type GlobalConfig struct {
 	Projects      map[string]ProjectConfig `mapstructure:"projects"       yaml:"projects,omitempty"`
 	Repos         []RepoEntry              `mapstructure:"repos"          yaml:"repos,omitempty"`
@@ -106,7 +106,7 @@ func expandHome(p string) string {
 	return p
 }
 
-// DefaultGlobalConfigPath returns the default path: ~/.config/gortex/config.yaml,
+// DefaultGlobalConfigPath returns the default path: ~/.gortex/config.yaml,
 // or the $XDG_CONFIG_HOME equivalent when that variable is set.
 //
 // Resolved fresh on every call so HOME / XDG_CONFIG_HOME changes (notably
@@ -118,7 +118,7 @@ func DefaultGlobalConfigPath() string {
 	return filepath.Join(platform.ConfigDir(), "config.yaml")
 }
 
-// LoadGlobal reads the global config from ~/.config/gortex/config.yaml.
+// LoadGlobal reads the global config from ~/.gortex/config.yaml.
 // If the file does not exist, it returns an empty GlobalConfig (no error).
 // If configPath is empty, the default path is used.
 func LoadGlobal(configPath ...string) (*GlobalConfig, error) {

@@ -35,7 +35,7 @@ indexing and watching. Patterns follow .gitignore semantics.
 
 Targets (in precedence order; later layers override earlier):
   1. Builtin baseline (read-only)
-  2. Global   - ~/.config/gortex/config.yaml       (--global)
+  2. Global   - ~/.gortex/config.yaml              (--global)
   3. Repo    - GlobalConfig.repos[].exclude        (--repo <name>)
   4. Workspace - ./.gortex.yaml at the repo root   (default)
 
@@ -76,7 +76,7 @@ func init() {
 
 	for _, c := range []*cobra.Command{configExcludeAddCmd, configExcludeRemoveCmd} {
 		c.Flags().BoolVar(&excludeGlobalFlag, "global", false,
-			"write to ~/.config/gortex/config.yaml (GlobalConfig.exclude)")
+			"write to ~/.gortex/config.yaml (GlobalConfig.exclude)")
 		c.Flags().StringVar(&excludeRepoFlag, "repo", "",
 			"write to the named RepoEntry in the global config")
 	}

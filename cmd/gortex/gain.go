@@ -50,7 +50,7 @@ Default behavior:
   1. Find the most recent gortex bench tokens output (auto-discovery
      under bench/results/, then a transparent re-run when none).
   2. Render a USD-per-model card scaled to --responses-per-day.
-  3. Append a short "Your history" section from ~/.cache/gortex/savings.json
+  3. Append a short "Your history" section from ~/.gortex/cache/savings.json
      when --since's window has any tracked calls.
 
 Flags:

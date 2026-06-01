@@ -4,7 +4,7 @@ Gortex tracks how many tokens it saves compared to naive file reads — per-call
 
 - **Per-call:** `get_symbol_source` and other source-reading tools include a `tokens_saved` field in the response, showing the difference between reading the full file vs the targeted symbol.
 - **Session-level:** `graph_stats` returns a `token_savings` object with `calls_counted`, `tokens_returned`, `tokens_saved`, `efficiency_ratio`.
-- **Cumulative (cross-session):** `graph_stats` also returns `cumulative_savings` when persistence is wired — includes `first_seen`, `last_updated`, and `cost_avoided_usd` per model (Claude Opus/Sonnet/Haiku, GPT-4o, GPT-4o-mini). Backed by `~/.cache/gortex/savings.json` (top-line totals + per-repo + per-language) and a sibling `~/.cache/gortex/savings.jsonl` event log (one line per call) used to render the windowed buckets and the per-tool breakdown.
+- **Cumulative (cross-session):** `graph_stats` also returns `cumulative_savings` when persistence is wired — includes `first_seen`, `last_updated`, and `cost_avoided_usd` per model (Claude Opus/Sonnet/Haiku, GPT-4o, GPT-4o-mini). Backed by `~/.gortex/cache/savings.json` (top-line totals + per-repo + per-language) and a sibling `~/.gortex/cache/savings.jsonl` event log (one line per call) used to render the windowed buckets and the per-tool breakdown.
 
 `gortex savings` renders a three-bucket dashboard:
 
