@@ -99,7 +99,7 @@ func (s *Store) LoadFileMtimes(repoPrefix string) map[string]int64 {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out map[string]int64
 	for rows.Next() {
@@ -132,7 +132,7 @@ func (s *Store) FileMtimes(repoPrefix string) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make(map[string]int64)
 	for rows.Next() {

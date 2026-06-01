@@ -453,9 +453,9 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}()
 
 	insertNode := tx.Stmt(s.stmtInsertNode)
-	defer insertNode.Close()
+	defer func() { _ = insertNode.Close() }()
 	insertEdge := tx.Stmt(s.stmtInsertEdge)
-	defer insertEdge.Close()
+	defer func() { _ = insertEdge.Close() }()
 
 	for _, n := range nodes {
 		if n == nil || n.ID == "" {
@@ -721,18 +721,18 @@ func (s *Store) evictByScopeLocked(selectIDs, deleteNodes *sql.Stmt, scope strin
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return 0, 0
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		panicOnFatal(err)
 		return 0, 0
 	}
-	rows.Close()
+	_ = rows.Close()
 	if len(ids) == 0 {
 		return 0, 0
 	}
@@ -823,7 +823,7 @@ func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
 		panicOnFatal(err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []*graph.Node
 	for rows.Next() {
 		n, err := scanNode(rows)
@@ -868,7 +868,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		panicOnFatal(err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdge(rows)
@@ -918,13 +918,13 @@ func (s *Store) Stats() graph.GraphStats {
 		var kind string
 		var n int
 		if err := rows.Scan(&kind, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return st
 		}
 		st.ByKind[kind] = n
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	rows, err = s.stmtStatsByLanguage.Query()
 	if err != nil {
@@ -935,13 +935,13 @@ func (s *Store) Stats() graph.GraphStats {
 		var lang string
 		var n int
 		if err := rows.Scan(&lang, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return st
 		}
 		st.ByLanguage[lang] = n
 	}
-	rows.Close()
+	_ = rows.Close()
 	return st
 }
 
@@ -956,7 +956,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		var repo, kind, lang string
 		var n int
 		if err := rows.Scan(&repo, &kind, &lang, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return out
 		}
@@ -969,7 +969,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		st.ByLanguage[lang] += n
 		out[repo] = st
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	rows, err = s.stmtRepoStatsEdges.Query()
 	if err != nil {
@@ -980,7 +980,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return out
 		}
@@ -991,7 +991,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 		st.TotalEdges = n
 		out[repo] = st
 	}
-	rows.Close()
+	_ = rows.Close()
 	return out
 }
 
@@ -1001,7 +1001,7 @@ func (s *Store) RepoPrefixes() []string {
 		panicOnFatal(err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string
@@ -1068,7 +1068,7 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return out
 		}
@@ -1077,7 +1077,7 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 		est.NodeBytes = uint64(n) * perNodeByteEstimate
 		out[repo] = est
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	rows, err = s.stmtAllRepoCountsEdges.Query()
 	if err != nil {
@@ -1088,7 +1088,7 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			panicOnFatal(err)
 			return out
 		}
@@ -1097,7 +1097,7 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 		est.EdgeBytes = uint64(n) * perEdgeByteEstimate
 		out[repo] = est
 	}
-	rows.Close()
+	_ = rows.Close()
 	return out
 }
 

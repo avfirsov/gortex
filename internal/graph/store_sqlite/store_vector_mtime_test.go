@@ -237,7 +237,6 @@ func TestSQLiteVectorSimilarTo(t *testing.T) {
 }
 
 func TestSQLiteVectorPersistence(t *testing.T) {
-	const dims = 8
 	path := filepath.Join(t.TempDir(), "v.sqlite")
 
 	corpus := map[string][]float32{
