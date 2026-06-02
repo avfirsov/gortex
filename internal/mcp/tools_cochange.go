@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"go.uber.org/zap"
 	"sort"
 	"strings"
 
@@ -207,6 +208,15 @@ func (s *Server) mineCoChange() {
 
 	if s.coChangeFromEdges(scores, counts) {
 		s.storeCoChange(scores, counts)
+		// The co-change graph COULD be refreshed by re-mining git log,
+		// but was NOT: persisted EdgeCoChange edges already exist, so the
+		// lazy path serves them as-is. If history advanced since the last
+		// mine these counts are stale until an explicit refresh. Surface
+		// that rather than silently serving possibly-stale data.
+		if s.logger != nil {
+			s.logger.Info("co-change served from persisted edges; not re-mined (could be updated, but was not) — run `gortex enrich cochange` to refresh after history changes",
+				zap.Int("file_relations", len(scores)))
+		}
 		return
 	}
 
