@@ -789,7 +789,7 @@ func (s *SidecarStore) MigrateLegacyScopes(legacyPath string) error {
 		if sc.Name == "" {
 			continue
 		}
-		if err := s.UpsertScope(ScopeRow{Name: sc.Name, Description: sc.Description, Repos: sc.Repos, Paths: sc.Paths}); err != nil {
+		if err := s.UpsertScope(ScopeRow(sc)); err != nil {
 			return err
 		}
 	}

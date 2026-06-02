@@ -1,13 +1,9 @@
 package main
 
 import (
-	"context"
-	"fmt"
-
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
-	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/progress"
 )
 
@@ -35,22 +31,4 @@ func loggerForSpinner(cmd *cobra.Command, real *zap.Logger) *zap.Logger {
 		return real
 	}
 	return zap.NewNop()
-}
-
-// indexWithSpinner runs the indexer with a progress spinner attached, reporting
-// stage transitions as the sub-status. Used by every enrich subcommand that
-// needs an in-memory graph before running its enrichment pass.
-func indexWithSpinner(cmd *cobra.Command, idx *indexer.Indexer, path string) error {
-	sp := newCLISpinner(cmd, "Indexing repository")
-	sp.Set("", path)
-	ctx := progress.WithReporter(context.Background(), sp)
-	result, err := idx.IndexCtx(ctx, path)
-	if err != nil {
-		sp.Fail(err)
-		return fmt.Errorf("index %s: %w", path, err)
-	}
-	sp.Set("", fmt.Sprintf("%s files · %s nodes · %s edges · %dms",
-		humanizeInt(result.FileCount), humanizeInt(result.NodeCount), humanizeInt(result.EdgeCount), result.DurationMs))
-	sp.Done()
-	return nil
 }

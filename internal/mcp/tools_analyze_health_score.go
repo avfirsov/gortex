@@ -655,24 +655,6 @@ func scoreGrade(score float64) string {
 	}
 }
 
-// extractTimestamp pulls the `timestamp` field out of meta.last_authored.
-// Accepts both int64 (in-process enrichment) and float64 (json/gob
-// round-trip lands integers as float64). Same shape recovery the
-// stale-code analyzer uses.
-func extractTimestamp(meta map[string]any) (int64, bool) {
-	la, ok := meta["last_authored"].(map[string]any)
-	if !ok {
-		return 0, false
-	}
-	if ts, ok := la["timestamp"].(int64); ok {
-		return ts, true
-	}
-	if f, ok := la["timestamp"].(float64); ok {
-		return int64(f), true
-	}
-	return 0, false
-}
-
 func clamp01(v float64) float64 {
 	if v < 0 {
 		return 0
