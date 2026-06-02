@@ -77,14 +77,21 @@ func ComputeHITS(g graph.Store) *HITSResult {
 
 	// Adjacency restricted to the call/reference edge set. outLinks
 	// drives the hub update; inLinks drives the authority update.
-	outLinks := make(map[string][]string)
-	inLinks := make(map[string][]string)
+	// Each link carries a provenance weight (graph.ProvenanceWeight)
+	// so the abundant LSP-dispatch / framework-wiring tier does not
+	// inflate authority over direct, structurally-unambiguous calls.
+	// With uniform weights (e.g. a graph with no Origin stamped) the
+	// scaling is constant and, after L2 normalisation, leaves the
+	// ranking identical to the unweighted computation.
+	outLinks := make(map[string][]weightedLink)
+	inLinks := make(map[string][]weightedLink)
 	for _, e := range g.AllEdges() {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
-		outLinks[e.From] = append(outLinks[e.From], e.To)
-		inLinks[e.To] = append(inLinks[e.To], e.From)
+		w := graph.ProvenanceWeight(e)
+		outLinks[e.From] = append(outLinks[e.From], weightedLink{e.To, w})
+		inLinks[e.To] = append(inLinks[e.To], weightedLink{e.From, w})
 	}
 
 	auth := make(map[string]float64, n)
@@ -101,7 +108,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 		for _, nd := range nodes {
 			var sum float64
 			for _, src := range inLinks[nd.ID] {
-				sum += hub[src]
+				sum += src.w * hub[src.id]
 			}
 			nextAuth[nd.ID] = sum
 		}
@@ -111,7 +118,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 		for _, nd := range nodes {
 			var sum float64
 			for _, dst := range outLinks[nd.ID] {
-				sum += nextAuth[dst]
+				sum += dst.w * nextAuth[dst.id]
 			}
 			nextHub[nd.ID] = sum
 		}

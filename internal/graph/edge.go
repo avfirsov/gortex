@@ -676,6 +676,51 @@ func DefaultOriginFor(kind EdgeKind, confidence float64, semanticSource string) 
 	return OriginTextMatched
 }
 
+// Provenance-attenuation weights for graph centrality (HITS /
+// PageRank) and the rerank provenance signal. Code intelligence
+// enriched by LSP providers (gopls, clangd, tsserver) materialises a
+// dense layer of framework-wiring and interface-dispatch edges;
+// counting every such edge at full weight inflates the apparent
+// centrality of utility and framework code over genuine domain
+// authorities. Attenuating the abundant lsp tier — and the weak,
+// possibly-spurious text-matched tier — relative to the
+// structurally-unambiguous ast_resolved baseline rebalances authority
+// toward real load-bearing code. ProvenanceWeightMin / Max bound the
+// returned band so consumers can normalise onto [0,1].
+const (
+	ProvenanceWeightMin   = 0.5 // text_matched: weakest, possible false positive
+	ProvenanceWeightMax   = 1.0 // ast_resolved: the trusted centrality baseline
+	provWeightLSP         = 0.6 // lsp_resolved / lsp_dispatch: abundant, attenuate
+	provWeightASTInferred = 0.8 // heuristic type inference: slight discount
+)
+
+// ProvenanceWeight returns the centrality weight for an edge based on
+// its resolution provenance, in [ProvenanceWeightMin, ProvenanceWeightMax].
+// Edges with an unset Origin are backfilled via DefaultOriginFor so
+// pre-Origin indexes weight consistently. A nil edge weights at the
+// trusted baseline.
+func ProvenanceWeight(e *Edge) float64 {
+	if e == nil {
+		return ProvenanceWeightMax
+	}
+	origin := e.Origin
+	if origin == "" {
+		sem, _ := e.Meta["semantic_source"].(string)
+		origin = DefaultOriginFor(e.Kind, e.Confidence, sem)
+	}
+	switch origin {
+	case OriginLSPResolved, OriginLSPDispatch:
+		return provWeightLSP
+	case OriginASTResolved:
+		return ProvenanceWeightMax
+	case OriginASTInferred:
+		return provWeightASTInferred
+	case OriginTextMatched:
+		return ProvenanceWeightMin
+	}
+	return provWeightASTInferred
+}
+
 // ConfidenceLabelFor returns EXTRACTED, INFERRED, or AMBIGUOUS for an edge
 // based on its kind and confidence value.
 //

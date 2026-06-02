@@ -200,6 +200,7 @@ func DefaultSignals() []Signal {
 		PathPenaltySignal{},
 		DefinitionBiasSignal{},
 		SourceBiasSignal{},
+		ProvenanceSignal{},
 	}
 }
 
@@ -235,6 +236,7 @@ func DefaultWeights() map[string]float64 {
 		SignalPathPenalty:    0.40,
 		SignalDefinitionBias: 0.60,
 		SignalSourceBias:     0.25,
+		SignalProvenance:     0.15,
 	}
 }
 
@@ -258,6 +260,7 @@ const (
 	SignalPathPenalty    = "path_penalty"
 	SignalDefinitionBias = "definition_bias"
 	SignalSourceBias     = "source_bias"
+	SignalProvenance     = "provenance"
 )
 
 // AllSignalNames lists every canonical signal name. Useful for config
@@ -281,5 +284,6 @@ func AllSignalNames() []string {
 		SignalPathPenalty,
 		SignalDefinitionBias,
 		SignalSourceBias,
+		SignalProvenance,
 	}
 }

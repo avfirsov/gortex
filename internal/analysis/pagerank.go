@@ -2,6 +2,15 @@ package analysis
 
 import "github.com/zzet/gortex/internal/graph"
 
+// weightedLink is one adjacency entry carrying the provenance weight of
+// the edge it represents. Shared by ComputeHITS and ComputePageRank so
+// both centrality measures attenuate over-represented LSP-dispatch
+// edges the same way.
+type weightedLink struct {
+	id string
+	w  float64
+}
+
 // PageRankResult holds per-node PageRank centrality scores.
 type PageRankResult struct {
 	// Scores maps node ID to its PageRank value. The values sum to
@@ -50,14 +59,23 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 		return &PageRankResult{Scores: map[string]float64{}}
 	}
 
-	outDegree := make(map[string]int, n)
-	inLinks := make(map[string][]string)
+	// Provenance-weighted adjacency: each edge contributes its
+	// graph.ProvenanceWeight to the source's out-weight and rides that
+	// weight on the in-link. Score then flows along an edge in
+	// proportion to w/outWeight, so the transition matrix columns
+	// still sum to 1 (mass is conserved) but an abundant LSP-dispatch
+	// fan-out no longer hands a leaf utility outsized centrality. With
+	// uniform weights the w/outWeight ratio reduces to 1/outDegree —
+	// identical to the unweighted PageRank.
+	outWeight := make(map[string]float64, n)
+	inLinks := make(map[string][]weightedLink)
 	for _, e := range g.AllEdges() {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
-		outDegree[e.From]++
-		inLinks[e.To] = append(inLinks[e.To], e.From)
+		w := graph.ProvenanceWeight(e)
+		outWeight[e.From] += w
+		inLinks[e.To] = append(inLinks[e.To], weightedLink{e.From, w})
 	}
 
 	score := make(map[string]float64, n)
@@ -72,7 +90,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 		// and spread it across every node so no mass leaks.
 		var dangling float64
 		for _, nd := range nodes {
-			if outDegree[nd.ID] == 0 {
+			if outWeight[nd.ID] == 0 {
 				dangling += score[nd.ID]
 			}
 		}
@@ -82,8 +100,8 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 		for _, nd := range nodes {
 			var sum float64
 			for _, src := range inLinks[nd.ID] {
-				if d := outDegree[src]; d > 0 {
-					sum += score[src] / float64(d)
+				if d := outWeight[src.id]; d > 0 {
+					sum += score[src.id] * src.w / d
 				}
 			}
 			next[nd.ID] = base + danglingShare + pageRankDamping*sum
