@@ -1323,8 +1323,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if filterErr != nil {
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
-	nodes = filterNodes(nodes, allowed)
-
 	// kind filter so callers can scope to a single new node kind
 	// (todo, license, team, module, …). Comma-separated list —
 	// case-insensitive — applied post-search so BM25 ranking is
@@ -1334,31 +1332,40 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if kindArg == "" {
 		kindArg = fq.Kind
 	}
-	if kindArg != "" {
-		nodes = filterNodesByKind(nodes, kindArg)
-	}
-	// lang: / path: / repo: clauses from the field-qualified syntax.
-	nodes = applyFieldFilters(nodes, fq)
-
-	// Sub-path scoping: anchored, slash-segment prefix narrowing
-	// below the repository grain. The filter set unions the `path`
-	// argument, the inline `path:` clause, and any `scope:`-named
-	// saved scope's Paths. Distinct from the loose `path:` substring
-	// match in applyFieldFilters -- this is a directory-boundary
-	// anchored prefix test.
-	if pathFilter := s.resolvePathFilter(req, fq); len(pathFilter) > 0 {
-		nodes = applyPathFilter(nodes, pathFilter)
-	}
-
+	pathFilter := s.resolvePathFilter(req, fq)
 	// Corpus selection: `code` (default) keeps only code symbols,
 	// `docs` keeps only prose-section (KindDoc) nodes, `all` keeps
-	// both. Runs after the path filter so a scoped docs query stays
-	// inside its sub-path.
+	// both.
 	corpus, corpusErr := parseCorpus(req)
 	if corpusErr != nil {
 		return mcp.NewToolResultError(corpusErr.Error()), nil
 	}
-	nodes = filterNodesByCorpus(nodes, corpus)
+
+	// applyAllPostFilters runs the full post-search filter sequence
+	// (repo / kind / lang+path clauses / sub-path scope / corpus) over
+	// a candidate slice in the order the primary path uses it. Lifted
+	// into a closure so the zero-result decomposition fallback applies
+	// identical filtering to its re-fetched candidates — a fallback
+	// that skipped any of these would surface results the caller's
+	// scope was supposed to exclude.
+	applyAllPostFilters := func(cands []*graph.Node) []*graph.Node {
+		cands = filterNodes(cands, allowed)
+		if kindArg != "" {
+			cands = filterNodesByKind(cands, kindArg)
+		}
+		// lang: / path: / repo: clauses from the field-qualified syntax.
+		cands = applyFieldFilters(cands, fq)
+		// Sub-path scoping: anchored, slash-segment prefix narrowing
+		// below the repository grain. Distinct from the loose `path:`
+		// substring match in applyFieldFilters -- this is a
+		// directory-boundary anchored prefix test.
+		if len(pathFilter) > 0 {
+			cands = applyPathFilter(cands, pathFilter)
+		}
+		cands = filterNodesByCorpus(cands, corpus)
+		return cands
+	}
+	nodes = applyAllPostFilters(nodes)
 
 	// Fuzzy fallback: a field-qualified query that filtered down to
 	// nothing retries on the free text alone (still inside the
@@ -1370,6 +1377,27 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		if len(relaxed) > 0 {
 			nodes = relaxed
 			filtersRelaxed = true
+		}
+	}
+
+	// Leaf-decomposition fallback: a compound / dotted / CamelCase
+	// query that found nothing — even after the field-clause relax
+	// above — is decomposed into its leaf symbol-name tokens
+	// ("UserService.FindUser" -> user / service / find) which are
+	// re-fetched through the same BM25 OR-merge path the expansion
+	// uses. Gated on the query carrying a separator so a prose miss
+	// (which has no leaves to split into) never pays the extra fetch.
+	// All post-filters are re-applied so the rescued candidates honour
+	// the caller's repo / kind / lang / path / corpus scope.
+	decomposed := false
+	if len(nodes) == 0 && queryHasDecomposableSeparator(q) {
+		if leaves := decomposeQueryToLeaves(q); len(leaves) > 0 {
+			rescued, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			rescued = applyAllPostFilters(rescued)
+			if len(rescued) > 0 {
+				nodes = rescued
+				decomposed = true
+			}
 		}
 	}
 
@@ -1505,6 +1533,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	if filtersRelaxed {
 		resp["filters_relaxed"] = true
+	}
+	if decomposed {
+		resp["decomposed"] = true
 	}
 	// query_advice nudges the agent toward a cleaner query when the
 	// input was detected as keyword-soup. In "split" mode the search

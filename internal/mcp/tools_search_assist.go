@@ -10,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // assistMode controls whether the LLM-driven query expansion and
@@ -133,6 +134,79 @@ func shouldEngageAssist(mode assistMode, query string) bool {
 	default:
 		return looksNaturalLanguage(query)
 	}
+}
+
+// decomposeMinLeafLen is the shortest leaf token the decomposition
+// fallback keeps. One- and two-character fragments ("id", "to", a
+// lone "s") match too broadly to rescue a query usefully and only
+// inflate the OR-merge.
+const decomposeMinLeafLen = 3
+
+// queryHasDecomposableSeparator reports whether a query carries a
+// structural separator the leaf-decomposition fallback can split on —
+// a dot, slash, or scope-resolution qualifier, or an internal
+// camelCase / PascalCase boundary. A bare prose miss ("flush the
+// cache") has none of these, so the fallback skips it and pays no
+// extra fetch. An underscore counts too: snake_case identifiers
+// decompose the same way.
+func queryHasDecomposableSeparator(q string) bool {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return false
+	}
+	if strings.ContainsAny(q, "./_\\") || strings.Contains(q, "::") {
+		return true
+	}
+	// camelCase / PascalCase boundary: a lowercase→uppercase or
+	// uppercase-run→lowercase transition inside a single token.
+	var prev rune
+	for i, r := range q {
+		if i > 0 {
+			if r >= 'A' && r <= 'Z' && prev >= 'a' && prev <= 'z' {
+				return true
+			}
+			if r >= 'a' && r <= 'z' && prev >= 'A' && prev <= 'Z' {
+				return true
+			}
+		}
+		prev = r
+	}
+	return false
+}
+
+// decomposeQueryToLeaves splits a compound / dotted / CamelCase query
+// into its leaf symbol-name tokens via the camelCase-aware tokenizer
+// ("UserService.FindUser" -> [user, service, find]), drops tokens
+// shorter than decomposeMinLeafLen, and drops any leaf that equals the
+// original query (so a single-token query never re-searches itself).
+// The deduplicated result feeds the BM25 OR-merge so each leaf is
+// retrieved on its own terms. Returns nil when nothing usable
+// survives.
+func decomposeQueryToLeaves(q string) []string {
+	qLower := strings.ToLower(strings.TrimSpace(q))
+	if qLower == "" {
+		return nil
+	}
+	var (
+		out  []string
+		seen = map[string]struct{}{}
+	)
+	for _, t := range rerank.Tokenize(q) {
+		if len(t) < decomposeMinLeafLen {
+			continue
+		}
+		if t == qLower {
+			// The query was a single short token — nothing to
+			// decompose; re-searching it would just repeat the miss.
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 // expandSearchTerms calls the LLM expansion path and returns the
