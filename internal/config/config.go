@@ -530,6 +530,21 @@ type IndexConfig struct {
 	// documented per-domain defaults" — cheap structural domains on,
 	// expensive ones off.
 	Coverage CoverageConfig `mapstructure:"coverage" yaml:"coverage,omitempty"`
+	// HTTPClientAliases names project-defined wrapped HTTP-client
+	// functions so calls to them are recognised as HTTP consumer
+	// contracts (RoleConsumer) — without relying on the type-driven
+	// fetch/axios heuristics. Each entry is a bare function name (or
+	// receiver.method) that forwards a string-literal path to an
+	// underlying client, e.g. `apiGet`, `apiPost`, `client.request`.
+	// The contracts HTTP extractor mints an `http::METHOD::/path`
+	// consumer contract for every call to one of these names. The
+	// method is taken from the name's verb suffix (`apiGet` → GET,
+	// `apiPost` → POST, ...) when present, falling back to the first
+	// string-literal argument when the call passes the method
+	// explicitly (`apiCall('GET', '/users')`); the path is the first
+	// path-shaped string literal. Empty by default. Configured under
+	// `index.http_client_aliases` in .gortex.yaml.
+	HTTPClientAliases []string `mapstructure:"http_client_aliases" yaml:"http_client_aliases,omitempty"`
 }
 
 // GrammarSpec declares a user-supplied tree-sitter grammar to load at

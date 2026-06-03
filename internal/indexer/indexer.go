@@ -4076,7 +4076,7 @@ func (idx *Indexer) TotalDetected() int {
 // check per file.
 func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map[string][]contracts.Extractor) {
 	extractors := []contracts.Extractor{
-		&contracts.HTTPExtractor{},
+		&contracts.HTTPExtractor{ClientAliases: idx.config.HTTPClientAliases},
 		&contracts.GRPCExtractor{},
 		&contracts.GraphQLExtractor{},
 		&contracts.OpenAPIExtractor{},
