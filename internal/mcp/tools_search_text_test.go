@@ -227,3 +227,47 @@ func setupMiniRepoNamed(t *testing.T, name, body string) string {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(body), 0o644))
 	return dir
 }
+
+// TestSearchText_Regexp covers the regexp mode: the same query runs
+// through the trigram backbone as a compiled regular expression, an
+// alternation matches multiple sites a literal never would, and a bad
+// pattern surfaces as a tool error rather than zero hits.
+func TestSearchText_Regexp(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+		[]byte("package app\n\nfunc HandleAlpha() {}\n\nfunc HandleBeta() {}\n\nfunc Other() {}\n"), 0o644))
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	cfg := config.Default()
+	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	eng := query.NewEngine(g)
+	srv := NewServer(eng, g, idx, nil, zap.NewNop(), nil)
+
+	decode := func(res *mcplib.CallToolResult) int {
+		require.False(t, res.IsError)
+		var out struct {
+			Count int `json:"count"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &out))
+		return out.Count
+	}
+
+	// The alternation matches both Handle* funcs but not Other.
+	got := decode(callTool(t, srv, "search_text",
+		map[string]any{"query": "func Handle(Alpha|Beta)", "regexp": true}))
+	require.Equal(t, 2, got)
+
+	// The same string as a literal matches nothing.
+	lit := decode(callTool(t, srv, "search_text",
+		map[string]any{"query": "func Handle(Alpha|Beta)"}))
+	require.Equal(t, 0, lit)
+
+	// An invalid pattern is a tool error, not a silent empty result.
+	bad := callTool(t, srv, "search_text",
+		map[string]any{"query": "func Handle(", "regexp": true})
+	require.True(t, bad.IsError)
+}

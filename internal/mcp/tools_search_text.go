@@ -52,8 +52,25 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	// prefixes on the match paths so downstream tooling sees the same
 	// shape graph nodes use. Single-indexer callers (one-shot CLI,
 	// tests) fall through to the legacy path.
+	//
+	// regexp mode runs the same trigram-accelerated backbone through a
+	// compiled regular expression instead of a literal substring; a
+	// bad pattern surfaces as a tool error rather than zero hits, and
+	// the results flow through the identical enclosing-symbol
+	// enrichment so callers get the same shape either way.
+	useRegexp := req.GetBool("regexp", false)
 	var matches []trigram.Match
-	if s.multiIndexer != nil {
+	if useRegexp {
+		var err error
+		if s.multiIndexer != nil {
+			matches, err = s.multiIndexer.GrepRegexp(query, "", limit)
+		} else {
+			matches, err = s.indexer.GrepRegexp(query, "", limit)
+		}
+		if err != nil {
+			return mcp.NewToolResultError("search_text: invalid regexp: " + err.Error()), nil
+		}
+	} else if s.multiIndexer != nil {
 		matches = s.multiIndexer.GrepText(query, limit)
 	} else {
 		matches = s.indexer.GrepText(query, limit)
