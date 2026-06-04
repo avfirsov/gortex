@@ -146,7 +146,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 // unrelated keys.
 func upsertGortexServer(w io.Writer, path, command string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	return agents.MergeYAML(w, path, func(root *yaml.Node, _ bool) (bool, error) {
-		return agents.UpsertYAMLMapEntry(root, "mcp_servers", gortexServerName, gortexMCPEntry(command), opts.Force), nil
+		return agents.UpsertYAMLMapEntry(root, "mcp_servers", gortexServerName, gortexMCPEntry(command), opts.Force)
 	}, opts)
 }
 
