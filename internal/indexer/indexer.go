@@ -1040,6 +1040,22 @@ func (idx *Indexer) prefixPath(relPath string) string {
 	return idx.repoPrefix + "/" + relPath
 }
 
+// graphFilePaths maps reindex file paths (absolute or root-relative, as
+// passed to IndexFile) to the canonical graph file-path form
+// (prefixPath(relKey)) that GetFileNodes is keyed by — so file-scoped
+// passes can look up the just-reindexed files' nodes.
+func (idx *Indexer) graphFilePaths(files []string) []string {
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		abs := f
+		if !filepath.IsAbs(abs) && idx.rootPath != "" {
+			abs = filepath.Join(idx.rootPath, f)
+		}
+		out = append(out, idx.prefixPath(idx.relKey(abs)))
+	}
+	return out
+}
+
 // applyRepoPrefix transforms nodes and edges produced by an extractor to include
 // the repo prefix in IDs and file paths. Sets Node.RepoPrefix on all nodes.
 // This is a no-op when repoPrefix is empty (single-repo mode).
@@ -3800,7 +3816,9 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		idx.resolver.InferImplements()
 		idx.resolver.InferOverrides()
 		resolver.RunFrameworkSynthesizers(idx.graph)
-		resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled())
+		// Incremental: synthesize external calls only for the reindexed
+		// files (O(edited files)), not a full-graph recompute.
+		resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), idx.graphFilePaths(staleFiles))
 	}
 
 	// Skip the search-index rebuild on a zero-change reconcile when the
@@ -4011,10 +4029,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		// listen edge, and each synthesizer's index must be rebuilt
 		// against the fresh graph. Every pass is a full recompute.
 		resolver.RunFrameworkSynthesizers(idx.graph)
-		// External-call placeholder synthesis (opt-in) — re-run for the
-		// same reason: eviction can leave a previously-synthetic edge
-		// pointing at a stale terminal. The pass is a full recompute.
-		resolver.SynthesizeExternalCalls(idx.graph, idx.externalCallSynthesisEnabled())
+		// External-call synthesis (opt-in) — file-scoped to the reindexed
+		// files (O(edited files)), not a full-graph recompute. Eviction
+		// already dropped a removed file's synthetic edges; a re-indexed
+		// file's fresh external terminals are re-materialised here.
+		resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), idx.graphFilePaths(staleFiles))
 		// Clone detection is not re-run here: each stale file was
 		// re-indexed through IndexFile above, whose resolve pass
 		// already recomputed EdgeSimilarTo against the fresh graph,
