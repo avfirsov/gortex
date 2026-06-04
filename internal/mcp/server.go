@@ -837,6 +837,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerAnalysisTools()
 	s.registerEnhancementTools()
 	s.registerLSPTools()
+	s.registerLintTools()
 	s.registerDiagnosticsTools()
 	s.registerReadinessTools()
 	s.registerHealthTools()

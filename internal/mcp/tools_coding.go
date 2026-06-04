@@ -2568,19 +2568,26 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
+	reindexed := s.reindexFile(absPath)
+
 	// Count lines changed.
 	oldLines := strings.Count(oldSource, "\n") + 1
 	newLines := strings.Count(newSource, "\n") + 1
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	resp := map[string]any{
 		"file":         node.FilePath,
 		"symbol":       id,
 		"lines_before": oldLines,
 		"lines_after":  newLines,
 		"start_line":   node.StartLine,
 		"status":       "applied",
+		"reindexed":    reindexed,
 		"new_sha":      gitBlobSHA(newContentBytes),
-	})
+	}
+	if health := s.fileSyntaxHealth(node.FilePath, absPath); health != nil {
+		resp["syntax_health"] = health
+	}
+	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
 // readSingleLineAt reads a single line from an absolute filesystem path.
