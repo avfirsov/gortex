@@ -180,11 +180,16 @@ type Plan struct {
 // Result is what Apply returned. Detected mirrors what Detect
 // returned (captured on the result so callers don't need to
 // re-invoke detection). Configured is true when at least one write
-// succeeded (or would succeed under DryRun).
+// succeeded (or would succeed under DryRun). Warnings carries
+// non-fatal problems an adapter chose to continue past — e.g. a single
+// profile config that failed to write while the rest succeeded — so the
+// summary / --json report can surface them instead of burying them in a
+// stderr log line.
 type Result struct {
 	Name       string       `json:"name"`
 	Detected   bool         `json:"detected"`
 	Configured bool         `json:"configured"`
 	Files      []FileAction `json:"files,omitempty"`
+	Warnings   []string     `json:"warnings,omitempty"`
 	DocsURL    string       `json:"docs_url,omitempty"`
 }

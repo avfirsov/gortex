@@ -45,6 +45,24 @@ func emitAgentSummary(w io.Writer, results []*agents.Result, opts agents.ApplyOp
 		_, _ = fmt.Fprintln(w)
 	}
 
+	// Non-fatal problems an adapter continued past (e.g. a profile config
+	// that failed to write) — surfaced here rather than buried in stderr.
+	var warned []*agents.Result
+	for _, r := range detected {
+		if len(r.Warnings) > 0 {
+			warned = append(warned, r)
+		}
+	}
+	if len(warned) > 0 {
+		_, _ = fmt.Fprintln(w, "  "+progress.Heading("warnings"))
+		for _, r := range warned {
+			for _, msg := range r.Warnings {
+				_, _ = fmt.Fprintln(w, "   "+progress.Row(r.Name, msg, 14))
+			}
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
 	if len(notDetected) > 0 {
 		names := progress.SortStrings(notDetected)
 		_, _ = fmt.Fprintln(w, "  "+progress.Heading("not detected", strconv.Itoa(len(notDetected))))

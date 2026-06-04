@@ -1,0 +1,364 @@
+package hermes
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/agentstest"
+	yaml "gopkg.in/yaml.v3"
+)
+
+// frontmatterOf returns the YAML frontmatter block of a SKILL.md
+// (between the opening `---` and the next `---`), failing the test
+// when the body isn't frontmatter-fenced.
+func frontmatterOf(t *testing.T, name, body string) string {
+	t.Helper()
+	const open = "---\n"
+	if !strings.HasPrefix(body, open) {
+		t.Fatalf("%s: SKILL.md does not start with frontmatter:\n%s", name, body)
+	}
+	rest := body[len(open):]
+	fm, _, found := strings.Cut(rest, "\n---\n")
+	if !found {
+		t.Fatalf("%s: unterminated frontmatter", name)
+	}
+	return fm
+}
+
+// seedHermesHome creates an empty ~/.hermes so Detect() passes without
+// depending on a `hermes` binary being on the test machine's PATH.
+func seedHermesHome(t *testing.T, home string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, ".hermes"), 0o755); err != nil {
+		t.Fatalf("seed ~/.hermes: %v", err)
+	}
+}
+
+// TestHermesApplyWritesGlobalConfigAndSkill is the acceptance test:
+// `gortex install` must write the global mcp_servers.gortex stanza and
+// a user-level skill, and a re-run must be a pure no-op.
+func TestHermesApplyWritesGlobalConfigAndSkill(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+	a := New()
+
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !res.Configured {
+		t.Fatal("expected Configured=true")
+	}
+
+	// Global config: mcp_servers.gortex with command + args:[mcp] + timeouts.
+	cfg := agentstest.ReadYAML(t, globalConfigPath(env.Home))
+	servers, ok := cfg["mcp_servers"].(map[string]any)
+	if !ok {
+		t.Fatalf("mcp_servers missing or wrong type: %#v", cfg)
+	}
+	gortex, ok := servers["gortex"].(map[string]any)
+	if !ok {
+		t.Fatalf("gortex server missing: %#v", servers)
+	}
+	if cmd, _ := gortex["command"].(string); cmd == "" {
+		t.Errorf("gortex command empty: %#v", gortex)
+	}
+	args, ok := gortex["args"].([]any)
+	if !ok || len(args) != 1 || args[0] != "mcp" {
+		t.Errorf("gortex args = %#v, want [mcp]", gortex["args"])
+	}
+	if gortex["connect_timeout"] != connectTimeoutSecs {
+		t.Errorf("connect_timeout = %v, want %d", gortex["connect_timeout"], connectTimeoutSecs)
+	}
+	if gortex["timeout"] != requestTimeoutSecs {
+		t.Errorf("timeout = %v, want %d", gortex["timeout"], requestTimeoutSecs)
+	}
+
+	// Skill present, with Hermes frontmatter.
+	skill, err := os.ReadFile(skillPath(env.Home, SkillName))
+	if err != nil {
+		t.Fatalf("skill missing: %v", err)
+	}
+	for _, want := range []string{
+		"name: gortex", "metadata:", "hermes:", "set_active_project",
+		"platforms: [linux, macos, windows]", // standard Hermes frontmatter
+		"related_skills:",                    // links to the routing playbooks
+		"## Task playbooks",                  // slash-command discoverability
+		"/gortex-explore",                    // a representative routing command
+	} {
+		if !strings.Contains(string(skill), want) {
+			t.Errorf("skill missing %q", want)
+		}
+	}
+
+	agentstest.AssertIdempotent(t, a, env)
+}
+
+// TestHermesInstallsRoutingSkills covers the Claude Code parity skill
+// set: every routing playbook is installed with valid Hermes
+// frontmatter, and gortex-guide is excluded in favour of the native
+// master `gortex` skill.
+func TestHermesInstallsRoutingSkills(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+	a := New()
+
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	names := RoutingSkillNames()
+	if len(names) == 0 {
+		t.Fatal("no routing skills derived")
+	}
+	for _, name := range names {
+		if name == "gortex-guide" {
+			t.Errorf("gortex-guide should be excluded (native master covers it)")
+		}
+		p := skillPath(env.Home, name)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("routing skill %s missing: %v", name, err)
+			continue
+		}
+		// The frontmatter block must be valid YAML with the Hermes
+		// fields Hermes needs to discover and route the skill — Hermes
+		// silently ignores a skill whose frontmatter won't parse.
+		fm := frontmatterOf(t, name, string(data))
+		var meta struct {
+			Name        string `yaml:"name"`
+			Description string `yaml:"description"`
+			Version     string `yaml:"version"`
+			Metadata    struct {
+				Hermes struct {
+					Tags          []string `yaml:"tags"`
+					Category      string   `yaml:"category"`
+					Platforms     []string `yaml:"platforms"`
+					RelatedSkills []string `yaml:"related_skills"`
+				} `yaml:"hermes"`
+			} `yaml:"metadata"`
+		}
+		if err := yaml.Unmarshal([]byte(fm), &meta); err != nil {
+			t.Errorf("%s: frontmatter is not valid YAML: %v\n%s", name, err, fm)
+			continue
+		}
+		if meta.Name != name {
+			t.Errorf("%s: frontmatter name = %q", name, meta.Name)
+		}
+		if meta.Description == "" || meta.Version == "" || meta.Metadata.Hermes.Category == "" || len(meta.Metadata.Hermes.Tags) == 0 {
+			t.Errorf("%s: incomplete Hermes frontmatter: %+v", name, meta)
+		}
+		if len(meta.Metadata.Hermes.Platforms) == 0 || len(meta.Metadata.Hermes.RelatedSkills) == 0 {
+			t.Errorf("%s: missing platforms/related_skills: %+v", name, meta.Metadata.Hermes)
+		}
+	}
+
+	// A couple of representative routing skills must be present.
+	for _, want := range []string{"gortex-explore", "gortex-impact", "gortex-pr-review"} {
+		if _, err := os.Stat(skillPath(env.Home, want)); err != nil {
+			t.Errorf("expected routing skill %s: %v", want, err)
+		}
+	}
+	// The excluded guide must not be installed under its own name.
+	if _, err := os.Stat(skillPath(env.Home, "gortex-guide")); err == nil {
+		t.Error("gortex-guide should not be installed")
+	}
+}
+
+// TestHermesUpsertsEveryProfileConfig covers the "extra" robustness:
+// Hermes profiles can re-declare their own mcp_servers block, so the
+// adapter must upsert the gortex stanza into every existing profile
+// config, not just the global one.
+func TestHermesUpsertsEveryProfileConfig(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+
+	// Two profiles that already declare their own servers.
+	profiles := []string{"work", "personal"}
+	for _, name := range profiles {
+		p := filepath.Join(env.Home, ".hermes", "profiles", name, "config.yaml")
+		agentstest.WriteYAML(t, p, map[string]any{
+			"mcp_servers": map[string]any{
+				"github": map[string]any{"command": "npx", "args": []string{"-y", "server-github"}},
+			},
+		})
+	}
+
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	for _, name := range profiles {
+		p := filepath.Join(env.Home, ".hermes", "profiles", name, "config.yaml")
+		cfg := agentstest.ReadYAML(t, p)
+		servers, ok := cfg["mcp_servers"].(map[string]any)
+		if !ok {
+			t.Fatalf("profile %s: mcp_servers missing: %#v", name, cfg)
+		}
+		if _, ok := servers["gortex"]; !ok {
+			t.Errorf("profile %s: gortex not upserted: %#v", name, servers)
+		}
+		if _, ok := servers["github"]; !ok {
+			t.Errorf("profile %s: pre-existing github server dropped: %#v", name, servers)
+		}
+	}
+
+	agentstest.AssertIdempotent(t, a, env)
+}
+
+// TestHermesProfileFailureSurfacedAsWarning verifies that a profile that
+// fails to write is reported on the Result (not just stderr): the global
+// stanza covers inheriting profiles, but a non-inheriting one left
+// unconfigured must not hide behind Configured=true.
+func TestHermesProfileFailureSurfacedAsWarning(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+
+	// A profile whose config.yaml is actually a directory — the merge's
+	// read/write fails, exercising the per-profile error path.
+	badProfile := filepath.Join(env.Home, ".hermes", "profiles", "broken", "config.yaml")
+	if err := os.MkdirAll(badProfile, 0o755); err != nil {
+		t.Fatalf("seed bad profile: %v", err)
+	}
+
+	a := New()
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.Warnings) == 0 {
+		t.Fatal("expected a warning for the failed profile, got none")
+	}
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "broken") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("warning should name the failed profile: %#v", res.Warnings)
+	}
+}
+
+// TestHermesPreservesGlobalConfigComments guards the comment-rich
+// merge: a hand-edited config keeps its comments and unrelated keys.
+func TestHermesPreservesGlobalConfigComments(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+
+	cfgPath := globalConfigPath(env.Home)
+	original := `# my hermes config
+model: hermes-4 # the good one
+
+mcp_servers:
+  # filesystem access
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem"]
+`
+	if err := os.WriteFile(cfgPath, []byte(original), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	out, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	got := string(out)
+	for _, want := range []string{"# my hermes config", "# filesystem access", "the good one"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lost comment %q:\n%s", want, got)
+		}
+	}
+	cfg := agentstest.ReadYAML(t, cfgPath)
+	servers := cfg["mcp_servers"].(map[string]any)
+	if _, ok := servers["filesystem"]; !ok {
+		t.Error("pre-existing filesystem server dropped")
+	}
+	if _, ok := servers["gortex"]; !ok {
+		t.Error("gortex server not added")
+	}
+	if cfg["model"] != "hermes-4" {
+		t.Errorf("unrelated key model clobbered: %v", cfg["model"])
+	}
+}
+
+// TestHermesForceOverwritesEntry verifies --force replaces a stale
+// gortex entry instead of skipping.
+func TestHermesForceOverwritesEntry(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+	cfgPath := globalConfigPath(env.Home)
+	agentstest.WriteYAML(t, cfgPath, map[string]any{
+		"mcp_servers": map[string]any{
+			"gortex": map[string]any{"command": "OLD", "args": []string{"stale"}},
+		},
+	})
+
+	a := New()
+	res, err := a.Apply(env, agents.ApplyOpts{Force: true})
+	if err != nil {
+		t.Fatalf("apply --force: %v", err)
+	}
+	if !res.Configured {
+		t.Fatal("expected Configured=true")
+	}
+	cfg := agentstest.ReadYAML(t, cfgPath)
+	gortex := cfg["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
+	if gortex["command"] == "OLD" {
+		t.Errorf("force did not overwrite stale entry: %#v", gortex)
+	}
+	args, _ := gortex["args"].([]any)
+	if len(args) != 1 || args[0] != "mcp" {
+		t.Errorf("force did not rewrite args: %#v", gortex["args"])
+	}
+}
+
+// TestHermesDetect checks the home-directory gate. The PATH branch is
+// covered implicitly by exec.LookPath and not asserted here so the
+// test is independent of what's installed on the runner.
+func TestHermesDetect(t *testing.T) {
+	a := New()
+
+	// ~/.hermes present → detect.
+	home := t.TempDir()
+	seedHermesHome(t, home)
+	if detected, _ := a.Detect(agents.Env{Home: home}); !detected {
+		t.Error("expected detection when ~/.hermes exists")
+	}
+
+	// Empty Home and no detectable hermes → skip (unless the runner
+	// happens to have hermes on PATH, in which case true is correct).
+	if detected, _ := a.Detect(agents.Env{Home: ""}); detected {
+		if _, err := exec.LookPath("hermes"); err != nil {
+			t.Error("detected Hermes with empty Home and no hermes on PATH")
+		}
+	}
+}
+
+// TestHermesDryRunWritesNothing verifies the plan-only path.
+func TestHermesDryRunWritesNothing(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+	a := New()
+
+	if _, err := a.Apply(env, agents.ApplyOpts{DryRun: true}); err != nil {
+		t.Fatalf("dry-run apply: %v", err)
+	}
+	if _, err := os.Stat(globalConfigPath(env.Home)); !os.IsNotExist(err) {
+		t.Error("dry-run wrote the global config")
+	}
+	if _, err := os.Stat(skillPath(env.Home, SkillName)); !os.IsNotExist(err) {
+		t.Error("dry-run wrote the skill")
+	}
+}
