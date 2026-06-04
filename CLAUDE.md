@@ -60,7 +60,7 @@ Selected via `llm.provider` in `.gortex.yaml` or `~/.config/gortex/config.yaml`.
 - **Code search beyond symbols** — `search_text` is a trigram-indexed literal / regex search (the grep replacement for non-symbol strings); `search_ast` runs structural tree-sitter queries; `analyze kind=sast` is a 190-rule, CWE/OWASP-tagged security scan across 8 languages.
 - **Push notifications** — beyond `notifications/diagnostics`, the server pushes `graph_invalidated` (graph hot-reload), `daemon_health`, `stale_refs`, and `workspace_readiness`. `subscribe_*` once per session instead of polling.
 - **`get_architecture`** — one-call architectural snapshot (languages, communities, hotspots, processes); pass `resolution` for a hierarchical symbol → file → package → service → system rollup.
-- **`analyze` is a 57-kind dispatcher** — beyond the structural kinds, it now covers `impact` (composite change-risk score), `health_score` (per-symbol A–F grade), `sast` / `named` / `unsafe_patterns` (security), `clusters`, `connectivity_health`, `tests_as_edges`, and more.
+- **`analyze` is a 59-kind dispatcher** — beyond the structural kinds, it now covers `impact` (composite change-risk score), `health_score` (per-symbol A–F grade), `sast` / `named` / `unsafe_patterns` (security), `clusters`, `connectivity_health`, `tests_as_edges`, `synthesizers` (framework-dispatch-synthesized edges, grouped by pass + provenance), `resolution_outcomes` (structured why-unresolved taxonomy), and more.
 
 ## MANDATORY: Session memory — save, recall, distill
 

@@ -73,25 +73,25 @@ const ClaudeMdSentinel = agents.InstructionsSentinel
 // markdown content. Each file is a slash command Claude Code
 // auto-discovers.
 var SlashCommands = map[string]string{
-	"gortex-guide.md":                    commandGuide,
-	"gortex-explore.md":                  commandExplore,
-	"gortex-debug.md":                    commandDebug,
-	"gortex-impact.md":                   commandImpact,
-	"gortex-refactor.md":                 commandRefactor,
-	"gortex-safe-edit.md":                commandSafeEdit,
-	"gortex-fix-all.md":                  commandFixAll,
-	"gortex-extract-function.md":         commandExtractFunction,
-	"gortex-rename.md":                   commandRename,
-	"gortex-cross-repo-usage.md":         commandCrossRepoUsage,
-	"gortex-dataflow-trace.md":           commandDataflowTrace,
-	"gortex-add-test.md":                 commandAddTest,
-	"gortex-incident-investigation.md":   commandIncidentInvestigation,
-	"gortex-episode-replay.md":           commandEpisodeReplay,
-	"gortex-co-change.md":                commandCoChange,
-	"gortex-onboarding.md":               commandOnboarding,
-	"gortex-quality-audit.md":            commandQualityAudit,
-	"gortex-architecture-review.md":      commandArchitectureReview,
-	"gortex-pr-review.md":                commandPRReview,
+	"gortex-guide.md":                  commandGuide,
+	"gortex-explore.md":                commandExplore,
+	"gortex-debug.md":                  commandDebug,
+	"gortex-impact.md":                 commandImpact,
+	"gortex-refactor.md":               commandRefactor,
+	"gortex-safe-edit.md":              commandSafeEdit,
+	"gortex-fix-all.md":                commandFixAll,
+	"gortex-extract-function.md":       commandExtractFunction,
+	"gortex-rename.md":                 commandRename,
+	"gortex-cross-repo-usage.md":       commandCrossRepoUsage,
+	"gortex-dataflow-trace.md":         commandDataflowTrace,
+	"gortex-add-test.md":               commandAddTest,
+	"gortex-incident-investigation.md": commandIncidentInvestigation,
+	"gortex-episode-replay.md":         commandEpisodeReplay,
+	"gortex-co-change.md":              commandCoChange,
+	"gortex-onboarding.md":             commandOnboarding,
+	"gortex-quality-audit.md":          commandQualityAudit,
+	"gortex-architecture-review.md":    commandArchitectureReview,
+	"gortex-pr-review.md":              commandPRReview,
 }
 
 // GlobalSkills maps the directory name under ~/.claude/skills/ to
@@ -289,7 +289,7 @@ These wrap the discovery + impact + memory surfaces into ordered playbooks so po
 | get_dependents | What depends on a symbol (backward: blast radius) |
 | get_call_chain | Forward call graph from a function |
 | get_callers | Reverse call graph to a function |
-| find_usages | Every reference to a symbol. Use instead of Grep |
+| find_usages | Every reference to a symbol; each carries its reference context and accepts a context: filter (parameter_type / return_type / field / value / type / attribute / call). Use instead of Grep |
 | find_implementations | All types implementing an interface |
 | get_cluster | Bidirectional neighborhood around a node |
 
@@ -386,7 +386,7 @@ These wrap the discovery + impact + memory surfaces into ordered playbooks so po
 ### Code Quality
 | Tool | What it gives you |
 |------|-------------------|
-| analyze | Unified graph-analysis dispatcher (57 kinds). Structural: dead_code, hotspots, cycles, would_create_cycle, clusters, concepts, role, connectivity_health, edge_audit, constructors_missing_fields. Quality / security: health_score, impact, sast, hygiene, unsafe_patterns, named. Churn / ownership: todos, stale_code, ownership, fixes_history, blame. Coverage / releases: coverage, coverage_gaps, coverage_summary, releases. Schema / SQL: orphan_tables, unreferenced_tables, sql_call_sites, sql_rebuild, dbt_models, models. Flags / interop: stale_flags, cgo_users, wasm_users. Edge-driven: channel_ops, race_writes, unclosed_channels, goroutine_spawns, field_writers, annotation_users, config_readers, env_var_users, event_emitters, log_events, string_emitters, error_surface, external_calls, tests_as_edges. Web / infra: routes, components, k8s_resources, images, kustomize, pubsub. Cross-repo: cross_repo. Extensible: domain |
+| analyze | Unified graph-analysis dispatcher (59 kinds). Structural: dead_code, hotspots, cycles, would_create_cycle, clusters, concepts, role, connectivity_health, edge_audit, constructors_missing_fields. Quality / security: health_score, impact, sast, hygiene, unsafe_patterns, named. Churn / ownership: todos, stale_code, ownership, fixes_history, blame. Coverage / releases: coverage, coverage_gaps, coverage_summary, releases. Schema / SQL: orphan_tables, unreferenced_tables, sql_call_sites, sql_rebuild, dbt_models, models. Flags / interop: stale_flags, cgo_users, wasm_users. Edge-driven: channel_ops, race_writes, unclosed_channels, goroutine_spawns, field_writers, annotation_users, config_readers, env_var_users, event_emitters, log_events, string_emitters, error_surface, external_calls, tests_as_edges. Web / infra: routes, components, k8s_resources, images, kustomize, pubsub. Cross-repo: cross_repo. Provenance / resolution: synthesizers (framework-dispatch edges grouped by pass), resolution_outcomes (why a call/ref edge stayed unresolved). Extensible: domain |
 | analyze kind=dead_code | Symbols with zero incoming edges (excludes entry points, tests, exports) |
 | analyze kind=hotspots | Over-coupled symbols ranked by fan-in, fan-out, and community crossings |
 | analyze kind=cycles | Tarjan's SCC with severity classification |
