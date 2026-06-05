@@ -88,6 +88,19 @@ type Context struct {
 	// treated as 1.0 everywhere.
 	ComboBoostOf func(nodeID string) float64
 
+	// Centrality runs a Random-Walk-with-Restart (Personalized
+	// PageRank) from the given seed node IDs and returns each reachable
+	// node's proximity score. It is the data source for ProximitySignal.
+	// Set by the MCP server's buildRerankContext from the adjacency
+	// snapshot; nil on a cold graph (the signal then sits at 0). The
+	// returned scores need not be pre-normalised — prepare() rescales
+	// them to [0,1] against the batch maximum.
+	Centrality func(seeds []string) map[string]float64
+
+	// CentralitySeedCount caps how many top candidates seed the RWR
+	// walk. 0 means use defaultCentralitySeeds.
+	CentralitySeedCount int
+
 	// AuthorityOf and HubOf return a node's HITS authority and hub
 	// scores, each normalised into [0, 1] against the graph maxima.
 	// Authority measures "depended on by load-bearing code"; hub
@@ -103,6 +116,12 @@ type Context struct {
 	Now int64
 
 	// --- Internal scratch space populated by prepare(). ---
+
+	// centralityScores maps a candidate node ID → its RWR/PPR
+	// proximity to the query seeds, normalised to [0,1] against the
+	// batch maximum. Populated by prepare() when Centrality is wired;
+	// read by ProximitySignal. Nil when no centrality provider is set.
+	centralityScores map[string]float64
 
 	// communityCount maps community ID → number of candidates in that
 	// community. Used by the community signal to detect topic clusters.
@@ -413,6 +432,47 @@ func (c *Context) prepare(cands []*Candidate) {
 			c.fanOutMax = fo
 		}
 	}
+
+	// Centrality: one Random-Walk-with-Restart per Rerank, seeded from
+	// the strongest candidates, scored over the whole batch. Computed
+	// here (not per-candidate) so the walk runs once; ProximitySignal
+	// then reads the per-node result. Skipped when no provider is wired.
+	c.computeCentrality(cands)
+}
+
+// computeCentrality runs the RWR walk from the batch's strongest seeds
+// and stores per-candidate proximity normalised to [0,1]. No-op when
+// Centrality is nil or the walk returns nothing.
+func (c *Context) computeCentrality(cands []*Candidate) {
+	c.centralityScores = nil
+	if c.Centrality == nil || len(cands) == 0 {
+		return
+	}
+	seeds := selectCentralitySeeds(cands, c.CentralitySeedCount)
+	if len(seeds) == 0 {
+		return
+	}
+	raw := c.Centrality(seeds)
+	if len(raw) == 0 {
+		return
+	}
+	var max float64
+	for _, v := range raw {
+		if v > max {
+			max = v
+		}
+	}
+	if max <= 0 {
+		return
+	}
+	scores := make(map[string]float64, len(raw))
+	for id, v := range raw {
+		if v <= 0 {
+			continue
+		}
+		scores[id] = v / max
+	}
+	c.centralityScores = scores
 }
 
 // missingEdgeIDs returns the subset of ids whose edge slice is NOT

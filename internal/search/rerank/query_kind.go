@@ -379,6 +379,13 @@ func AlphaForClass(c QueryClass) float64 {
 type classWeights struct {
 	bm25     float64
 	semantic float64
+	// proximity scales the RWR/PPR centrality signal per class.
+	// Concept (natural-language) queries lean hardest on graph
+	// proximity — the user is describing intent, so "what is this code
+	// structurally about" is the strongest discriminator. Exact
+	// identifier / path queries dampen it so a central-but-wrong symbol
+	// can't unseat the literal match the user named.
+	proximity float64
 }
 
 // classWeightTable is the tuned per-class multiplier set. Concept is
@@ -388,11 +395,11 @@ type classWeights struct {
 // semantic channel down by amounts that grow with how literal the
 // query is.
 var classWeightTable = map[QueryClass]classWeights{
-	QueryClassConcept:     {bm25: 1.00, semantic: 1.00},
-	QueryClassSymbol:      {bm25: 1.20, semantic: 0.65},
-	QueryClassPath:        {bm25: 1.25, semantic: 0.45},
-	QueryClassSignature:   {bm25: 1.10, semantic: 0.80},
-	QueryClassKeywordSoup: {bm25: 1.20, semantic: 0.50},
+	QueryClassConcept:     {bm25: 1.00, semantic: 1.00, proximity: 1.30},
+	QueryClassSymbol:      {bm25: 1.20, semantic: 0.65, proximity: 0.55},
+	QueryClassPath:        {bm25: 1.25, semantic: 0.45, proximity: 0.40},
+	QueryClassSignature:   {bm25: 1.10, semantic: 0.80, proximity: 0.75},
+	QueryClassKeywordSoup: {bm25: 1.20, semantic: 0.50, proximity: 0.60},
 }
 
 // ClassWeightMultiplier returns the factor applied to a signal's
@@ -409,6 +416,11 @@ func ClassWeightMultiplier(c QueryClass, signal string) float64 {
 		return cw.bm25
 	case SignalSemantic:
 		return cw.semantic
+	case SignalProximity:
+		if cw.proximity == 0 {
+			return 1.0
+		}
+		return cw.proximity
 	default:
 		return 1.0
 	}
@@ -479,6 +491,14 @@ func continuousClassMultiplier(alpha float64, signal string) float64 {
 		return 1.0 + frac*(maxBM25-1.0)
 	case SignalSemantic:
 		return 1.0 - frac*(1.0-minSem)
+	case SignalProximity:
+		// Interpolate proximity from the concept (NL) anchor down to
+		// the path anchor, the mirror of how bm25/semantic move: a
+		// natural-language query leans hardest on graph centrality,
+		// an exact path/identifier query least.
+		nlProx := classWeightTable[QueryClassConcept].proximity
+		pathProx := classWeightTable[QueryClassPath].proximity
+		return nlProx + frac*(pathProx-nlProx)
 	default:
 		return 1.0
 	}

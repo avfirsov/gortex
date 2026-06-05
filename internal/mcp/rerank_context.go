@@ -96,6 +96,19 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 		}
 	}
 
+	// Centrality: a per-query Random-Walk-with-Restart (Personalized
+	// PageRank) over the call/reference graph, seeded from the query's
+	// strongest candidate matches, feeds ProximitySignal — the graph-
+	// centrality spine of retrieval. The walk runs against the
+	// immutable adjacency snapshot built by RunAnalysis; nil until then
+	// (the signal then sits at 0). The actual walk fires once per
+	// Rerank inside Context.prepare, after the seeds are chosen.
+	if snap := s.getAdjacency(); snap != nil {
+		rctx.Centrality = func(seeds []string) map[string]float64 {
+			return s.personalizedPageRank(snap, seeds)
+		}
+	}
+
 	// Co-change feeds the rerank pipeline once the git-history mine
 	// has run (lazily, on the first find_co_changing_symbols call, or
 	// from an enriched snapshot). Until then the signal sits at 0.

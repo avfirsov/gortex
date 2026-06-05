@@ -957,8 +957,10 @@ type QueryConfig struct {
 // default weight; setting a key to 0 disables that signal.
 type SearchConfig struct {
 	// Weights overrides per-signal scoring weights. Canonical names:
-	// bm25, semantic, fan_in, fan_out, churn, community, minhash,
-	// api_signature, type_signature, recency, feedback.
+	// bm25, semantic, fan_in, hits, fan_out, churn, co_change,
+	// community, minhash, api_signature, type_signature, recency,
+	// feedback, file_coherence, path_penalty, definition_bias,
+	// source_bias, provenance, proximity.
 	Weights map[string]float64 `mapstructure:"weights" yaml:"weights,omitempty"`
 
 	// KeywordSoupRewrite controls how `search_symbols` handles a

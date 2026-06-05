@@ -209,6 +209,7 @@ func DefaultSignals() []Signal {
 		DefinitionBiasSignal{},
 		SourceBiasSignal{},
 		ProvenanceSignal{},
+		ProximitySignal{},
 	}
 }
 
@@ -245,6 +246,7 @@ func DefaultWeights() map[string]float64 {
 		SignalDefinitionBias: 0.60,
 		SignalSourceBias:     0.25,
 		SignalProvenance:     0.15,
+		SignalProximity:      0.45,
 	}
 }
 
@@ -269,6 +271,7 @@ const (
 	SignalDefinitionBias = "definition_bias"
 	SignalSourceBias     = "source_bias"
 	SignalProvenance     = "provenance"
+	SignalProximity      = "proximity"
 )
 
 // AllSignalNames lists every canonical signal name. Useful for config
@@ -293,5 +296,6 @@ func AllSignalNames() []string {
 		SignalDefinitionBias,
 		SignalSourceBias,
 		SignalProvenance,
+		SignalProximity,
 	}
 }
