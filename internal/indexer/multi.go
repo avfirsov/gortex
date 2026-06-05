@@ -1011,6 +1011,36 @@ func (mi *MultiIndexer) resolveTrackPrefix(entry *config.RepoEntry, absPath stri
 	return prefix, mi.configMgr.GetRepoConfig(prefix)
 }
 
+// EffectiveRepoPrefix returns the prefix a repo entry is tracked under,
+// accounting for git-worktree instancing — the same value
+// resolveTrackPrefix registers, minus the (rare) collision-guard suffix
+// it cannot reproduce without the live registry. Warm-restart keying
+// (the snapshot-store mtime lookup, the resolve-time LSP helper
+// registry) uses this instead of config.ResolvePrefix so a disk-backed
+// reconcile finds the worktree instance's own persisted state rather
+// than the canonical checkout's. For a plain repo it equals
+// config.ResolvePrefix(entry). cm may be nil (then only an explicit
+// RepoEntry.Workspace override can trigger instancing).
+func EffectiveRepoPrefix(cm *config.ConfigManager, entry config.RepoEntry) string {
+	base := config.ResolvePrefix(entry)
+	if base == "" || base == "." || entry.Name != "" {
+		return base
+	}
+	absPath, err := filepath.Abs(entry.Path)
+	if err != nil {
+		return base
+	}
+	declaredWS := entry.Workspace
+	if declaredWS == "" && cm != nil {
+		cm.LoadWorkspaceConfig(base, absPath)
+		if cfg := cm.GetRepoConfig(base); cfg != nil {
+			declaredWS = cfg.Workspace
+		}
+	}
+	name, _ := WorktreeInstanceName(absPath, base, declaredWS, entry.AsWorktree)
+	return name
+}
+
 // TrackRepoCtx is TrackRepo with a context, allowing callers to pipe progress
 // reporters (via progress.WithReporter) through to the underlying Index call.
 func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry) (*IndexResult, error) {

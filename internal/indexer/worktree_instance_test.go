@@ -242,6 +242,29 @@ func TestWorktreeInstance_TwoWorktreesSameWorkspaceDisambiguated(t *testing.T) {
 	assert.Equal(t, 2, shared, "two distinct worktree instances under the shared workspace")
 }
 
+// TestEffectiveRepoPrefix_MatchesRegisteredPrefix guarantees the warm-
+// restart keying helper agrees with the prefix the indexer actually
+// registers — otherwise a disk-backed reconcile would key snapshot
+// mtimes by the wrong prefix and re-index the worktree every restart.
+func TestEffectiveRepoPrefix_MatchesRegisteredPrefix(t *testing.T) {
+	canon, wt := setupCollidingWorktree(t, "oas-orm", "task", "task-ws")
+	_, mi, cm := newWorktreeTestIndexer(t,
+		config.RepoEntry{Path: canon},
+		config.RepoEntry{Path: wt},
+	)
+	_, err := mi.IndexAll()
+	require.NoError(t, err)
+
+	// The helper reproduces the registered prefix for both checkouts.
+	assert.Equal(t, "oas-orm", EffectiveRepoPrefix(cm, config.RepoEntry{Path: canon}))
+	assert.Equal(t, "oas-orm@task-ws", EffectiveRepoPrefix(cm, config.RepoEntry{Path: wt}))
+	require.NotNil(t, mi.GetMetadata(EffectiveRepoPrefix(cm, config.RepoEntry{Path: wt})))
+	require.NotNil(t, mi.GetMetadata(EffectiveRepoPrefix(cm, config.RepoEntry{Path: canon})))
+
+	// An explicit Name is honoured verbatim (the interactive-track case).
+	assert.Equal(t, "custom", EffectiveRepoPrefix(cm, config.RepoEntry{Path: wt, Name: "custom"}))
+}
+
 func mustAbs(t *testing.T, p string) string {
 	t.Helper()
 	abs, err := filepath.Abs(p)
