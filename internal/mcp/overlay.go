@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -124,7 +125,19 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 		// untouched; a ready daemon is a transparent pass-through.
 		// See warmup_fastpath.go.
 		env, warming := s.checkWarmupFastPath(req.Params.Name)
+		// Retrieval query logging: time the call and install a
+		// result-count holder so handlers can report an exact count
+		// (the logger falls back to parsing the response otherwise).
+		logQuery := s.queryLog.shouldLog(req.Params.Name)
+		var qStart time.Time
+		if logQuery {
+			ctx, _ = withResultCount(ctx)
+			qStart = time.Now()
+		}
 		res, hErr := h(ctx, req)
+		if logQuery {
+			s.queryLog.record(s, ctx, req, res, hErr, qStart)
+		}
 		if warming && hErr == nil {
 			res = decorateResultWithWarming(res, env)
 		}

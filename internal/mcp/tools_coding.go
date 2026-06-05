@@ -1906,6 +1906,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		symbolContexts = append(symbolContexts, entry)
 	}
 	result["relevant_symbols"] = symbolContexts
+	// Report the focus-symbol count to the retrieval query log so a
+	// zero-result context assembly is recorded as such.
+	recordQueryResultCount(ctx, len(symbolContexts))
 
 	// 5b1. Graded-fidelity manifest: focus symbols at full source,
 	// their caller/callee adjacency ring as elided signature stubs,

@@ -220,6 +220,12 @@ type Server struct {
 	combo    *comboManager
 	frecency *frecencyTracker
 
+	// queryLog is the append-only retrieval query log (JSONL). It
+	// records every retrieval-shaped tool call so offline recall
+	// tuning and the eval harness have a substrate to measure. Always
+	// non-nil after NewServer; a disabled logger is a cheap no-op.
+	queryLog *queryLogger
+
 	// diagBroadcaster forwards LSP `publishDiagnostics` payloads to
 	// MCP clients as `notifications/diagnostics`. Lazy-initialised by
 	// SetLSPDiagnosticsBroadcasting; nil until then.
@@ -766,6 +772,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		guardRules: guardRules,
 		toolScopes: newScopeRegistry(),
 		agentReg:   newAgentRegistry(),
+		queryLog:   newQueryLogger(),
 	}
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
