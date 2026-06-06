@@ -18,11 +18,14 @@ import (
 	"github.com/zzet/gortex/internal/llm/provider/bedrock"
 	"github.com/zzet/gortex/internal/llm/provider/claudecli"
 	"github.com/zzet/gortex/internal/llm/provider/codex"
+	"github.com/zzet/gortex/internal/llm/provider/copilot"
+	"github.com/zzet/gortex/internal/llm/provider/cursor"
 	"github.com/zzet/gortex/internal/llm/provider/deepseek"
 	"github.com/zzet/gortex/internal/llm/provider/gemini"
 	"github.com/zzet/gortex/internal/llm/provider/local"
 	"github.com/zzet/gortex/internal/llm/provider/ollama"
 	"github.com/zzet/gortex/internal/llm/provider/openai"
+	"github.com/zzet/gortex/internal/llm/provider/opencode"
 )
 
 // New builds the llm.Provider selected by cfg.Provider. cfg should
@@ -48,6 +51,12 @@ func New(cfg llm.Config) (llm.Provider, error) {
 		return claudecli.New(cfg.ClaudeCLI)
 	case "codex":
 		return codex.New(cfg.Codex)
+	case "copilot":
+		return copilot.New(cfg.Copilot)
+	case "cursor":
+		return cursor.New(cfg.Cursor)
+	case "opencode":
+		return opencode.New(cfg.Opencode)
 	case "gemini":
 		return gemini.New(cfg.Gemini)
 	case "bedrock":
@@ -55,6 +64,6 @@ func New(cfg llm.Config) (llm.Provider, error) {
 	case "deepseek":
 		return deepseek.New(cfg.DeepSeek)
 	default:
-		return nil, fmt.Errorf("llm: unknown provider %q (want local|anthropic|openai|azure|ollama|claudecli|codex|gemini|bedrock|deepseek)", cfg.ProviderName())
+		return nil, fmt.Errorf("llm: unknown provider %q (want local|anthropic|openai|azure|ollama|claudecli|codex|copilot|cursor|opencode|gemini|bedrock|deepseek)", cfg.ProviderName())
 	}
 }

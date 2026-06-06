@@ -62,6 +62,15 @@ type Config struct {
 	DeepSeek RemoteConfig `mapstructure:"deepseek" yaml:"deepseek,omitempty"`
 	// Codex configures the OpenAI Codex CLI subprocess provider.
 	Codex CodexConfig `mapstructure:"codex" yaml:"codex,omitempty"`
+	// Copilot configures the GitHub Copilot CLI subprocess provider
+	// (`copilot -p`), reusing the user's `gh` / Copilot sign-in.
+	Copilot CLIConfig `mapstructure:"copilot" yaml:"copilot,omitempty"`
+	// Cursor configures the Cursor Agent CLI subprocess provider
+	// (`cursor-agent -p`), reusing the user's Cursor sign-in.
+	Cursor CLIConfig `mapstructure:"cursor" yaml:"cursor,omitempty"`
+	// Opencode configures the opencode CLI subprocess provider
+	// (`opencode run`), reusing the user's opencode credentials.
+	Opencode CLIConfig `mapstructure:"opencode" yaml:"opencode,omitempty"`
 
 	// Routing configures graph-aware model routing for the `ask`
 	// research agent — see RoutingConfig. Disabled by default: every
@@ -230,6 +239,26 @@ type CodexConfig struct {
 	TimeoutSeconds int `mapstructure:"timeout_seconds" yaml:"timeout_seconds,omitempty"`
 }
 
+// CLIConfig is the shared `llm.<copilot|cursor|opencode>:` sub-block —
+// the simple coding-agent CLI subprocess providers. Each shells out to
+// a locally installed binary that is already signed in (GitHub Copilot,
+// Cursor, opencode), so gortex never handles an API key. Field shape
+// mirrors ClaudeCLIConfig / CodexConfig; the per-provider binary
+// default and argv shape live in each provider package.
+type CLIConfig struct {
+	// Binary is the executable name or absolute path. Empty defaults to
+	// the provider's canonical binary (copilot / cursor-agent / opencode).
+	Binary string `mapstructure:"binary" yaml:"binary,omitempty"`
+	// Model is the model slug forwarded with the provider's model flag.
+	// Empty lets the CLI pick its own default.
+	Model string `mapstructure:"model" yaml:"model,omitempty"`
+	// Args is a list of extra arguments appended after the provider's
+	// own flags (e.g. a sandbox or permission flag).
+	Args []string `mapstructure:"args" yaml:"args,omitempty"`
+	// TimeoutSeconds caps one Complete call. 0 → 180s.
+	TimeoutSeconds int `mapstructure:"timeout_seconds" yaml:"timeout_seconds,omitempty"`
+}
+
 // Default endpoints / key env vars, applied by ApplyDefaults.
 const (
 	defaultAnthropicModel   = "claude-sonnet-4-6"
@@ -249,6 +278,10 @@ const (
 	defaultClaudeCLIBinary = "claude"
 
 	defaultCodexBinary = "codex"
+
+	defaultCopilotBinary  = "copilot"
+	defaultCursorBinary   = "cursor-agent"
+	defaultOpencodeBinary = "opencode"
 
 	defaultGeminiModel   = "gemini-2.5-pro"
 	defaultGeminiBaseURL = "https://generativelanguage.googleapis.com"
@@ -290,6 +323,12 @@ func (c Config) ActiveModel() string {
 		return c.ClaudeCLI.Model
 	case "codex":
 		return c.Codex.Model
+	case "copilot":
+		return c.Copilot.Model
+	case "cursor":
+		return c.Cursor.Model
+	case "opencode":
+		return c.Opencode.Model
 	case "gemini":
 		return c.Gemini.Model
 	case "bedrock":
@@ -322,6 +361,12 @@ func (c Config) WithModel(model string) Config {
 		c.ClaudeCLI.Model = model
 	case "codex":
 		c.Codex.Model = model
+	case "copilot":
+		c.Copilot.Model = model
+	case "cursor":
+		c.Cursor.Model = model
+	case "opencode":
+		c.Opencode.Model = model
 	case "gemini":
 		c.Gemini.Model = model
 	case "bedrock":
@@ -353,7 +398,7 @@ func (c Config) IsEnabled() bool {
 		return strings.TrimSpace(c.Azure.Deployment) != ""
 	case "ollama":
 		return strings.TrimSpace(c.Ollama.Model) != ""
-	case "claudecli", "codex":
+	case "claudecli", "codex", "copilot", "cursor", "opencode":
 		return true
 	case "gemini":
 		return strings.TrimSpace(c.Gemini.Model) != ""
@@ -393,6 +438,12 @@ func (c Config) MergeEnv() Config {
 			c.ClaudeCLI.Model = v
 		case "codex":
 			c.Codex.Model = v
+		case "copilot":
+			c.Copilot.Model = v
+		case "cursor":
+			c.Cursor.Model = v
+		case "opencode":
+			c.Opencode.Model = v
 		case "gemini":
 			c.Gemini.Model = v
 		case "bedrock":
@@ -408,6 +459,15 @@ func (c Config) MergeEnv() Config {
 	}
 	if v := os.Getenv("GORTEX_LLM_CODEX_BINARY"); v != "" {
 		c.Codex.Binary = v
+	}
+	if v := os.Getenv("GORTEX_LLM_COPILOT_BINARY"); v != "" {
+		c.Copilot.Binary = v
+	}
+	if v := os.Getenv("GORTEX_LLM_CURSOR_BINARY"); v != "" {
+		c.Cursor.Binary = v
+	}
+	if v := os.Getenv("GORTEX_LLM_OPENCODE_BINARY"); v != "" {
+		c.Opencode.Binary = v
 	}
 	if v := os.Getenv("GORTEX_LLM_BEDROCK_REGION"); v != "" {
 		c.Bedrock.Region = v
@@ -511,6 +571,17 @@ func (c Config) ApplyDefaults() Config {
 		c.Codex.Binary = defaultCodexBinary
 	}
 
+	// copilot / cursor / opencode CLI providers
+	if c.Copilot.Binary == "" {
+		c.Copilot.Binary = defaultCopilotBinary
+	}
+	if c.Cursor.Binary == "" {
+		c.Cursor.Binary = defaultCursorBinary
+	}
+	if c.Opencode.Binary == "" {
+		c.Opencode.Binary = defaultOpencodeBinary
+	}
+
 	// gemini
 	if c.Gemini.Model == "" {
 		c.Gemini.Model = defaultGeminiModel
@@ -572,6 +643,9 @@ func (c Config) MergedWith(fb Config) Config {
 	c.Bedrock = c.Bedrock.mergedWith(fb.Bedrock)
 	c.DeepSeek = c.DeepSeek.mergedWith(fb.DeepSeek)
 	c.Codex = c.Codex.mergedWith(fb.Codex)
+	c.Copilot = c.Copilot.mergedWith(fb.Copilot)
+	c.Cursor = c.Cursor.mergedWith(fb.Cursor)
+	c.Opencode = c.Opencode.mergedWith(fb.Opencode)
 	c.Routing = c.Routing.mergedWith(fb.Routing)
 	return c
 }
@@ -689,6 +763,22 @@ func (c ClaudeCLIConfig) mergedWith(fb ClaudeCLIConfig) ClaudeCLIConfig {
 }
 
 func (c CodexConfig) mergedWith(fb CodexConfig) CodexConfig {
+	if c.Binary == "" {
+		c.Binary = fb.Binary
+	}
+	if c.Model == "" {
+		c.Model = fb.Model
+	}
+	if len(c.Args) == 0 {
+		c.Args = fb.Args
+	}
+	if c.TimeoutSeconds == 0 {
+		c.TimeoutSeconds = fb.TimeoutSeconds
+	}
+	return c
+}
+
+func (c CLIConfig) mergedWith(fb CLIConfig) CLIConfig {
 	if c.Binary == "" {
 		c.Binary = fb.Binary
 	}

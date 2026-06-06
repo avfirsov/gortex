@@ -41,6 +41,9 @@ func TestConfig_IsEnabled(t *testing.T) {
 		{"deepseek no model", Config{Provider: "deepseek"}, false},
 		{"codex no model", Config{Provider: "codex"}, true},
 		{"codex with model", Config{Provider: "codex", Codex: CodexConfig{Model: "gpt-5-codex"}}, true},
+		{"copilot no model", Config{Provider: "copilot"}, true},
+		{"cursor no model", Config{Provider: "cursor"}, true},
+		{"opencode no model", Config{Provider: "opencode"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,6 +82,9 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 	}
 	if c.Codex.Binary != defaultCodexBinary {
 		t.Errorf("codex binary=%q want %q", c.Codex.Binary, defaultCodexBinary)
+	}
+	if c.Copilot.Binary != defaultCopilotBinary || c.Cursor.Binary != defaultCursorBinary || c.Opencode.Binary != defaultOpencodeBinary {
+		t.Errorf("cli provider binary defaults wrong: copilot=%q cursor=%q opencode=%q", c.Copilot.Binary, c.Cursor.Binary, c.Opencode.Binary)
 	}
 	if c.Gemini.Model != defaultGeminiModel || c.Gemini.APIKeyEnv != defaultGeminiKeyEnv || c.Gemini.BaseURL != defaultGeminiBaseURL {
 		t.Errorf("gemini defaults wrong: %+v", c.Gemini)
@@ -140,6 +146,45 @@ func TestConfig_MergeEnv_AzureDeploymentEndpointVersion(t *testing.T) {
 	}
 	if c.Azure.APIVersion != "2025-01-01-preview" {
 		t.Errorf("azure api_version=%q", c.Azure.APIVersion)
+	}
+}
+
+func TestConfig_MergeEnv_CLIProviderBinaryAndModel(t *testing.T) {
+	t.Setenv("GORTEX_LLM_PROVIDER", "copilot")
+	t.Setenv("GORTEX_LLM_MODEL", "claude-opus-4.1")
+	t.Setenv("GORTEX_LLM_COPILOT_BINARY", "/opt/gh/copilot")
+	t.Setenv("GORTEX_LLM_CURSOR_BINARY", "/opt/cursor/cursor-agent")
+	t.Setenv("GORTEX_LLM_OPENCODE_BINARY", "/opt/oc/opencode")
+	c := Config{}.MergeEnv()
+	if c.Copilot.Model != "claude-opus-4.1" {
+		t.Errorf("copilot model=%q — GORTEX_LLM_MODEL should target the active provider", c.Copilot.Model)
+	}
+	if c.Copilot.Binary != "/opt/gh/copilot" {
+		t.Errorf("copilot binary=%q", c.Copilot.Binary)
+	}
+	if c.Cursor.Binary != "/opt/cursor/cursor-agent" {
+		t.Errorf("cursor binary=%q", c.Cursor.Binary)
+	}
+	if c.Opencode.Binary != "/opt/oc/opencode" {
+		t.Errorf("opencode binary=%q", c.Opencode.Binary)
+	}
+}
+
+func TestConfig_MergedWith_CLIProviders(t *testing.T) {
+	global := Config{
+		Provider: "opencode",
+		Opencode: CLIConfig{Binary: "/usr/local/bin/opencode", Args: []string{"--mode", "ask"}, TimeoutSeconds: 90},
+	}
+	local := Config{Opencode: CLIConfig{Model: "anthropic/claude-sonnet-4-6"}}
+	got := local.MergedWith(global)
+	if got.Opencode.Binary != "/usr/local/bin/opencode" {
+		t.Errorf("binary=%q — global should fill", got.Opencode.Binary)
+	}
+	if got.Opencode.Model != "anthropic/claude-sonnet-4-6" {
+		t.Errorf("model=%q — local should win", got.Opencode.Model)
+	}
+	if len(got.Opencode.Args) != 2 || got.Opencode.TimeoutSeconds != 90 {
+		t.Errorf("args/timeout not filled from global: %+v", got.Opencode)
 	}
 }
 
@@ -245,6 +290,9 @@ func TestConfig_ActiveModelAndWithModel(t *testing.T) {
 		{"ollama", Config{Provider: "ollama"}},
 		{"claudecli", Config{Provider: "claudecli"}},
 		{"codex", Config{Provider: "codex"}},
+		{"copilot", Config{Provider: "copilot"}},
+		{"cursor", Config{Provider: "cursor"}},
+		{"opencode", Config{Provider: "opencode"}},
 		{"gemini", Config{Provider: "gemini"}},
 		{"bedrock", Config{Provider: "bedrock"}},
 		{"deepseek", Config{Provider: "deepseek"}},
