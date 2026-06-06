@@ -21,78 +21,80 @@
     .pulse{ fill: #6FC47B; }
   }
 
-  /* every scaled element pivots around its own centre, regardless of UA defaults */
-  .node, .dot, .green-grp, .green-core, .green-glow {
-    transform-box: fill-box;
-    transform-origin: center;
-  }
+  .node, .dot, .ghome-pop { transform-box: fill-box; transform-origin: center; }
 
   /* ---------- node + dot intro : staggered pop-in, plays once ---------- */
   .node, .dot { opacity: 0; animation: pop .5s cubic-bezier(.34,1.3,.5,1) both; }
-  @keyframes pop {
-    0%   { opacity: 0; transform: scale(.2); }
-    100% { opacity: 1; transform: scale(1); }
-  }
+  @keyframes pop { 0%{opacity:0;transform:scale(.2)} 100%{opacity:1;transform:scale(1)} }
 
   /* ---------- edges draw themselves in once ---------- */
-  .edge {
-    fill: none; stroke-width: 2; stroke-linecap: round;
-    stroke-dasharray: 100; stroke-dashoffset: 100;
-    animation: draw .7s ease-out forwards;
-  }
+  .edge { fill:none; stroke-width:2; stroke-linecap:round;
+           stroke-dasharray:100; stroke-dashoffset:100; animation: draw .7s ease-out forwards; }
   @keyframes draw { to { stroke-dashoffset: 0; } }
 
-  /* ---------- green "active" node : pop in, then pulse forever ---------- */
-  .green-grp  { opacity: 0; animation: pop .5s cubic-bezier(.34,1.3,.5,1) 0.3s both; }
-  .green-core { animation: gpulse 2.8s ease-in-out 1.5s infinite; }
-  .green-glow { opacity: 0; animation: gglow 2.8s ease-in-out 1.5s infinite; }
-  @keyframes gpulse {
-    0%,40%   { transform: scale(1); }
-    58%      { transform: scale(1.16); }
-    78%,100% { transform: scale(1); }
-  }
-  @keyframes gglow {
-    0%,40%   { opacity: 0; transform: scale(1); }
-    58%      { opacity: .55; transform: scale(1.9); }
-    82%,100% { opacity: 0; transform: scale(2.4); }
-  }
+  /* ---------- the green light travelling the ring ---------- */
+  .ghome-pop { opacity:0; animation: pop .5s cubic-bezier(.34,1.3,.5,1) 0.3s both; }
+  .c0 { animation: chase0 6.0s linear 1.7s infinite backwards; }
+  .c1 { animation: chase1 6.0s linear 1.7s infinite backwards; }
+  .c2 { animation: chase2 6.0s linear 1.7s infinite backwards; }
+  .c3 { animation: chase3 6.0s linear 1.7s infinite backwards; }
+  .c4 { animation: chase4 6.0s linear 1.7s infinite backwards; }
+  .c5 { animation: chase5 6.0s linear 1.7s infinite backwards; }
+  .c6 { animation: chase6 6.0s linear 1.7s infinite backwards; }
+  .c7 { animation: chase7 6.0s linear 1.7s infinite backwards; }
+  .c8 { animation: chase8 6.0s linear 1.7s infinite backwards; }
+  .c9 { animation: chase9 6.0s linear 1.7s infinite backwards; }
+  .c10 { animation: chase10 6.0s linear 1.7s infinite backwards; }
+  .c11 { animation: chase11 6.0s linear 1.7s infinite backwards; }
+  @keyframes chase0 { 0%{opacity:1} 16.000%{opacity:1} 16.450%{opacity:0} 78.333%{opacity:0} 78.783%{opacity:1} 100%{opacity:1} }
+  @keyframes chase1 { 0%,15.550%{opacity:0} 16.000%{opacity:1} 21.667%{opacity:1} 22.117%,100%{opacity:0} }
+  @keyframes chase2 { 0%,21.217%{opacity:0} 21.667%{opacity:1} 27.333%{opacity:1} 27.783%,100%{opacity:0} }
+  @keyframes chase3 { 0%,26.883%{opacity:0} 27.333%{opacity:1} 33.000%{opacity:1} 33.450%,100%{opacity:0} }
+  @keyframes chase4 { 0%,32.550%{opacity:0} 33.000%{opacity:1} 38.667%{opacity:1} 39.117%,100%{opacity:0} }
+  @keyframes chase5 { 0%,38.217%{opacity:0} 38.667%{opacity:1} 44.333%{opacity:1} 44.783%,100%{opacity:0} }
+  @keyframes chase6 { 0%,43.883%{opacity:0} 44.333%{opacity:1} 50.000%{opacity:1} 50.450%,100%{opacity:0} }
+  @keyframes chase7 { 0%,49.550%{opacity:0} 50.000%{opacity:1} 55.667%{opacity:1} 56.117%,100%{opacity:0} }
+  @keyframes chase8 { 0%,55.217%{opacity:0} 55.667%{opacity:1} 61.333%{opacity:1} 61.783%,100%{opacity:0} }
+  @keyframes chase9 { 0%,60.883%{opacity:0} 61.333%{opacity:1} 67.000%{opacity:1} 67.450%,100%{opacity:0} }
+  @keyframes chase10 { 0%,66.550%{opacity:0} 67.000%{opacity:1} 72.667%{opacity:1} 73.117%,100%{opacity:0} }
+  @keyframes chase11 { 0%,72.217%{opacity:0} 72.667%{opacity:1} 78.333%{opacity:1} 78.783%,100%{opacity:0} }
 
-  /* ---------- query pulse travelling the spine into the green node ---------- */
-  .qpulse { opacity: 0; animation: qp 2.8s linear 1.5s infinite; }
-  @keyframes qp { 0%,6%{opacity:0} 12%{opacity:1} 52%{opacity:1} 66%,100%{opacity:0} }
+  /* ---------- query dot : in along the spine, out the same way ---------- */
+  .qpulse { opacity:0; animation: qp 6.0s linear 1.7s infinite; }
+  @keyframes qp { 0%{opacity:0} 3%{opacity:1} 14%{opacity:1} 17%{opacity:0}
+                   83%{opacity:0} 86%{opacity:1} 97%{opacity:1} 100%{opacity:0} }
 
   /* ---------- wordmark fades + rises in once ---------- */
-  .wordmark { opacity: 0; transform: translateY(10px); animation: word .8s ease-out .55s forwards; }
-  @keyframes word { to { opacity: 1; transform: translateY(0); } }
+  .wordmark { opacity:0; transform: translateY(10px); animation: word .8s ease-out .55s forwards; }
+  @keyframes word { to { opacity:1; transform: translateY(0); } }
 
-  /* ---------- respect reduced-motion : show the settled logo, no motion ---------- */
+  /* ---------- reduced motion : settled logo, green at home, no movement ---------- */
   @media (prefers-reduced-motion: reduce) {
-    .node,.dot,.edge,.green-grp,.green-core,.wordmark {
-      animation: none !important; opacity: 1 !important;
-      transform: none !important; stroke-dashoffset: 0 !important;
-    }
-    .green-glow, .qpulse { animation: none !important; opacity: 0 !important; }
+    .node,.dot,.edge,.ghome-pop,.wordmark { animation:none!important; opacity:1!important;
+        transform:none!important; stroke-dashoffset:0!important; }
+    .c0 { animation:none!important; opacity:1!important; }
+    .c1,.c2,.c3,.c4,.c5,.c6,.c7,.c8,.c9,.c10,.c11,.qpulse { animation:none!important; opacity:0!important; }
   }
   </style>
   </defs>
 
-  <!-- knowledge-graph edges -->
+  <!-- knowledge-graph edges (the ring the green light travels) -->
   <g>
-    <path class="edge" d="M190 300 L351 300" pathLength="100" style="animation-delay:0.55s"/>
-    <path class="edge" d="M351 300 L431 300" pathLength="100" style="animation-delay:0.585s"/>
-    <path class="edge" d="M431 300 L511 300" pathLength="100" style="animation-delay:0.62s"/>
-    <path class="edge" d="M511 220 L511 300" pathLength="100" style="animation-delay:0.655s"/>
-    <path class="edge" d="M511 380 L511 300" pathLength="100" style="animation-delay:0.69s"/>
-    <path class="edge" d="M431 140 L511 220" pathLength="100" style="animation-delay:0.725s"/>
-    <path class="edge" d="M431 460 L511 380" pathLength="100" style="animation-delay:0.76s"/>
-    <path class="edge" d="M270 140 L351 140" pathLength="100" style="animation-delay:0.795s"/>
-    <path class="edge" d="M351 140 L431 140" pathLength="100" style="animation-delay:0.83s"/>
-    <path class="edge" d="M270 460 L351 460" pathLength="100" style="animation-delay:0.865s"/>
-    <path class="edge" d="M351 460 L431 460" pathLength="100" style="animation-delay:0.9s"/>
-    <path class="edge" d="M190 220 L190 300" pathLength="100" style="animation-delay:0.935s"/>
-    <path class="edge" d="M190 300 L190 380" pathLength="100" style="animation-delay:0.97s"/>
-    <path class="edge" d="M270 140 L190 220" pathLength="100" style="animation-delay:1.005s"/>
-    <path class="edge" d="M270 460 L190 380" pathLength="100" style="animation-delay:1.04s"/>
+    <path class="edge" d="M190 300 L351 300" pathLength="100" style="animation-delay:0.5s"/>
+    <path class="edge" d="M351 300 L431 300" pathLength="100" style="animation-delay:0.53s"/>
+    <path class="edge" d="M431 300 L511 300" pathLength="100" style="animation-delay:0.56s"/>
+    <path class="edge" d="M511 220 L511 300" pathLength="100" style="animation-delay:0.59s"/>
+    <path class="edge" d="M511 380 L511 300" pathLength="100" style="animation-delay:0.62s"/>
+    <path class="edge" d="M431 140 L511 220" pathLength="100" style="animation-delay:0.65s"/>
+    <path class="edge" d="M431 460 L511 380" pathLength="100" style="animation-delay:0.68s"/>
+    <path class="edge" d="M270 140 L351 140" pathLength="100" style="animation-delay:0.71s"/>
+    <path class="edge" d="M351 140 L431 140" pathLength="100" style="animation-delay:0.74s"/>
+    <path class="edge" d="M270 460 L351 460" pathLength="100" style="animation-delay:0.77s"/>
+    <path class="edge" d="M351 460 L431 460" pathLength="100" style="animation-delay:0.8s"/>
+    <path class="edge" d="M190 220 L190 300" pathLength="100" style="animation-delay:0.83s"/>
+    <path class="edge" d="M190 300 L190 380" pathLength="100" style="animation-delay:0.86s"/>
+    <path class="edge" d="M270 140 L190 220" pathLength="100" style="animation-delay:0.89s"/>
+    <path class="edge" d="M270 460 L190 380" pathLength="100" style="animation-delay:0.92s"/>
   </g>
 
   <!-- inactive cells -->
@@ -110,7 +112,7 @@
     <rect class="dot dim" x="503.5" y="452.5" width="15" height="15" style="animation-delay:0.4s"/>
   </g>
 
-  <!-- nodes -->
+  <!-- nodes (black base) -->
   <g>
     <rect class="node ink" x="248" y="118" width="44" height="44" style="animation-delay:0.05s"/>
     <rect class="node ink" x="329" y="118" width="44" height="44" style="animation-delay:0.1s"/>
@@ -125,19 +127,68 @@
     <rect class="node ink" x="248" y="438" width="44" height="44" style="animation-delay:0.25s"/>
     <rect class="node ink" x="329" y="438" width="44" height="44" style="animation-delay:0.3s"/>
     <rect class="node ink" x="409" y="438" width="44" height="44" style="animation-delay:0.35s"/>
+    <rect class="node ink" x="489" y="278" width="44" height="44" style="animation-delay:0.3s"/>
   </g>
 
-  <!-- active (green) node -->
-    <g class="green-grp">
-      <rect class="green-glow glow" x="489" y="278" width="44" height="44" filter="url(#soft)"/>
-      <rect class="green-core grn" x="489" y="278" width="44" height="44"/>
+  <!-- green light : home + ring positions -->
+    <g class="ghome-pop">
+      <g class="c0">
+        <rect class="glow" x="489" y="278" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="278" width="44" height="44"/>
+      </g>
     </g>
+  <g>
+      <g class="c1">
+        <rect class="glow" x="489" y="358" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="358" width="44" height="44"/>
+      </g>
+      <g class="c2">
+        <rect class="glow" x="409" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="409" y="438" width="44" height="44"/>
+      </g>
+      <g class="c3">
+        <rect class="glow" x="329" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="329" y="438" width="44" height="44"/>
+      </g>
+      <g class="c4">
+        <rect class="glow" x="248" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="248" y="438" width="44" height="44"/>
+      </g>
+      <g class="c5">
+        <rect class="glow" x="168" y="358" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="358" width="44" height="44"/>
+      </g>
+      <g class="c6">
+        <rect class="glow" x="168" y="278" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="278" width="44" height="44"/>
+      </g>
+      <g class="c7">
+        <rect class="glow" x="168" y="198" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="198" width="44" height="44"/>
+      </g>
+      <g class="c8">
+        <rect class="glow" x="248" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="248" y="118" width="44" height="44"/>
+      </g>
+      <g class="c9">
+        <rect class="glow" x="329" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="329" y="118" width="44" height="44"/>
+      </g>
+      <g class="c10">
+        <rect class="glow" x="409" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="409" y="118" width="44" height="44"/>
+      </g>
+      <g class="c11">
+        <rect class="glow" x="489" y="198" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="198" width="44" height="44"/>
+      </g>
+  </g>
 
-  <!-- query pulse traversing the graph -->
+  <!-- query dot -->
     <circle class="qpulse pulse" r="6" filter="url(#soft)">
-      <animateMotion dur="2.8s" begin="1.5s" repeatCount="indefinite"
-        path="M190 300 L511 300" keyPoints="0;1;1" keyTimes="0;0.55;1" calcMode="spline"
-        keySplines="0.45 0 0.25 1;0 0 1 1"/>
+      <animateMotion dur="6.0s" begin="1.7s" repeatCount="indefinite"
+        path="M190 300 L511 300" keyPoints="0;1;1;0" keyTimes="0;0.16;0.84;1"
+        calcMode="spline" keySplines="0.4 0 0.2 1; 0 0 1 1; 0.4 0 0.2 1"/>
     </circle>
 
   <!-- wordmark -->
