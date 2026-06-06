@@ -182,6 +182,12 @@ type RemoteConfig struct {
 	// BaseURL overrides the API endpoint (proxies, gateways, Azure).
 	// Defaulted per provider by ApplyDefaults.
 	BaseURL string `mapstructure:"base_url" yaml:"base_url,omitempty"`
+	// Effort is an optional reasoning-effort level. Off by default.
+	// Anthropic sends it as output_config.effort (low|medium|high|max|
+	// xhigh, gated by model capability); OpenAI sends it as
+	// reasoning_effort (minimal|low|medium|high). Empty leaves the knob
+	// untouched.
+	Effort string `mapstructure:"effort" yaml:"effort,omitempty"`
 }
 
 // AzureConfig is the `llm.azure:` sub-block — settings for the Azure
@@ -572,6 +578,18 @@ func (c Config) MergeEnv() Config {
 	if v := os.Getenv("GORTEX_LLM_AZURE_API_VERSION"); v != "" {
 		c.Azure.APIVersion = v
 	}
+	if v := os.Getenv("GORTEX_LLM_EFFORT"); v != "" {
+		switch c.ProviderName() {
+		case "anthropic":
+			c.Anthropic.Effort = v
+		case "openai":
+			c.OpenAI.Effort = v
+		case "gemini":
+			c.Gemini.Effort = v
+		case "deepseek":
+			c.DeepSeek.Effort = v
+		}
+	}
 	if v := os.Getenv("GORTEX_LLM_CTX"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Local.Ctx = n
@@ -785,6 +803,9 @@ func (r RemoteConfig) mergedWith(fb RemoteConfig) RemoteConfig {
 	}
 	if r.BaseURL == "" {
 		r.BaseURL = fb.BaseURL
+	}
+	if r.Effort == "" {
+		r.Effort = fb.Effort
 	}
 	return r
 }

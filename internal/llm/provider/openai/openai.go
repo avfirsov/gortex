@@ -40,12 +40,13 @@ func New(cfg llm.RemoteConfig) (llm.Provider, error) {
 		base = "https://api.openai.com"
 	}
 	return &openaicompat.Client{
-		ProviderID: "openai",
-		Tag:        "openai",
-		Model:      cfg.Model,
-		URL:        base + "/v1/chat/completions",
-		Headers:    map[string]string{"authorization": "Bearer " + key},
-		HTTPClient: &http.Client{Timeout: 120 * time.Second},
-		SchemaMode: openaicompat.SchemaJSONSchema,
+		ProviderID:      "openai",
+		Tag:             "openai",
+		Model:           cfg.Model,
+		URL:             base + "/v1/chat/completions",
+		Headers:         map[string]string{"authorization": "Bearer " + key},
+		HTTPClient:      &http.Client{Timeout: 120 * time.Second},
+		SchemaMode:      openaicompat.SchemaJSONSchema,
+		ReasoningEffort: strings.TrimSpace(cfg.Effort),
 	}, nil
 }

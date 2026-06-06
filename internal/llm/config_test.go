@@ -181,6 +181,21 @@ func TestConfig_MergedWith_CustomProviders(t *testing.T) {
 	}
 }
 
+func TestConfig_Effort_EnvAndMerge(t *testing.T) {
+	t.Setenv("GORTEX_LLM_PROVIDER", "anthropic")
+	t.Setenv("GORTEX_LLM_EFFORT", "high")
+	c := Config{}.MergeEnv()
+	if c.Anthropic.Effort != "high" {
+		t.Errorf("GORTEX_LLM_EFFORT should target the active provider, got anthropic.effort=%q", c.Anthropic.Effort)
+	}
+
+	global := Config{Provider: "openai", OpenAI: RemoteConfig{Effort: "medium"}}
+	local := Config{}
+	if got := local.MergedWith(global); got.OpenAI.Effort != "medium" {
+		t.Errorf("effort should merge from global, got %q", got.OpenAI.Effort)
+	}
+}
+
 func TestConfig_IsBuiltinProvider(t *testing.T) {
 	for _, name := range []string{"openai", "azure", "copilot", " Anthropic ", "BEDROCK"} {
 		if !IsBuiltinProvider(name) {
