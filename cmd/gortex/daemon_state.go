@@ -31,6 +31,7 @@ import (
 	"github.com/zzet/gortex/internal/semantic/goanalysis"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 	"github.com/zzet/gortex/internal/semantic/scip"
+	"github.com/zzet/gortex/internal/serverstack"
 )
 
 // daemonState is the bundle of long-lived objects the daemon owns. One
@@ -101,15 +102,7 @@ type daemonState struct {
 // isFalsyEnv returns true when the env var is explicitly set to one
 // of the "no" spellings: "0", "false", "no", "off", "n". An unset or
 // empty env returns false (default-on semantics for opt-out flags).
-func isFalsyEnv(name string) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
-	switch v {
-	case "0", "false", "no", "off", "n":
-		return true
-	default:
-		return false
-	}
-}
+func isFalsyEnv(name string) bool { return serverstack.IsFalsyEnv(name) }
 
 // lspDisabledSet builds the set of LSP spec names that should NOT be
 // auto-registered by Router.RegisterAvailable. Two inputs are merged:
@@ -126,32 +119,7 @@ func isFalsyEnv(name string) bool {
 // "skip auto-register everywhere" and is checked separately by
 // callers; per-spec keys carry the spec.Name.
 func lspDisabledSet(providers []config.SemanticProviderConfig, envVar string) map[string]bool {
-	out := map[string]bool{}
-	for _, pc := range providers {
-		if pc.Enabled {
-			continue
-		}
-		// Only consider entries that resolve to a known LSP spec —
-		// otherwise an `enabled: false` for a SCIP indexer or a
-		// custom daemon would silently shadow an LSP of the same
-		// name (rare in practice, but the registry-membership check
-		// makes the intent explicit).
-		if lsp.SpecByName(pc.Name) != nil {
-			out[pc.Name] = true
-		}
-	}
-	for _, raw := range strings.Split(envVar, ",") {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		if strings.EqualFold(name, "all") || name == "*" {
-			out["__all__"] = true
-			continue
-		}
-		out[name] = true
-	}
-	return out
+	return serverstack.LspDisabledSet(providers, envVar)
 }
 
 func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
@@ -571,12 +539,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 // and even then the cost is "no LSP precision" rather than incorrect
 // behaviour.
 func repoLikelyHasTypeScriptIntent(absRoot string) bool {
-	for _, marker := range []string{"tsconfig.json", "jsconfig.json", "package.json"} {
-		if _, err := os.Stat(filepath.Join(absRoot, marker)); err == nil {
-			return true
-		}
-	}
-	return false
+	return serverstack.RepoLikelyHasTypeScriptIntent(absRoot)
 }
 
 // buildResolverLSPHelper constructs the resolve-time LSP helper for a
@@ -592,27 +555,7 @@ func repoLikelyHasTypeScriptIntent(absRoot string) bool {
 // (GORTEX_LSP_POOL_SIZE > 1) and the recommendation is to use it only
 // when the tracked-workspace count is small.
 func buildResolverLSPHelper(router *lsp.Router, spec *lsp.ServerSpec, absRoot string, poolSize int, logger *zap.Logger) *lsp.ResolverHelper {
-	if poolSize <= 1 {
-		return lsp.NewLazyResolverHelper(
-			func() (*lsp.Provider, error) {
-				return router.ForSpecWorkspace(spec, absRoot)
-			},
-			absRoot,
-			spec.Extensions,
-			0,
-			logger,
-		)
-	}
-	return lsp.NewPooledResolverHelper(
-		func() (*lsp.Provider, error) {
-			return lsp.SpawnProviderForResolver(spec, absRoot, logger)
-		},
-		absRoot,
-		spec.Extensions,
-		0,
-		poolSize,
-		logger,
-	)
+	return serverstack.BuildResolverLSPHelper(router, spec, absRoot, poolSize, logger)
 }
 
 // warmupDaemonState performs the per-repo TrackRepoCtx loop and brings
