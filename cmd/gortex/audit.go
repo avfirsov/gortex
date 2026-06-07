@@ -255,19 +255,19 @@ func emitAuditGradeCard(w io.Writer, r auditReport) {
 	_, _ = fmt.Fprintln(w)
 }
 
+// Coverage-grade badge colours — the shields.io standard palette, shared
+// by the terminal badge background (auditGradeBG) and the SVG/markdown
+// badge colour (gradeColour).
+const (
+	badgeBrightGreen = "#4c1"
+	badgeGreen       = "#97ca00"
+	badgeYellow      = "#dfb317"
+	badgeOrange      = "#fe7d37"
+	badgeRed         = "#e05d44"
+)
+
 func auditGradeBG(grade string) lipgloss.Color {
-	switch grade {
-	case "A":
-		return lipgloss.Color("#4c1")
-	case "B":
-		return lipgloss.Color("#97ca00")
-	case "C":
-		return lipgloss.Color("#dfb317")
-	case "D":
-		return lipgloss.Color("#fe7d37")
-	default:
-		return lipgloss.Color("#e05d44")
-	}
+	return lipgloss.Color(gradeColour(grade))
 }
 
 func gradeBlurb(grade string) string {
@@ -301,14 +301,14 @@ func auditStatSeverity(grade string) progress.StatSeverity {
 func gradeColour(grade string) string {
 	switch grade {
 	case "A":
-		return "#4c1"
+		return badgeBrightGreen
 	case "B":
-		return "#97ca00"
+		return badgeGreen
 	case "C":
-		return "#dfb317"
+		return badgeYellow
 	case "D":
-		return "#fe7d37"
+		return badgeOrange
 	default:
-		return "#e05d44"
+		return badgeRed
 	}
 }
