@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/forge"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/llm/svc"
 )
 
 // forgeList / forgeFiles are the package-level seam over the forge free
@@ -27,6 +28,21 @@ var (
 	forgeList  = forge.ListPRs
 	forgeFiles = forge.PRFiles
 )
+
+// llmRerank is the package-level seam over the optional LLM re-rank used
+// by triage_prs. It reports whether the service is usable (a constructed,
+// enabled provider) and, when usable, runs one freeform Generate call.
+// It defaults to routing through the server's real *svc.Service; a test
+// swaps it for a closure returning a fixed ordering so the re-rank path
+// is exercised with no provider and no network. Keep this the only
+// indirection over the LLM call so the deterministic path stays pure.
+var llmRerank = func(ctx context.Context, service *svc.Service, prompt string, maxTokens int) (text string, usable bool, err error) {
+	if service == nil || !service.Enabled() {
+		return "", false, nil
+	}
+	out, gerr := service.Generate(ctx, prompt, maxTokens)
+	return out, true, gerr
+}
 
 // prCacheTTL is how long a fetched forge.PR is reused before a refetch.
 // A short TTL means a triage re-run within the window does not refetch
@@ -127,6 +143,8 @@ func (s *Server) registerPRTools() {
 			mcp.WithNumber("limit", mcp.Description("Cap the number of open PRs triaged / returned (default 20).")),
 			mcp.WithString("prs", mcp.Description("JSON array of already-fetched forge.PR objects to triage instead of listing via the forge.")),
 			mcp.WithString("files", mcp.Description("JSON object mapping a PR number (as a string key) to its already-fetched changed file paths, so a per-PR file fetch is skipped.")),
+			mcp.WithBoolean("use_llm", mcp.Description("When true and an LLM provider is configured, re-rank the deterministic queue with one compact LLM pass and attach a short per-PR rationale (llm_used:true). Falls back to the deterministic score-descending order (llm_used:false) when no provider is configured or the model response is unparseable — never errors.")),
+			mcp.WithNumber("max_tokens", mcp.Description("Generation cap for the LLM re-rank pass (default 512). No effect unless use_llm is true and a provider is configured.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 		),
@@ -497,7 +515,10 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 		})
 	}
 
-	// Deterministic: score descending, PR number ascending on a tie.
+	// Deterministic: score descending, PR number ascending on a tie. This
+	// always runs first so the deterministic order is the baseline the LLM
+	// re-rank refines and the stable fallback tail when the model omits or
+	// mangles a PR.
 	sort.SliceStable(ranked, func(i, j int) bool {
 		si, _ := ranked[i]["score"].(float64)
 		sj, _ := ranked[j]["score"].(float64)
@@ -509,9 +530,19 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 		return ni < nj
 	})
 
+	// Opt-in LLM re-rank: reorder the deterministic queue and attach a
+	// per-PR rationale when a provider is configured. A disabled service
+	// or an unparseable response leaves the deterministic order untouched
+	// and stamps llm_used:false — never an error.
+	llmUsed := false
+	if req.GetBool("use_llm", false) {
+		ranked, llmUsed = llmRankPRs(ctx, s.llmService, ranked, req.GetInt("max_tokens", 512))
+	}
+
 	payload := map[string]any{
-		"ranked": ranked,
-		"total":  len(ranked),
+		"ranked":   ranked,
+		"total":    len(ranked),
+		"llm_used": llmUsed,
 	}
 
 	if s.isGCX(ctx, req) {
@@ -521,6 +552,194 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 		return returnTOON(payload)
 	}
 	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+// llmRankPRs re-ranks an already-deterministically-ordered triage list
+// with a single LLM pass. It builds one compact prompt from the per-PR
+// rows, calls the service via the llmRerank seam, parses the model's
+// ordered PR numbers + rationale, and reorders the rows accordingly,
+// stamping a "rationale" field on each row the model annotated. It is
+// total: a disabled service, a Generate error, or an unparseable response
+// returns the input order unchanged with used=false. The returned slice
+// is a fresh permutation of the input rows (the input is not mutated in
+// place beyond the rationale stamp on shared row maps).
+func llmRankPRs(ctx context.Context, service *svc.Service, ranked []map[string]any, maxTokens int) (out []map[string]any, used bool) {
+	if len(ranked) == 0 {
+		return ranked, false
+	}
+	prompt := buildTriagePrompt(ranked)
+	text, usable, err := llmRerank(ctx, service, prompt, maxTokens)
+	if !usable || err != nil || strings.TrimSpace(text) == "" {
+		return ranked, false
+	}
+
+	order, rationales := parseTriageRanking(text)
+	if len(order) == 0 {
+		return ranked, false
+	}
+
+	// Index the deterministic rows by PR number so the parsed order can
+	// pull them in the model's sequence; numbers the model omitted or
+	// invented are handled by appending the unseen deterministic tail.
+	byNumber := make(map[int]map[string]any, len(ranked))
+	for _, r := range ranked {
+		if n, ok := rowNumber(r); ok {
+			byNumber[n] = r
+		}
+	}
+
+	reordered := make([]map[string]any, 0, len(ranked))
+	placed := make(map[int]bool, len(ranked))
+	for _, n := range order {
+		row, ok := byNumber[n]
+		if !ok || placed[n] {
+			// A number the model invented or repeated — skip it.
+			continue
+		}
+		if rat := strings.TrimSpace(rationales[n]); rat != "" {
+			row["rationale"] = rat
+		}
+		reordered = append(reordered, row)
+		placed[n] = true
+	}
+	// Preserve the deterministic tail for any PR the model dropped, in the
+	// original (score-descending) order, so the queue stays complete.
+	for _, r := range ranked {
+		n, ok := rowNumber(r)
+		if !ok || placed[n] {
+			continue
+		}
+		reordered = append(reordered, r)
+		placed[n] = true
+	}
+
+	if len(reordered) != len(ranked) {
+		// Defensive: a row without a usable number would be lost. Fall
+		// back to the deterministic order rather than truncate the queue.
+		return ranked, false
+	}
+	return reordered, true
+}
+
+// rowNumber extracts the PR number from a triage row, tolerating both the
+// int form (built in-process) and the float64 form (a JSON round-trip).
+func rowNumber(row map[string]any) (int, bool) {
+	switch v := row["number"].(type) {
+	case int:
+		return v, true
+	case float64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+// buildTriagePrompt renders one compact, deterministic prompt from the
+// per-PR triage rows: number, title, author, risk, and deterministic
+// score. It is pure — same rows in, same prompt out — so the prompt is
+// stable across runs and trivially testable. The model is asked to return
+// one "PR <n>: <rationale>" line per PR, most-important first.
+func buildTriagePrompt(ranked []map[string]any) string {
+	var b strings.Builder
+	b.WriteString("You are triaging a code-review queue. Below are open pull requests, ")
+	b.WriteString("each with a graph-derived risk tier and score (higher score = more blast radius). ")
+	b.WriteString("Rank them from most to least important to review first, considering risk, ")
+	b.WriteString("score, and title. Reply with one line per PR in your chosen order, formatted ")
+	b.WriteString("exactly as `PR <number>: <one-sentence rationale>`. Include every PR exactly once.\n\n")
+	for _, r := range ranked {
+		n, _ := rowNumber(r)
+		title, _ := r["title"].(string)
+		author, _ := r["author"].(string)
+		risk, _ := r["risk"].(string)
+		score, _ := r["score"].(float64)
+		b.WriteString(fmt.Sprintf("PR %d | risk=%s score=%.1f | %s",
+			n, strings.TrimSpace(risk), score, strings.TrimSpace(title)))
+		if a := strings.TrimSpace(author); a != "" {
+			b.WriteString(" | by " + a)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// parseTriageRanking parses an LLM ranking response into an ordered list
+// of PR numbers and a per-number rationale. It is pure and forgiving: it
+// scans line by line for the first integer following an optional `PR`/`#`
+// token, treats the remainder of the line (after a `:` or `-` separator)
+// as that PR's rationale, ignores lines with no number, and drops a
+// repeated number's later occurrences. A response with no parseable
+// numbers yields an empty order, signalling the caller to fall back.
+func parseTriageRanking(text string) (order []int, rationales map[int]string) {
+	rationales = map[int]string{}
+	seen := map[int]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		n, rationale, ok := parseRankLine(line)
+		if !ok || seen[n] {
+			continue
+		}
+		seen[n] = true
+		order = append(order, n)
+		if rationale != "" {
+			rationales[n] = rationale
+		}
+	}
+	return order, rationales
+}
+
+// parseRankLine pulls the leading PR number and trailing rationale out of
+// one ranking line. It tolerates `PR 12: reason`, `#12 - reason`, `12.
+// reason`, `1) PR 12 reason`, and bare `12`. Returns ok=false when the
+// line carries no PR number.
+func parseRankLine(line string) (number int, rationale string, ok bool) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return 0, "", false
+	}
+	// Strip a leading ordinal like "1." / "1)" so it is not mistaken for
+	// the PR number — but only when a `PR`/`#` token follows, which marks
+	// the real number.
+	if lower := strings.ToLower(s); strings.Contains(lower, "pr ") || strings.Contains(lower, "pr#") || strings.Contains(s, "#") {
+		s = stripLeadingOrdinal(s)
+	}
+	// Advance to the first digit, skipping an optional `PR` / `#` marker.
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			break
+		}
+		i++
+	}
+	if i >= len(s) {
+		return 0, "", false
+	}
+	j := i
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	num, err := strconv.Atoi(s[i:j])
+	if err != nil {
+		return 0, "", false
+	}
+	rest := strings.TrimSpace(s[j:])
+	rest = strings.TrimLeft(rest, ":-—–.) \t")
+	return num, strings.TrimSpace(rest), true
+}
+
+// stripLeadingOrdinal removes a leading "N." or "N)" list marker so the
+// real PR number (which follows a PR/# token) is the one parsed.
+func stripLeadingOrdinal(s string) string {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(s) {
+		return s
+	}
+	if s[i] == '.' || s[i] == ')' {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return s
 }
 
 // fetchPRFiles resolves the changed-file set for one PR via the forge,

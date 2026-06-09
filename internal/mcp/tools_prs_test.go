@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/forge"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/llm/svc"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -399,4 +400,221 @@ func TestRetryAfterSeconds(t *testing.T) {
 	require.Equal(t, 90, retryAfterSeconds(fmt.Errorf("%w (retry after 1m30s)", forge.ErrRateLimited)))
 	require.Equal(t, -1, retryAfterSeconds(fmt.Errorf("%w: secondary limit", forge.ErrRateLimited)))
 	require.Equal(t, -1, retryAfterSeconds(nil))
+}
+
+// --- triage_prs: opt-in LLM re-rank ----------------------------------------
+
+// withLLMRerank swaps the package-level llmRerank seam so the re-rank path
+// runs with a fixed model response and no provider / network. usable=false
+// simulates a disabled service; err simulates a failed Generate call.
+func withLLMRerank(t *testing.T, text string, usable bool, err error) {
+	t.Helper()
+	orig := llmRerank
+	llmRerank = func(context.Context, *svc.Service, string, int) (string, bool, error) {
+		return text, usable, err
+	}
+	t.Cleanup(func() { llmRerank = orig })
+}
+
+func TestBuildTriagePrompt_Stable(t *testing.T) {
+	rows := []map[string]any{
+		{"number": 7, "title": "fix auth", "author": "alice", "risk": "CRITICAL", "score": float64(9.5)},
+		{"number": 3, "title": "tweak docs", "author": "bob", "risk": "LOW", "score": float64(1.0)},
+	}
+	p1 := buildTriagePrompt(rows)
+	p2 := buildTriagePrompt(rows)
+	require.Equal(t, p1, p2, "buildTriagePrompt must be deterministic")
+	require.Contains(t, p1, "PR 7 | risk=CRITICAL score=9.5 | fix auth | by alice")
+	require.Contains(t, p1, "PR 3 | risk=LOW score=1.0 | tweak docs | by bob")
+}
+
+func TestParseTriageRanking_WellFormed(t *testing.T) {
+	resp := "PR 3: docs change, low risk but quick to land\n" +
+		"PR 7 - auth fix, review carefully\n" +
+		"#11 some other thing\n"
+	order, rationales := parseTriageRanking(resp)
+	require.Equal(t, []int{3, 7, 11}, order)
+	require.Equal(t, "docs change, low risk but quick to land", rationales[3])
+	require.Equal(t, "auth fix, review carefully", rationales[7])
+	require.Equal(t, "some other thing", rationales[11])
+}
+
+func TestParseTriageRanking_OrdinalAndBareForms(t *testing.T) {
+	resp := "1. PR 7: highest blast radius\n" +
+		"2) PR 3 - secondary\n" +
+		"42: bare number with rationale\n"
+	order, rationales := parseTriageRanking(resp)
+	require.Equal(t, []int{7, 3, 42}, order, "leading ordinals must not be mistaken for PR numbers")
+	require.Equal(t, "highest blast radius", rationales[7])
+	require.Equal(t, "secondary", rationales[3])
+	require.Equal(t, "bare number with rationale", rationales[42])
+}
+
+func TestParseTriageRanking_GarbageEmpty(t *testing.T) {
+	for _, in := range []string{"", "no numbers here at all", "I cannot rank these.\nSorry!"} {
+		order, rationales := parseTriageRanking(in)
+		require.Empty(t, order, "garbage %q must yield no order", in)
+		require.Empty(t, rationales)
+	}
+}
+
+func TestParseTriageRanking_DropsRepeats(t *testing.T) {
+	order, _ := parseTriageRanking("PR 5: a\nPR 5: duplicate\nPR 8: b\n")
+	require.Equal(t, []int{5, 8}, order, "a repeated number keeps only its first occurrence")
+}
+
+// triageRows builds two supplied PRs (low-risk #1, security-hub #2) plus
+// the files map so triage_prs runs with no forge call.
+func triageRows(t *testing.T, srv *Server, hubFile string) (prsJSON, filesJSON string) {
+	t.Helper()
+	prs := []forge.PR{
+		{Number: 1, Title: "low", Author: "a"},
+		{Number: 2, Title: "high", Author: "b"},
+	}
+	pj, _ := json.Marshal(prs)
+	fj, _ := json.Marshal(map[string][]string{"1": {"pkg/unrelated.go"}, "2": {hubFile}})
+	withSeams(t,
+		func(context.Context, string, forge.ListOpts) ([]forge.PR, error) { t.Fatal("list seam hit"); return nil, nil },
+		func(context.Context, string, int) ([]string, error) { t.Fatal("files seam hit"); return nil, nil },
+	)
+	return string(pj), string(fj)
+}
+
+func TestTriagePRs_LLMRerankReordersAndStampsRationale(t *testing.T) {
+	srv, hubFile := prToolsTestServer(t)
+	prsJSON, filesJSON := triageRows(t, srv, hubFile)
+
+	// The deterministic order ranks the security hub (#2) first. The fake
+	// model flips it: #1 first, with a per-PR rationale.
+	withLLMRerank(t, "PR 1: ship the trivial one first\nPR 2: bigger blast radius, slower review\n", true, nil)
+
+	res := callPRTool(t, srv, "triage_prs", srv.handleTriagePRs, map[string]any{
+		"prs":     prsJSON,
+		"files":   filesJSON,
+		"use_llm": true,
+	})
+	require.False(t, res.IsError, "errored: %v", res)
+
+	var out struct {
+		Total   int  `json:"total"`
+		LLMUsed bool `json:"llm_used"`
+		Ranked  []struct {
+			Number    int    `json:"number"`
+			Rationale string `json:"rationale"`
+		} `json:"ranked"`
+	}
+	unmarshalPRResult(t, res, &out)
+	require.True(t, out.LLMUsed, "llm_used must be true when the model returns a usable ranking")
+	require.Len(t, out.Ranked, 2)
+	require.Equal(t, 1, out.Ranked[0].Number, "LLM order must override deterministic order")
+	require.Equal(t, 2, out.Ranked[1].Number)
+	require.Equal(t, "ship the trivial one first", out.Ranked[0].Rationale)
+	require.Equal(t, "bigger blast radius, slower review", out.Ranked[1].Rationale)
+}
+
+func TestTriagePRs_LLMDisabledFallsBackDeterministic(t *testing.T) {
+	srv, hubFile := prToolsTestServer(t)
+	prsJSON, filesJSON := triageRows(t, srv, hubFile)
+
+	// Service reports unusable (no provider configured).
+	withLLMRerank(t, "", false, nil)
+
+	res := callPRTool(t, srv, "triage_prs", srv.handleTriagePRs, map[string]any{
+		"prs":     prsJSON,
+		"files":   filesJSON,
+		"use_llm": true,
+	})
+	require.False(t, res.IsError)
+
+	var out struct {
+		LLMUsed bool `json:"llm_used"`
+		Ranked  []struct {
+			Number    int    `json:"number"`
+			Rationale string `json:"rationale"`
+		} `json:"ranked"`
+	}
+	unmarshalPRResult(t, res, &out)
+	require.False(t, out.LLMUsed, "a disabled service must fall back with llm_used:false")
+	require.Equal(t, 2, out.Ranked[0].Number, "deterministic order ranks the security hub first")
+	require.Empty(t, out.Ranked[0].Rationale, "no rationale on the fallback path")
+}
+
+func TestTriagePRs_LLMGarbageFallsBackDeterministic(t *testing.T) {
+	srv, hubFile := prToolsTestServer(t)
+	prsJSON, filesJSON := triageRows(t, srv, hubFile)
+
+	// Provider usable, but the response has no parseable PR numbers.
+	withLLMRerank(t, "I am unable to rank these pull requests.", true, nil)
+
+	res := callPRTool(t, srv, "triage_prs", srv.handleTriagePRs, map[string]any{
+		"prs":     prsJSON,
+		"files":   filesJSON,
+		"use_llm": true,
+	})
+	require.False(t, res.IsError)
+
+	var out struct {
+		LLMUsed bool `json:"llm_used"`
+		Ranked  []struct {
+			Number int `json:"number"`
+		} `json:"ranked"`
+	}
+	unmarshalPRResult(t, res, &out)
+	require.False(t, out.LLMUsed, "an unparseable response must fall back with llm_used:false")
+	require.Equal(t, 2, out.Ranked[0].Number, "deterministic order is preserved on fallback")
+}
+
+func TestTriagePRs_UseLLMFalseStaysDeterministic(t *testing.T) {
+	srv, hubFile := prToolsTestServer(t)
+	prsJSON, filesJSON := triageRows(t, srv, hubFile)
+
+	// The seam must not be consulted at all when use_llm is omitted.
+	withLLMRerank(t, "PR 1: should be ignored\nPR 2: ignored\n", true, nil)
+	llmRerank = func(context.Context, *svc.Service, string, int) (string, bool, error) {
+		t.Fatal("llmRerank seam hit with use_llm=false")
+		return "", false, nil
+	}
+
+	res := callPRTool(t, srv, "triage_prs", srv.handleTriagePRs, map[string]any{
+		"prs":   prsJSON,
+		"files": filesJSON,
+	})
+	require.False(t, res.IsError)
+
+	var out struct {
+		LLMUsed bool `json:"llm_used"`
+		Ranked  []struct {
+			Number int `json:"number"`
+		} `json:"ranked"`
+	}
+	unmarshalPRResult(t, res, &out)
+	require.False(t, out.LLMUsed)
+	require.Equal(t, 2, out.Ranked[0].Number)
+}
+
+func TestLLMRankPRs_PreservesDroppedTail(t *testing.T) {
+	rows := []map[string]any{
+		{"number": 1, "title": "a", "author": "x", "risk": "LOW", "score": float64(1)},
+		{"number": 2, "title": "b", "author": "y", "risk": "HIGH", "score": float64(5)},
+		{"number": 3, "title": "c", "author": "z", "risk": "MEDIUM", "score": float64(3)},
+	}
+	withLLMRerank(t, "PR 3: most urgent\nPR 1: then this\n", true, nil)
+	out, used := llmRankPRs(context.Background(), nil, rows, 256)
+	require.True(t, used)
+	require.Len(t, out, 3, "no PR may be dropped from the queue")
+	nums := []int{out[0]["number"].(int), out[1]["number"].(int), out[2]["number"].(int)}
+	require.Equal(t, []int{3, 1, 2}, nums, "model order first, then the deterministic tail (#2)")
+}
+
+func TestLLMRankPRs_InventedNumberIgnored(t *testing.T) {
+	rows := []map[string]any{
+		{"number": 1, "title": "a", "author": "x", "risk": "LOW", "score": float64(1)},
+		{"number": 2, "title": "b", "author": "y", "risk": "HIGH", "score": float64(5)},
+	}
+	// 99 does not exist; it must be skipped, and both real PRs preserved.
+	withLLMRerank(t, "PR 99: hallucinated\nPR 2: real\nPR 1: real\n", true, nil)
+	out, used := llmRankPRs(context.Background(), nil, rows, 256)
+	require.True(t, used)
+	require.Len(t, out, 2)
+	require.Equal(t, []int{2, 1}, []int{out[0]["number"].(int), out[1]["number"].(int)})
 }
