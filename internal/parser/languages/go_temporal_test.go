@@ -200,3 +200,113 @@ func setup(w Worker) {
 	require.Len(t, stubs, 1)
 	require.Len(t, registers, 2)
 }
+
+// --- In-workflow handler declarations (query / signal / update) -----
+//
+// These mirror the Java SDK's @QueryMethod / @SignalMethod /
+// @UpdateMethod annotations: from inside a workflow body the Go SDK
+// declares the named query / signal / update channels the workflow
+// serves. We surface each as a `via=temporal.handler` EdgeCalls edge
+// carrying temporal_kind + temporal_name so the graph records, per
+// workflow, the named handlers it exposes — symmetric with the Java
+// side's per-method annotation edges.
+
+func TestGoTemporal_SetQueryHandler(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context) error {
+	workflow.SetQueryHandler(ctx, "status", func() (string, error) { return "ok", nil })
+	return nil
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.handler")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "query", e.Meta["temporal_kind"])
+	assert.Equal(t, "status", e.Meta["temporal_name"])
+	assert.Equal(t, "pkg/foo.go::OrderWorkflow", e.From,
+		"handler edge must originate from the enclosing workflow function")
+}
+
+func TestGoTemporal_GetSignalChannel(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context) error {
+	ch := workflow.GetSignalChannel(ctx, "cancel")
+	_ = ch
+	return nil
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.handler")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "signal", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "cancel", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_SetUpdateHandler(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context) error {
+	workflow.SetUpdateHandler(ctx, "retry", func() error { return nil })
+	return nil
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.handler")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "update", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "retry", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_SetUpdateHandlerWithOptions(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context) error {
+	workflow.SetUpdateHandlerWithOptions(ctx, "retry", func() error { return nil }, workflow.UpdateHandlerOptions{})
+	return nil
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.handler")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "update", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "retry", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_HandlerNonLiteralNameUndetected(t *testing.T) {
+	// Query / signal / update names are matched by string at runtime;
+	// a non-literal name (variable / selector) can't be pinned here, so
+	// no handler edge is emitted — high-precision, no guessing.
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx workflow.Context, q string) error {
+	workflow.SetQueryHandler(ctx, q, func() (string, error) { return "ok", nil })
+	return nil
+}
+`)
+	assert.Empty(t, temporalEdgesByVia(fix, "temporal.handler"),
+		"non-literal handler name must not be detected")
+}
+
+func TestGoTemporal_HandlerAliasedImportNotDetected(t *testing.T) {
+	// Consistent with the dispatch detector: only the canonical
+	// "workflow" receiver alias is recognised.
+	fix := runGoExtract(t, `package wf
+
+import wf "go.temporal.io/sdk/workflow"
+
+func OrderWorkflow(ctx wf.Context) error {
+	wf.SetQueryHandler(ctx, "status", func() (string, error) { return "ok", nil })
+	return nil
+}
+`)
+	assert.Empty(t, temporalEdgesByVia(fix, "temporal.handler"))
+}

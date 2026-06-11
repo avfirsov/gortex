@@ -201,6 +201,12 @@ type goDeferredCall struct {
 	tempKind  string
 	tempName  string
 	tempLocal bool
+	// tempHandlerKind is "query" / "signal" / "update" when this call
+	// is a `workflow.SetQueryHandler` / `GetSignalChannel` /
+	// `SetUpdateHandler` in-workflow handler declaration; tempName then
+	// carries the handler's string name. `via=temporal.handler` meta is
+	// stamped on the emitted edge in the call post-pass below.
+	tempHandlerKind string
 }
 
 type goDeferredTypeRef struct {
@@ -344,6 +350,13 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				// `w.RegisterActivity(F)` etc.
 				if name := goTemporalRegisterName(expr.Node, src); name != "" {
 					dc.tempKind = "register_" + kind
+					dc.tempName = name
+				}
+			} else if hkind, ok := goTemporalHandlerKind(receiver, method); ok {
+				// Temporal in-workflow handler declaration:
+				// `workflow.SetQueryHandler(ctx, "name", fn)` etc.
+				if name := goTemporalHandlerName(expr.Node, src); name != "" {
+					dc.tempHandlerKind = hkind
 					dc.tempName = name
 				}
 			}
@@ -668,6 +681,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -680,6 +694,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
