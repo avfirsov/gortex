@@ -328,16 +328,18 @@ func (h *gainHistory) toJSON() map[string]any {
 // Calls=0 so the caller can decide whether to render.
 func loadHistory(cacheDir string, since time.Duration) (*gainHistory, error) {
 	path := savings.DefaultDBPath()
-	legacyJSON := savings.DefaultPath()
 	if cacheDir != "" {
 		path = persistence.DefaultSidecarPath(cacheDir)
-		legacyJSON = filepath.Join(cacheDir, "savings.json")
 	}
 	store, err := savings.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	_ = store.ImportLegacy(legacyJSON)
+	// Same rule as `gortex savings`: the legacy import only runs against
+	// the default location — a --cache-dir read must not rename files.
+	if cacheDir == "" {
+		_ = store.ImportLegacy(savings.DefaultPath())
+	}
 	snap, serr := store.Snapshot()
 	if serr != nil {
 		fmt.Fprintf(os.Stderr, "[gortex gain] savings totals read failed: %v\n", serr)

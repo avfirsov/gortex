@@ -87,13 +87,17 @@ type SharedServerConfig struct {
 	// builds the call graph; anything else (default) type-checks.
 	SemanticMode string
 	// SavingsPath overrides the token-savings ledger database; empty
-	// derives <SideStores.NotesDir>/sidecar.sqlite (the same sidecar the
-	// notes/memories managers share), falling back to the machine
-	// default under the data dir. SavingsRepo scopes the accumulated
-	// totals (empty = workspace-global). SavingsLegacyJSON names the
-	// flat-file era's cumulative savings.json to import once — its
-	// sibling .jsonl event log rides along; empty uses the historical
-	// default location under the cache dir.
+	// defaults to the machine-global sidecar under the data dir
+	// (savings.DefaultDBPath() — the same database the `gortex savings`
+	// CLI reads), independent of SideStores: deriving it from a per-mode
+	// side-store dir would split the ledger between writer and reader.
+	// Tests MUST set it (with SavingsLegacyJSON) to temp paths or the
+	// constructor mutates the developer's real ledger. SavingsRepo
+	// scopes the accumulated totals (empty = workspace-global).
+	// SavingsLegacyJSON names the flat-file era's cumulative
+	// savings.json to import once — its sibling .jsonl event log rides
+	// along; empty uses the historical default location under the
+	// cache dir.
 	SavingsPath       string
 	SavingsLegacyJSON string
 	SavingsRepo       string

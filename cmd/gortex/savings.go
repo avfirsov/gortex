@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -43,10 +42,16 @@ database (~/.gortex/sidecar.sqlite); flat-file ledgers from older
 releases (savings.json / savings.jsonl under the cache dir) are imported
 once and renamed *.bak.
 
-Override the ledger location with --cache-dir (uses that directory's
-sidecar.sqlite and imports its legacy files), override pricing by
-exporting GORTEX_MODEL_PRICING_JSON, and pass --verbose for a per-tool
-breakdown inside each bucket.`,
+Percentages are computed over ALL recorded source fetches — including
+uncompressed read_file calls that returned the whole file and saved
+nothing — so the bars reflect how the agent actually reads, not just
+the best cases; per-tool rates live in --verbose.
+
+Override the ledger location with --cache-dir (reads that directory's
+sidecar.sqlite; the one-shot legacy import runs only against the
+default location), override pricing by exporting
+GORTEX_MODEL_PRICING_JSON, and pass --verbose for a per-tool breakdown
+inside each bucket.`,
 	RunE: runSavings,
 }
 
@@ -63,18 +68,21 @@ func init() {
 
 func runSavings(_ *cobra.Command, _ []string) error {
 	dbPath := savings.DefaultDBPath()
-	legacyJSON := savings.DefaultPath()
 	if savingsCacheDir != "" {
 		dbPath = persistence.DefaultSidecarPath(savingsCacheDir)
-		legacyJSON = filepath.Join(savingsCacheDir, "savings.json")
 	}
 
 	store, err := savings.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open savings ledger: %w", err)
 	}
-	if ierr := store.ImportLegacy(legacyJSON); ierr != nil {
-		fmt.Fprintf(os.Stderr, "[gortex savings] legacy import failed: %v\n", ierr)
+	// Legacy flat-file import runs only against the default locations:
+	// pointing the dashboard at a directory with --cache-dir must never
+	// rename files there as a side effect of looking.
+	if savingsCacheDir == "" {
+		if ierr := store.ImportLegacy(savings.DefaultPath()); ierr != nil {
+			fmt.Fprintf(os.Stderr, "[gortex savings] legacy import failed: %v\n", ierr)
+		}
 	}
 
 	if savingsReset {
