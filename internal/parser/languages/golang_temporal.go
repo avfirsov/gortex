@@ -79,6 +79,68 @@ func goTemporalRegisterKind(method string) (kind string, plural bool, ok bool) {
 	return "", false, false
 }
 
+// goTemporalHandlerKind reports whether (receiver, method) names one of
+// the Temporal in-workflow handler-declaration helpers and, if so,
+// returns the canonical kind ("query" / "signal" / "update").
+//
+//	workflow.SetQueryHandler(ctx, "name", fn)
+//	workflow.GetSignalChannel(ctx, "name")
+//	workflow.SetUpdateHandler(ctx, "name", fn)
+//	workflow.SetUpdateHandlerWithOptions(ctx, "name", fn, opts)
+//
+// These mirror the Java SDK's `@QueryMethod` / `@SignalMethod` /
+// `@UpdateMethod` annotations: a workflow declares, from inside its
+// body, the named query / signal / update channels it serves. As with
+// the dispatch helpers we require the receiver text to be exactly the
+// canonical "workflow" alias.
+func goTemporalHandlerKind(receiver, method string) (kind string, ok bool) {
+	if receiver != "workflow" {
+		return "", false
+	}
+	switch method {
+	case "SetQueryHandler":
+		return "query", true
+	case "GetSignalChannel":
+		return "signal", true
+	case "SetUpdateHandler", "SetUpdateHandlerWithOptions":
+		return "update", true
+	}
+	return "", false
+}
+
+// goTemporalHandlerName extracts the query / signal / update name from a
+// handler-declaration call — the second positional argument (after the
+// workflow.Context). Unlike dispatch names we accept ONLY a string
+// literal: handler names are matched by string at runtime, so a
+// non-literal (variable / selector) can't be pinned to a name here and
+// is left undetected, keeping the detector high-precision. Returns ""
+// when the second argument is missing or is not a string literal.
+func goTemporalHandlerName(callNode *sitter.Node, src []byte) string {
+	if callNode == nil || callNode.Type() != "call_expression" {
+		return ""
+	}
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return ""
+	}
+	count := 0
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		c := args.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		count++
+		if count == 2 {
+			switch c.Type() {
+			case "interpreted_string_literal", "raw_string_literal":
+				return goTemporalNameFromExpr(c, src)
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 // goTemporalDispatchName extracts the activity (or child-workflow)
 // name from a `workflow.ExecuteActivity(ctx, X, args...)` call. X is
 // the second positional argument and is either:
@@ -165,6 +227,28 @@ func applyGoTemporalRegisterMeta(edge *graph.Edge, c goDeferredCall) {
 	}
 	edge.Meta["via"] = "temporal.register"
 	edge.Meta["temporal_kind"] = kind
+	edge.Meta["temporal_name"] = c.tempName
+}
+
+// applyGoTemporalHandlerMeta stamps `via=temporal.handler` plus
+// `temporal_kind` (query / signal / update) and `temporal_name` (the
+// handler's string name) onto the EdgeCalls edge derived from a
+// `workflow.SetQueryHandler` / `GetSignalChannel` / `SetUpdateHandler`
+// call. No-op when c.tempHandlerKind / c.tempName are unset.
+//
+// The edge originates from the enclosing workflow function, so the
+// graph records — per workflow — the named query / signal / update
+// handlers it exposes, symmetric with the Java side's per-method
+// `@QueryMethod` / `@SignalMethod` / `@UpdateMethod` annotation edges.
+func applyGoTemporalHandlerMeta(edge *graph.Edge, c goDeferredCall) {
+	if edge == nil || c.tempHandlerKind == "" || c.tempName == "" {
+		return
+	}
+	if edge.Meta == nil {
+		edge.Meta = map[string]any{}
+	}
+	edge.Meta["via"] = "temporal.handler"
+	edge.Meta["temporal_kind"] = c.tempHandlerKind
 	edge.Meta["temporal_name"] = c.tempName
 }
 
