@@ -516,24 +516,9 @@ func parseHunkStart(line, sidePrefix string) (int, bool) {
 
 // rawDiff runs the same context-bearing diff MapGitDiffWithLines uses so the
 // old-side lines can be recovered. Routed through gitcmd (no ad-hoc exec).
+// analysis.GitDiffArgs pins the a/ b/ header prefixes the parsers anchor on.
 func rawDiff(repoRoot, scope, baseRef string) (string, error) {
-	return gitcmd.Output(context.Background(), repoRoot, diffArgs(scope, baseRef)...)
-}
-
-func diffArgs(scope, baseRef string) []string {
-	switch scope {
-	case "staged":
-		return []string{"diff", "--cached", "--unified=3"}
-	case "all":
-		return []string{"diff", "HEAD", "--unified=3"}
-	case "compare":
-		if baseRef == "" {
-			baseRef = "main"
-		}
-		return []string{"diff", baseRef + "...HEAD", "--unified=3"}
-	default:
-		return []string{"diff", "--unified=3"}
-	}
+	return gitcmd.Output(context.Background(), repoRoot, analysis.GitDiffArgs(scope, baseRef, 3)...)
 }
 
 // readFile returns the post-change file content from disk under RepoRoot.

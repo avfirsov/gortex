@@ -136,38 +136,42 @@ func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk) *Dif
 	return result
 }
 
-func buildDiffArgs(scope, baseRef string) []string {
+// GitDiffArgs builds the `git diff` argv for a scope ("unstaged", "staged",
+// "all", "compare") with the given context width. The -c overrides pin the
+// diff header prefixes to git's standard a/ b/ form: parseDiffHunks and
+// parseDiffLines anchor on "+++ b/", which a developer's diff.mnemonicPrefix
+// (c/ w/ headers on worktree-side diffs) or diff.noprefix config would
+// otherwise silently zero out — every hunk drops, every diff-driven tool
+// reports an empty changeset.
+func GitDiffArgs(scope, baseRef string, unified int) []string {
+	args := []string{
+		"-c", "diff.mnemonicPrefix=false",
+		"-c", "diff.noprefix=false",
+		"diff",
+	}
 	switch scope {
 	case "staged":
-		return []string{"diff", "--cached", "--unified=0"}
+		args = append(args, "--cached")
 	case "all":
-		return []string{"diff", "HEAD", "--unified=0"}
+		args = append(args, "HEAD")
 	case "compare":
 		if baseRef == "" {
 			baseRef = "main"
 		}
-		return []string{"diff", baseRef + "...HEAD", "--unified=0"}
-	default: // unstaged
-		return []string{"diff", "--unified=0"}
+		args = append(args, baseRef+"...HEAD")
+	default: // unstaged — bare `git diff`
 	}
+	return append(args, fmt.Sprintf("--unified=%d", unified))
+}
+
+func buildDiffArgs(scope, baseRef string) []string {
+	return GitDiffArgs(scope, baseRef, 0)
 }
 
 // buildDiffArgsWithContext mirrors buildDiffArgs but emits a context window so
 // the new-side line text survives into the hunk body for snippet grounding.
 func buildDiffArgsWithContext(scope, baseRef string) []string {
-	switch scope {
-	case "staged":
-		return []string{"diff", "--cached", "--unified=3"}
-	case "all":
-		return []string{"diff", "HEAD", "--unified=3"}
-	case "compare":
-		if baseRef == "" {
-			baseRef = "main"
-		}
-		return []string{"diff", baseRef + "...HEAD", "--unified=3"}
-	default: // unstaged
-		return []string{"diff", "--unified=3"}
-	}
+	return GitDiffArgs(scope, baseRef, 3)
 }
 
 // HunkLine is a single new-side line carried out of a unified diff: added lines

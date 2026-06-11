@@ -502,19 +502,9 @@ func (s *Server) rawFileDiff(ctx context.Context, repoRoot, scope, baseRef, file
 // siblingDiffArgs mirrors the analysis diff-arg selection but emits a context
 // window (unified=3) so the raw sibling diff carries readable surrounding lines.
 func siblingDiffArgs(scope, baseRef string) []string {
-	switch scope {
-	case "staged":
-		return []string{"diff", "--cached", "--unified=3"}
-	case "all":
-		return []string{"diff", "HEAD", "--unified=3"}
-	case "compare":
-		if baseRef == "" {
-			baseRef = "main"
-		}
-		return []string{"diff", baseRef + "...HEAD", "--unified=3"}
-	default: // unstaged
-		return []string{"diff", "--unified=3"}
-	}
+	// analysis.GitDiffArgs pins the a/ b/ header prefixes the diff parsers
+	// anchor on (diff.mnemonicPrefix / diff.noprefix would zero them out).
+	return analysis.GitDiffArgs(scope, baseRef, 3)
 }
 
 // siblingDiffPayload projects the ranked siblings onto the wire shape.

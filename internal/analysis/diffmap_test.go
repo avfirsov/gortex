@@ -236,6 +236,61 @@ func TestMapGitDiffRepoPrefixJoin(t *testing.T) {
 	}
 }
 
+// TestMapGitDiffMnemonicPrefixConfig pins the diff header prefixes against
+// hostile git config: with diff.mnemonicPrefix=true a worktree diff emits
+// "+++ w/..." headers, which the "+++ b/" parser anchor would zero out —
+// every diff-driven tool would silently report an empty changeset. The -c
+// overrides in GitDiffArgs must win over repo and global config.
+func TestMapGitDiffMnemonicPrefixConfig(t *testing.T) {
+	dir := newTestRepo(t)
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// Hostile repo-local config (newTestRepo sets both to false; flip them).
+	run("config", "diff.mnemonicPrefix", "true")
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID:        "foo.go::Foo",
+		Kind:      graph.KindFunction,
+		Name:      "Foo",
+		FilePath:  "foo.go",
+		StartLine: 3,
+		EndLine:   6,
+		Language:  "go",
+	})
+
+	res, err := MapGitDiff(g, dir, "", "all", "")
+	if err != nil {
+		t.Fatalf("MapGitDiff: %v", err)
+	}
+	if len(res.Hunks) == 0 {
+		t.Fatalf("expected hunks despite diff.mnemonicPrefix=true, got none")
+	}
+	var sawFoo bool
+	for _, cs := range res.ChangedSymbols {
+		if cs.ID == "foo.go::Foo" {
+			sawFoo = true
+		}
+	}
+	if !sawFoo {
+		t.Fatalf("expected Foo among changed symbols: %#v", res.ChangedSymbols)
+	}
+
+	run("config", "diff.noprefix", "true")
+	res, err = MapGitDiff(g, dir, "", "all", "")
+	if err != nil {
+		t.Fatalf("MapGitDiff (noprefix): %v", err)
+	}
+	if len(res.Hunks) == 0 {
+		t.Fatalf("expected hunks despite diff.noprefix=true, got none")
+	}
+}
+
 func TestJoinFileNodes(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
