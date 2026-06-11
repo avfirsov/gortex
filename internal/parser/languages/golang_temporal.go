@@ -156,12 +156,21 @@ func goTemporalHandlerName(callNode *sitter.Node, src []byte) string {
 // can't reduce to a name (e.g. a function literal), or when the call
 // has fewer than two positional arguments.
 func goTemporalDispatchName(callNode *sitter.Node, src []byte) string {
+	return goTemporalNameFromExpr(goTemporalDispatchArg(callNode), src)
+}
+
+// goTemporalDispatchArg returns the second positional argument node of a
+// dispatch call (`workflow.ExecuteActivity(ctx, X, ...)` → X), or nil.
+// Exposed separately from goTemporalDispatchName so the env-default
+// refinement can inspect the argument's shape (a bare identifier is the
+// only case it tries to resolve to a literal default).
+func goTemporalDispatchArg(callNode *sitter.Node) *sitter.Node {
 	if callNode == nil || callNode.Type() != "call_expression" {
-		return ""
+		return nil
 	}
 	args := callNode.ChildByFieldName("arguments")
 	if args == nil {
-		return ""
+		return nil
 	}
 	count := 0
 	for i := 0; i < int(args.NamedChildCount()); i++ {
@@ -171,10 +180,10 @@ func goTemporalDispatchName(callNode *sitter.Node, src []byte) string {
 		}
 		count++
 		if count == 2 {
-			return goTemporalNameFromExpr(c, src)
+			return c
 		}
 	}
-	return ""
+	return nil
 }
 
 // goTemporalRegisterName extracts the registered function name from a
@@ -283,4 +292,169 @@ func goTemporalNameFromExpr(node *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
+}
+
+// goTemporalEnvDefaultName attempts to resolve a bare-identifier dispatch
+// name to the string-literal default of an env-var-with-default
+// assignment in the enclosing function. Returns the default and true for
+// one of these shapes (anchored on a literal os.Getenv / os.LookupEnv
+// read so the value is provably env-sourced):
+//
+//	name := cmp.Or(os.Getenv("KEY"), "Default")   // any call mixing an
+//	                                              // os.Getenv read with a
+//	                                              // string-literal arg
+//	name := os.Getenv("KEY")
+//	if name == "" { name = "Default" }            // (or `name, ok := os.LookupEnv(...)`
+//	                                              //  followed by a literal assign)
+//
+// Intra-procedural and literal-only: only assignments lexically before
+// the dispatch call are considered, and anything that isn't an
+// os.Getenv-anchored literal default returns "", false. This is a
+// deliberately narrow data-flow shortcut, not general constant
+// propagation — see the speculative tier the resolver lands it at.
+func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (string, bool) {
+	body := goEnclosingFuncBody(callNode)
+	if body == nil {
+		return "", false
+	}
+	limit := callNode.StartByte()
+	envDeclSeen := false
+	var result string
+	var found bool
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || found {
+			return
+		}
+		// Only consider assignments lexically before the dispatch call.
+		if (n.Type() == "short_var_declaration" || n.Type() == "assignment_statement") &&
+			n.StartByte() < limit && goAssignHasTarget(n, name, src) {
+			if rhs := goAssignRHSExpr(n); rhs != nil {
+				if rhs.Type() == "call_expression" {
+					if goIsEnvRead(rhs, src) {
+						envDeclSeen = true
+					} else if def, ok := goCallEnvDefaultLiteral(rhs, src); ok {
+						result, found = def, true
+						return
+					}
+				} else if envDeclSeen {
+					if lit, ok := goStringLiteralValue(rhs, src); ok {
+						result, found = lit, true
+						return
+					}
+				}
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+			if found {
+				return
+			}
+		}
+	}
+	walk(body)
+	return result, found
+}
+
+// goEnclosingFuncBody walks up from n to the nearest function-like
+// ancestor and returns its body block, or nil.
+func goEnclosingFuncBody(n *sitter.Node) *sitter.Node {
+	for cur := n; cur != nil; cur = cur.Parent() {
+		switch cur.Type() {
+		case "function_declaration", "method_declaration", "func_literal":
+			return cur.ChildByFieldName("body")
+		}
+	}
+	return nil
+}
+
+// goAssignHasTarget reports whether `name` appears among the left-hand
+// targets of a short_var_declaration / assignment_statement.
+func goAssignHasTarget(assign *sitter.Node, name string, src []byte) bool {
+	left := assign.ChildByFieldName("left")
+	if left == nil {
+		return false
+	}
+	for i := 0; i < int(left.NamedChildCount()); i++ {
+		c := left.NamedChild(i)
+		if c != nil && c.Type() == "identifier" && c.Content(src) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// goAssignRHSExpr returns the first right-hand expression of an
+// assignment (the value for a single-target assign, or the lone call for
+// a multi-return `a, b := f()`), or nil.
+func goAssignRHSExpr(assign *sitter.Node) *sitter.Node {
+	right := assign.ChildByFieldName("right")
+	if right == nil || right.NamedChildCount() == 0 {
+		return nil
+	}
+	return right.NamedChild(0)
+}
+
+// goIsEnvRead reports whether a call_expression is `os.Getenv(...)` or
+// `os.LookupEnv(...)`.
+func goIsEnvRead(call *sitter.Node, src []byte) bool {
+	fn := call.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "selector_expression" {
+		return false
+	}
+	op := fn.ChildByFieldName("operand")
+	field := fn.ChildByFieldName("field")
+	if op == nil || field == nil || op.Content(src) != "os" {
+		return false
+	}
+	switch field.Content(src) {
+	case "Getenv", "LookupEnv":
+		return true
+	}
+	return false
+}
+
+// goCallEnvDefaultLiteral inspects a call's arguments for the
+// env-or-default shape `f(os.Getenv("KEY"), "Default")`: at least one
+// argument is an os.Getenv / os.LookupEnv read AND at least one is a
+// string literal. Returns the last string-literal argument and true on a
+// match.
+func goCallEnvDefaultLiteral(call *sitter.Node, src []byte) (string, bool) {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return "", false
+	}
+	hasEnvRead := false
+	lastLiteral := ""
+	haveLiteral := false
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		c := args.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		if c.Type() == "call_expression" && goIsEnvRead(c, src) {
+			hasEnvRead = true
+			continue
+		}
+		if lit, ok := goStringLiteralValue(c, src); ok {
+			lastLiteral, haveLiteral = lit, true
+		}
+	}
+	if hasEnvRead && haveLiteral {
+		return lastLiteral, true
+	}
+	return "", false
+}
+
+// goStringLiteralValue returns the unquoted value of a Go string literal
+// node, or ("", false) for any other node type.
+func goStringLiteralValue(n *sitter.Node, src []byte) (string, bool) {
+	if n == nil {
+		return "", false
+	}
+	switch n.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		return goTemporalNameFromExpr(n, src), true
+	}
+	return "", false
 }
