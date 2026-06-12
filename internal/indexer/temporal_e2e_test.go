@@ -229,3 +229,57 @@ func StatusWorkflow(ctx workflow.Context) error {
 	assert.Equal(t, "query", handler.Meta["temporal_kind"])
 	assert.Equal(t, "status", handler.Meta["temporal_name"])
 }
+
+// TestTemporalE2E_GoOutboundSignalQuery exercises the consumer side of the
+// signal/query namespaces through the real indexer: a workflow that signals
+// an external workflow and a service that queries a running workflow must
+// surface via=temporal.signal-send / via=temporal.query-call edges carrying
+// the signal/query name (the 4th positional string literal).
+func TestTemporalE2E_GoOutboundSignalQuery(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "orchestrator.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func Orchestrator(ctx workflow.Context) error {
+	return workflow.SignalExternalWorkflow(ctx, "order-123", "", "cancel-request", nil).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "service.go"), `package wf
+
+type Client interface {
+	QueryWorkflow(ctx any, wid, rid, queryType string, args ...any) (any, error)
+}
+
+func CheckStatus(ctx any, c Client) {
+	c.QueryWorkflow(ctx, "order-123", "", "get-status")
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	findOut := func(fnName, via string) *graph.Edge {
+		fn := g.FindNodesByName(fnName)
+		require.NotEmpty(t, fn, "function %s must be indexed", fnName)
+		for _, e := range g.GetOutEdges(fn[0].ID) {
+			if e != nil && e.Meta != nil && e.Meta["via"] == via {
+				return e
+			}
+		}
+		return nil
+	}
+
+	sig := findOut("Orchestrator", "temporal.signal-send")
+	require.NotNil(t, sig, "Orchestrator must have an outbound temporal.signal-send edge")
+	assert.Equal(t, "signal", sig.Meta["temporal_kind"])
+	assert.Equal(t, "cancel-request", sig.Meta["temporal_name"])
+
+	qry := findOut("CheckStatus", "temporal.query-call")
+	require.NotNil(t, qry, "CheckStatus must have an outbound temporal.query-call edge")
+	assert.Equal(t, "query", qry.Meta["temporal_kind"])
+	assert.Equal(t, "get-status", qry.Meta["temporal_name"])
+}
