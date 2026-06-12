@@ -1,0 +1,16 @@
+=== home/.openclaw/openclaw.json ===
+{
+  "mcp": {
+    "servers": {
+      "gortex": {
+        "args": [
+          "mcp"
+        ],
+        "command": "gortex",
+        "env": {
+          "GORTEX_INDEX_WORKERS": "8"
+        }
+      }
+    }
+  }
+}

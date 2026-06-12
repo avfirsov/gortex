@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# gortex-impact — blast radius analysis via eval-server
+# Usage: gortex-impact <symbol_ids>
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+
+symbol_ids="${1:-}"
+
+if [ -z "$symbol_ids" ]; then
+    echo "Usage: gortex-impact <symbol_ids>"
+    echo "Analyze the blast radius of changing one or more symbols."
+    echo "Pass comma-separated symbol IDs for multiple symbols."
+    echo ""
+    echo "Examples:"
+    echo '  gortex-impact "internal/auth/service.go::ValidateToken"'
+    echo '  gortex-impact "api/handler.go::HandleRequest,internal/auth/service.go::ValidateToken"'
+    exit 1
+fi
+
+payload=$(printf '{"symbol_ids":"%s"}' "$symbol_ids")
+
+# Try eval-server (fast path)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/tool/explain_change_impact" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    if command -v jq &>/dev/null; then
+        echo "=== Change Impact: $symbol_ids ==="
+        echo ""
+        echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif type == "object" and .error then
+                "Error: \(.error)"
+            else
+                tostring
+            end
+        ' 2>/dev/null || echo "$response"
+    else
+        echo "=== Change Impact: $symbol_ids ==="
+        echo ""
+        echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+    fi
+else
+    # Fallback: gortex CLI
+    echo "Error: Gortex eval-server not running on port $GORTEX_EVAL_PORT. Start it with: gortex eval-server --index /testbed" >&2
+    if false; then
+        gortex impact --symbols "$symbol_ids" 2>&1
+    else
+        echo "Error: Gortex tools temporarily unavailable (no eval-server, no CLI)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "--- Next steps ---"
+echo "  gortex-usages \"<symbol_id>\"     — find all references to update after your change"
+echo "  gortex-context \"<fix task>\"      — get full context and edit plan for the fix"
+echo "  gortex-overview                   — check overall graph stats and health"

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# gortex-context — smart context via eval-server
+# Usage: gortex-context <task_description> [entry_point] [max_symbols]
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+
+task="${1:-}"
+entry_point="${2:-}"
+max_symbols="${3:-5}"
+
+if [ -z "$task" ]; then
+    echo "Usage: gortex-context <task_description> [entry_point] [max_symbols]"
+    echo "Get compact context for a task: relevant files, symbols, relationships."
+    echo ""
+    echo "Examples:"
+    echo '  gortex-context "fix authentication timeout bug"'
+    echo '  gortex-context "add rate limiting" "api/handler.go::HandleRequest"'
+    echo '  gortex-context "refactor database layer" "" 10'
+    exit 1
+fi
+
+# Build JSON payload
+payload="{\"task\":\"$task\",\"max_symbols\":$max_symbols"
+[ -n "$entry_point" ] && payload="$payload,\"entry_point\":\"$entry_point\""
+payload="$payload}"
+
+# Try eval-server (fast path)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/tool/smart_context" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    if command -v jq &>/dev/null; then
+        echo "=== Smart Context: $task ==="
+        echo ""
+        # Extract the text content from the MCP response, then parse the inner
+        # JSON and produce a compact summary — dropping source code to save tokens.
+        echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif type == "object" and .error then
+                "Error: \(.error)"
+            else
+                tostring
+            end
+        ' 2>/dev/null | jq -r '
+            # Parse the smart_context JSON blob and produce compact output.
+            if type != "object" then . else
+
+            # Files to edit
+            (if .files_to_edit then
+                "Files to edit:\n" + (.files_to_edit | map("  " + .) | join("\n"))
+            else empty end),
+
+            # Relevant symbols (compact: signature only, no source)
+            (if .relevant_symbols then
+                "\nRelevant symbols:\n" + (
+                    .relevant_symbols | map(
+                        "  " + .kind + " " + .name + " " + .file_path + ":" + (.start_line // 0 | tostring)
+                        + (if .signature then " — " + .signature else "" end)
+                    ) | join("\n")
+                )
+            else empty end),
+
+            # Callers
+            (if .callers then
+                "\nCallers:\n" + (.callers | map("  " + .) | join("\n"))
+            else empty end),
+
+            # Callees
+            (if .callees then
+                "\nCallees:\n" + (.callees | map("  " + .) | join("\n"))
+            else empty end),
+
+            # Related test files
+            (if .related_test_files and (.related_test_files | length) > 0 then
+                "\nTest files:\n" + (.related_test_files | map("  " + .) | join("\n"))
+            else empty end),
+
+            # Cross-repo deps (compact)
+            (if .cross_repo_dependencies then
+                "\nCross-repo deps:\n" + (
+                    .cross_repo_dependencies | map(
+                        "  " + .edge_kind + " " + .name + " (" + .repo_prefix + ")"
+                    ) | join("\n")
+                )
+            else empty end),
+
+            # Keywords used
+            (if .keywords then
+                "\nKeywords: " + (.keywords | join(", "))
+            else empty end)
+
+            end
+        ' 2>/dev/null || {
+            # If inner jq parse fails (non-JSON text), just print the raw text
+            echo "$response" | jq -r '
+                if .content then
+                    .content[] | select(.type == "text") | .text
+                else tostring end
+            ' 2>/dev/null || echo "$response"
+        }
+    else
+        echo "=== Smart Context: $task ==="
+        echo ""
+        echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+    fi
+else
+    # Fallback: gortex CLI
+    echo "Error: Gortex eval-server not running on port $GORTEX_EVAL_PORT. Start it with: gortex eval-server --index /testbed" >&2
+    if false; then
+        gortex smart-context --task "$task" ${entry_point:+--entry-point "$entry_point"} --max-symbols "$max_symbols" 2>&1
+    else
+        echo "Error: Gortex tools temporarily unavailable (no eval-server, no CLI)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "--- Next steps ---"
+echo "  gortex-search \"<pattern>\"     — search for more symbols related to the task"
+echo "  gortex-impact \"<symbol_id>\"   — check blast radius before making changes"
+echo "  gortex-usages \"<symbol_id>\"   — find all callers of a symbol you plan to modify"

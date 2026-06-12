@@ -1,0 +1,3652 @@
+// Package storetest provides a conformance test suite that every
+// graph.Store implementation MUST pass. Each backend (in-memory,
+// bbolt-on-disk, SQLite-on-disk, remote-network-client) has a thin
+// _test.go that calls RunConformance(t, factory) and inherits the
+// full battery.
+//
+// The contract this package encodes is the union of behaviour the
+// rest of gortex depends on from *graph.Graph today. New Store
+// implementations are expected to satisfy every test before they can
+// be considered a drop-in replacement.
+package storetest
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// Factory constructs a fresh, empty Store. RunConformance calls it
+// many times across subtests; each invocation must yield an
+// independent store with no leakage from previous runs. Backends with
+// on-disk state should use t.TempDir() internally to isolate.
+type Factory func(t *testing.T) graph.Store
+
+// RunConformance runs the full conformance suite against the Store
+// produced by factory. Backends invoke it from a _test.go in their
+// own package.
+func RunConformance(t *testing.T, factory Factory) {
+	t.Helper()
+	t.Run("AddGetNode", func(t *testing.T) { testAddGetNode(t, factory) })
+	t.Run("AddGetEdge", func(t *testing.T) { testAddGetEdge(t, factory) })
+	t.Run("AddNodeIdempotent", func(t *testing.T) { testAddNodeIdempotent(t, factory) })
+	t.Run("AddEdgeIdempotent", func(t *testing.T) { testAddEdgeIdempotent(t, factory) })
+	t.Run("AddEdgeLineDisambiguates", func(t *testing.T) { testAddEdgeLineDisambiguates(t, factory) })
+	t.Run("AddBatch", func(t *testing.T) { testAddBatch(t, factory) })
+	t.Run("RemoveEdge", func(t *testing.T) { testRemoveEdge(t, factory) })
+	t.Run("EvictFile", func(t *testing.T) { testEvictFile(t, factory) })
+	t.Run("EvictFile_NoNodes", func(t *testing.T) { testEvictFileNoNodes(t, factory) })
+	t.Run("EvictRepo", func(t *testing.T) { testEvictRepo(t, factory) })
+	t.Run("EvictRepo_NoNodes", func(t *testing.T) { testEvictRepoNoNodes(t, factory) })
+	t.Run("NodeAndEdgeCount", func(t *testing.T) { testNodeAndEdgeCount(t, factory) })
+	t.Run("AllNodesAndEdges", func(t *testing.T) { testAllNodesAndEdges(t, factory) })
+	t.Run("FindNodesByName", func(t *testing.T) { testFindNodesByName(t, factory) })
+	t.Run("FindNodesByNameInRepo", func(t *testing.T) { testFindNodesByNameInRepo(t, factory) })
+	t.Run("FindNodesByNameContaining", func(t *testing.T) { testFindNodesByNameContaining(t, factory) })
+	t.Run("GetFileNodes", func(t *testing.T) { testGetFileNodes(t, factory) })
+	t.Run("GetRepoNodes", func(t *testing.T) { testGetRepoNodes(t, factory) })
+	t.Run("GetRepoEdges", func(t *testing.T) { testGetRepoEdges(t, factory) })
+	t.Run("GetNodeByQualName", func(t *testing.T) { testGetNodeByQualName(t, factory) })
+	t.Run("Stats", func(t *testing.T) { testStats(t, factory) })
+	t.Run("RepoStats", func(t *testing.T) { testRepoStats(t, factory) })
+	t.Run("RepoPrefixes", func(t *testing.T) { testRepoPrefixes(t, factory) })
+	t.Run("SetEdgeProvenance", func(t *testing.T) { testSetEdgeProvenance(t, factory) })
+	t.Run("SetEdgeProvenanceBatch", func(t *testing.T) { testSetEdgeProvenanceBatch(t, factory) })
+	t.Run("ReindexEdge", func(t *testing.T) { testReindexEdge(t, factory) })
+	t.Run("ReindexEdges", func(t *testing.T) { testReindexEdges(t, factory) })
+	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
+	t.Run("EdgeIdentityRevisions", func(t *testing.T) { testEdgeIdentityRevisions(t, factory) })
+	t.Run("VerifyEdgeIdentities", func(t *testing.T) { testVerifyEdgeIdentities(t, factory) })
+	t.Run("RepoMemoryEstimate", func(t *testing.T) { testRepoMemoryEstimate(t, factory) })
+	t.Run("AllRepoMemoryEstimates", func(t *testing.T) { testAllRepoMemoryEstimates(t, factory) })
+	t.Run("MetaPreserved", func(t *testing.T) { testMetaPreserved(t, factory) })
+	t.Run("EmptyStore", func(t *testing.T) { testEmptyStore(t, factory) })
+	t.Run("EdgesByKind", func(t *testing.T) { testEdgesByKind(t, factory) })
+	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
+	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
+	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
+	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
+	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
+	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })
+	t.Run("DeadCodeCandidator", func(t *testing.T) { testDeadCodeCandidator(t, factory) })
+	t.Run("IfaceImplementsScanner", func(t *testing.T) { testIfaceImplementsScanner(t, factory) })
+	t.Run("NodeDegreeAggregator", func(t *testing.T) { testNodeDegreeAggregator(t, factory) })
+	t.Run("NodeFanAggregator", func(t *testing.T) { testNodeFanAggregator(t, factory) })
+	t.Run("FileImporters", func(t *testing.T) { testFileImporters(t, factory) })
+	t.Run("InEdgeCounter", func(t *testing.T) { testInEdgeCounter(t, factory) })
+	t.Run("NodesInFilesByKindFinder", func(t *testing.T) { testNodesInFilesByKindFinder(t, factory) })
+	t.Run("EdgesByKindsScanner", func(t *testing.T) { testEdgesByKindsScanner(t, factory) })
+	t.Run("NodesByKindsScanner", func(t *testing.T) { testNodesByKindsScanner(t, factory) })
+	t.Run("EdgeKindCounter", func(t *testing.T) { testEdgeKindCounter(t, factory) })
+	t.Run("CrossRepoEdgeAggregator", func(t *testing.T) { testCrossRepoEdgeAggregator(t, factory) })
+	t.Run("FileImportAggregator", func(t *testing.T) { testFileImportAggregator(t, factory) })
+	t.Run("InDegreeForNodes", func(t *testing.T) { testInDegreeForNodes(t, factory) })
+	t.Run("ReachableForwardByKinds", func(t *testing.T) { testReachableForwardByKinds(t, factory) })
+	t.Run("ThrowerErrorSurfacer", func(t *testing.T) { testThrowerErrorSurfacer(t, factory) })
+	t.Run("EdgeAdjacencyForKinds", func(t *testing.T) { testEdgeAdjacencyForKinds(t, factory) })
+	t.Run("CommunityCrossingsByKind", func(t *testing.T) { testCommunityCrossingsByKind(t, factory) })
+	t.Run("NodeIDsByKinds", func(t *testing.T) { testNodeIDsByKinds(t, factory) })
+	t.Run("MemberMethodsByType", func(t *testing.T) { testMemberMethodsByType(t, factory) })
+	t.Run("StructuralParentEdges", func(t *testing.T) { testStructuralParentEdges(t, factory) })
+	t.Run("CrossRepoCandidates", func(t *testing.T) { testCrossRepoCandidates(t, factory) })
+	t.Run("ExtractCandidates", func(t *testing.T) { testExtractCandidates(t, factory) })
+	t.Run("FileSymbolNamesByPaths", func(t *testing.T) { testFileSymbolNamesByPaths(t, factory) })
+	t.Run("ClassHierarchyTraverser", func(t *testing.T) { testClassHierarchyTraverser(t, factory) })
+	t.Run("FileEditingContext", func(t *testing.T) { testFileEditingContext(t, factory) })
+	t.Run("NodeDegreeByKinds", func(t *testing.T) { testNodeDegreeByKinds(t, factory) })
+	t.Run("CloneShingleSidecar", func(t *testing.T) { testCloneShingleSidecar(t, factory) })
+	t.Run("ChurnEnrichmentSidecar", func(t *testing.T) { testChurnEnrichmentSidecar(t, factory) })
+	t.Run("CoverageEnrichmentSidecar", func(t *testing.T) { testCoverageEnrichmentSidecar(t, factory) })
+	t.Run("ReleaseEnrichmentSidecar", func(t *testing.T) { testReleaseEnrichmentSidecar(t, factory) })
+	t.Run("BlameEnrichmentSidecar", func(t *testing.T) { testBlameEnrichmentSidecar(t, factory) })
+}
+
+// -- fixture helpers ---------------------------------------------------
+
+func mkNode(id, name, file string, kind graph.NodeKind) *graph.Node {
+	return &graph.Node{
+		ID:        id,
+		Kind:      kind,
+		Name:      name,
+		FilePath:  file,
+		StartLine: 1,
+		EndLine:   10,
+		Language:  "go",
+	}
+}
+
+func mkRepoNode(id, name, file, repo string, kind graph.NodeKind) *graph.Node {
+	n := mkNode(id, name, file, kind)
+	n.RepoPrefix = repo
+	return n
+}
+
+func mkEdge(from, to string, kind graph.EdgeKind) *graph.Edge {
+	return &graph.Edge{
+		From: from, To: to, Kind: kind,
+		FilePath: "test.go", Line: 1,
+		Confidence: 1.0,
+		Origin:     graph.OriginASTResolved,
+	}
+}
+
+func sortNodeIDs(nodes []*graph.Node) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			ids = append(ids, n.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func sortEdgeKeys(edges []*graph.Edge) []string {
+	keys := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if e != nil {
+			keys = append(keys, fmt.Sprintf("%s|%s|%s|%d", e.From, e.To, e.Kind, e.Line))
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// -- individual subtests ----------------------------------------------
+
+func testAddGetNode(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n := mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction)
+	s.AddNode(n)
+	got := s.GetNode("a.go::Foo")
+	if got == nil {
+		t.Fatalf("GetNode returned nil for inserted node")
+		return
+	}
+	if got.Name != "Foo" || got.FilePath != "a.go" || got.Kind != graph.KindFunction {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	if s.GetNode("missing") != nil {
+		t.Fatalf("GetNode should return nil for missing key")
+	}
+}
+
+func testAddGetEdge(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeCalls))
+
+	out := s.GetOutEdges("a")
+	if len(out) != 1 || out[0].To != "b" {
+		t.Fatalf("GetOutEdges(a) = %+v, want one edge to b", out)
+	}
+	in := s.GetInEdges("b")
+	if len(in) != 1 || in[0].From != "a" {
+		t.Fatalf("GetInEdges(b) = %+v, want one edge from a", in)
+	}
+}
+
+func testAddNodeIdempotent(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n := mkNode("dup", "Dup", "x.go", graph.KindFunction)
+	s.AddNode(n)
+	s.AddNode(n)
+	s.AddNode(n)
+	if s.NodeCount() != 1 {
+		t.Fatalf("NodeCount after 3x add = %d, want 1", s.NodeCount())
+	}
+}
+
+func testAddEdgeIdempotent(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	e := mkEdge("a", "b", graph.EdgeCalls)
+	s.AddEdge(e)
+	s.AddEdge(e)
+	s.AddEdge(e)
+	if got := len(s.GetOutEdges("a")); got != 1 {
+		t.Fatalf("OutEdges after 3x add = %d, want 1", got)
+	}
+}
+
+func testAddEdgeLineDisambiguates(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "b", graph.EdgeCalls)
+	e2.Line = 5
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	if got := len(s.GetOutEdges("a")); got != 2 {
+		t.Fatalf("OutEdges with different lines = %d, want 2", got)
+	}
+}
+
+func testAddBatch(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	nodes := []*graph.Node{
+		mkNode("a", "A", "x.go", graph.KindFunction),
+		mkNode("b", "B", "x.go", graph.KindFunction),
+		mkNode("c", "C", "y.go", graph.KindType),
+	}
+	edges := []*graph.Edge{
+		mkEdge("a", "b", graph.EdgeCalls),
+		mkEdge("b", "c", graph.EdgeReferences),
+	}
+	s.AddBatch(nodes, edges)
+	if s.NodeCount() != 3 {
+		t.Fatalf("NodeCount after AddBatch = %d, want 3", s.NodeCount())
+	}
+	if s.EdgeCount() != 2 {
+		t.Fatalf("EdgeCount after AddBatch = %d, want 2", s.EdgeCount())
+	}
+}
+
+func testRemoveEdge(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	e := mkEdge("a", "b", graph.EdgeCalls)
+	s.AddEdge(e)
+	if !s.RemoveEdge("a", "b", graph.EdgeCalls) {
+		t.Fatalf("RemoveEdge returned false for existing edge")
+	}
+	if len(s.GetOutEdges("a")) != 0 {
+		t.Fatalf("OutEdges after RemoveEdge = nonzero")
+	}
+	if len(s.GetInEdges("b")) != 0 {
+		t.Fatalf("InEdges after RemoveEdge = nonzero")
+	}
+	// Removing non-existent should report false but not panic.
+	if s.RemoveEdge("a", "b", graph.EdgeCalls) {
+		t.Fatalf("RemoveEdge returned true for missing edge")
+	}
+}
+
+func testEvictFile(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("a.go::Bar", "Bar", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Baz", "Baz", "b.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a.go::Foo", "a.go::Bar", graph.EdgeCalls))
+	s.AddEdge(mkEdge("a.go::Bar", "b.go::Baz", graph.EdgeCalls))
+
+	nodesRemoved, edgesRemoved := s.EvictFile("a.go")
+	if nodesRemoved != 2 {
+		t.Fatalf("EvictFile nodesRemoved = %d, want 2", nodesRemoved)
+	}
+	if edgesRemoved == 0 {
+		t.Fatalf("EvictFile edgesRemoved should be > 0")
+	}
+	if s.GetNode("a.go::Foo") != nil {
+		t.Fatalf("evicted node still present")
+	}
+	if s.GetNode("b.go::Baz") == nil {
+		t.Fatalf("unrelated node was evicted")
+	}
+}
+
+func testEvictFileNoNodes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n, e := s.EvictFile("nonexistent.go")
+	if n != 0 || e != 0 {
+		t.Fatalf("EvictFile on empty file returned (%d, %d), want (0, 0)", n, e)
+	}
+}
+
+func testEvictRepo(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r1/b.go::Bar", "Bar", "r1/b.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+	s.AddEdge(mkEdge("r1/a.go::Foo", "r1/b.go::Bar", graph.EdgeCalls))
+
+	nodesRemoved, edgesRemoved := s.EvictRepo("r1")
+	if nodesRemoved != 2 {
+		t.Fatalf("EvictRepo nodesRemoved = %d, want 2", nodesRemoved)
+	}
+	if edgesRemoved == 0 {
+		t.Fatalf("EvictRepo edgesRemoved should be > 0")
+	}
+	if s.GetNode("r1/a.go::Foo") != nil {
+		t.Fatalf("r1 node still present")
+	}
+	if s.GetNode("r2/x.go::Baz") == nil {
+		t.Fatalf("r2 node was evicted")
+	}
+}
+
+func testEvictRepoNoNodes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n, e := s.EvictRepo("nonexistent-repo")
+	if n != 0 || e != 0 {
+		t.Fatalf("EvictRepo on missing repo returned (%d, %d), want (0, 0)", n, e)
+	}
+}
+
+func testNodeAndEdgeCount(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	if s.NodeCount() != 0 || s.EdgeCount() != 0 {
+		t.Fatalf("empty store reports nonzero counts")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeCalls))
+	if s.NodeCount() != 2 {
+		t.Fatalf("NodeCount = %d, want 2", s.NodeCount())
+	}
+	if s.EdgeCount() != 1 {
+		t.Fatalf("EdgeCount = %d, want 1", s.EdgeCount())
+	}
+}
+
+func testAllNodesAndEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "y.go", graph.KindType))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))
+
+	gotN := sortNodeIDs(s.AllNodes())
+	wantN := []string{"a", "b"}
+	if fmt.Sprint(gotN) != fmt.Sprint(wantN) {
+		t.Fatalf("AllNodes = %v, want %v", gotN, wantN)
+	}
+	gotE := sortEdgeKeys(s.AllEdges())
+	if len(gotE) != 1 {
+		t.Fatalf("AllEdges = %v, want one entry", gotE)
+	}
+}
+
+func testFindNodesByName(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Foo", "Foo", "b.go", graph.KindFunction))
+	s.AddNode(mkNode("c.go::Bar", "Bar", "c.go", graph.KindFunction))
+	got := sortNodeIDs(s.FindNodesByName("Foo"))
+	want := []string{"a.go::Foo", "b.go::Foo"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("FindNodesByName(Foo) = %v, want %v", got, want)
+	}
+	if len(s.FindNodesByName("MissingName")) != 0 {
+		t.Fatalf("FindNodesByName for missing name should be empty")
+	}
+}
+
+func testFindNodesByNameInRepo(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/a.go::Foo", "Foo", "r2/a.go", "r2", graph.KindFunction))
+	got := sortNodeIDs(s.FindNodesByNameInRepo("Foo", "r1"))
+	want := []string{"r1/a.go::Foo"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("FindNodesByNameInRepo(Foo, r1) = %v, want %v", got, want)
+	}
+}
+
+func testFindNodesByNameContaining(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	// Three "log"-containing names + one unrelated.
+	s.AddNode(mkNode("a.go::Login", "Login", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::LoginHandler", "LoginHandler", "b.go", graph.KindFunction))
+	s.AddNode(mkNode("c.go::Logout", "Logout", "c.go", graph.KindFunction))
+	s.AddNode(mkNode("d.go::Unrelated", "Unrelated", "d.go", graph.KindFunction))
+
+	// Case-insensitive substring match should return exactly the 3
+	// "log"-bearing nodes.
+	got := sortNodeIDs(s.FindNodesByNameContaining("log", 10))
+	want := []string{"a.go::Login", "b.go::LoginHandler", "c.go::Logout"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("FindNodesByNameContaining(log, 10) = %v, want %v", got, want)
+	}
+
+	// Mixed-case query — must still match (case-insensitive).
+	gotUpper := sortNodeIDs(s.FindNodesByNameContaining("LOG", 10))
+	if fmt.Sprint(gotUpper) != fmt.Sprint(want) {
+		t.Fatalf("FindNodesByNameContaining(LOG, 10) = %v, want %v", gotUpper, want)
+	}
+
+	// Limit is honoured. Asking for 2 must return at most 2.
+	gotLimited := s.FindNodesByNameContaining("log", 2)
+	if len(gotLimited) != 2 {
+		t.Fatalf("FindNodesByNameContaining(log, 2) returned %d, want 2", len(gotLimited))
+	}
+
+	// Empty needle returns nothing — never the whole graph.
+	if got := s.FindNodesByNameContaining("", 10); len(got) != 0 {
+		t.Fatalf("FindNodesByNameContaining(\"\") returned %d, want 0", len(got))
+	}
+
+	// No match — empty slice.
+	if got := s.FindNodesByNameContaining("nonexistent_substring_xyz", 10); len(got) != 0 {
+		t.Fatalf("FindNodesByNameContaining(no-match) returned %d, want 0", len(got))
+	}
+}
+
+func testGetFileNodes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("a.go::Bar", "Bar", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Baz", "Baz", "b.go", graph.KindFunction))
+	got := sortNodeIDs(s.GetFileNodes("a.go"))
+	want := []string{"a.go::Bar", "a.go::Foo"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("GetFileNodes(a.go) = %v, want %v", got, want)
+	}
+}
+
+func testGetRepoNodes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r1/b.go::Bar", "Bar", "r1/b.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+	got := sortNodeIDs(s.GetRepoNodes("r1"))
+	want := []string{"r1/a.go::Foo", "r1/b.go::Bar"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("GetRepoNodes(r1) = %v, want %v", got, want)
+	}
+}
+
+// testGetRepoEdges asserts that GetRepoEdges returns every edge whose
+// SOURCE node carries the requested RepoPrefix, regardless of where
+// the target lives — same-repo intra edges, cross-repo edges (source
+// in r1 → target in r2), AND unresolved::* targets all count. Edges
+// whose source is in a different repo (or unscoped) MUST NOT appear.
+// Empty prefix returns nil so callers don't accidentally fall through
+// to a full-graph scan.
+func testGetRepoEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	// r1 has two nodes that originate outgoing edges; r2 has a target
+	// node and one of its own source nodes.
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r1/b.go::Bar", "Bar", "r1/b.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/y.go::Qux", "Qux", "r2/y.go", "r2", graph.KindFunction))
+
+	// r1-intra (Foo → Bar) — same repo.
+	s.AddEdge(mkEdge("r1/a.go::Foo", "r1/b.go::Bar", graph.EdgeCalls))
+	// r1 → r2 cross-repo (Foo → Baz).
+	s.AddEdge(mkEdge("r1/a.go::Foo", "r2/x.go::Baz", graph.EdgeCalls))
+	// r1 → unresolved (Bar → unresolved::Missing) — counts because
+	// source is in r1.
+	s.AddEdge(mkEdge("r1/b.go::Bar", "unresolved::Missing", graph.EdgeCalls))
+	// r2-intra (Qux → Baz) — MUST NOT appear in r1's slice.
+	s.AddEdge(mkEdge("r2/y.go::Qux", "r2/x.go::Baz", graph.EdgeCalls))
+	// r2 → r1 cross-repo (Qux → Foo) — MUST NOT appear in r1's slice
+	// because the source is in r2.
+	s.AddEdge(mkEdge("r2/y.go::Qux", "r1/a.go::Foo", graph.EdgeCalls))
+
+	gotR1 := sortEdgeKeys(s.GetRepoEdges("r1"))
+	wantR1 := sortEdgeKeys([]*graph.Edge{
+		mkEdge("r1/a.go::Foo", "r1/b.go::Bar", graph.EdgeCalls),
+		mkEdge("r1/a.go::Foo", "r2/x.go::Baz", graph.EdgeCalls),
+		mkEdge("r1/b.go::Bar", "unresolved::Missing", graph.EdgeCalls),
+	})
+	if fmt.Sprint(gotR1) != fmt.Sprint(wantR1) {
+		t.Fatalf("GetRepoEdges(r1) =\n  %v\nwant\n  %v", gotR1, wantR1)
+	}
+
+	gotR2 := sortEdgeKeys(s.GetRepoEdges("r2"))
+	wantR2 := sortEdgeKeys([]*graph.Edge{
+		mkEdge("r2/y.go::Qux", "r2/x.go::Baz", graph.EdgeCalls),
+		mkEdge("r2/y.go::Qux", "r1/a.go::Foo", graph.EdgeCalls),
+	})
+	if fmt.Sprint(gotR2) != fmt.Sprint(wantR2) {
+		t.Fatalf("GetRepoEdges(r2) =\n  %v\nwant\n  %v", gotR2, wantR2)
+	}
+
+	// Empty prefix MUST return nothing (use AllEdges for the global
+	// view). Disk backends must not fall through to a full scan.
+	if got := s.GetRepoEdges(""); len(got) != 0 {
+		t.Fatalf("GetRepoEdges(\"\") = %d edges, want 0", len(got))
+	}
+
+	// Unknown prefix MUST return empty (no panic, no fallthrough).
+	if got := s.GetRepoEdges("nope"); len(got) != 0 {
+		t.Fatalf("GetRepoEdges(nope) = %d edges, want 0", len(got))
+	}
+}
+
+func testGetNodeByQualName(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n := mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction)
+	n.QualName = "pkg.Foo"
+	s.AddNode(n)
+	got := s.GetNodeByQualName("pkg.Foo")
+	if got == nil || got.ID != "a.go::Foo" {
+		t.Fatalf("GetNodeByQualName(pkg.Foo) = %v, want a.go::Foo", got)
+	}
+	if s.GetNodeByQualName("missing.Qual") != nil {
+		t.Fatalf("GetNodeByQualName missing should be nil")
+	}
+}
+
+func testStats(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "y.go", graph.KindType))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))
+	st := s.Stats()
+	if st.TotalNodes != 2 || st.TotalEdges != 1 {
+		t.Fatalf("Stats = %+v, want TotalNodes=2, TotalEdges=1", st)
+	}
+	if st.ByKind[string(graph.KindFunction)] != 1 || st.ByKind[string(graph.KindType)] != 1 {
+		t.Fatalf("Stats.ByKind = %v, want one each", st.ByKind)
+	}
+}
+
+func testRepoStats(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindType))
+	st := s.RepoStats()
+	if len(st) != 2 {
+		t.Fatalf("RepoStats has %d entries, want 2", len(st))
+	}
+	if st["r1"].TotalNodes != 1 {
+		t.Fatalf("RepoStats[r1].TotalNodes = %d, want 1", st["r1"].TotalNodes)
+	}
+}
+
+func testRepoPrefixes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindType))
+	got := s.RepoPrefixes()
+	sort.Strings(got)
+	want := []string{"r1", "r2"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("RepoPrefixes = %v, want %v", got, want)
+	}
+}
+
+func testSetEdgeProvenance(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	e := mkEdge("a", "b", graph.EdgeCalls)
+	e.Origin = graph.OriginTextMatched
+	s.AddEdge(e)
+
+	bumped := s.SetEdgeProvenance(e, graph.OriginLSPResolved)
+	if !bumped {
+		t.Fatalf("SetEdgeProvenance returned false for real upgrade")
+	}
+	out := s.GetOutEdges("a")
+	if len(out) != 1 || out[0].Origin != graph.OriginLSPResolved {
+		t.Fatalf("Origin did not propagate: %+v", out)
+	}
+}
+
+func testReindexEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	// Build a small graph with three out-edges from "a" pointing at
+	// three different targets, then re-bind all three to a fourth
+	// target in one batched call.
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("d", "D", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("z", "Z", "x.go", graph.KindFunction))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "c", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("a", "d", graph.EdgeCalls)
+	e3.Line = 3
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+
+	// Mutate each edge's To, then hand the batch over. After the
+	// call, all three edges must show as in-edges of z; none of the
+	// originals must remain.
+	e1.To, e2.To, e3.To = "z", "z", "z"
+	s.ReindexEdges([]graph.EdgeReindex{
+		{Edge: e1, OldTo: "b"},
+		{Edge: e2, OldTo: "c"},
+		{Edge: e3, OldTo: "d"},
+	})
+
+	for _, oldID := range []string{"b", "c", "d"} {
+		if got := len(s.GetInEdges(oldID)); got != 0 {
+			t.Fatalf("GetInEdges(%q) after batch reindex = %d, want 0", oldID, got)
+		}
+	}
+	if got := len(s.GetInEdges("z")); got != 3 {
+		t.Fatalf("GetInEdges(z) after batch reindex = %d, want 3", got)
+	}
+	if got := len(s.GetOutEdges("a")); got != 3 {
+		t.Fatalf("GetOutEdges(a) after batch reindex = %d, want 3", got)
+	}
+
+	// Empty batch is a no-op.
+	s.ReindexEdges(nil)
+	s.ReindexEdges([]graph.EdgeReindex{})
+}
+
+func testSetEdgeProvenanceBatch(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e1.Origin = graph.OriginTextMatched
+	e2 := mkEdge("a", "b", graph.EdgeCalls)
+	e2.Line = 2
+	e2.Origin = graph.OriginTextMatched
+	e3 := mkEdge("a", "b", graph.EdgeCalls)
+	e3.Line = 3
+	e3.Origin = graph.OriginLSPResolved // already at target tier — should be no-op
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+
+	changed := s.SetEdgeProvenanceBatch([]graph.EdgeProvenanceUpdate{
+		{Edge: e1, NewOrigin: graph.OriginLSPResolved},
+		{Edge: e2, NewOrigin: graph.OriginLSPResolved},
+		{Edge: e3, NewOrigin: graph.OriginLSPResolved},
+	})
+	if changed != 2 {
+		t.Fatalf("SetEdgeProvenanceBatch reported %d changed, want 2 (one was already at target tier)", changed)
+	}
+	// Verify both promotions landed in the persisted edges.
+	out := s.GetOutEdges("a")
+	if len(out) != 3 {
+		t.Fatalf("GetOutEdges(a) = %d, want 3", len(out))
+	}
+	for _, e := range out {
+		if e.Origin != graph.OriginLSPResolved {
+			t.Fatalf("edge %s->%s Origin = %q, want lsp_resolved", e.From, e.To, e.Origin)
+		}
+	}
+
+	// Empty batch is a no-op and returns 0.
+	if got := s.SetEdgeProvenanceBatch(nil); got != 0 {
+		t.Fatalf("empty batch returned %d, want 0", got)
+	}
+	if got := s.SetEdgeProvenanceBatch([]graph.EdgeProvenanceUpdate{}); got != 0 {
+		t.Fatalf("empty batch returned %d, want 0", got)
+	}
+}
+
+func testReindexEdge(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("old", "Old", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("new", "New", "x.go", graph.KindFunction))
+	e := mkEdge("a", "old", graph.EdgeCalls)
+	s.AddEdge(e)
+
+	e.To = "new"
+	s.ReindexEdge(e, "old")
+
+	if got := len(s.GetInEdges("old")); got != 0 {
+		t.Fatalf("InEdges(old) after reindex = %d, want 0", got)
+	}
+	in := s.GetInEdges("new")
+	if len(in) != 1 || in[0].From != "a" {
+		t.Fatalf("InEdges(new) = %+v, want one edge from a", in)
+	}
+}
+
+func testConcurrency(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	const workers = 8
+	const perWorker = 50
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range perWorker {
+				id := fmt.Sprintf("w%d/n%d", w, i)
+				s.AddNode(mkNode(id, fmt.Sprintf("N%d", i), fmt.Sprintf("f%d.go", w), graph.KindFunction))
+			}
+		}(w)
+	}
+	wg.Wait()
+	if got, want := s.NodeCount(), workers*perWorker; got != want {
+		t.Fatalf("concurrent NodeCount = %d, want %d", got, want)
+	}
+}
+
+func testEdgeIdentityRevisions(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	// Just ensure the method exists and returns a non-negative int.
+	// The semantic invariant ("bumps on origin change") is
+	// implementation-defined; backends may return 0 if they don't
+	// track this.
+	if got := s.EdgeIdentityRevisions(); got < 0 {
+		t.Fatalf("EdgeIdentityRevisions negative: %d", got)
+	}
+}
+
+func testVerifyEdgeIdentities(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeCalls))
+	if err := s.VerifyEdgeIdentities(); err != nil {
+		t.Fatalf("VerifyEdgeIdentities on consistent store: %v", err)
+	}
+}
+
+func testRepoMemoryEstimate(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	// Backends may return zero (disk/remote) or a real estimate
+	// (in-memory). The contract is that the call succeeds and
+	// NodeCount matches what we inserted.
+	est := s.RepoMemoryEstimate("r1")
+	if est.NodeCount != 1 {
+		t.Fatalf("RepoMemoryEstimate NodeCount = %d, want 1", est.NodeCount)
+	}
+}
+
+func testAllRepoMemoryEstimates(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkRepoNode("r1/a.go::Foo", "Foo", "r1/a.go", "r1", graph.KindFunction))
+	s.AddNode(mkRepoNode("r2/x.go::Baz", "Baz", "r2/x.go", "r2", graph.KindFunction))
+	all := s.AllRepoMemoryEstimates()
+	if len(all) != 2 {
+		t.Fatalf("AllRepoMemoryEstimates len = %d, want 2", len(all))
+	}
+}
+
+func testMetaPreserved(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	n := mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction)
+	n.Meta = map[string]any{
+		"signature":  "func Foo(x int) error",
+		"visibility": "public",
+	}
+	s.AddNode(n)
+	got := s.GetNode("a.go::Foo")
+	if got == nil {
+		t.Fatalf("GetNode returned nil")
+		return
+	}
+	if got.Meta == nil {
+		t.Fatalf("Meta not preserved")
+	}
+	if got.Meta["signature"] != "func Foo(x int) error" {
+		t.Fatalf("Meta[signature] = %v", got.Meta["signature"])
+	}
+	if got.Meta["visibility"] != "public" {
+		t.Fatalf("Meta[visibility] = %v", got.Meta["visibility"])
+	}
+}
+
+func testEdgesByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindType))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "b", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("a", "c", graph.EdgeReferences)
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+
+	var calls []*graph.Edge
+	for e := range s.EdgesByKind(graph.EdgeCalls) {
+		calls = append(calls, e)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("EdgesByKind(EdgeCalls) yielded %d, want 2", len(calls))
+	}
+	for _, e := range calls {
+		if e.Kind != graph.EdgeCalls {
+			t.Fatalf("yielded edge has wrong kind: %s", e.Kind)
+		}
+	}
+
+	var refs []*graph.Edge
+	for e := range s.EdgesByKind(graph.EdgeReferences) {
+		refs = append(refs, e)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("EdgesByKind(EdgeReferences) yielded %d, want 1", len(refs))
+	}
+
+	// Unknown kind yields nothing.
+	count := 0
+	for range s.EdgesByKind(graph.EdgeKind("nonexistent")) {
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("EdgesByKind(nonexistent) yielded %d, want 0", count)
+	}
+
+	// Early stop honours the contract.
+	stopped := 0
+	for range s.EdgesByKind(graph.EdgeCalls) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testNodesByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindType))
+
+	var fns []*graph.Node
+	for n := range s.NodesByKind(graph.KindFunction) {
+		fns = append(fns, n)
+	}
+	if len(fns) != 2 {
+		t.Fatalf("NodesByKind(KindFunction) yielded %d, want 2", len(fns))
+	}
+	for _, n := range fns {
+		if n.Kind != graph.KindFunction {
+			t.Fatalf("yielded node has wrong kind: %s", n.Kind)
+		}
+	}
+
+	var types []*graph.Node
+	for n := range s.NodesByKind(graph.KindType) {
+		types = append(types, n)
+	}
+	if len(types) != 1 {
+		t.Fatalf("NodesByKind(KindType) yielded %d, want 1", len(types))
+	}
+
+	// Early stop honours the contract.
+	stopped := 0
+	for range s.NodesByKind(graph.KindFunction) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testEdgesWithUnresolvedTarget(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+
+	e1 := mkEdge("a", "b", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("a", "unresolved::Foo", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("a", "unresolved::Bar", graph.EdgeCalls)
+	e3.Line = 3
+	e4 := mkEdge("a", "resolved", graph.EdgeCalls)
+	e4.Line = 4
+	// Multi-repo COPY rewrite form: copyBulkLocked rewrites a bare
+	// `unresolved::<name>` stub to `<repoPrefix>::unresolved::<name>`
+	// so per-repo stubs can't collide on the COPY primary key. The
+	// pending-edge scan MUST yield this form too, or the Go resolver
+	// never gets a second pass at multi-repo stubs (the whole-repo
+	// "every function looks dead" bug). graph.IsUnresolvedTarget is
+	// the canonical matcher for both encodings.
+	e5 := mkEdge("a", "gortex::unresolved::Baz", graph.EdgeCalls)
+	e5.Line = 5
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+	s.AddEdge(e5)
+
+	var unres []*graph.Edge
+	for e := range s.EdgesWithUnresolvedTarget() {
+		unres = append(unres, e)
+	}
+	if len(unres) != 3 {
+		t.Fatalf("EdgesWithUnresolvedTarget yielded %d, want 3 (unresolved::Foo, unresolved::Bar, gortex::unresolved::Baz)", len(unres))
+	}
+	gotPrefixed := false
+	for _, e := range unres {
+		if !graph.IsUnresolvedTarget(e.To) {
+			t.Fatalf("yielded edge has non-unresolved To: %s", e.To)
+		}
+		if e.To == "gortex::unresolved::Baz" {
+			gotPrefixed = true
+		}
+	}
+	if !gotPrefixed {
+		t.Fatalf("EdgesWithUnresolvedTarget did not yield the multi-repo prefixed stub gortex::unresolved::Baz")
+	}
+}
+
+func testEmptyStore(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	if s.NodeCount() != 0 {
+		t.Fatalf("empty NodeCount = %d, want 0", s.NodeCount())
+	}
+	if s.EdgeCount() != 0 {
+		t.Fatalf("empty EdgeCount = %d, want 0", s.EdgeCount())
+	}
+	if len(s.AllNodes()) != 0 {
+		t.Fatalf("empty AllNodes nonzero")
+	}
+	if len(s.AllEdges()) != 0 {
+		t.Fatalf("empty AllEdges nonzero")
+	}
+	if len(s.RepoPrefixes()) != 0 {
+		t.Fatalf("empty RepoPrefixes nonzero")
+	}
+}
+
+func testGetNodesByIDs(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("a.go::Bar", "Bar", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Baz", "Baz", "b.go", graph.KindType))
+
+	got := s.GetNodesByIDs([]string{"a.go::Foo", "b.go::Baz", "missing", "a.go::Bar", "a.go::Foo"})
+	if len(got) != 3 {
+		t.Fatalf("GetNodesByIDs len = %d, want 3 (3 present, 1 missing, 1 duplicate)", len(got))
+	}
+	if got["a.go::Foo"] == nil || got["a.go::Foo"].Name != "Foo" {
+		t.Fatalf("missing or wrong Foo: %v", got["a.go::Foo"])
+	}
+	if got["b.go::Baz"] == nil || got["b.go::Baz"].Kind != graph.KindType {
+		t.Fatalf("missing or wrong Baz: %v", got["b.go::Baz"])
+	}
+	if _, present := got["missing"]; present {
+		t.Fatalf("missing ID should not be in map, got %v", got["missing"])
+	}
+
+	// Empty / nil input is a no-op.
+	if got := s.GetNodesByIDs(nil); len(got) != 0 {
+		t.Fatalf("nil input returned %d entries", len(got))
+	}
+	if got := s.GetNodesByIDs([]string{}); len(got) != 0 {
+		t.Fatalf("empty input returned %d entries", len(got))
+	}
+	if got := s.GetNodesByIDs([]string{""}); len(got) != 0 {
+		t.Fatalf("empty-string ID returned %d entries", len(got))
+	}
+}
+
+func testFindNodesByNames(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("b.go::Foo", "Foo", "b.go", graph.KindFunction))
+	s.AddNode(mkNode("c.go::Bar", "Bar", "c.go", graph.KindFunction))
+
+	got := s.FindNodesByNames([]string{"Foo", "Missing", "Bar", "Foo"})
+	if len(got) != 2 {
+		t.Fatalf("FindNodesByNames len = %d, want 2 (2 present, 1 missing, 1 duplicate)", len(got))
+	}
+	foos := got["Foo"]
+	if len(foos) != 2 {
+		t.Fatalf("Foo matches = %d, want 2", len(foos))
+	}
+	for _, n := range foos {
+		if n.Name != "Foo" {
+			t.Fatalf("matched node has wrong Name: %s", n.Name)
+		}
+	}
+	bars := got["Bar"]
+	if len(bars) != 1 || bars[0].Name != "Bar" {
+		t.Fatalf("Bar matches wrong: %v", bars)
+	}
+	if _, present := got["Missing"]; present {
+		t.Fatalf("missing name should not be in map")
+	}
+
+	// Empty / nil input.
+	if got := s.FindNodesByNames(nil); len(got) != 0 {
+		t.Fatalf("nil input returned %d entries", len(got))
+	}
+	if got := s.FindNodesByNames([]string{}); len(got) != 0 {
+		t.Fatalf("empty input returned %d entries", len(got))
+	}
+}
+
+// testGetEdgesByNodeIDs covers the batched fan-in / fan-out edge
+// lookups. Builds a small graph with mixed fan-in/out, calls both
+// methods with a mix of present and missing ids (plus an empty
+// string), and asserts the per-id slices match what GetInEdges /
+// GetOutEdges would return individually.
+func testGetEdgesByNodeIDs(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	// Nodes
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("d", "D", "y.go", graph.KindFunction))
+	// Edges: a→b, a→c, b→c, d→c (so c has 3 in-edges, a has 2 out-edges).
+	s.AddEdge(mkEdge("a", "b", graph.EdgeCalls))
+	s.AddEdge(mkEdge("a", "c", graph.EdgeCalls))
+	s.AddEdge(mkEdge("b", "c", graph.EdgeCalls))
+	s.AddEdge(mkEdge("d", "c", graph.EdgeReferences))
+
+	// --- GetOutEdgesByNodeIDs ---
+	outMap := s.GetOutEdgesByNodeIDs([]string{"a", "b", "d", "missing", "a"})
+	// a has 2 out-edges (a→b, a→c).
+	if got := sortEdgeKeys(outMap["a"]); len(got) != 2 {
+		t.Fatalf("GetOutEdgesByNodeIDs[a] = %v, want 2 edges", got)
+	}
+	// b has 1 out-edge (b→c).
+	if got := outMap["b"]; len(got) != 1 || got[0].To != "c" {
+		t.Fatalf("GetOutEdgesByNodeIDs[b] = %v, want one edge to c", got)
+	}
+	// d has 1 out-edge (d→c).
+	if got := outMap["d"]; len(got) != 1 || got[0].To != "c" {
+		t.Fatalf("GetOutEdgesByNodeIDs[d] = %v, want one edge to c", got)
+	}
+	// missing key — range over nil is a no-op, so callers can index
+	// without an ok-check.
+	if got := outMap["missing"]; len(got) != 0 {
+		t.Fatalf("GetOutEdgesByNodeIDs[missing] = %v, want empty", got)
+	}
+
+	// --- GetInEdgesByNodeIDs ---
+	inMap := s.GetInEdgesByNodeIDs([]string{"a", "b", "c", "missing"})
+	// a has 0 in-edges.
+	if got := inMap["a"]; len(got) != 0 {
+		t.Fatalf("GetInEdgesByNodeIDs[a] = %v, want empty", got)
+	}
+	// b has 1 in-edge (a→b).
+	if got := inMap["b"]; len(got) != 1 || got[0].From != "a" {
+		t.Fatalf("GetInEdgesByNodeIDs[b] = %v, want one edge from a", got)
+	}
+	// c has 3 in-edges (a→c, b→c, d→c).
+	if got := inMap["c"]; len(got) != 3 {
+		t.Fatalf("GetInEdgesByNodeIDs[c] = %v, want 3 edges", got)
+	}
+	froms := map[string]bool{}
+	for _, e := range inMap["c"] {
+		froms[e.From] = true
+	}
+	for _, want := range []string{"a", "b", "d"} {
+		if !froms[want] {
+			t.Fatalf("GetInEdgesByNodeIDs[c] missing edge from %q", want)
+		}
+	}
+	if got := inMap["missing"]; len(got) != 0 {
+		t.Fatalf("GetInEdgesByNodeIDs[missing] = %v, want empty", got)
+	}
+
+	// Empty / nil / empty-string inputs are no-ops.
+	if got := s.GetOutEdgesByNodeIDs(nil); len(got) != 0 {
+		t.Fatalf("GetOutEdgesByNodeIDs(nil) returned %d entries", len(got))
+	}
+	if got := s.GetInEdgesByNodeIDs(nil); len(got) != 0 {
+		t.Fatalf("GetInEdgesByNodeIDs(nil) returned %d entries", len(got))
+	}
+	if got := s.GetOutEdgesByNodeIDs([]string{}); len(got) != 0 {
+		t.Fatalf("GetOutEdgesByNodeIDs([]) returned %d entries", len(got))
+	}
+	if got := s.GetInEdgesByNodeIDs([]string{""}); len(got) != 0 {
+		t.Fatalf("GetInEdgesByNodeIDs([\"\"]) returned %d entries", len(got))
+	}
+}
+
+// testSymbolBundleSearcher exercises the optional
+// graph.SymbolBundleSearcher capability. The interface is opt-in
+// (today only the disk backend implements it; the in-memory
+// *Graph deliberately leaves it unimplemented so the engine's
+// fallback path stays exercised) — backends without the capability
+// skip the subtest cleanly.
+//
+// Coverage:
+//   - SymbolSearcher.BulkUpsertSymbolFTS + BuildSymbolIndex must be
+//     called first so the FTS index is populated.
+//   - SearchSymbolBundles returns a bundle per matched id with the
+//     correct in/out edges attached.
+//   - Empty / no-match query returns an empty bundle slice.
+func testSymbolBundleSearcher(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	bs, ok := s.(graph.SymbolBundleSearcher)
+	if !ok {
+		t.Skip("backend does not implement graph.SymbolBundleSearcher")
+	}
+	ss, ok := s.(graph.SymbolSearcher)
+	if !ok {
+		t.Skip("backend implements SymbolBundleSearcher but not SymbolSearcher — cannot populate FTS")
+	}
+
+	// Build a small graph: A → B → C, plus an unrelated isolated D.
+	// FTS-searchable name tokens that should land on the same hit.
+	s.AddNode(mkNode("a", "AlphaWidget", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "BetaWidget", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "GammaWidget", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("d", "Delta", "y.go", graph.KindFunction))
+	s.AddEdge(mkEdge("a", "b", graph.EdgeCalls))
+	s.AddEdge(mkEdge("b", "c", graph.EdgeCalls))
+	s.AddEdge(mkEdge("a", "c", graph.EdgeCalls))
+
+	// Populate the FTS sidecar — every searchable node carries its
+	// tokenised name as the FTS text.
+	items := []graph.SymbolFTSItem{
+		{NodeID: "a", Tokens: "alpha widget"},
+		{NodeID: "b", Tokens: "beta widget"},
+		{NodeID: "c", Tokens: "gamma widget"},
+		{NodeID: "d", Tokens: "delta"},
+	}
+	if err := ss.BulkUpsertSymbolFTS("", items); err != nil {
+		t.Fatalf("BulkUpsertSymbolFTS: %v", err)
+	}
+	if err := ss.BuildSymbolIndex(); err != nil {
+		t.Fatalf("BuildSymbolIndex: %v", err)
+	}
+
+	// Querying for "widget" should match a/b/c and not d. Each bundle
+	// must carry the correct in/out edges off the graph.
+	bundles, err := bs.SearchSymbolBundles("widget", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbolBundles: %v", err)
+	}
+	if len(bundles) == 0 {
+		t.Fatalf("SearchSymbolBundles returned no bundles — expected matches for a/b/c")
+	}
+	gotIDs := make(map[string]graph.SymbolBundle, len(bundles))
+	for _, b := range bundles {
+		if b.Node == nil {
+			t.Fatalf("bundle has nil node: %+v", b)
+			continue
+		}
+		gotIDs[b.Node.ID] = b
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if _, ok := gotIDs[want]; !ok {
+			t.Fatalf("missing bundle for id %q; got ids=%v", want, idsOf(bundles))
+		}
+	}
+	if _, ok := gotIDs["d"]; ok {
+		t.Fatalf("unexpected bundle for id %q (no 'widget' token in its FTS row)", "d")
+	}
+
+	// Edge verification: per-bundle in/out edges must match the
+	// in-memory truth surfaced via the existing GetIn/Out edges.
+	for id, b := range gotIDs {
+		wantOut := s.GetOutEdges(id)
+		if !edgeSlicesMatch(wantOut, b.OutEdges) {
+			t.Fatalf("bundle[%s].OutEdges mismatch: want=%v got=%v", id, edgeKeys(wantOut), edgeKeys(b.OutEdges))
+		}
+		wantIn := s.GetInEdges(id)
+		if !edgeSlicesMatch(wantIn, b.InEdges) {
+			t.Fatalf("bundle[%s].InEdges mismatch: want=%v got=%v", id, edgeKeys(wantIn), edgeKeys(b.InEdges))
+		}
+	}
+
+	// Empty query is a clean no-op.
+	if empty, err := bs.SearchSymbolBundles("", 10); err != nil || len(empty) != 0 {
+		t.Fatalf("SearchSymbolBundles(\"\"): err=%v len=%d, want empty", err, len(empty))
+	}
+	// No-match query — backend MAY return nil or empty slice; both
+	// are valid.
+	if no, err := bs.SearchSymbolBundles("nomatchforanything", 10); err != nil {
+		t.Fatalf("SearchSymbolBundles(nomatch): err=%v", err)
+	} else if len(no) != 0 {
+		t.Fatalf("SearchSymbolBundles(nomatch) returned %d bundles, want 0", len(no))
+	}
+}
+
+// idsOf is a small helper for the bundle assertions above.
+func idsOf(bs []graph.SymbolBundle) []string {
+	out := make([]string, 0, len(bs))
+	for _, b := range bs {
+		if b.Node != nil {
+			out = append(out, b.Node.ID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// edgeSlicesMatch reports whether two edge slices contain the same
+// (from, to, kind) tuples regardless of order. Used by the bundle
+// assertions to ignore back-end-imposed ordering differences.
+func edgeSlicesMatch(want, got []*graph.Edge) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	wantKeys := edgeKeys(want)
+	gotKeys := edgeKeys(got)
+	sort.Strings(wantKeys)
+	sort.Strings(gotKeys)
+	for i := range wantKeys {
+		if wantKeys[i] != gotKeys[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// edgeKeys flattens a slice of edges into deterministic (from→to:kind)
+// strings for ordered diffing.
+func edgeKeys(es []*graph.Edge) []string {
+	out := make([]string, 0, len(es))
+	for _, e := range es {
+		if e == nil {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s->%s:%s", e.From, e.To, e.Kind))
+	}
+	return out
+}
+
+// testDeadCodeCandidator exercises the optional
+// graph.DeadCodeCandidator capability. Builds a small graph with
+// nodes that fall into each filter case the analyzer cares about:
+//
+//   - zero in-edges (dead).
+//   - in-edges of disallowed kind only (dead).
+//   - in-edges of allowed kind (alive).
+//   - mixed kinds across the candidate set (per-row allowlist must apply).
+//
+// The in-memory *graph.Graph implements this; the disk backend overrides
+// with a server-side query. Both must return the same candidate set.
+func testDeadCodeCandidator(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	dc, ok := s.(graph.DeadCodeCandidator)
+	if !ok {
+		t.Skip("backend does not implement graph.DeadCodeCandidator")
+	}
+
+	// Functions: AliveFunc (called), DeadFunc (no in-edges),
+	// ReadOnlyFunc (only EdgeReads — disallowed for KindFunction).
+	s.AddNode(mkNode("AliveFunc", "AliveFunc", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("DeadFunc", "DeadFunc", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("ReadOnlyFunc", "ReadOnlyFunc", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Caller", "Caller", "a.go", graph.KindFunction))
+	// Types: AliveType (referenced), DeadType (no in-edges).
+	s.AddNode(mkNode("AliveType", "AliveType", "b.go", graph.KindType))
+	s.AddNode(mkNode("DeadType", "DeadType", "b.go", graph.KindType))
+	// Methods: AliveMethod (called), DeadMethod (no in-edges).
+	s.AddNode(mkNode("AliveMethod", "AliveMethod", "c.go", graph.KindMethod))
+	s.AddNode(mkNode("DeadMethod", "DeadMethod", "c.go", graph.KindMethod))
+
+	// Edges that exercise the per-kind allowlist.
+	e1 := mkEdge("Caller", "AliveFunc", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("Caller", "ReadOnlyFunc", graph.EdgeReads)
+	e2.Line = 2
+	e3 := mkEdge("Caller", "AliveMethod", graph.EdgeCalls)
+	e3.Line = 3
+	e4 := mkEdge("Caller", "AliveType", graph.EdgeReferences)
+	e4.Line = 4
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+
+	// Per-kind allowlist mirrors analysis.incomingUsageKinds for the
+	// three kinds under test. Functions are alive on Calls/References;
+	// methods on Calls/Implements; types on References/Instantiates.
+	allowedKinds := []graph.NodeKind{
+		graph.KindFunction,
+		graph.KindMethod,
+		graph.KindType,
+	}
+	allowedInEdges := map[graph.NodeKind][]graph.EdgeKind{
+		graph.KindFunction: {graph.EdgeCalls, graph.EdgeReferences},
+		graph.KindMethod:   {graph.EdgeCalls, graph.EdgeImplements},
+		graph.KindType:     {graph.EdgeReferences, graph.EdgeInstantiates},
+	}
+
+	got := dc.DeadCodeCandidates(allowedKinds, allowedInEdges)
+	gotIDs := sortNodeIDs(got)
+	// Caller has zero in-edges of any kind, so it surfaces too — the
+	// analyzer's per-kind allowlist would also flag it as a candidate
+	// here. The backend's job is just the candidate set; post-filters
+	// (exported / test / entry-point) run in Go.
+	want := []string{"Caller", "DeadFunc", "DeadMethod", "DeadType", "ReadOnlyFunc"}
+	if fmt.Sprint(gotIDs) != fmt.Sprint(want) {
+		t.Fatalf("DeadCodeCandidates = %v\nwant %v", gotIDs, want)
+	}
+
+	// Empty kind list returns nothing — never the whole graph.
+	if got := dc.DeadCodeCandidates(nil, allowedInEdges); len(got) != 0 {
+		t.Fatalf("DeadCodeCandidates(nil) = %d, want 0", len(got))
+	}
+
+	// Empty per-kind allowlist means "any incoming edge counts as
+	// usage" — AliveFunc and ReadOnlyFunc (both have *some* in-edge)
+	// drop out; only DeadFunc + Caller remain among functions.
+	anyKind := map[graph.NodeKind][]graph.EdgeKind{
+		graph.KindFunction: nil,
+	}
+	gotAny := dc.DeadCodeCandidates([]graph.NodeKind{graph.KindFunction}, anyKind)
+	gotAnyIDs := sortNodeIDs(gotAny)
+	wantAny := []string{"Caller", "DeadFunc"}
+	if fmt.Sprint(gotAnyIDs) != fmt.Sprint(wantAny) {
+		t.Fatalf("DeadCodeCandidates(any-kind) = %v\nwant %v", gotAnyIDs, wantAny)
+	}
+}
+
+// testIfaceImplementsScanner exercises the optional
+// graph.IfaceImplementsScanner capability. Seeds two interfaces (one
+// with methods Meta, one without) plus a type that implements each;
+// the row set must include only the (type, iface) tuple whose target
+// has a Meta["methods"] payload — the no-meta interface drops out.
+func testIfaceImplementsScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scanner, ok := s.(graph.IfaceImplementsScanner)
+	if !ok {
+		t.Skip("backend does not implement graph.IfaceImplementsScanner")
+	}
+
+	// Interface with required methods.
+	ifaceA := mkNode("iface_A", "Reader", "a.go", graph.KindInterface)
+	ifaceA.Meta = map[string]any{"methods": []string{"Read", "Close"}}
+	s.AddNode(ifaceA)
+	// Interface with no Meta — must not appear in the row set.
+	ifaceB := mkNode("iface_B", "Empty", "a.go", graph.KindInterface)
+	s.AddNode(ifaceB)
+	// Implementing type for each.
+	s.AddNode(mkNode("type_A", "ReaderImpl", "a.go", graph.KindType))
+	s.AddNode(mkNode("type_B", "EmptyImpl", "a.go", graph.KindType))
+	s.AddEdge(mkEdge("type_A", "iface_A", graph.EdgeImplements))
+	s.AddEdge(mkEdge("type_B", "iface_B", graph.EdgeImplements))
+
+	rows := scanner.IfaceImplementsRows()
+	if len(rows) != 1 {
+		t.Fatalf("IfaceImplementsRows len = %d, want 1 (iface_B has no Meta)", len(rows))
+	}
+	r := rows[0]
+	if r.TypeID != "type_A" || r.IfaceID != "iface_A" {
+		t.Fatalf("row = %+v, want type_A → iface_A", r)
+	}
+	if r.IfaceMeta == nil {
+		t.Fatalf("IfaceMeta is nil")
+	}
+	raw, ok := r.IfaceMeta["methods"]
+	if !ok {
+		t.Fatalf("IfaceMeta missing methods key: %+v", r.IfaceMeta)
+	}
+	// Meta encoding round-trips lists differently between backends
+	// (in-memory keeps []string; gob-encoded comes back as []any).
+	// Accept either.
+	var methods []string
+	switch v := raw.(type) {
+	case []string:
+		methods = v
+	case []any:
+		for _, m := range v {
+			if str, ok := m.(string); ok {
+				methods = append(methods, str)
+			}
+		}
+	default:
+		t.Fatalf("unexpected methods type %T: %v", raw, raw)
+	}
+	sort.Strings(methods)
+	if fmt.Sprint(methods) != fmt.Sprint([]string{"Close", "Read"}) {
+		t.Fatalf("methods = %v, want [Close Read]", methods)
+	}
+}
+
+// testNodeDegreeAggregator exercises the optional
+// graph.NodeDegreeAggregator capability. Builds a small graph with
+// nodes that cover every classification branch
+// graph.GraphConnectivity / graph.ClassifyZeroEdge care about:
+//
+//   - isolated (zero edges).
+//   - leaf (exactly one edge in either direction).
+//   - usage-edge in-bound only (alive — at least one EdgeCalls in).
+//   - non-usage-edge in-bound only (no EdgeCalls / EdgeReferences /
+//     etc — counts as "likely unused").
+//   - usage-edge mixed with non-usage in-edges (still alive).
+//   - unknown id (must be elided).
+func testNodeDegreeAggregator(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	dc, ok := s.(graph.NodeDegreeAggregator)
+	if !ok {
+		t.Skip("backend does not implement graph.NodeDegreeAggregator")
+	}
+
+	s.AddNode(mkNode("Isolated", "Isolated", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("LeafSink", "LeafSink", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("LeafSource", "LeafSource", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Alive", "Alive", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("StructuralOnly", "StructuralOnly", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Mixed", "Mixed", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Caller", "Caller", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("FileNode", "FileNode", "a.go", graph.KindFile))
+
+	// One incoming call into LeafSink → leaf (in_count=1, out_count=0).
+	e1 := mkEdge("Caller", "LeafSink", graph.EdgeCalls)
+	e1.Line = 1
+	s.AddEdge(e1)
+	// One outgoing reference from LeafSource → leaf (in=0, out=1).
+	e2 := mkEdge("LeafSource", "Caller", graph.EdgeReferences)
+	e2.Line = 2
+	s.AddEdge(e2)
+	// Alive: incoming call → alive (in=1 usage).
+	e3 := mkEdge("Caller", "Alive", graph.EdgeCalls)
+	e3.Line = 3
+	s.AddEdge(e3)
+	// StructuralOnly: incoming EdgeDefines (NOT a usage kind) →
+	// classified as "likely unused" but not isolated.
+	e4 := mkEdge("FileNode", "StructuralOnly", graph.EdgeDefines)
+	e4.Line = 4
+	s.AddEdge(e4)
+	// Mixed: incoming EdgeDefines (non-usage) + incoming EdgeCalls
+	// (usage). UsageInCount must reflect ONLY the usage edge.
+	e5 := mkEdge("FileNode", "Mixed", graph.EdgeDefines)
+	e5.Line = 5
+	s.AddEdge(e5)
+	e6 := mkEdge("Caller", "Mixed", graph.EdgeCalls)
+	e6.Line = 6
+	s.AddEdge(e6)
+
+	ids := []string{
+		"Isolated",
+		"LeafSink",
+		"LeafSource",
+		"Alive",
+		"StructuralOnly",
+		"Mixed",
+		"unknown::id",
+	}
+	usage := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	rows := dc.NodeDegreeCounts(ids, usage)
+
+	byID := make(map[string]graph.NodeDegreeRow, len(rows))
+	for _, r := range rows {
+		byID[r.NodeID] = r
+	}
+	// Unknown id MUST be elided.
+	if _, ok := byID["unknown::id"]; ok {
+		t.Fatalf("NodeDegreeCounts must elide unknown ids, got row")
+	}
+
+	type want struct{ in, out, usageIn int }
+	cases := map[string]want{
+		"Isolated":       {0, 0, 0},
+		"LeafSink":       {1, 0, 1},
+		"LeafSource":     {0, 1, 0},
+		"Alive":          {1, 0, 1},
+		"StructuralOnly": {1, 0, 0},
+		"Mixed":          {2, 0, 1},
+	}
+	for id, w := range cases {
+		got, ok := byID[id]
+		if !ok {
+			t.Errorf("missing row for %s", id)
+			continue
+		}
+		if got.InCount != w.in || got.OutCount != w.out || got.UsageInCount != w.usageIn {
+			t.Errorf("row %s = in=%d out=%d usage=%d, want in=%d out=%d usage=%d",
+				id, got.InCount, got.OutCount, got.UsageInCount,
+				w.in, w.out, w.usageIn)
+		}
+	}
+
+	// Empty ids returns nil — never the whole graph.
+	if got := dc.NodeDegreeCounts(nil, usage); len(got) != 0 {
+		t.Fatalf("NodeDegreeCounts(nil) = %d, want 0", len(got))
+	}
+
+	// Empty usage kinds means UsageInCount is always 0 (totals
+	// still populated).
+	noUsage := dc.NodeDegreeCounts([]string{"Mixed"}, nil)
+	if len(noUsage) != 1 {
+		t.Fatalf("NodeDegreeCounts(Mixed, nil) = %d rows, want 1", len(noUsage))
+	}
+	if noUsage[0].InCount != 2 || noUsage[0].UsageInCount != 0 {
+		t.Fatalf("NodeDegreeCounts(Mixed, nil) = in=%d usage=%d, want in=2 usage=0",
+			noUsage[0].InCount, noUsage[0].UsageInCount)
+	}
+}
+
+// testNodeFanAggregator exercises the optional
+// graph.NodeFanAggregator capability. Builds a small graph that
+// exercises the per-direction kind filter independently:
+//
+//   - Hub: high fan-in (Calls + References) AND high fan-out (Calls).
+//   - Leaf: zero fan in either direction.
+//   - ReadHeavy: incoming Reads only — fan-in must be 0 when the
+//     filter is Calls+References.
+//   - CallerOnly: outgoing Calls only — fan-out non-zero, fan-in 0.
+//   - Unknown id elided.
+func testNodeFanAggregator(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	fa, ok := s.(graph.NodeFanAggregator)
+	if !ok {
+		t.Skip("backend does not implement graph.NodeFanAggregator")
+	}
+
+	s.AddNode(mkNode("Hub", "Hub", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Leaf", "Leaf", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("ReadHeavy", "ReadHeavy", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("CallerOnly", "CallerOnly", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Target1", "Target1", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Target2", "Target2", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Src1", "Src1", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Src2", "Src2", "a.go", graph.KindFunction))
+
+	// Hub: 2 incoming Calls + 1 incoming Reference + 2 outgoing
+	// Calls + 1 outgoing Reference. With fan-in=Calls+Refs and
+	// fan-out=Calls: fan_in=3, fan_out=2.
+	add := func(from, to string, kind graph.EdgeKind, line int) {
+		e := mkEdge(from, to, kind)
+		e.Line = line
+		s.AddEdge(e)
+	}
+	add("Src1", "Hub", graph.EdgeCalls, 1)
+	add("Src2", "Hub", graph.EdgeCalls, 2)
+	add("Src1", "Hub", graph.EdgeReferences, 3)
+	add("Hub", "Target1", graph.EdgeCalls, 4)
+	add("Hub", "Target2", graph.EdgeCalls, 5)
+	add("Hub", "Target1", graph.EdgeReferences, 6)
+
+	// ReadHeavy: incoming Reads only.
+	add("Src1", "ReadHeavy", graph.EdgeReads, 7)
+	add("Src2", "ReadHeavy", graph.EdgeReads, 8)
+
+	// CallerOnly: outgoing Calls only.
+	add("CallerOnly", "Target1", graph.EdgeCalls, 9)
+
+	ids := []string{"Hub", "Leaf", "ReadHeavy", "CallerOnly", "unknown::id"}
+	rows := fa.NodeFanCounts(ids,
+		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
+		[]graph.EdgeKind{graph.EdgeCalls},
+	)
+
+	byID := make(map[string]graph.NodeFanRow, len(rows))
+	for _, r := range rows {
+		byID[r.NodeID] = r
+	}
+	if _, ok := byID["unknown::id"]; ok {
+		t.Fatalf("NodeFanCounts must elide unknown ids, got row")
+	}
+
+	type want struct{ in, out int }
+	cases := map[string]want{
+		"Hub":        {3, 2},
+		"Leaf":       {0, 0},
+		"ReadHeavy":  {0, 0},
+		"CallerOnly": {0, 1},
+	}
+	for id, w := range cases {
+		got, ok := byID[id]
+		if !ok {
+			t.Errorf("missing row for %s", id)
+			continue
+		}
+		if got.FanIn != w.in || got.FanOut != w.out {
+			t.Errorf("row %s = in=%d out=%d, want in=%d out=%d",
+				id, got.FanIn, got.FanOut, w.in, w.out)
+		}
+	}
+
+	// Empty ids returns nil.
+	if got := fa.NodeFanCounts(nil, []graph.EdgeKind{graph.EdgeCalls}, nil); len(got) != 0 {
+		t.Fatalf("NodeFanCounts(nil) = %d, want 0", len(got))
+	}
+
+	// Empty kind sets → all-zero rows for known ids only.
+	zeros := fa.NodeFanCounts([]string{"Hub", "unknown::id"}, nil, nil)
+	if len(zeros) != 1 {
+		t.Fatalf("NodeFanCounts(empty kinds) = %d rows, want 1 (Hub only)", len(zeros))
+	}
+	if zeros[0].NodeID != "Hub" || zeros[0].FanIn != 0 || zeros[0].FanOut != 0 {
+		t.Fatalf("NodeFanCounts(empty kinds) = %+v, want Hub/0/0", zeros[0])
+	}
+}
+
+// testFileImporters exercises the optional graph.FileImporters
+// capability. Seeds two importing files (one production, one test)
+// plus an unrelated import edge that targets a different file. The
+// returned rows must include exactly the importers of the target
+// file — both via the file-node ID and via the FilePath-on-symbol
+// shape — and must not surface the unrelated edge.
+func testFileImporters(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	fi, ok := s.(graph.FileImporters)
+	if !ok {
+		t.Skip("backend does not implement graph.FileImporters")
+	}
+
+	// target file node + a symbol inside it.
+	s.AddNode(mkNode("pkg/target.go", "target.go", "pkg/target.go", graph.KindFile))
+	s.AddNode(mkNode("TargetFunc", "TargetFunc", "pkg/target.go", graph.KindFunction))
+
+	// Two importing files: one production, one test. Each has an
+	// import edge — one targets the file node by id, the other
+	// targets a symbol inside the file (FilePath match path).
+	s.AddNode(mkNode("pkg/prod.go", "prod.go", "pkg/prod.go", graph.KindFile))
+	s.AddNode(mkNode("pkg/test_test.go", "test_test.go", "pkg/test_test.go", graph.KindFile))
+
+	// And an unrelated importer that points elsewhere — must NOT
+	// surface in the results.
+	s.AddNode(mkNode("pkg/other.go", "other.go", "pkg/other.go", graph.KindFile))
+	s.AddNode(mkNode("pkg/elsewhere.go", "elsewhere.go", "pkg/elsewhere.go", graph.KindFile))
+
+	s.AddEdge(mkEdge("pkg/prod.go", "pkg/target.go", graph.EdgeImports))
+	s.AddEdge(mkEdge("pkg/test_test.go", "TargetFunc", graph.EdgeImports))
+	s.AddEdge(mkEdge("pkg/other.go", "pkg/elsewhere.go", graph.EdgeImports))
+	// A non-imports edge to the target file must also drop out.
+	s.AddEdge(mkEdge("pkg/prod.go", "TargetFunc", graph.EdgeCalls))
+
+	rows := fi.FileImporters("pkg/target.go")
+	got := make([]string, 0, len(rows))
+	for _, r := range rows {
+		got = append(got, r.FromFile)
+	}
+	sort.Strings(got)
+	want := []string{"pkg/prod.go", "pkg/test_test.go"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("FileImporters = %v, want %v", got, want)
+	}
+
+	if got := fi.FileImporters(""); len(got) != 0 {
+		t.Fatalf("FileImporters(empty) = %d rows, want 0", len(got))
+	}
+	if got := fi.FileImporters("pkg/no_such.go"); len(got) != 0 {
+		t.Fatalf("FileImporters(unknown) = %d rows, want 0", len(got))
+	}
+}
+
+// testInEdgeCounter exercises the optional graph.InEdgeCounter
+// capability. Seeds a small graph and asserts the per-To fan-in
+// count matches what an AllEdges-bucketing loop would compute for
+// the same edge-kind set.
+func testInEdgeCounter(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ic, ok := s.(graph.InEdgeCounter)
+	if !ok {
+		t.Skip("backend does not implement graph.InEdgeCounter")
+	}
+
+	s.AddNode(mkNode("A", "A", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("B", "B", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("C", "C", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("T", "T", "a.go", graph.KindType))
+
+	// B is called twice (from A and C), referenced once (from A).
+	e1 := mkEdge("A", "B", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("C", "B", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("A", "B", graph.EdgeReferences)
+	e3.Line = 3
+	// T is referenced once and held by an import edge that should
+	// not be counted under {calls,references}.
+	e4 := mkEdge("A", "T", graph.EdgeReferences)
+	e4.Line = 4
+	e5 := mkEdge("A", "T", graph.EdgeImports)
+	e5.Line = 5
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+	s.AddEdge(e5)
+
+	got := ic.InEdgeCountsByKind([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
+	if got["B"] != 3 {
+		t.Fatalf("count[B] = %d, want 3", got["B"])
+	}
+	if got["T"] != 1 {
+		t.Fatalf("count[T] = %d, want 1", got["T"])
+	}
+	if _, ok := got["A"]; ok {
+		t.Fatalf("A should have zero matching incoming edges, got %d", got["A"])
+	}
+
+	// Empty kind list must return nil — never the whole graph.
+	if got := ic.InEdgeCountsByKind(nil); got != nil {
+		t.Fatalf("InEdgeCountsByKind(nil) = %v, want nil", got)
+	}
+
+	// Single-kind filter dedups when callers pass duplicates.
+	got2 := ic.InEdgeCountsByKind([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeCalls})
+	if got2["B"] != 2 {
+		t.Fatalf("count[B] (calls only, deduped) = %d, want 2", got2["B"])
+	}
+}
+
+// testNodesInFilesByKindFinder exercises the optional
+// graph.NodesInFilesByKindFinder capability. Seeds a graph spanning
+// three files and three kinds; the result must include only the
+// requested-kind nodes whose FilePath sits in the requested file
+// set.
+func testNodesInFilesByKindFinder(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	fn, ok := s.(graph.NodesInFilesByKindFinder)
+	if !ok {
+		t.Skip("backend does not implement graph.NodesInFilesByKindFinder")
+	}
+
+	// f1.go: function + method + type.
+	s.AddNode(mkNode("f1::F1", "F1", "f1.go", graph.KindFunction))
+	s.AddNode(mkNode("f1::M1", "M1", "f1.go", graph.KindMethod))
+	s.AddNode(mkNode("f1::T1", "T1", "f1.go", graph.KindType))
+	// f2.go: function only.
+	s.AddNode(mkNode("f2::F2", "F2", "f2.go", graph.KindFunction))
+	// f3.go: drops out of every result — not in the requested files.
+	s.AddNode(mkNode("f3::F3", "F3", "f3.go", graph.KindFunction))
+
+	got := fn.NodesInFilesByKind(
+		[]string{"f1.go", "f2.go"},
+		[]graph.NodeKind{graph.KindFunction, graph.KindMethod},
+	)
+	gotIDs := sortNodeIDs(got)
+	want := []string{"f1::F1", "f1::M1", "f2::F2"}
+	if fmt.Sprint(gotIDs) != fmt.Sprint(want) {
+		t.Fatalf("NodesInFilesByKind = %v, want %v", gotIDs, want)
+	}
+
+	// Empty files / kinds must return nil — never a whole-graph scan.
+	if got := fn.NodesInFilesByKind(nil, []graph.NodeKind{graph.KindFunction}); got != nil {
+		t.Fatalf("NodesInFilesByKind(nil files) = %v, want nil", got)
+	}
+	if got := fn.NodesInFilesByKind([]string{"f1.go"}, nil); got != nil {
+		t.Fatalf("NodesInFilesByKind(nil kinds) = %v, want nil", got)
+	}
+
+	// Dedup: passing the same file / kind twice must not double-yield.
+	gotDup := fn.NodesInFilesByKind(
+		[]string{"f1.go", "f1.go"},
+		[]graph.NodeKind{graph.KindType, graph.KindType},
+	)
+	if len(gotDup) != 1 || gotDup[0].ID != "f1::T1" {
+		t.Fatalf("NodesInFilesByKind(dup) = %v, want [f1::T1]", sortNodeIDs(gotDup))
+	}
+}
+
+// testEdgesByKindsScanner exercises the optional
+// graph.EdgesByKindsScanner capability. Builds a small graph with a
+// mix of edge kinds, then verifies the streaming filter returns
+// exactly the union of the requested kinds in any order. Covers the
+// edge cases that the edge-driven analyzers rely on: zero-match (no
+// edge matches the requested kinds), empty filter (yields nothing —
+// never a whole-table scan), and early stop honouring the iterator
+// contract.
+func testEdgesByKindsScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("c", "C", "y.go", graph.KindType))
+	s.AddNode(mkNode("d", "D", "y.go", graph.KindField))
+
+	calls1 := mkEdge("a", "b", graph.EdgeCalls)
+	calls1.Line = 1
+	calls2 := mkEdge("a", "b", graph.EdgeCalls)
+	calls2.Line = 2
+	refs := mkEdge("a", "c", graph.EdgeReferences)
+	writes := mkEdge("a", "d", graph.EdgeWrites)
+	throws := mkEdge("a", "c", graph.EdgeThrows)
+	s.AddEdge(calls1)
+	s.AddEdge(calls2)
+	s.AddEdge(refs)
+	s.AddEdge(writes)
+	s.AddEdge(throws)
+
+	es, ok := s.(graph.EdgesByKindsScanner)
+	if !ok {
+		t.Skip("backend does not implement graph.EdgesByKindsScanner")
+	}
+
+	// Multi-kind: union of Calls + References must surface all three
+	// calls/refs edges; counts (not pointers) compared so the in-memory
+	// and disk backends agree without relying on edge identity.
+	counts := map[graph.EdgeKind]int{}
+	for e := range es.EdgesByKinds([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}) {
+		counts[e.Kind]++
+	}
+	if counts[graph.EdgeCalls] != 2 || counts[graph.EdgeReferences] != 1 {
+		t.Fatalf("EdgesByKinds(Calls,References) = %+v, want Calls:2 References:1", counts)
+	}
+	if got := len(counts); got != 2 {
+		t.Fatalf("EdgesByKinds(Calls,References) yielded %d distinct kinds, want 2", got)
+	}
+
+	// Single-kind via the multi-kind path must match EdgesByKind.
+	single := 0
+	for e := range es.EdgesByKinds([]graph.EdgeKind{graph.EdgeWrites}) {
+		if e.Kind != graph.EdgeWrites {
+			t.Fatalf("EdgesByKinds(Writes) yielded kind=%s, want Writes", e.Kind)
+		}
+		single++
+	}
+	if single != 1 {
+		t.Fatalf("EdgesByKinds(Writes) yielded %d, want 1", single)
+	}
+
+	// Dedupe: repeating a kind must not double-yield. The backend's
+	// IN-list MUST collapse duplicates.
+	dup := 0
+	for range es.EdgesByKinds([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeCalls}) {
+		dup++
+	}
+	if dup != 2 {
+		t.Fatalf("EdgesByKinds(Calls,Calls) yielded %d, want 2 (no double-yield)", dup)
+	}
+
+	// Empty kinds yields nothing — never a whole-table scan.
+	empty := 0
+	for range es.EdgesByKinds(nil) {
+		empty++
+	}
+	if empty != 0 {
+		t.Fatalf("EdgesByKinds(nil) yielded %d, want 0", empty)
+	}
+	emptySlice := 0
+	for range es.EdgesByKinds([]graph.EdgeKind{}) {
+		emptySlice++
+	}
+	if emptySlice != 0 {
+		t.Fatalf("EdgesByKinds([]) yielded %d, want 0", emptySlice)
+	}
+
+	// Empty string kinds get elided (matches dedupeEdgeKinds contract).
+	blank := 0
+	for range es.EdgesByKinds([]graph.EdgeKind{"", "", ""}) {
+		blank++
+	}
+	if blank != 0 {
+		t.Fatalf("EdgesByKinds(blank) yielded %d, want 0", blank)
+	}
+
+	// Zero-match: a kind nothing in the graph uses yields nothing.
+	zero := 0
+	for range es.EdgesByKinds([]graph.EdgeKind{graph.EdgeKind("nonexistent")}) {
+		zero++
+	}
+	if zero != 0 {
+		t.Fatalf("EdgesByKinds(nonexistent) yielded %d, want 0", zero)
+	}
+
+	// Early stop honours the iterator contract.
+	stopped := 0
+	for range es.EdgesByKinds([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+// testNodesByKindsScanner exercises the optional graph.NodesByKindsScanner
+// capability. Seeds nodes of several kinds, including ones whose Meta
+// holds the keys the metadata analyzers read, and asserts:
+//   - the IN-list returns exactly the union of the requested kinds
+//     (with nodes' Meta intact so post-filtering still works);
+//   - kinds the caller did not request never surface;
+//   - empty / nil kinds returns nil without scanning;
+//   - duplicate kinds in the input never duplicate the output.
+//
+// The Meta-preservation assertion is the load-bearing one: every
+// downstream handler still runs its meta gate in Go after the kind
+// pushdown, so the capability is worthless if Meta doesn't round-trip
+// through the backend.
+func testNodesByKindsScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.NodesByKindsScanner)
+	if !ok {
+		t.Skip("backend does not implement graph.NodesByKindsScanner")
+	}
+
+	// Two functions (one with coverage meta), one method, one type,
+	// one file (with cgo meta), one todo (with assignee meta), one
+	// table. Mix of meta-bearing and meta-bare nodes so the
+	// round-trip assertion covers both shapes. Meta values stay
+	// scalar — testMetaPreserved already covers flat round-trip, and
+	// the disk backend's gob encoder needs gob.Register for nested
+	// map shapes (out of scope for a kind-pushdown capability test).
+	fn1 := mkNode("pkg/a.go::Fn1", "Fn1", "pkg/a.go", graph.KindFunction)
+	fn1.Meta = map[string]any{
+		"coverage_pct": 42.5,
+		"author_email": "alice@example.com",
+	}
+	fn2 := mkNode("pkg/a.go::Fn2", "Fn2", "pkg/a.go", graph.KindFunction)
+	method := mkNode("pkg/a.go::T.M", "M", "pkg/a.go", graph.KindMethod)
+	typ := mkNode("pkg/a.go::T", "T", "pkg/a.go", graph.KindType)
+	file := mkNode("pkg/a.go", "a.go", "pkg/a.go", graph.KindFile)
+	file.Meta = map[string]any{"uses_cgo": true}
+	todo := mkNode("pkg/a.go::TODO:7", "TODO", "pkg/a.go", graph.KindTodo)
+	todo.Meta = map[string]any{
+		"tag":      "TODO",
+		"assignee": "alice",
+		"text":     "wire this up",
+	}
+	tbl := mkNode("table::users", "users", "schema/001.sql", graph.KindTable)
+	tbl.Meta = map[string]any{"table": "users", "dialect": "postgres"}
+
+	for _, n := range []*graph.Node{fn1, fn2, method, typ, file, todo, tbl} {
+		s.AddNode(n)
+	}
+
+	// Function + method — the stale_code/ownership/coverage default.
+	gotFnM := scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	wantFnM := []string{"pkg/a.go::Fn1", "pkg/a.go::Fn2", "pkg/a.go::T.M"}
+	if got := sortNodeIDs(gotFnM); fmt.Sprint(got) != fmt.Sprint(wantFnM) {
+		t.Fatalf("NodesByKinds(function,method) = %v, want %v", got, wantFnM)
+	}
+
+	// Meta round-trip: pick up Fn1 and assert flat scalar meta survived.
+	var fn1Got *graph.Node
+	for _, n := range gotFnM {
+		if n.ID == "pkg/a.go::Fn1" {
+			fn1Got = n
+			break
+		}
+	}
+	if fn1Got == nil {
+		t.Fatalf("Fn1 missing from result")
+		return
+	}
+	if pct, _ := fn1Got.Meta["coverage_pct"].(float64); pct != 42.5 {
+		t.Fatalf("Fn1.Meta.coverage_pct = %v, want 42.5", fn1Got.Meta["coverage_pct"])
+	}
+	if email, _ := fn1Got.Meta["author_email"].(string); email != "alice@example.com" {
+		t.Fatalf("Fn1.Meta.author_email = %q, want alice@example.com", email)
+	}
+
+	// Single kind on a kind with meta — todo/file.
+	gotTodo := scan.NodesByKinds([]graph.NodeKind{graph.KindTodo})
+	if len(gotTodo) != 1 || gotTodo[0].ID != "pkg/a.go::TODO:7" {
+		t.Fatalf("NodesByKinds(todo) = %v, want [pkg/a.go::TODO:7]", sortNodeIDs(gotTodo))
+	}
+	if tag, _ := gotTodo[0].Meta["tag"].(string); tag != "TODO" {
+		t.Fatalf("Todo.Meta.tag = %q, want TODO", tag)
+	}
+
+	gotFile := scan.NodesByKinds([]graph.NodeKind{graph.KindFile})
+	if len(gotFile) != 1 || gotFile[0].ID != "pkg/a.go" {
+		t.Fatalf("NodesByKinds(file) = %v, want [pkg/a.go]", sortNodeIDs(gotFile))
+	}
+	if cgo, _ := gotFile[0].Meta["uses_cgo"].(bool); !cgo {
+		t.Fatalf("File.Meta.uses_cgo = false, want true")
+	}
+
+	// Table kind — for orphan/unreferenced analyzers.
+	gotTbl := scan.NodesByKinds([]graph.NodeKind{graph.KindTable})
+	if len(gotTbl) != 1 || gotTbl[0].ID != "table::users" {
+		t.Fatalf("NodesByKinds(table) = %v, want [table::users]", sortNodeIDs(gotTbl))
+	}
+
+	// Empty / nil kinds — nil result, no scan.
+	if got := scan.NodesByKinds(nil); got != nil {
+		t.Fatalf("NodesByKinds(nil) = %v, want nil", got)
+	}
+	if got := scan.NodesByKinds([]graph.NodeKind{}); got != nil {
+		t.Fatalf("NodesByKinds([]) = %v, want nil", got)
+	}
+
+	// Unknown kind — no rows, but still nil/empty, never the full table.
+	if got := scan.NodesByKinds([]graph.NodeKind{graph.NodeKind("no_such_kind")}); len(got) != 0 {
+		t.Fatalf("NodesByKinds(unknown) = %v, want 0 rows", got)
+	}
+
+	// Dedup: passing the same kind twice must not double-yield.
+	gotDup := scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindFunction})
+	wantDup := []string{"pkg/a.go::Fn1", "pkg/a.go::Fn2"}
+	if got := sortNodeIDs(gotDup); fmt.Sprint(got) != fmt.Sprint(wantDup) {
+		t.Fatalf("NodesByKinds(dup function) = %v, want %v", got, wantDup)
+	}
+}
+
+// testEdgeKindCounter exercises the optional graph.EdgeKindCounter
+// capability. Seeds a graph with several kinds in different
+// frequencies and asserts the per-kind tally matches what an
+// AllEdges()+map[kind]++ loop would compute.
+func testEdgeKindCounter(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ek, ok := s.(graph.EdgeKindCounter)
+	if !ok {
+		t.Skip("backend does not implement graph.EdgeKindCounter")
+	}
+
+	// Empty graph returns nil or empty — both are valid per the
+	// contract; callers must treat them the same.
+	if got := ek.EdgeKindCounts(); len(got) != 0 {
+		t.Fatalf("EdgeKindCounts(empty) = %v, want empty", got)
+	}
+
+	s.AddNode(mkNode("A", "A", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("B", "B", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("C", "C", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("f1", "a.go", "a.go", graph.KindFile))
+
+	// 3 calls, 2 references, 1 imports.
+	e1 := mkEdge("A", "B", graph.EdgeCalls)
+	e2 := mkEdge("A", "C", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("B", "C", graph.EdgeCalls)
+	e3.Line = 3
+	e4 := mkEdge("A", "C", graph.EdgeReferences)
+	e4.Line = 4
+	e5 := mkEdge("B", "C", graph.EdgeReferences)
+	e5.Line = 5
+	e6 := mkEdge("A", "f1", graph.EdgeImports)
+	e6.Line = 6
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+	s.AddEdge(e5)
+	s.AddEdge(e6)
+
+	got := ek.EdgeKindCounts()
+	if got[graph.EdgeCalls] != 3 {
+		t.Fatalf("EdgeKindCounts[calls] = %d, want 3", got[graph.EdgeCalls])
+	}
+	if got[graph.EdgeReferences] != 2 {
+		t.Fatalf("EdgeKindCounts[references] = %d, want 2", got[graph.EdgeReferences])
+	}
+	if got[graph.EdgeImports] != 1 {
+		t.Fatalf("EdgeKindCounts[imports] = %d, want 1", got[graph.EdgeImports])
+	}
+	// No extends edge was added; absence must produce 0 via the
+	// zero value (callers index with `m[k]`).
+	if got[graph.EdgeExtends] != 0 {
+		t.Fatalf("EdgeKindCounts[extends] = %d, want 0", got[graph.EdgeExtends])
+	}
+}
+
+// testCrossRepoEdgeAggregator exercises the optional
+// graph.CrossRepoEdgeAggregator capability. Seeds a two-repo graph
+// with one cross_repo_calls + one cross_repo_implements and two
+// same-repo edges of other kinds. Asserts the per-triple counts and
+// that single-repo edges drop out.
+func testCrossRepoEdgeAggregator(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ag, ok := s.(graph.CrossRepoEdgeAggregator)
+	if !ok {
+		t.Skip("backend does not implement graph.CrossRepoEdgeAggregator")
+	}
+
+	// Empty graph -> nil.
+	if got := ag.CrossRepoEdgeCounts(); got != nil {
+		t.Fatalf("CrossRepoEdgeCounts(empty) = %v, want nil", got)
+	}
+
+	s.AddNode(mkRepoNode("repoA::Caller", "Caller", "a/c.go", "repoA", graph.KindFunction))
+	s.AddNode(mkRepoNode("repoA::Callee2", "Callee2", "a/d.go", "repoA", graph.KindFunction))
+	s.AddNode(mkRepoNode("repoB::Callee", "Callee", "b/d.go", "repoB", graph.KindFunction))
+	s.AddNode(mkRepoNode("repoB::Iface", "Iface", "b/i.go", "repoB", graph.KindType))
+	s.AddNode(mkRepoNode("repoA::Impl", "Impl", "a/i.go", "repoA", graph.KindType))
+
+	// Two cross-repo edges to the same (kind, fromRepo, toRepo) +
+	// one cross-repo implements + one non-cross edge.
+	e1 := mkEdge("repoA::Caller", "repoB::Callee", graph.EdgeCrossRepoCalls)
+	e2 := mkEdge("repoA::Caller", "repoB::Callee", graph.EdgeCrossRepoCalls)
+	e2.Line = 2
+	e3 := mkEdge("repoA::Impl", "repoB::Iface", graph.EdgeCrossRepoImplements)
+	e3.Line = 3
+	e4 := mkEdge("repoA::Caller", "repoA::Callee2", graph.EdgeCalls)
+	e4.Line = 4
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+
+	rows := ag.CrossRepoEdgeCounts()
+	// Sort for stable assertions — capability output order is
+	// unspecified.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Kind != rows[j].Kind {
+			return rows[i].Kind < rows[j].Kind
+		}
+		if rows[i].FromRepo != rows[j].FromRepo {
+			return rows[i].FromRepo < rows[j].FromRepo
+		}
+		return rows[i].ToRepo < rows[j].ToRepo
+	})
+	if len(rows) != 2 {
+		t.Fatalf("CrossRepoEdgeCounts: got %d rows, want 2 (rows=%v)", len(rows), rows)
+	}
+	if rows[0].Kind != graph.EdgeCrossRepoCalls || rows[0].FromRepo != "repoA" || rows[0].ToRepo != "repoB" || rows[0].Count != 2 {
+		t.Fatalf("CrossRepoEdgeCounts[0] = %+v, want {cross_repo_calls,repoA,repoB,2}", rows[0])
+	}
+	if rows[1].Kind != graph.EdgeCrossRepoImplements || rows[1].FromRepo != "repoA" || rows[1].ToRepo != "repoB" || rows[1].Count != 1 {
+		t.Fatalf("CrossRepoEdgeCounts[1] = %+v, want {cross_repo_implements,repoA,repoB,1}", rows[1])
+	}
+}
+
+// testFileImportAggregator exercises the optional
+// graph.FileImportAggregator capability. Seeds a graph with several
+// import edges and asserts the per-target-file counts. Covers both
+// the unscoped and the scope-bound paths plus the file-node-by-ID
+// vs symbol-FilePath import shapes.
+func testFileImportAggregator(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ag, ok := s.(graph.FileImportAggregator)
+	if !ok {
+		t.Skip("backend does not implement graph.FileImportAggregator")
+	}
+
+	if got := ag.FileImportCounts(nil); got != nil {
+		t.Fatalf("FileImportCounts(empty graph) = %v, want nil", got)
+	}
+
+	// Two targets, three importing files, mixed shapes.
+	s.AddNode(mkNode("pkg/popular.go", "popular.go", "pkg/popular.go", graph.KindFile))
+	s.AddNode(mkNode("PopularFn", "PopularFn", "pkg/popular.go", graph.KindFunction))
+	s.AddNode(mkNode("pkg/lonely.go", "lonely.go", "pkg/lonely.go", graph.KindFile))
+	s.AddNode(mkNode("pkg/a.go", "a.go", "pkg/a.go", graph.KindFile))
+	s.AddNode(mkNode("pkg/b.go", "b.go", "pkg/b.go", graph.KindFile))
+	s.AddNode(mkNode("pkg/c.go", "c.go", "pkg/c.go", graph.KindFile))
+
+	// pkg/popular.go imported by 3 files (two via file-id, one via symbol-FilePath).
+	s.AddEdge(mkEdge("pkg/a.go", "pkg/popular.go", graph.EdgeImports))
+	s.AddEdge(mkEdge("pkg/b.go", "pkg/popular.go", graph.EdgeImports))
+	s.AddEdge(mkEdge("pkg/c.go", "PopularFn", graph.EdgeImports))
+	// pkg/lonely.go imported once.
+	s.AddEdge(mkEdge("pkg/a.go", "pkg/lonely.go", graph.EdgeImports))
+	// A calls edge — must drop out of imports counts.
+	s.AddEdge(mkEdge("pkg/a.go", "PopularFn", graph.EdgeCalls))
+
+	rows := ag.FileImportCounts(nil)
+	got := map[string]int{}
+	for _, r := range rows {
+		got[r.FilePath] = r.Count
+	}
+	if got["pkg/popular.go"] != 3 {
+		t.Fatalf("FileImportCounts[popular.go] = %d, want 3", got["pkg/popular.go"])
+	}
+	if got["pkg/lonely.go"] != 1 {
+		t.Fatalf("FileImportCounts[lonely.go] = %d, want 1", got["pkg/lonely.go"])
+	}
+
+	// Scope-bound: only count edges whose target is in the allow set.
+	scoped := ag.FileImportCounts([]string{"pkg/lonely.go"})
+	if len(scoped) != 1 || scoped[0].FilePath != "pkg/lonely.go" || scoped[0].Count != 1 {
+		t.Fatalf("FileImportCounts(scope=lonely) = %v, want [lonely.go:1]", scoped)
+	}
+
+	// Scope-bound with file-id + symbol shape both targeting popular.
+	scopedPop := ag.FileImportCounts([]string{"pkg/popular.go", "PopularFn"})
+	gotPop := map[string]int{}
+	for _, r := range scopedPop {
+		gotPop[r.FilePath] = r.Count
+	}
+	if gotPop["pkg/popular.go"] != 3 {
+		t.Fatalf("FileImportCounts(scope=popular+sym) = %v, want popular.go:3", scopedPop)
+	}
+
+	// Empty (non-nil) scope MUST return nil — never a whole-graph scan.
+	if got := ag.FileImportCounts([]string{}); got != nil {
+		t.Fatalf("FileImportCounts(empty scope) = %v, want nil", got)
+	}
+}
+
+// testInDegreeForNodes exercises the optional graph.InDegreeForNodes
+// capability. Seeds a tiny graph with three targets carrying 0 / 1 / 3
+// incoming edges (of mixed kinds) and asserts the counter returns the
+// per-target count restricted to the caller's id set.
+func testInDegreeForNodes(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ic, ok := s.(graph.InDegreeForNodes)
+	if !ok {
+		t.Skip("backend does not implement graph.InDegreeForNodes")
+	}
+
+	s.AddNode(mkNode("Hub", "Hub", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Lonely", "Lonely", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Isolated", "Isolated", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("C1", "C1", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("C2", "C2", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("C3", "C3", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Outside", "Outside", "a.go", graph.KindFunction))
+
+	e1 := mkEdge("C1", "Hub", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("C2", "Hub", graph.EdgeReferences)
+	e2.Line = 2
+	e3 := mkEdge("C3", "Hub", graph.EdgeReads)
+	e3.Line = 3
+	e4 := mkEdge("C1", "Lonely", graph.EdgeCalls)
+	e4.Line = 4
+	// One incoming edge that targets Outside — must NOT surface when
+	// Outside is absent from the caller's id list.
+	e5 := mkEdge("C2", "Outside", graph.EdgeCalls)
+	e5.Line = 5
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+	s.AddEdge(e5)
+
+	got := ic.InDegreeForNodes([]string{"Hub", "Lonely", "Isolated"})
+	if got["Hub"] != 3 {
+		t.Fatalf("InDegreeForNodes[Hub] = %d, want 3", got["Hub"])
+	}
+	if got["Lonely"] != 1 {
+		t.Fatalf("InDegreeForNodes[Lonely] = %d, want 1", got["Lonely"])
+	}
+	// Isolated and Outside are absent — the contract drops zero-count
+	// targets from the map.
+	if _, ok := got["Isolated"]; ok {
+		t.Fatalf("InDegreeForNodes[Isolated] surfaced with value %d, want absent", got["Isolated"])
+	}
+	if _, ok := got["Outside"]; ok {
+		t.Fatalf("InDegreeForNodes[Outside] surfaced — caller didn't ask for it")
+	}
+
+	// Empty ids => nil (never a whole-table scan).
+	if got := ic.InDegreeForNodes(nil); got != nil {
+		t.Fatalf("InDegreeForNodes(nil) = %v, want nil", got)
+	}
+	if got := ic.InDegreeForNodes([]string{}); got != nil {
+		t.Fatalf("InDegreeForNodes(empty) = %v, want nil", got)
+	}
+	// Duplicated ids dedup naturally.
+	dup := ic.InDegreeForNodes([]string{"Hub", "Hub", "Hub"})
+	if dup["Hub"] != 3 {
+		t.Fatalf("InDegreeForNodes(dup Hub) = %d, want 3", dup["Hub"])
+	}
+}
+
+// testReachableForwardByKinds exercises the optional
+// graph.ReachableForwardByKinds capability. Seeds a small directed
+// graph mixing allowed and disallowed edge kinds, then asserts the
+// closure from the seed set is the transitive subset reachable
+// through only the allowed kinds.
+func testReachableForwardByKinds(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	rf, ok := s.(graph.ReachableForwardByKinds)
+	if !ok {
+		t.Skip("backend does not implement graph.ReachableForwardByKinds")
+	}
+
+	// Layout:
+	//   Test -> A (calls)
+	//   A    -> B (calls)
+	//   B    -> C (references)
+	//   C    -> D (reads)  <-- disallowed kind: D unreachable
+	//   X    -> Y (calls)  <-- disjoint subgraph: neither in closure
+	for _, id := range []string{"Test", "A", "B", "C", "D", "X", "Y"} {
+		s.AddNode(mkNode(id, id, "a.go", graph.KindFunction))
+	}
+	e1 := mkEdge("Test", "A", graph.EdgeCalls)
+	e1.Line = 1
+	e2 := mkEdge("A", "B", graph.EdgeCalls)
+	e2.Line = 2
+	e3 := mkEdge("B", "C", graph.EdgeReferences)
+	e3.Line = 3
+	e4 := mkEdge("C", "D", graph.EdgeReads)
+	e4.Line = 4
+	e5 := mkEdge("X", "Y", graph.EdgeCalls)
+	e5.Line = 5
+	s.AddEdge(e1)
+	s.AddEdge(e2)
+	s.AddEdge(e3)
+	s.AddEdge(e4)
+	s.AddEdge(e5)
+
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	got := rf.ReachableForwardByKinds([]string{"Test"}, kinds)
+	want := map[string]bool{"Test": true, "A": true, "B": true, "C": true}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("ReachableForwardByKinds: missing %q in closure %v", id, got)
+		}
+	}
+	if got["D"] {
+		t.Fatalf("ReachableForwardByKinds: D should not be reachable (reads is disallowed)")
+	}
+	if got["X"] || got["Y"] {
+		t.Fatalf("ReachableForwardByKinds: disjoint subgraph leaked: %v", got)
+	}
+
+	// Empty seeds => nil.
+	if got := rf.ReachableForwardByKinds(nil, kinds); got != nil {
+		t.Fatalf("ReachableForwardByKinds(nil) = %v, want nil", got)
+	}
+	// Empty kinds => seed set only.
+	zero := rf.ReachableForwardByKinds([]string{"Test"}, nil)
+	if !zero["Test"] || zero["A"] {
+		t.Fatalf("ReachableForwardByKinds(no kinds) = %v, want {Test:true}", zero)
+	}
+	// Duplicate seeds dedup naturally.
+	dup := rf.ReachableForwardByKinds([]string{"Test", "Test"}, kinds)
+	if !dup["Test"] || !dup["A"] || !dup["B"] || !dup["C"] {
+		t.Fatalf("ReachableForwardByKinds(dup seeds) = %v, want full closure", dup)
+	}
+}
+
+// testThrowerErrorSurfacer exercises the optional
+// graph.ThrowerErrorSurfacer capability. Seeds throwers with mixed
+// error targets and EdgeEmits→KindString attachments, asserts the
+// per-thrower row dedup + path-prefix filter both fire.
+func testThrowerErrorSurfacer(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	ts, ok := s.(graph.ThrowerErrorSurfacer)
+	if !ok {
+		t.Skip("backend does not implement graph.ThrowerErrorSurfacer")
+	}
+
+	// Throwers ThrowA (in pkg/keep/), ThrowB (in pkg/drop/). Targets
+	// ErrIO + ErrTimeout. ThrowA also emits two literal error_msg
+	// strings; one EdgeEmits goes to a non-error_msg context that
+	// must NOT surface in ErrorMsgs.
+	s.AddNode(mkNode("ThrowA", "ThrowA", "pkg/keep/a.go", graph.KindFunction))
+	s.AddNode(mkNode("ThrowB", "ThrowB", "pkg/drop/b.go", graph.KindFunction))
+	s.AddNode(mkNode("ErrIO", "ErrIO", "errors/io.go", graph.KindType))
+	s.AddNode(mkNode("ErrTimeout", "ErrTimeout", "errors/io.go", graph.KindType))
+
+	msgOK1 := mkNode("msg1", "open failed", "pkg/keep/a.go", graph.KindString)
+	msgOK1.Meta = map[string]any{"context": "error_msg"}
+	s.AddNode(msgOK1)
+	msgOK2 := mkNode("msg2", "timeout", "pkg/keep/a.go", graph.KindString)
+	msgOK2.Meta = map[string]any{"context": "error_msg"}
+	s.AddNode(msgOK2)
+	// Wrong context — must be filtered out.
+	msgWrong := mkNode("msg3", "log line", "pkg/keep/a.go", graph.KindString)
+	msgWrong.Meta = map[string]any{"context": "log_msg"}
+	s.AddNode(msgWrong)
+
+	// ThrowA throws ErrIO twice (dedup to one target) + ErrTimeout once.
+	e1 := mkEdge("ThrowA", "ErrIO", graph.EdgeThrows)
+	e1.FilePath = "pkg/keep/a.go"
+	e1.Line = 10
+	e2 := mkEdge("ThrowA", "ErrIO", graph.EdgeThrows)
+	e2.FilePath = "pkg/keep/a.go"
+	e2.Line = 12
+	e3 := mkEdge("ThrowA", "ErrTimeout", graph.EdgeThrows)
+	e3.FilePath = "pkg/keep/a.go"
+	e3.Line = 14
+	// ThrowB throws ErrIO once.
+	e4 := mkEdge("ThrowB", "ErrIO", graph.EdgeThrows)
+	e4.FilePath = "pkg/drop/b.go"
+	e4.Line = 4
+	// EdgeEmits attachments for ThrowA.
+	e5 := mkEdge("ThrowA", "msg1", graph.EdgeEmits)
+	e5.Line = 11
+	e6 := mkEdge("ThrowA", "msg2", graph.EdgeEmits)
+	e6.Line = 13
+	e7 := mkEdge("ThrowA", "msg3", graph.EdgeEmits)
+	e7.Line = 15
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5, e6, e7} {
+		s.AddEdge(e)
+	}
+
+	rows := ts.ThrowerErrorSurface("")
+	byID := map[string]graph.ThrowerErrorRow{}
+	for _, r := range rows {
+		byID[r.ThrowerID] = r
+	}
+
+	a, ok := byID["ThrowA"]
+	if !ok {
+		t.Fatalf("ThrowerErrorSurface: ThrowA missing from rows %v", rows)
+	}
+	if a.Throws != 3 {
+		t.Fatalf("ThrowA.Throws = %d, want 3", a.Throws)
+	}
+	gotTargets := append([]string(nil), a.ErrorTargets...)
+	sort.Strings(gotTargets)
+	if fmt.Sprint(gotTargets) != fmt.Sprint([]string{"ErrIO", "ErrTimeout"}) {
+		t.Fatalf("ThrowA.ErrorTargets = %v, want [ErrIO ErrTimeout]", gotTargets)
+	}
+	gotMsgs := append([]string(nil), a.ErrorMsgs...)
+	sort.Strings(gotMsgs)
+	if fmt.Sprint(gotMsgs) != fmt.Sprint([]string{"open failed", "timeout"}) {
+		t.Fatalf("ThrowA.ErrorMsgs = %v, want [open failed timeout]", gotMsgs)
+	}
+
+	b, ok := byID["ThrowB"]
+	if !ok || b.Throws != 1 || len(b.ErrorTargets) != 1 || b.ErrorTargets[0] != "ErrIO" {
+		t.Fatalf("ThrowB row = %+v, want Throws=1 ErrorTargets=[ErrIO]", b)
+	}
+	if len(b.ErrorMsgs) != 0 {
+		t.Fatalf("ThrowB.ErrorMsgs = %v, want empty", b.ErrorMsgs)
+	}
+
+	// Path-prefix filter drops ThrowB (under pkg/drop/) and keeps ThrowA.
+	keep := ts.ThrowerErrorSurface("pkg/keep/")
+	if len(keep) != 1 || keep[0].ThrowerID != "ThrowA" {
+		t.Fatalf("ThrowerErrorSurface(pkg/keep/) = %v, want only ThrowA", keep)
+	}
+	drop := ts.ThrowerErrorSurface("pkg/missing/")
+	if len(drop) != 0 {
+		t.Fatalf("ThrowerErrorSurface(pkg/missing/) = %v, want empty", drop)
+	}
+}
+
+// testEdgeAdjacencyForKinds exercises the optional
+// graph.EdgeAdjacencyForKinds capability. Seeds a graph mixing
+// function/method/type nodes joined by Calls / References / Writes
+// edges and asserts the iterator yields only (from, to) pairs whose
+// edge kind is in the allowed set AND whose endpoints both fall in
+// the allowed node-kind set.
+func testEdgeAdjacencyForKinds(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.EdgeAdjacencyForKinds)
+	if !ok {
+		t.Skip("backend does not implement graph.EdgeAdjacencyForKinds")
+	}
+
+	s.AddNode(mkNode("F1", "F1", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("F2", "F2", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("M1", "M1", "x.go", graph.KindMethod))
+	s.AddNode(mkNode("T1", "T1", "y.go", graph.KindType))
+	s.AddNode(mkNode("V1", "V1", "y.go", graph.KindVariable))
+
+	// F1 → F2 Calls (function→function, in-set)
+	e1 := mkEdge("F1", "F2", graph.EdgeCalls)
+	e1.Line = 1
+	// F2 → M1 References (function→method, in-set)
+	e2 := mkEdge("F2", "M1", graph.EdgeReferences)
+	e2.Line = 2
+	// F1 → T1 References (function→type, NOT in-set: T1 excluded)
+	e3 := mkEdge("F1", "T1", graph.EdgeReferences)
+	e3.Line = 3
+	// T1 → F2 References (type→function, NOT in-set: T1 excluded)
+	e4 := mkEdge("T1", "F2", graph.EdgeReferences)
+	e4.Line = 4
+	// M1 → F1 Writes (method→function, edge kind excluded)
+	e5 := mkEdge("M1", "F1", graph.EdgeWrites)
+	e5.Line = 5
+	// F1 → V1 References (function→variable, NOT in-set: V1 excluded)
+	e6 := mkEdge("F1", "V1", graph.EdgeReferences)
+	e6.Line = 6
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5, e6} {
+		s.AddEdge(e)
+	}
+
+	eKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+	nKinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
+
+	got := make(map[[2]string]int)
+	for pair := range scan.EdgeAdjacencyForKinds(eKinds, nKinds) {
+		got[pair]++
+	}
+	want := map[[2]string]int{
+		{"F1", "F2"}: 1,
+		{"F2", "M1"}: 1,
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("EdgeAdjacencyForKinds = %v, want %v", got, want)
+	}
+
+	// Empty edge kinds yields nothing — never a whole-table scan.
+	empty := 0
+	for range scan.EdgeAdjacencyForKinds(nil, nKinds) {
+		empty++
+	}
+	if empty != 0 {
+		t.Fatalf("EdgeAdjacencyForKinds(nil edges) yielded %d, want 0", empty)
+	}
+	// Empty node kinds yields nothing.
+	for range scan.EdgeAdjacencyForKinds(eKinds, nil) {
+		empty++
+	}
+	if empty != 0 {
+		t.Fatalf("EdgeAdjacencyForKinds(nil nodes) yielded %d, want 0", empty)
+	}
+	// Zero-match: edge kind absent from graph yields nothing.
+	zero := 0
+	for range scan.EdgeAdjacencyForKinds([]graph.EdgeKind{graph.EdgeKind("nonexistent")}, nKinds) {
+		zero++
+	}
+	if zero != 0 {
+		t.Fatalf("EdgeAdjacencyForKinds(nonexistent edge) yielded %d, want 0", zero)
+	}
+	// Node-kind filter actually narrows: asking only for {Type} drops every pair.
+	narrowed := 0
+	for range scan.EdgeAdjacencyForKinds(eKinds, []graph.NodeKind{graph.KindType}) {
+		narrowed++
+	}
+	if narrowed != 0 {
+		t.Fatalf("EdgeAdjacencyForKinds(Type only) yielded %d, want 0", narrowed)
+	}
+	// Early stop honours the iterator contract.
+	stopped := 0
+	for range scan.EdgeAdjacencyForKinds(eKinds, nKinds) {
+		stopped++
+		if stopped == 1 {
+			break
+		}
+	}
+	if stopped != 1 {
+		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+// testCommunityCrossingsByKind exercises the optional
+// graph.CommunityCrossingsByKind capability. Seeds a small graph
+// with a known community partition and asserts per-source crossing
+// counts match for: no edges, all-same-community, all-cross, mixed.
+func testCommunityCrossingsByKind(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.CommunityCrossingsByKind)
+	if !ok {
+		t.Skip("backend does not implement graph.CommunityCrossingsByKind")
+	}
+
+	s.AddNode(mkNode("A1", "A1", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("A2", "A2", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("B1", "B1", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("B2", "B2", "y.go", graph.KindFunction))
+	s.AddNode(mkNode("C1", "C1", "z.go", graph.KindFunction))
+
+	// A1 → A2 Calls (same community A — NOT a crossing)
+	e1 := mkEdge("A1", "A2", graph.EdgeCalls)
+	e1.Line = 1
+	// A1 → B1 Calls (A→B — crossing)
+	e2 := mkEdge("A1", "B1", graph.EdgeCalls)
+	e2.Line = 2
+	// A1 → C1 References (A→C — crossing, second from A1)
+	e3 := mkEdge("A1", "C1", graph.EdgeReferences)
+	e3.Line = 3
+	// B1 → B2 References (same community B — NOT a crossing)
+	e4 := mkEdge("B1", "B2", graph.EdgeReferences)
+	e4.Line = 4
+	// B2 → C1 Calls (B→C — crossing)
+	e5 := mkEdge("B2", "C1", graph.EdgeCalls)
+	e5.Line = 5
+	// A2 → B2 Writes (different community but edge kind excluded)
+	e6 := mkEdge("A2", "B2", graph.EdgeWrites)
+	e6.Line = 6
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5, e6} {
+		s.AddEdge(e)
+	}
+
+	communities := map[string]string{
+		"A1": "A", "A2": "A",
+		"B1": "B", "B2": "B",
+		"C1": "C",
+	}
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
+
+	got := scan.CommunityCrossingsByKind(kinds, communities)
+	want := map[string]int{
+		"A1": 2, // → B1 + → C1
+		"B2": 1, // → C1
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("CommunityCrossingsByKind(mixed) = %v, want %v", got, want)
+	}
+
+	// All-same-community partition: no crossings at all.
+	same := map[string]string{
+		"A1": "A", "A2": "A", "B1": "A", "B2": "A", "C1": "A",
+	}
+	if r := scan.CommunityCrossingsByKind(kinds, same); len(r) != 0 {
+		t.Fatalf("CommunityCrossingsByKind(all-same) = %v, want empty", r)
+	}
+
+	// All-cross-community partition: every edge in scope is a crossing.
+	allCross := map[string]string{
+		"A1": "1", "A2": "2", "B1": "3", "B2": "4", "C1": "5",
+	}
+	allGot := scan.CommunityCrossingsByKind(kinds, allCross)
+	allWant := map[string]int{
+		"A1": 3, // A1 has 3 in-scope out-edges
+		"B1": 1, // B1 → B2 (now also a crossing)
+		"B2": 1, // B2 → C1
+	}
+	if fmt.Sprint(allGot) != fmt.Sprint(allWant) {
+		t.Fatalf("CommunityCrossingsByKind(all-cross) = %v, want %v", allGot, allWant)
+	}
+
+	// Empty kinds returns nil — never a whole-table scan.
+	if r := scan.CommunityCrossingsByKind(nil, communities); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nil kinds) = %v, want nil", r)
+	}
+	// Empty community map returns nil.
+	if r := scan.CommunityCrossingsByKind(kinds, nil); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nil comm) = %v, want nil", r)
+	}
+	// Kind absent from graph yields nil.
+	if r := scan.CommunityCrossingsByKind([]graph.EdgeKind{graph.EdgeKind("nonexistent")}, communities); r != nil {
+		t.Fatalf("CommunityCrossingsByKind(nonexistent) = %v, want nil", r)
+	}
+}
+
+// testNodeIDsByKinds exercises the optional graph.NodeIDsByKinds
+// capability. Seeds nodes of several kinds and asserts the
+// projection returns just the IDs of the requested kinds, with
+// duplicates collapsed and empty input returning nil.
+func testNodeIDsByKinds(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.NodeIDsByKinds)
+	if !ok {
+		t.Skip("backend does not implement graph.NodeIDsByKinds")
+	}
+
+	s.AddNode(mkNode("F1", "F1", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("F2", "F2", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("M1", "M1", "x.go", graph.KindMethod))
+	s.AddNode(mkNode("T1", "T1", "y.go", graph.KindType))
+	s.AddNode(mkNode("V1", "V1", "y.go", graph.KindVariable))
+
+	got := scan.NodeIDsByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	sort.Strings(got)
+	want := []string{"F1", "F2", "M1"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("NodeIDsByKinds(Function,Method) = %v, want %v", got, want)
+	}
+
+	// Empty kinds returns nil.
+	if r := scan.NodeIDsByKinds(nil); r != nil {
+		t.Fatalf("NodeIDsByKinds(nil) = %v, want nil", r)
+	}
+	if r := scan.NodeIDsByKinds([]graph.NodeKind{}); r != nil {
+		t.Fatalf("NodeIDsByKinds(empty) = %v, want nil", r)
+	}
+
+	// Blank kinds are elided.
+	if r := scan.NodeIDsByKinds([]graph.NodeKind{"", ""}); r != nil {
+		t.Fatalf("NodeIDsByKinds(blank) = %v, want nil", r)
+	}
+
+	// Duplicates collapse — the IN-list must dedupe.
+	dup := scan.NodeIDsByKinds([]graph.NodeKind{graph.KindFunction, graph.KindFunction})
+	sort.Strings(dup)
+	wantDup := []string{"F1", "F2"}
+	if fmt.Sprint(dup) != fmt.Sprint(wantDup) {
+		t.Fatalf("NodeIDsByKinds(Function,Function) = %v, want %v", dup, wantDup)
+	}
+
+	// Kinds absent from the graph yield an empty slice (or nil).
+	miss := scan.NodeIDsByKinds([]graph.NodeKind{graph.KindInterface})
+	if len(miss) != 0 {
+		t.Fatalf("NodeIDsByKinds(Interface) = %v, want empty", miss)
+	}
+}
+
+// testMemberMethodsByType exercises the optional
+// graph.MemberMethodsByType capability. Seeds a graph with multiple
+// types, their methods, and a non-method EdgeMemberOf edge to verify
+// the kind gate.
+func testMemberMethodsByType(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.MemberMethodsByType)
+	if !ok {
+		t.Skip("backend does not implement graph.MemberMethodsByType")
+	}
+
+	// Two types with method members + a noise field.
+	s.AddNode(mkNode("T1", "T1", "a.go", graph.KindType))
+	s.AddNode(mkNode("T2", "T2", "b.go", graph.KindType))
+	s.AddNode(mkNode("M1", "Foo", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("M2", "Bar", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("M3", "Foo", "b.go", graph.KindMethod))
+	s.AddNode(mkNode("F1", "Field1", "a.go", graph.KindField))
+
+	s.AddEdge(mkEdge("M1", "T1", graph.EdgeMemberOf))
+	s.AddEdge(mkEdge("M2", "T1", graph.EdgeMemberOf))
+	s.AddEdge(mkEdge("M3", "T2", graph.EdgeMemberOf))
+	// Non-method source — must NOT appear.
+	s.AddEdge(mkEdge("F1", "T1", graph.EdgeMemberOf))
+
+	got := scan.MemberMethodsByType()
+	t1Names := map[string]bool{}
+	for _, m := range got["T1"] {
+		t1Names[m.Name] = true
+	}
+	if !t1Names["Foo"] || !t1Names["Bar"] {
+		t.Fatalf("MemberMethodsByType T1 = %v, want {Foo, Bar}", got["T1"])
+	}
+	if len(got["T1"]) != 2 {
+		t.Fatalf("MemberMethodsByType T1 size = %d, want 2", len(got["T1"]))
+	}
+	t2Names := map[string]bool{}
+	for _, m := range got["T2"] {
+		t2Names[m.Name] = true
+	}
+	if !t2Names["Foo"] || len(got["T2"]) != 1 {
+		t.Fatalf("MemberMethodsByType T2 = %v, want {Foo}", got["T2"])
+	}
+	// Verify FilePath / StartLine columns are projected.
+	for _, m := range got["T1"] {
+		if m.MethodID == "" || m.FilePath == "" {
+			t.Fatalf("MemberMethodsByType T1 row missing columns: %+v", m)
+		}
+	}
+
+	// Empty store returns nil.
+	empty := factory(t)
+	if r := empty.(graph.MemberMethodsByType).MemberMethodsByType(); r != nil {
+		t.Fatalf("MemberMethodsByType(empty) = %v, want nil", r)
+	}
+}
+
+// testStructuralParentEdges exercises the optional
+// graph.StructuralParentEdges capability. Seeds a mix of extends /
+// implements / composes edges with varying endpoint kinds.
+func testStructuralParentEdges(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.StructuralParentEdges)
+	if !ok {
+		t.Skip("backend does not implement graph.StructuralParentEdges")
+	}
+
+	// Types / interfaces (in-set endpoints).
+	s.AddNode(mkNode("C1", "Child", "a.go", graph.KindType))
+	s.AddNode(mkNode("P1", "Parent", "a.go", graph.KindType))
+	s.AddNode(mkNode("I1", "Iface", "a.go", graph.KindInterface))
+	// A method (NOT in-set).
+	s.AddNode(mkNode("M1", "Foo", "a.go", graph.KindMethod))
+
+	// In-set: type → type extends.
+	e1 := mkEdge("C1", "P1", graph.EdgeExtends)
+	e1.Line = 1
+	e1.Origin = graph.OriginASTResolved
+	// In-set: type → interface implements.
+	e2 := mkEdge("C1", "I1", graph.EdgeImplements)
+	e2.Line = 2
+	e2.Origin = graph.OriginASTInferred
+	// In-set: type → type composes.
+	e3 := mkEdge("C1", "P1", graph.EdgeComposes)
+	e3.Line = 3
+	// OUT: extends with a method on one side.
+	e4 := mkEdge("M1", "P1", graph.EdgeExtends)
+	e4.Line = 4
+	// OUT: irrelevant kind.
+	e5 := mkEdge("C1", "P1", graph.EdgeCalls)
+	e5.Line = 5
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5} {
+		s.AddEdge(e)
+	}
+
+	rows := scan.StructuralParentEdges()
+	if len(rows) != 3 {
+		t.Fatalf("StructuralParentEdges len = %d, want 3 (rows=%v)", len(rows), rows)
+	}
+	// Verify origin propagation on the ast_resolved row.
+	var sawResolved, sawInferred bool
+	for _, r := range rows {
+		if r.FromID != "C1" {
+			t.Fatalf("unexpected FromID %q in row %v", r.FromID, r)
+		}
+		if r.FromKind != graph.KindType {
+			t.Fatalf("unexpected FromKind %q in row %v", r.FromKind, r)
+		}
+		if r.Origin == graph.OriginASTResolved {
+			sawResolved = true
+		}
+		if r.Origin == graph.OriginASTInferred {
+			sawInferred = true
+		}
+	}
+	if !sawResolved || !sawInferred {
+		t.Fatalf("origin not propagated: resolved=%v inferred=%v", sawResolved, sawInferred)
+	}
+
+	// Empty graph returns nil/empty.
+	empty := factory(t)
+	if r := empty.(graph.StructuralParentEdges).StructuralParentEdges(); len(r) != 0 {
+		t.Fatalf("StructuralParentEdges(empty) = %v, want empty", r)
+	}
+}
+
+// testCrossRepoCandidates exercises the optional
+// graph.CrossRepoCandidates capability. Seeds same-repo and
+// cross-repo edges and asserts only the distinct, non-empty
+// repo-prefix pairs survive.
+func testCrossRepoCandidates(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.CrossRepoCandidates)
+	if !ok {
+		t.Skip("backend does not implement graph.CrossRepoCandidates")
+	}
+
+	// Repo A.
+	s.AddNode(mkRepoNode("A1", "fnA1", "a.go", "repoA", graph.KindFunction))
+	s.AddNode(mkRepoNode("A2", "fnA2", "a.go", "repoA", graph.KindFunction))
+	// Repo B.
+	s.AddNode(mkRepoNode("B1", "fnB1", "b.go", "repoB", graph.KindFunction))
+	// No repo.
+	s.AddNode(mkNode("X1", "fnX1", "x.go", graph.KindFunction))
+
+	// Same-repo calls — must NOT appear.
+	e1 := mkEdge("A1", "A2", graph.EdgeCalls)
+	e1.Line = 1
+	// Cross-repo call — in.
+	e2 := mkEdge("A1", "B1", graph.EdgeCalls)
+	e2.Line = 2
+	// Cross-repo implements — in.
+	e3 := mkEdge("A1", "B1", graph.EdgeImplements)
+	e3.Line = 3
+	// Cross-repo edge but kind not in baseKinds — out.
+	e4 := mkEdge("A1", "B1", graph.EdgeReferences)
+	e4.Line = 4
+	// Either endpoint missing repo — out.
+	e5 := mkEdge("A1", "X1", graph.EdgeCalls)
+	e5.Line = 5
+	for _, e := range []*graph.Edge{e1, e2, e3, e4, e5} {
+		s.AddEdge(e)
+	}
+
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeImplements, graph.EdgeExtends}
+	rows := scan.CrossRepoCandidates(kinds)
+	if len(rows) != 2 {
+		t.Fatalf("CrossRepoCandidates len = %d, want 2 (rows=%v)", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.FromRepo != "repoA" || r.ToRepo != "repoB" {
+			t.Fatalf("unexpected repos in row %v", r)
+		}
+		if r.Edge == nil || r.Edge.From != "A1" || r.Edge.To != "B1" {
+			t.Fatalf("unexpected edge in row %v", r)
+		}
+	}
+
+	// Empty kinds returns nil — never a whole-table scan.
+	if r := scan.CrossRepoCandidates(nil); r != nil {
+		t.Fatalf("CrossRepoCandidates(nil) = %v, want nil", r)
+	}
+}
+
+// testExtractCandidates exercises the optional
+// graph.ExtractCandidatesScanner capability. Builds a graph with
+// three functions:
+//   - Long+Hot:   long body, 3 distinct callers, 6 distinct callees
+//     (passes every threshold).
+//   - Long+Cold:  long body, 1 caller, 6 callees (fails minCallers).
+//   - Short+Hot:  short body, 3 callers, 6 callees (fails minLines).
+func testExtractCandidates(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.ExtractCandidatesScanner)
+	if !ok {
+		t.Skip("backend does not implement graph.ExtractCandidatesScanner")
+	}
+
+	mk := func(id string, kind graph.NodeKind, start, end int) *graph.Node {
+		n := mkNode(id, id, "p/a.go", kind)
+		n.StartLine = start
+		n.EndLine = end
+		return n
+	}
+	s.AddNode(mk("LongHot", graph.KindFunction, 1, 60))
+	s.AddNode(mk("LongCold", graph.KindFunction, 100, 160))
+	s.AddNode(mk("ShortHot", graph.KindFunction, 200, 205))
+	// Callers + callees as plain function nodes.
+	for i := 0; i < 6; i++ {
+		c := mkNode(fmt.Sprintf("C%d", i), fmt.Sprintf("C%d", i), "p/c.go", graph.KindFunction)
+		s.AddNode(c)
+		t := mkNode(fmt.Sprintf("T%d", i), fmt.Sprintf("T%d", i), "p/t.go", graph.KindFunction)
+		s.AddNode(t)
+	}
+	// LongHot: 3 distinct callers, 6 distinct callees.
+	for i := 0; i < 3; i++ {
+		e := mkEdge(fmt.Sprintf("C%d", i), "LongHot", graph.EdgeCalls)
+		e.Line = i + 1
+		s.AddEdge(e)
+	}
+	for i := 0; i < 6; i++ {
+		e := mkEdge("LongHot", fmt.Sprintf("T%d", i), graph.EdgeCalls)
+		e.Line = 100 + i
+		s.AddEdge(e)
+	}
+	// LongCold: 1 caller, 6 callees.
+	e := mkEdge("C0", "LongCold", graph.EdgeCalls)
+	e.Line = 200
+	s.AddEdge(e)
+	for i := 0; i < 6; i++ {
+		e := mkEdge("LongCold", fmt.Sprintf("T%d", i), graph.EdgeCalls)
+		e.Line = 300 + i
+		s.AddEdge(e)
+	}
+	// ShortHot: 3 callers, 6 callees but too short.
+	for i := 0; i < 3; i++ {
+		e := mkEdge(fmt.Sprintf("C%d", i), "ShortHot", graph.EdgeCalls)
+		e.Line = 400 + i
+		s.AddEdge(e)
+	}
+	for i := 0; i < 6; i++ {
+		e := mkEdge("ShortHot", fmt.Sprintf("T%d", i), graph.EdgeCalls)
+		e.Line = 500 + i
+		s.AddEdge(e)
+	}
+
+	rows := scan.ExtractCandidates(
+		[]graph.EdgeKind{graph.EdgeCalls},
+		20, // minLines
+		2,  // minCallers
+		5,  // minFanOut
+		"", // no prefix
+	)
+	byID := make(map[string]graph.ExtractCandidateRow)
+	for _, r := range rows {
+		byID[r.NodeID] = r
+	}
+	r, ok := byID["LongHot"]
+	if !ok {
+		t.Fatalf("expected LongHot in result, got %v", rows)
+	}
+	if r.CallerCount != 3 || r.FanOut != 6 || r.LineCount != 60 {
+		t.Fatalf("LongHot row mismatch: %+v", r)
+	}
+	if _, present := byID["LongCold"]; present {
+		t.Fatalf("LongCold should have been filtered (caller count < 2)")
+	}
+	if _, present := byID["ShortHot"]; present {
+		t.Fatalf("ShortHot should have been filtered (lines < 20)")
+	}
+
+	// Path prefix narrows to only LongHot (it's the one in p/a.go;
+	// LongCold and ShortHot also are in p/a.go so use a prefix that
+	// doesn't match).
+	none := scan.ExtractCandidates(
+		[]graph.EdgeKind{graph.EdgeCalls}, 20, 2, 5, "no/such/",
+	)
+	if len(none) != 0 {
+		t.Fatalf("ExtractCandidates with non-matching prefix = %d, want 0", len(none))
+	}
+	// Empty kinds returns nil.
+	if r := scan.ExtractCandidates(nil, 0, 0, 0, ""); r != nil {
+		t.Fatalf("ExtractCandidates(nil kinds) = %v, want nil", r)
+	}
+}
+
+// testFileSymbolNamesByPaths exercises the optional
+// graph.FileSymbolNamesByPaths capability.
+func testFileSymbolNamesByPaths(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.FileSymbolNamesByPaths)
+	if !ok {
+		t.Skip("backend does not implement graph.FileSymbolNamesByPaths")
+	}
+
+	s.AddNode(mkNode("Alpha", "Alpha", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("Beta", "Beta", "a.go", graph.KindType))
+	s.AddNode(mkNode("Gamma", "Gamma", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("LowCardField", "LowCardField", "a.go", graph.KindField))
+	s.AddNode(mkNode("Delta", "Delta", "b.go", graph.KindFunction))
+
+	rows := scan.FileSymbolNamesByPaths(
+		[]string{"a.go", "b.go"},
+		[]graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface},
+	)
+	byFile := make(map[string]map[string]struct{})
+	for _, r := range rows {
+		seen := byFile[r.FilePath]
+		if seen == nil {
+			seen = make(map[string]struct{})
+			byFile[r.FilePath] = seen
+		}
+		seen[r.Name] = struct{}{}
+	}
+	want := map[string]map[string]struct{}{
+		"a.go": {"Alpha": {}, "Beta": {}, "Gamma": {}},
+		"b.go": {"Delta": {}},
+	}
+	for file, names := range want {
+		got := byFile[file]
+		if len(got) != len(names) {
+			t.Fatalf("file %q: got %v, want %v", file, got, names)
+		}
+		for n := range names {
+			if _, ok := got[n]; !ok {
+				t.Errorf("file %q: missing name %q (got %v)", file, n, got)
+			}
+		}
+	}
+	// LowCardField (KindField) must not appear because it's not in
+	// the requested kinds.
+	if _, ok := byFile["a.go"]["LowCardField"]; ok {
+		t.Fatalf("kind filter leaked KindField row")
+	}
+
+	// Empty paths returns nil.
+	if r := scan.FileSymbolNamesByPaths(nil, nil); r != nil {
+		t.Fatalf("FileSymbolNamesByPaths(nil) = %v, want nil", r)
+	}
+}
+
+// testClassHierarchyTraverser exercises the optional
+// graph.ClassHierarchyTraverser capability.
+func testClassHierarchyTraverser(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.ClassHierarchyTraverser)
+	if !ok {
+		t.Skip("backend does not implement graph.ClassHierarchyTraverser")
+	}
+
+	s.AddNode(mkNode("Animal", "Animal", "z.go", graph.KindInterface))
+	s.AddNode(mkNode("Dog", "Dog", "z.go", graph.KindType))
+	s.AddNode(mkNode("Puppy", "Puppy", "z.go", graph.KindType))
+	// Dog implements Animal; Puppy extends Dog.
+	e1 := mkEdge("Dog", "Animal", graph.EdgeImplements)
+	e1.Line = 1
+	s.AddEdge(e1)
+	e2 := mkEdge("Puppy", "Dog", graph.EdgeExtends)
+	e2.Line = 2
+	s.AddEdge(e2)
+
+	upRows := scan.ClassHierarchyTraverse(
+		"Puppy", "up",
+		[]graph.EdgeKind{graph.EdgeExtends, graph.EdgeImplements, graph.EdgeComposes},
+		5,
+	)
+	if len(upRows) != 2 {
+		t.Fatalf("Puppy up: %d rows, want 2 (Dog, Animal). rows=%v", len(upRows), upRows)
+	}
+	visited := map[string]bool{}
+	for _, r := range upRows {
+		for _, id := range r.Path {
+			visited[id] = true
+		}
+	}
+	if !visited["Dog"] || !visited["Animal"] {
+		t.Fatalf("Puppy up: missing Dog or Animal in visited set: %v", visited)
+	}
+	downRows := scan.ClassHierarchyTraverse(
+		"Animal", "down",
+		[]graph.EdgeKind{graph.EdgeExtends, graph.EdgeImplements, graph.EdgeComposes},
+		5,
+	)
+	visited = map[string]bool{}
+	for _, r := range downRows {
+		for _, id := range r.Path {
+			visited[id] = true
+		}
+	}
+	if !visited["Dog"] || !visited["Puppy"] {
+		t.Fatalf("Animal down: missing Dog or Puppy in visited set: %v", visited)
+	}
+
+	// Empty kinds / depth=0 / unknown seed must return nil.
+	if r := scan.ClassHierarchyTraverse("Puppy", "up", nil, 5); r != nil {
+		t.Fatalf("nil kinds: got %v", r)
+	}
+	if r := scan.ClassHierarchyTraverse("Puppy", "up",
+		[]graph.EdgeKind{graph.EdgeExtends}, 0); r != nil {
+		t.Fatalf("depth=0: got %v", r)
+	}
+	if r := scan.ClassHierarchyTraverse("nope", "up",
+		[]graph.EdgeKind{graph.EdgeExtends}, 5); r != nil {
+		t.Fatalf("unknown seed: got %v", r)
+	}
+}
+
+// testFileEditingContext exercises the optional
+// graph.FileEditingContext capability.
+func testFileEditingContext(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.FileEditingContext)
+	if !ok {
+		t.Skip("backend does not implement graph.FileEditingContext")
+	}
+	// File node + two functions inside it; an importing file with one
+	// function that calls into the file; a downstream file with a
+	// function the file's function calls.
+	s.AddNode(mkNode("a.go", "a.go", "a.go", graph.KindFile))
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+	s.AddNode(mkNode("a.go::Bar", "Bar", "a.go", graph.KindMethod))
+	s.AddNode(mkNode("b.go", "b.go", "b.go", graph.KindFile))
+	s.AddNode(mkNode("b.go::Caller", "Caller", "b.go", graph.KindFunction))
+	s.AddNode(mkNode("c.go::Callee", "Callee", "c.go", graph.KindFunction))
+
+	// Import edge: a.go imports b.go.
+	e := mkEdge("a.go", "b.go", graph.EdgeImports)
+	e.Line = 1
+	s.AddEdge(e)
+	// Caller in b.go calls Foo in a.go.
+	e = mkEdge("b.go::Caller", "a.go::Foo", graph.EdgeCalls)
+	e.Line = 2
+	s.AddEdge(e)
+	// Foo in a.go calls Callee in c.go.
+	e = mkEdge("a.go::Foo", "c.go::Callee", graph.EdgeCalls)
+	e.Line = 3
+	s.AddEdge(e)
+
+	res := scan.FileEditingContext("a.go", []graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	if res == nil {
+		t.Fatalf("FileEditingContext returned nil for a.go")
+		return
+	}
+	if res.FileNode == nil || res.FileNode.ID != "a.go" {
+		t.Fatalf("FileNode missing or wrong: %+v", res.FileNode)
+	}
+	defineIDs := map[string]bool{}
+	for _, n := range res.Defines {
+		defineIDs[n.ID] = true
+	}
+	if !defineIDs["a.go::Foo"] || !defineIDs["a.go::Bar"] {
+		t.Fatalf("defines missing entries: got %v", defineIDs)
+	}
+	if len(res.Imports) != 1 || res.Imports[0].To != "b.go" {
+		t.Fatalf("imports = %v, want one edge a.go→b.go", res.Imports)
+	}
+	calledBy := map[string]bool{}
+	for _, n := range res.CalledBy {
+		calledBy[n.ID] = true
+	}
+	if !calledBy["b.go::Caller"] {
+		t.Fatalf("called_by missing Caller: %v", calledBy)
+	}
+	calls := map[string]bool{}
+	for _, n := range res.Calls {
+		calls[n.ID] = true
+	}
+	if !calls["c.go::Callee"] {
+		t.Fatalf("calls missing Callee: %v", calls)
+	}
+
+	// Empty path returns nil.
+	if r := scan.FileEditingContext("", nil); r != nil {
+		t.Fatalf("empty path: got %v, want nil", r)
+	}
+}
+
+// testNodeDegreeByKinds exercises the optional
+// graph.NodeDegreeByKinds capability.
+func testNodeDegreeByKinds(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	scan, ok := s.(graph.NodeDegreeByKinds)
+	if !ok {
+		t.Skip("backend does not implement graph.NodeDegreeByKinds")
+	}
+	s.AddNode(mkNode("Iso", "Iso", "pkg/iso.go", graph.KindFunction))
+	s.AddNode(mkNode("Hub", "Hub", "pkg/hub.go", graph.KindFunction))
+	s.AddNode(mkNode("Leaf", "Leaf", "pkg/leaf.go", graph.KindMethod))
+	s.AddNode(mkNode("Other", "Other", "pkg/other.go", graph.KindType))
+	s.AddNode(mkNode("Caller", "Caller", "pkg/caller.go", graph.KindFunction))
+	// 2 incoming + 1 outgoing on Hub.
+	for i, from := range []string{"Caller", "Leaf"} {
+		e := mkEdge(from, "Hub", graph.EdgeCalls)
+		e.Line = i + 1
+		s.AddEdge(e)
+	}
+	e := mkEdge("Hub", "Leaf", graph.EdgeCalls)
+	e.Line = 3
+	s.AddEdge(e)
+
+	rows := scan.NodeDegreeByKinds(
+		[]graph.NodeKind{graph.KindFunction, graph.KindMethod},
+		"",
+	)
+	byID := make(map[string]graph.NodeDegreeRow)
+	for _, r := range rows {
+		byID[r.NodeID] = r
+	}
+	if got := byID["Hub"]; got.InCount != 2 || got.OutCount != 1 {
+		t.Fatalf("Hub: %+v, want in=2 out=1", got)
+	}
+	if got, ok := byID["Iso"]; !ok || got.InCount != 0 || got.OutCount != 0 {
+		t.Fatalf("Iso: ok=%v got=%+v, want in=0 out=0", ok, got)
+	}
+	if _, ok := byID["Other"]; ok {
+		t.Fatalf("Other (KindType) leaked into kind-filtered result")
+	}
+	// Empty kinds returns nil.
+	if r := scan.NodeDegreeByKinds(nil, ""); r != nil {
+		t.Fatalf("NodeDegreeByKinds(nil) = %v, want nil", r)
+	}
+	// Path prefix narrows.
+	rows = scan.NodeDegreeByKinds(
+		[]graph.NodeKind{graph.KindFunction, graph.KindMethod},
+		"pkg/leaf",
+	)
+	if len(rows) != 1 || rows[0].NodeID != "Leaf" {
+		t.Fatalf("pathPrefix scope mismatch: got %v", rows)
+	}
+}
+
+// eqShingles reports whether two []uint64 are element-for-element
+// equal with order preserved — the exact contract LoadCloneShingles
+// must round-trip.
+func eqShingles(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// testCloneShingleSidecar mirrors the FileMtime sidecar conformance:
+// set shingle sets for a few node ids under a repo prefix, Load them
+// back (asserting exact []uint64 equality with order preserved),
+// Delete a subset and re-Load (asserting the gone rows are gone and
+// the survivors untouched), verify repo-prefix scoping isolates rows,
+// and that an empty/absent load returns an empty (non-nil) map, not an
+// error. Backends that don't implement the capability skip — both the
+// in-memory Graph and the SQLite Store do implement it.
+func testCloneShingleSidecar(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	w, ok := s.(graph.CloneShingleWriter)
+	if !ok {
+		t.Skip("backend does not implement graph.CloneShingleWriter")
+	}
+	r, ok := s.(graph.CloneShingleReader)
+	if !ok {
+		t.Skip("backend implements CloneShingleWriter but not CloneShingleReader")
+	}
+
+	// Empty / absent load returns an empty (non-nil) map, not an error.
+	if got, err := r.LoadCloneShingles("repoA"); err != nil {
+		t.Fatalf("LoadCloneShingles(empty store): %v", err)
+	} else if got == nil {
+		t.Fatalf("LoadCloneShingles(empty store) = nil, want empty non-nil map")
+	} else if len(got) != 0 {
+		t.Fatalf("LoadCloneShingles(empty store) = %v, want empty", got)
+	}
+
+	// Empty input is a no-op.
+	if err := w.BulkSetCloneShingles("repoA", nil); err != nil {
+		t.Fatalf("BulkSetCloneShingles(nil): %v", err)
+	}
+
+	// Write three shingle sets under repoA. Order within each set must
+	// survive the round-trip, so use non-sorted, repeated-value slices.
+	want := map[string][]uint64{
+		"a.go::Foo": {9, 1, 9, 4, 2},
+		"a.go::Bar": {7},
+		"b.go::Baz": {0xFFFFFFFFFFFFFFFF, 0, 42},
+	}
+	if err := w.BulkSetCloneShingles("repoA", want); err != nil {
+		t.Fatalf("BulkSetCloneShingles(repoA): %v", err)
+	}
+
+	got, err := r.LoadCloneShingles("repoA")
+	if err != nil {
+		t.Fatalf("LoadCloneShingles(repoA): %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("LoadCloneShingles(repoA) len = %d, want %d", len(got), len(want))
+	}
+	for id, ws := range want {
+		if !eqShingles(got[id], ws) {
+			t.Fatalf("LoadCloneShingles(repoA)[%q] = %v, want %v (order preserved)", id, got[id], ws)
+		}
+	}
+
+	// Overwrite is idempotent in place: re-setting one id replaces it.
+	if err := w.BulkSetCloneShingles("repoA", map[string][]uint64{"a.go::Bar": {7, 8, 9}}); err != nil {
+		t.Fatalf("BulkSetCloneShingles(overwrite): %v", err)
+	}
+	if got, err := r.LoadCloneShingles("repoA"); err != nil {
+		t.Fatalf("LoadCloneShingles after overwrite: %v", err)
+	} else if !eqShingles(got["a.go::Bar"], []uint64{7, 8, 9}) {
+		t.Fatalf("overwrite not in place: a.go::Bar = %v, want [7 8 9]", got["a.go::Bar"])
+	}
+
+	// Deep-copy isolation: mutating the input slice after the write must
+	// not corrupt stored state, and mutating the returned slice must not
+	// corrupt the next read.
+	src := []uint64{1, 2, 3}
+	if err := w.BulkSetCloneShingles("repoA", map[string][]uint64{"a.go::Foo": src}); err != nil {
+		t.Fatalf("BulkSetCloneShingles(isolation): %v", err)
+	}
+	src[0] = 999
+	got2, err := r.LoadCloneShingles("repoA")
+	if err != nil {
+		t.Fatalf("LoadCloneShingles(isolation): %v", err)
+	}
+	if !eqShingles(got2["a.go::Foo"], []uint64{1, 2, 3}) {
+		t.Fatalf("input mutation leaked into store: a.go::Foo = %v, want [1 2 3]", got2["a.go::Foo"])
+	}
+	got2["a.go::Foo"][0] = 777
+	if got3, _ := r.LoadCloneShingles("repoA"); !eqShingles(got3["a.go::Foo"], []uint64{1, 2, 3}) {
+		t.Fatalf("returned-slice mutation leaked into store: a.go::Foo = %v, want [1 2 3]", got3["a.go::Foo"])
+	}
+
+	// Delete a subset and re-Load — the deleted rows must be gone; the
+	// survivors untouched.
+	if err := w.DeleteCloneShingles([]string{"a.go::Bar", "b.go::Baz", "missing::id", ""}); err != nil {
+		t.Fatalf("DeleteCloneShingles: %v", err)
+	}
+	after, err := r.LoadCloneShingles("repoA")
+	if err != nil {
+		t.Fatalf("LoadCloneShingles after delete: %v", err)
+	}
+	if _, present := after["a.go::Bar"]; present {
+		t.Fatalf("a.go::Bar still present after delete")
+	}
+	if _, present := after["b.go::Baz"]; present {
+		t.Fatalf("b.go::Baz still present after delete")
+	}
+	if !eqShingles(after["a.go::Foo"], []uint64{1, 2, 3}) {
+		t.Fatalf("survivor a.go::Foo corrupted after delete: %v", after["a.go::Foo"])
+	}
+
+	// Empty delete is a no-op.
+	if err := w.DeleteCloneShingles(nil); err != nil {
+		t.Fatalf("DeleteCloneShingles(nil): %v", err)
+	}
+
+	// Repo-prefix scoping: a write under repoB must not surface under
+	// repoA, and vice versa.
+	if err := w.BulkSetCloneShingles("repoB", map[string][]uint64{"c.go::Qux": {5, 6}}); err != nil {
+		t.Fatalf("BulkSetCloneShingles(repoB): %v", err)
+	}
+	aRows, err := r.LoadCloneShingles("repoA")
+	if err != nil {
+		t.Fatalf("LoadCloneShingles(repoA) after repoB write: %v", err)
+	}
+	if _, leaked := aRows["c.go::Qux"]; leaked {
+		t.Fatalf("repoB row c.go::Qux leaked into repoA scope")
+	}
+	bRows, err := r.LoadCloneShingles("repoB")
+	if err != nil {
+		t.Fatalf("LoadCloneShingles(repoB): %v", err)
+	}
+	if len(bRows) != 1 || !eqShingles(bRows["c.go::Qux"], []uint64{5, 6}) {
+		t.Fatalf("LoadCloneShingles(repoB) = %v, want {c.go::Qux:[5 6]}", bRows)
+	}
+}
+
+// testChurnEnrichmentSidecar mirrors the clone-shingle sidecar
+// conformance for the churn enrichment capability (change A): write,
+// read-all vs read-by-prefix, idempotent overwrite, per-repo isolation,
+// and delete.
+func testChurnEnrichmentSidecar(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	w, ok := s.(graph.ChurnEnrichmentWriter)
+	if !ok {
+		t.Skip("backend does not implement graph.ChurnEnrichmentWriter")
+	}
+	r, ok := s.(graph.ChurnEnrichmentReader)
+	if !ok {
+		t.Skip("backend implements ChurnEnrichmentWriter but not ChurnEnrichmentReader")
+	}
+
+	// Empty store + empty input are no-ops.
+	if got := r.ChurnRows("repoA"); len(got) != 0 {
+		t.Fatalf("ChurnRows(empty store) = %v, want empty", got)
+	}
+	if err := w.BulkSetChurn("repoA", nil); err != nil {
+		t.Fatalf("BulkSetChurn(nil): %v", err)
+	}
+
+	rowsA := []graph.ChurnEnrichment{
+		{NodeID: "a.go", CommitCount: 5, AgeDays: 30, ChurnRate: 1.5, LastAuthor: "x@y", LastCommitAt: "2026-01-01T00:00:00Z", HeadSHA: "abc", Branch: "main", ComputedAt: "2026-06-01T00:00:00Z"},
+		{NodeID: "a.go::Foo", CommitCount: 2, AgeDays: 10, ChurnRate: 0.2, LastAuthor: "z@y", LastCommitAt: "2026-02-01T00:00:00Z"},
+	}
+	rowsB := []graph.ChurnEnrichment{
+		{NodeID: "b.go::Bar", CommitCount: 9, AgeDays: 90, ChurnRate: 0.1, LastAuthor: "q@y"},
+	}
+	if err := w.BulkSetChurn("repoA", rowsA); err != nil {
+		t.Fatalf("BulkSetChurn(repoA): %v", err)
+	}
+	if err := w.BulkSetChurn("repoB", rowsB); err != nil {
+		t.Fatalf("BulkSetChurn(repoB): %v", err)
+	}
+
+	// Per-repo read isolation.
+	if got := r.ChurnRows("repoA"); len(got) != 2 {
+		t.Fatalf("ChurnRows(repoA) len = %d, want 2", len(got))
+	}
+	if got := r.ChurnRows("repoB"); len(got) != 1 {
+		t.Fatalf("ChurnRows(repoB) len = %d, want 1", len(got))
+	}
+	// Empty prefix returns ALL rows across repos.
+	all := r.ChurnRows("")
+	if len(all) != 3 {
+		t.Fatalf("ChurnRows(\"\") len = %d, want 3 (all repos)", len(all))
+	}
+
+	// Field round-trip + repo_prefix stamping.
+	byID := map[string]graph.ChurnEnrichment{}
+	for _, e := range all {
+		byID[e.NodeID] = e
+	}
+	foo := byID["a.go"]
+	if foo.RepoPrefix != "repoA" || foo.CommitCount != 5 || foo.ChurnRate != 1.5 ||
+		foo.LastAuthor != "x@y" || foo.LastCommitAt != "2026-01-01T00:00:00Z" ||
+		foo.HeadSHA != "abc" || foo.Branch != "main" {
+		t.Fatalf("round-trip mismatch for a.go: %+v", foo)
+	}
+
+	// Idempotent overwrite (INSERT OR REPLACE on node_id).
+	rowsA[0].CommitCount = 99
+	if err := w.BulkSetChurn("repoA", rowsA[:1]); err != nil {
+		t.Fatalf("BulkSetChurn(overwrite): %v", err)
+	}
+	for _, e := range r.ChurnRows("repoA") {
+		if e.NodeID == "a.go" && e.CommitCount != 99 {
+			t.Fatalf("overwrite failed: a.go commit_count = %d, want 99", e.CommitCount)
+		}
+	}
+
+	// Delete.
+	if err := w.DeleteChurn([]string{"a.go", "a.go::Foo"}); err != nil {
+		t.Fatalf("DeleteChurn: %v", err)
+	}
+	if got := r.ChurnRows("repoA"); len(got) != 0 {
+		t.Fatalf("ChurnRows(repoA) after delete = %d, want 0", len(got))
+	}
+	if got := r.ChurnRows("repoB"); len(got) != 1 {
+		t.Fatalf("DeleteChurn must not touch repoB: len = %d, want 1", len(got))
+	}
+}
+
+// testCoverageEnrichmentSidecar mirrors the churn sidecar conformance.
+func testCoverageEnrichmentSidecar(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	w, ok := s.(graph.CoverageEnrichmentWriter)
+	if !ok {
+		t.Skip("backend does not implement graph.CoverageEnrichmentWriter")
+	}
+	r, ok := s.(graph.CoverageEnrichmentReader)
+	if !ok {
+		t.Skip("backend implements CoverageEnrichmentWriter but not Reader")
+	}
+	if got := r.CoverageRows("repoA"); len(got) != 0 {
+		t.Fatalf("CoverageRows(empty) = %v, want empty", got)
+	}
+	if err := w.BulkSetCoverage("repoA", nil); err != nil {
+		t.Fatalf("BulkSetCoverage(nil): %v", err)
+	}
+	rowsA := []graph.CoverageEnrichment{
+		{NodeID: "a.go::Foo", CoveragePct: 87.5, NumStmt: 8, Hit: 7},
+		{NodeID: "a.go::Bar", CoveragePct: 0, NumStmt: 3, Hit: 0},
+	}
+	rowsB := []graph.CoverageEnrichment{{NodeID: "b.go::Baz", CoveragePct: 100, NumStmt: 1, Hit: 1}}
+	if err := w.BulkSetCoverage("repoA", rowsA); err != nil {
+		t.Fatalf("BulkSetCoverage(repoA): %v", err)
+	}
+	if err := w.BulkSetCoverage("repoB", rowsB); err != nil {
+		t.Fatalf("BulkSetCoverage(repoB): %v", err)
+	}
+	if got := r.CoverageRows("repoA"); len(got) != 2 {
+		t.Fatalf("CoverageRows(repoA) = %d, want 2", len(got))
+	}
+	if got := r.CoverageRows(""); len(got) != 3 {
+		t.Fatalf("CoverageRows(all) = %d, want 3", len(got))
+	}
+	byID := map[string]graph.CoverageEnrichment{}
+	for _, e := range r.CoverageRows("") {
+		byID[e.NodeID] = e
+	}
+	foo := byID["a.go::Foo"]
+	if foo.RepoPrefix != "repoA" || foo.CoveragePct != 87.5 || foo.NumStmt != 8 || foo.Hit != 7 {
+		t.Fatalf("round-trip mismatch: %+v", foo)
+	}
+	rowsA[0].CoveragePct = 12.0
+	if err := w.BulkSetCoverage("repoA", rowsA[:1]); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	for _, e := range r.CoverageRows("repoA") {
+		if e.NodeID == "a.go::Foo" && e.CoveragePct != 12.0 {
+			t.Fatalf("overwrite failed: %v", e.CoveragePct)
+		}
+	}
+	if err := w.DeleteCoverage([]string{"a.go::Foo", "a.go::Bar"}); err != nil {
+		t.Fatalf("DeleteCoverage: %v", err)
+	}
+	if got := r.CoverageRows("repoA"); len(got) != 0 {
+		t.Fatalf("after delete repoA = %d, want 0", len(got))
+	}
+	if got := r.CoverageRows("repoB"); len(got) != 1 {
+		t.Fatalf("delete must not touch repoB: %d", len(got))
+	}
+}
+
+// testReleaseEnrichmentSidecar mirrors the churn/coverage sidecar conformance.
+func testReleaseEnrichmentSidecar(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	w, ok := s.(graph.ReleaseEnrichmentWriter)
+	if !ok {
+		t.Skip("backend does not implement graph.ReleaseEnrichmentWriter")
+	}
+	r := s.(graph.ReleaseEnrichmentReader)
+	if err := w.BulkSetReleases("repoA", nil); err != nil {
+		t.Fatalf("BulkSetReleases(nil): %v", err)
+	}
+	if err := w.BulkSetReleases("repoA", []graph.ReleaseEnrichment{
+		{NodeID: "a.go", AddedIn: "v1.0.0"},
+		{NodeID: "b.go", AddedIn: "v1.2.0"},
+	}); err != nil {
+		t.Fatalf("BulkSetReleases(repoA): %v", err)
+	}
+	if err := w.BulkSetReleases("repoB", []graph.ReleaseEnrichment{{NodeID: "c.go", AddedIn: "v2.0.0"}}); err != nil {
+		t.Fatalf("BulkSetReleases(repoB): %v", err)
+	}
+	if got := r.ReleaseRows("repoA"); len(got) != 2 {
+		t.Fatalf("ReleaseRows(repoA) = %d, want 2", len(got))
+	}
+	if got := r.ReleaseRows(""); len(got) != 3 {
+		t.Fatalf("ReleaseRows(all) = %d, want 3", len(got))
+	}
+	byID := map[string]graph.ReleaseEnrichment{}
+	for _, e := range r.ReleaseRows("") {
+		byID[e.NodeID] = e
+	}
+	if byID["a.go"].AddedIn != "v1.0.0" || byID["a.go"].RepoPrefix != "repoA" {
+		t.Fatalf("round-trip mismatch: %+v", byID["a.go"])
+	}
+	if err := w.DeleteReleases([]string{"a.go", "b.go"}); err != nil {
+		t.Fatalf("DeleteReleases: %v", err)
+	}
+	if got := r.ReleaseRows("repoA"); len(got) != 0 {
+		t.Fatalf("after delete repoA = %d, want 0", len(got))
+	}
+	if got := r.ReleaseRows("repoB"); len(got) != 1 {
+		t.Fatalf("delete must not touch repoB: %d", len(got))
+	}
+}
+
+// testBlameEnrichmentSidecar mirrors the other enrichment sidecars.
+func testBlameEnrichmentSidecar(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	w, ok := s.(graph.BlameEnrichmentWriter)
+	if !ok {
+		t.Skip("backend does not implement graph.BlameEnrichmentWriter")
+	}
+	r := s.(graph.BlameEnrichmentReader)
+	if err := w.BulkSetBlame("repoA", nil); err != nil {
+		t.Fatalf("BulkSetBlame(nil): %v", err)
+	}
+	if err := w.BulkSetBlame("repoA", []graph.BlameEnrichment{
+		{NodeID: "a.go::Foo", Commit: "abc", Email: "x@y", Timestamp: 1700000000},
+		{NodeID: "a.go::Bar", Commit: "def", Email: "z@y", Timestamp: 1700001000},
+	}); err != nil {
+		t.Fatalf("BulkSetBlame(repoA): %v", err)
+	}
+	if err := w.BulkSetBlame("repoB", []graph.BlameEnrichment{{NodeID: "b.go::Baz", Commit: "ghi", Email: "q@y", Timestamp: 1700002000}}); err != nil {
+		t.Fatalf("BulkSetBlame(repoB): %v", err)
+	}
+	if got := r.BlameRows("repoA"); len(got) != 2 {
+		t.Fatalf("BlameRows(repoA) = %d, want 2", len(got))
+	}
+	if got := r.BlameRows(""); len(got) != 3 {
+		t.Fatalf("BlameRows(all) = %d, want 3", len(got))
+	}
+	byID := map[string]graph.BlameEnrichment{}
+	for _, e := range r.BlameRows("") {
+		byID[e.NodeID] = e
+	}
+	foo := byID["a.go::Foo"]
+	if foo.RepoPrefix != "repoA" || foo.Commit != "abc" || foo.Email != "x@y" || foo.Timestamp != 1700000000 {
+		t.Fatalf("round-trip mismatch: %+v", foo)
+	}
+	if err := w.DeleteBlame([]string{"a.go::Foo", "a.go::Bar"}); err != nil {
+		t.Fatalf("DeleteBlame: %v", err)
+	}
+	if got := r.BlameRows("repoA"); len(got) != 0 {
+		t.Fatalf("after delete repoA = %d, want 0", len(got))
+	}
+	if got := r.BlameRows("repoB"); len(got) != 1 {
+		t.Fatalf("delete must not touch repoB: %d", len(got))
+	}
+}

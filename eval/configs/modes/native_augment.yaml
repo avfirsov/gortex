@@ -1,0 +1,27 @@
+# Native + Augment mode — the primary evaluation mode
+#
+# Combines two capabilities:
+# 1. Explicit Gortex tools: gortex-search, gortex-context, gortex-impact, gortex-overview, gortex-usages
+#    Available as fast bash commands (~100ms via eval-server)
+# 2. Automatic grep enrichment: grep/rg results are transparently augmented with
+#    [Gortex] annotations showing callers, callees, and execution flows
+#
+# The agent decides when to use explicit tools vs rely on enriched grep results.
+agent:
+  agent_class: 'eval.agents.gortex_agent.GortexAgent'
+  gortex_mode: 'native_augment'
+  step_limit: 30
+  cost_limit: 3.0
+  augment_timeout: 5.0
+  augment_min_pattern_length: 3
+  track_gortex_usage: true
+
+environment:
+  environment_class: 'eval.environments.gortex_docker.GortexDockerEnvironment'
+  enable_gortex: true
+  gortex_timeout: 120
+  eval_server_port: 4747
+  # Set to 'podman' if using podman instead of docker
+  container_executable: 'podman'
+  # Path to linux/amd64 gortex binary for container injection
+  gortex_binary: './gortex-linux'

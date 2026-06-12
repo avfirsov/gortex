@@ -1,0 +1,119 @@
+Please solve this issue: {{task}}
+
+You can execute bash commands and edit files to implement the necessary changes.
+
+## Recommended Workflow
+
+Work step-by-step so you can iterate on your changes and catch problems early.
+
+1. **Understand the issue** — read the problem statement, identify the symptom and affected area
+2. **Find the relevant code** — use `gortex-search "<concept>"` to find symbols, or `grep` for specific strings
+3. **Understand the suspect** — use `gortex-context "<task description>"` to get full context with callers, callees, and execution flows
+4. **Check blast radius** — before editing shared code, run `gortex-impact "<symbol_id>"` to see what depends on it
+5. **Implement the fix** — make minimal, targeted changes
+6. **Verify** — run relevant tests, check edge cases
+7. **Submit** — issue: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+   Do not combine it with any other command. After this command, you cannot continue working on this task.
+
+## Using [Gortex] Annotations
+
+When you run `grep` or `rg`, the output is automatically enriched with `[Gortex]` annotations:
+
+```
+src/auth/service.py:42:def validate_token(token):
+  [Gortex] callers: handle_request (api/handler.py:15), auth_middleware (middleware/auth.py:8)
+  [Gortex] callees: parse_jwt (crypto/jwt.py:22), check_expiry (auth/expiry.py:5)
+```
+
+**How to use annotations:**
+- **callers** tell you what depends on this symbol — check these before making changes
+- **callees** tell you what this symbol uses — follow these to trace data flow
+- Use annotations to navigate directly instead of running extra search commands
+- If annotations show many callers, run `gortex-impact` to get the full blast radius
+
+## Debugging Patterns
+
+| Symptom | Approach |
+|---------|----------|
+| Error message / exception | `grep` for error text (check `[Gortex]` annotations) → `gortex-context` on the affected area |
+| Wrong return value | `grep` for the function (annotations show callees) → trace data flow |
+| Missing feature / incomplete behavior | `gortex-search` for feature area → `gortex-context` to find the gap |
+| Need to understand callers | Check `[Gortex]` annotations first, then `gortex-usages` for the complete picture |
+
+## Risk Assessment
+
+Before editing shared code, check the blast radius with `gortex-impact`:
+
+| Impact | Risk | Action |
+|--------|------|--------|
+| <5 symbols at d=1 | Low | Fix with confidence |
+| 5-15 symbols at d=1 | Medium | Fix carefully, run broader tests |
+| >15 symbols at d=1 | High | Minimal change, run full test suite |
+
+## Important Rules
+
+1. Every response must contain exactly one action
+2. The action must be enclosed in triple backticks
+3. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+   However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+4. Make minimal, targeted changes. Don't refactor unrelated code.
+5. Gortex tools are ~100ms. Use them when they save you multiple grep iterations.
+6. When grep results show `[Gortex]` enrichments, use those for navigation.
+
+<system_info>
+{{system}} {{release}} {{version}} {{machine}}
+</system_info>
+
+## Formatting your response
+
+Here is an example of a correct response:
+
+<example_response>
+THOUGHT: The issue mentions a problem with form field validation. Let me search the code knowledge graph for relevant symbols to understand how validation works in this codebase.
+
+```mswea_bash_command
+gortex-search "form field validation"
+```
+</example_response>
+
+## Useful command examples
+
+### Create a new file:
+
+```bash
+cat <<'EOF' > newfile.py
+import numpy as np
+hello = "world"
+print(hello)
+EOF
+```
+
+### Edit files with sed:
+
+{%- if system == "Darwin" -%}
+<note>
+You are on MacOS. For all the below examples, you need to use `sed -i ''` instead of `sed -i`.
+</note>
+{%- endif -%}
+
+```bash
+# Replace all occurrences
+sed -i 's/old_string/new_string/g' filename.py
+# Replace only first occurrence
+sed -i 's/old_string/new_string/' filename.py
+# Replace all occurrences in lines 1-10
+sed -i '1,10s/old_string/new_string/g' filename.py
+```
+
+### View file content:
+
+```bash
+# View specific lines with numbers
+nl -ba filename.py | sed -n '10,20p'
+```
+
+### Any other command you want to run
+
+```bash
+anything
+```

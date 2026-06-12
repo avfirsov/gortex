@@ -1,0 +1,25 @@
+tool: search_symbols
+description: 20 search hits with signatures
+input: |
+  [
+    {"id":"cmd/gortex/main.go::main","kind":"function","name":"main","file_path":"cmd/gortex/main.go","start_line":14,"signature":"func main()"},
+    {"id":"cmd/gortex/serve.go::runServe","kind":"function","name":"runServe","file_path":"cmd/gortex/serve.go","start_line":48,"signature":"func runServe(cmd *cobra.Command, args []string) error"},
+    {"id":"cmd/gortex/bridge.go::runBridge","kind":"function","name":"runBridge","file_path":"cmd/gortex/bridge.go","start_line":36,"signature":"func runBridge(cmd *cobra.Command, args []string) error"},
+    {"id":"cmd/gortex/daemon.go::runDaemonStart","kind":"function","name":"runDaemonStart","file_path":"cmd/gortex/daemon.go","start_line":78,"signature":"func runDaemonStart(cmd *cobra.Command, args []string) error"},
+    {"id":"cmd/gortex/daemon.go::runDaemonStop","kind":"function","name":"runDaemonStop","file_path":"cmd/gortex/daemon.go","start_line":152,"signature":"func runDaemonStop(cmd *cobra.Command, args []string) error"},
+    {"id":"internal/indexer/indexer.go::Indexer.Index","kind":"method","name":"Index","file_path":"internal/indexer/indexer.go","start_line":110,"signature":"func (i *Indexer) Index(root string) error"},
+    {"id":"internal/indexer/indexer.go::Indexer.IndexCtx","kind":"method","name":"IndexCtx","file_path":"internal/indexer/indexer.go","start_line":116,"signature":"func (i *Indexer) IndexCtx(ctx context.Context, root string) error"},
+    {"id":"internal/indexer/multi.go::MultiIndexer.TrackRepo","kind":"method","name":"TrackRepo","file_path":"internal/indexer/multi.go","start_line":88,"signature":"func (mi *MultiIndexer) TrackRepo(entry config.RepoEntry) error"},
+    {"id":"internal/indexer/multi.go::MultiIndexer.TrackRepoCtx","kind":"method","name":"TrackRepoCtx","file_path":"internal/indexer/multi.go","start_line":94,"signature":"func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry) error"},
+    {"id":"internal/query/engine.go::Engine.SearchSymbols","kind":"method","name":"SearchSymbols","file_path":"internal/query/engine.go","start_line":142,"signature":"func (e *Engine) SearchSymbols(q string, limit int) []*graph.Node"},
+    {"id":"internal/query/engine.go::Engine.FindUsages","kind":"method","name":"FindUsages","file_path":"internal/query/engine.go","start_line":207,"signature":"func (e *Engine) FindUsages(id string) *SubGraph"},
+    {"id":"internal/query/engine.go::Engine.GetCallers","kind":"method","name":"GetCallers","file_path":"internal/query/engine.go","start_line":255,"signature":"func (e *Engine) GetCallers(id string, opts QueryOptions) *SubGraph"},
+    {"id":"internal/query/engine.go::Engine.GetCallChain","kind":"method","name":"GetCallChain","file_path":"internal/query/engine.go","start_line":298,"signature":"func (e *Engine) GetCallChain(id string, opts QueryOptions) *SubGraph"},
+    {"id":"internal/graph/graph.go::Graph.AddNode","kind":"method","name":"AddNode","file_path":"internal/graph/graph.go","start_line":94,"signature":"func (g *Graph) AddNode(n *Node)"},
+    {"id":"internal/graph/graph.go::Graph.AddEdge","kind":"method","name":"AddEdge","file_path":"internal/graph/graph.go","start_line":128,"signature":"func (g *Graph) AddEdge(e *Edge)"},
+    {"id":"internal/graph/graph.go::Graph.GetNode","kind":"method","name":"GetNode","file_path":"internal/graph/graph.go","start_line":155,"signature":"func (g *Graph) GetNode(id string) *Node"},
+    {"id":"internal/resolver/resolver.go::Resolver.Resolve","kind":"method","name":"Resolve","file_path":"internal/resolver/resolver.go","start_line":60,"signature":"func (r *Resolver) Resolve(g *graph.Graph)"},
+    {"id":"internal/semantic/enricher.go::Enricher.Enrich","kind":"method","name":"Enrich","file_path":"internal/semantic/enricher.go","start_line":48,"signature":"func (e *Enricher) Enrich(ctx context.Context, g *graph.Graph) (*EnrichResult, error)"},
+    {"id":"internal/contracts/bind.go::Bridge","kind":"function","name":"Bridge","file_path":"internal/contracts/bind.go","start_line":33,"signature":"func Bridge(g *graph.Graph, reg *Registry) []*graph.Edge"},
+    {"id":"internal/parser/parser.go::Parser.Parse","kind":"method","name":"Parse","file_path":"internal/parser/parser.go","start_line":52,"signature":"func (p *Parser) Parse(path string) (*parser.Result, error)"}
+  ]

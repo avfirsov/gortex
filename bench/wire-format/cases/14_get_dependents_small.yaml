@@ -1,0 +1,18 @@
+tool: get_dependents
+description: transitive dependents, 5 nodes
+input: |
+  {
+    "nodes":[
+      {"id":"internal/config/config.go::Config","kind":"type","name":"Config","file_path":"internal/config/config.go","start_line":40},
+      {"id":"internal/config/manager.go::Manager","kind":"type","name":"Manager","file_path":"internal/config/manager.go","start_line":22},
+      {"id":"cmd/gortex/serve.go::runServe","kind":"function","name":"runServe","file_path":"cmd/gortex/serve.go","start_line":48},
+      {"id":"cmd/gortex/bridge.go::runBridge","kind":"function","name":"runBridge","file_path":"cmd/gortex/bridge.go","start_line":36},
+      {"id":"cmd/gortex/daemon.go::runDaemonStart","kind":"function","name":"runDaemonStart","file_path":"cmd/gortex/daemon.go","start_line":78}
+    ],
+    "edges":[
+      {"from":"internal/config/manager.go::Manager","to":"internal/config/config.go::Config","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"cmd/gortex/serve.go::runServe","to":"internal/config/manager.go::Manager","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"cmd/gortex/bridge.go::runBridge","to":"internal/config/manager.go::Manager","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"cmd/gortex/daemon.go::runDaemonStart","to":"internal/config/manager.go::Manager","kind":"references","confidence":1.0,"origin":"ast_resolved"}
+    ]
+  }

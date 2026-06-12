@@ -1,0 +1,110 @@
+# Angular DI-recall fixture
+#
+# Modern Angular has two DI shapes:
+#   1. Constructor injection: `constructor(private svc: Svc) {}` — same
+#      shape as NestJS. Type-aware resolution already handles this.
+#   2. inject() function: `private svc = inject(Svc)` — field
+#      initializer calls `inject(Target)` to resolve the dependency.
+#      The call site is a function call to `inject`, not to Target.
+#      Without a special pass, the dependency is invisible — same
+#      shape as FastAPI's Depends(target) in that respect.
+#
+# Angular's @Injectable({ providedIn: 'root' }) is metadata only —
+# doesn't affect graph shape, just marks the class as injectable. No
+# extraction needed for the recall queries in this fixture.
+name: gortex-angular-di
+cases:
+
+  # ------------------------------------------------------------------
+  # Tier 1 — exact: named symbols
+  # ------------------------------------------------------------------
+  - id: exact-UsersService
+    tier: exact
+    query: UsersService
+    expected: [src/app/users/users.service.ts::UsersService]
+  - id: exact-AuthService
+    tier: exact
+    query: AuthService
+    expected: [src/app/auth/auth.service.ts::AuthService]
+  - id: exact-UsersListComponent
+    tier: exact
+    query: UsersListComponent
+    expected: [src/app/users/users.controller.ts::UsersListComponent]
+  - id: exact-findOne
+    tier: exact
+    query: findOne
+    expected: [src/app/users/users.service.ts::UsersService.findOne]
+
+  # ------------------------------------------------------------------
+  # Tier 2 — concept
+  # ------------------------------------------------------------------
+  - id: concept-list-all-users
+    tier: concept
+    query: list every user
+    expected: [src/app/users/users.service.ts::UsersService.findAll]
+  - id: concept-validate-credentials
+    tier: concept
+    query: validate user credentials
+    expected: [src/app/auth/auth.service.ts::AuthService.validate]
+
+  # ------------------------------------------------------------------
+  # Tier 3 — di: classic constructor injection with explicit types
+  # ------------------------------------------------------------------
+  # UsersListComponent has `constructor(private auth: AuthService)`.
+  # `this.auth.validate(...)` in validateAndList resolves via the
+  # parameter-property typing pass — Angular uses the same TS shape
+  # as NestJS here.
+  - id: di-call_chain-validateAndList
+    tier: di
+    query: "call_chain:src/app/users/users.controller.ts::UsersListComponent.validateAndList"
+    expected:
+      - src/app/auth/auth.service.ts::AuthService.validate
+
+  # ------------------------------------------------------------------
+  # Tier 4 — di_gap: inject() function-style injection
+  # ------------------------------------------------------------------
+  # AuthService uses `private users = inject(UsersService)`. The
+  # `users.findOne(userId)` call site can only resolve to UsersService.findOne
+  # if the graph knows `this.users` has type UsersService. Without
+  # inject()-aware extraction, the field's type is unknown and the
+  # call chain stops here.
+  - id: di_gap-call_chain-AuthService-validate
+    tier: di_gap
+    query: "call_chain:src/app/auth/auth.service.ts::AuthService.validate"
+    expected:
+      - src/app/users/users.service.ts::UsersService.findOne
+
+  # UsersListComponent.displayList calls `this.users.findAll()` where
+  # `users = inject(UsersService)` — same gap.
+  - id: di_gap-call_chain-displayList
+    tier: di_gap
+    query: "call_chain:src/app/users/users.controller.ts::UsersListComponent.displayList"
+    expected:
+      - src/app/users/users.service.ts::UsersService.findAll
+
+  # Direct callers query: who uses UsersService? With inject()
+  # extraction, the answer includes classes that inject() it, not
+  # just constructor-injected consumers.
+  - id: di_gap-callers-UsersService-findAll
+    tier: di_gap
+    query: "callers:src/app/users/users.service.ts::UsersService.findAll"
+    expected:
+      - src/app/users/users.controller.ts::UsersListComponent.displayList
+
+  - id: di_gap-callers-UsersService-findOne
+    tier: di_gap
+    query: "callers:src/app/users/users.service.ts::UsersService.findOne"
+    expected:
+      - src/app/auth/auth.service.ts::AuthService.validate
+
+  # Ambiguous method names: SessionService also has a findOne() method.
+  # SessionService.currentUser calls `this.users.findOne(...)` where
+  # `users = inject(UsersService)`. A name-only fallback would pick
+  # either SessionService.findOne or UsersService.findOne arbitrarily.
+  # This case tests whether inject()-aware type resolution routes the
+  # call correctly to UsersService.findOne.
+  - id: di_gap-call_chain-SessionService-currentUser
+    tier: di_gap
+    query: "call_chain:src/app/auth/session.service.ts::SessionService.currentUser"
+    expected:
+      - src/app/users/users.service.ts::UsersService.findOne

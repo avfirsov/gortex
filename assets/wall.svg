@@ -1,0 +1,207 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="105 67 1180 468" width="1180" height="468" role="img" aria-label="Gortex">
+  <title>Gortex — code graph and intelligence engine</title>
+  <defs>
+    <filter id="soft" x="-120%" y="-120%" width="340%" height="340%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <style>
+  /* ---------- palette : light default, dark via prefers-color-scheme ---------- */
+  .ink  { fill: #18181A; }
+  .dim  { fill: #CBCBCA; }
+  .grn  { fill: #4C9655; }
+  .glow { fill: #4C9655; }
+  .edge { stroke: #18181A; stroke-opacity: .15; }
+  .pulse{ fill: #4C9655; }
+  @media (prefers-color-scheme: dark) {
+    .ink  { fill: #ECECEA; }
+    .dim  { fill: #3C3C42; }
+    .grn  { fill: #5FB36C; }
+    .glow { fill: #5FB36C; }
+    .edge { stroke: #ECECEA; stroke-opacity: .14; }
+    .pulse{ fill: #6FC47B; }
+  }
+
+  .node, .dot, .ghome-pop { transform-box: fill-box; transform-origin: center; }
+
+  /* ---------- node + dot intro : staggered pop-in, plays once ---------- */
+  .node, .dot { opacity: 0; animation: pop .5s cubic-bezier(.34,1.3,.5,1) both; }
+  @keyframes pop { 0%{opacity:0;transform:scale(.2)} 100%{opacity:1;transform:scale(1)} }
+
+  /* ---------- edges draw themselves in once ---------- */
+  .edge { fill:none; stroke-width:2; stroke-linecap:round;
+           stroke-dasharray:100; stroke-dashoffset:100; animation: draw .7s ease-out forwards; }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+
+  /* ---------- the green light travelling the ring ---------- */
+  .ghome-pop { opacity:0; animation: pop .5s cubic-bezier(.34,1.3,.5,1) 0.3s both; }
+  .c0 { animation: chase0 6.0s linear 1.7s infinite backwards; }
+  .c1 { animation: chase1 6.0s linear 1.7s infinite backwards; }
+  .c2 { animation: chase2 6.0s linear 1.7s infinite backwards; }
+  .c3 { animation: chase3 6.0s linear 1.7s infinite backwards; }
+  .c4 { animation: chase4 6.0s linear 1.7s infinite backwards; }
+  .c5 { animation: chase5 6.0s linear 1.7s infinite backwards; }
+  .c6 { animation: chase6 6.0s linear 1.7s infinite backwards; }
+  .c7 { animation: chase7 6.0s linear 1.7s infinite backwards; }
+  .c8 { animation: chase8 6.0s linear 1.7s infinite backwards; }
+  .c9 { animation: chase9 6.0s linear 1.7s infinite backwards; }
+  .c10 { animation: chase10 6.0s linear 1.7s infinite backwards; }
+  .c11 { animation: chase11 6.0s linear 1.7s infinite backwards; }
+  @keyframes chase0 { 0%{opacity:1} 16.000%{opacity:1} 16.450%{opacity:0} 78.333%{opacity:0} 78.783%{opacity:1} 100%{opacity:1} }
+  @keyframes chase1 { 0%,15.550%{opacity:0} 16.000%{opacity:1} 21.667%{opacity:1} 22.117%,100%{opacity:0} }
+  @keyframes chase2 { 0%,21.217%{opacity:0} 21.667%{opacity:1} 27.333%{opacity:1} 27.783%,100%{opacity:0} }
+  @keyframes chase3 { 0%,26.883%{opacity:0} 27.333%{opacity:1} 33.000%{opacity:1} 33.450%,100%{opacity:0} }
+  @keyframes chase4 { 0%,32.550%{opacity:0} 33.000%{opacity:1} 38.667%{opacity:1} 39.117%,100%{opacity:0} }
+  @keyframes chase5 { 0%,38.217%{opacity:0} 38.667%{opacity:1} 44.333%{opacity:1} 44.783%,100%{opacity:0} }
+  @keyframes chase6 { 0%,43.883%{opacity:0} 44.333%{opacity:1} 50.000%{opacity:1} 50.450%,100%{opacity:0} }
+  @keyframes chase7 { 0%,49.550%{opacity:0} 50.000%{opacity:1} 55.667%{opacity:1} 56.117%,100%{opacity:0} }
+  @keyframes chase8 { 0%,55.217%{opacity:0} 55.667%{opacity:1} 61.333%{opacity:1} 61.783%,100%{opacity:0} }
+  @keyframes chase9 { 0%,60.883%{opacity:0} 61.333%{opacity:1} 67.000%{opacity:1} 67.450%,100%{opacity:0} }
+  @keyframes chase10 { 0%,66.550%{opacity:0} 67.000%{opacity:1} 72.667%{opacity:1} 73.117%,100%{opacity:0} }
+  @keyframes chase11 { 0%,72.217%{opacity:0} 72.667%{opacity:1} 78.333%{opacity:1} 78.783%,100%{opacity:0} }
+
+  /* ---------- query dot : in along the spine, out the same way ---------- */
+  .qpulse { opacity:0; animation: qp 6.0s linear 1.7s infinite; }
+  @keyframes qp { 0%{opacity:0} 3%{opacity:1} 14%{opacity:1} 17%{opacity:0}
+                   83%{opacity:0} 86%{opacity:1} 97%{opacity:1} 100%{opacity:0} }
+
+  /* ---------- wordmark fades + rises in once ---------- */
+  .wordmark { opacity:0; transform: translateY(10px); animation: word .8s ease-out .55s forwards; }
+  @keyframes word { to { opacity:1; transform: translateY(0); } }
+
+  /* ---------- reduced motion : settled logo, green at home, no movement ---------- */
+  @media (prefers-reduced-motion: reduce) {
+    .node,.dot,.edge,.ghome-pop,.wordmark { animation:none!important; opacity:1!important;
+        transform:none!important; stroke-dashoffset:0!important; }
+    .c0 { animation:none!important; opacity:1!important; }
+    .c1,.c2,.c3,.c4,.c5,.c6,.c7,.c8,.c9,.c10,.c11,.qpulse { animation:none!important; opacity:0!important; }
+  }
+  </style>
+  </defs>
+
+  <!-- knowledge-graph edges (the ring the green light travels) -->
+  <g>
+    <path class="edge" d="M190 300 L351 300" pathLength="100" style="animation-delay:0.5s"/>
+    <path class="edge" d="M351 300 L431 300" pathLength="100" style="animation-delay:0.53s"/>
+    <path class="edge" d="M431 300 L511 300" pathLength="100" style="animation-delay:0.56s"/>
+    <path class="edge" d="M511 220 L511 300" pathLength="100" style="animation-delay:0.59s"/>
+    <path class="edge" d="M511 380 L511 300" pathLength="100" style="animation-delay:0.62s"/>
+    <path class="edge" d="M431 140 L511 220" pathLength="100" style="animation-delay:0.65s"/>
+    <path class="edge" d="M431 460 L511 380" pathLength="100" style="animation-delay:0.68s"/>
+    <path class="edge" d="M270 140 L351 140" pathLength="100" style="animation-delay:0.71s"/>
+    <path class="edge" d="M351 140 L431 140" pathLength="100" style="animation-delay:0.74s"/>
+    <path class="edge" d="M270 460 L351 460" pathLength="100" style="animation-delay:0.77s"/>
+    <path class="edge" d="M351 460 L431 460" pathLength="100" style="animation-delay:0.8s"/>
+    <path class="edge" d="M190 220 L190 300" pathLength="100" style="animation-delay:0.83s"/>
+    <path class="edge" d="M190 300 L190 380" pathLength="100" style="animation-delay:0.86s"/>
+    <path class="edge" d="M270 140 L190 220" pathLength="100" style="animation-delay:0.89s"/>
+    <path class="edge" d="M270 460 L190 380" pathLength="100" style="animation-delay:0.92s"/>
+  </g>
+
+  <!-- inactive cells -->
+  <g>
+    <rect class="dot dim" x="182.5" y="132.5" width="15" height="15" style="animation-delay:0.0s"/>
+    <rect class="dot dim" x="503.5" y="132.5" width="15" height="15" style="animation-delay:0.2s"/>
+    <rect class="dot dim" x="262.5" y="212.5" width="15" height="15" style="animation-delay:0.1s"/>
+    <rect class="dot dim" x="343.5" y="212.5" width="15" height="15" style="animation-delay:0.15s"/>
+    <rect class="dot dim" x="423.5" y="212.5" width="15" height="15" style="animation-delay:0.2s"/>
+    <rect class="dot dim" x="262.5" y="292.5" width="15" height="15" style="animation-delay:0.15s"/>
+    <rect class="dot dim" x="262.5" y="372.5" width="15" height="15" style="animation-delay:0.2s"/>
+    <rect class="dot dim" x="343.5" y="372.5" width="15" height="15" style="animation-delay:0.25s"/>
+    <rect class="dot dim" x="423.5" y="372.5" width="15" height="15" style="animation-delay:0.3s"/>
+    <rect class="dot dim" x="182.5" y="452.5" width="15" height="15" style="animation-delay:0.2s"/>
+    <rect class="dot dim" x="503.5" y="452.5" width="15" height="15" style="animation-delay:0.4s"/>
+  </g>
+
+  <!-- nodes (black base) -->
+  <g>
+    <rect class="node ink" x="248" y="118" width="44" height="44" style="animation-delay:0.05s"/>
+    <rect class="node ink" x="329" y="118" width="44" height="44" style="animation-delay:0.1s"/>
+    <rect class="node ink" x="409" y="118" width="44" height="44" style="animation-delay:0.15s"/>
+    <rect class="node ink" x="168" y="198" width="44" height="44" style="animation-delay:0.05s"/>
+    <rect class="node ink" x="489" y="198" width="44" height="44" style="animation-delay:0.25s"/>
+    <rect class="node ink" x="168" y="278" width="44" height="44" style="animation-delay:0.1s"/>
+    <rect class="node ink" x="329" y="278" width="44" height="44" style="animation-delay:0.2s"/>
+    <rect class="node ink" x="409" y="278" width="44" height="44" style="animation-delay:0.25s"/>
+    <rect class="node ink" x="168" y="358" width="44" height="44" style="animation-delay:0.15s"/>
+    <rect class="node ink" x="489" y="358" width="44" height="44" style="animation-delay:0.35s"/>
+    <rect class="node ink" x="248" y="438" width="44" height="44" style="animation-delay:0.25s"/>
+    <rect class="node ink" x="329" y="438" width="44" height="44" style="animation-delay:0.3s"/>
+    <rect class="node ink" x="409" y="438" width="44" height="44" style="animation-delay:0.35s"/>
+    <rect class="node ink" x="489" y="278" width="44" height="44" style="animation-delay:0.3s"/>
+  </g>
+
+  <!-- green light : home + ring positions -->
+    <g class="ghome-pop">
+      <g class="c0">
+        <rect class="glow" x="489" y="278" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="278" width="44" height="44"/>
+      </g>
+    </g>
+  <g>
+      <g class="c1">
+        <rect class="glow" x="489" y="358" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="358" width="44" height="44"/>
+      </g>
+      <g class="c2">
+        <rect class="glow" x="409" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="409" y="438" width="44" height="44"/>
+      </g>
+      <g class="c3">
+        <rect class="glow" x="329" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="329" y="438" width="44" height="44"/>
+      </g>
+      <g class="c4">
+        <rect class="glow" x="248" y="438" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="248" y="438" width="44" height="44"/>
+      </g>
+      <g class="c5">
+        <rect class="glow" x="168" y="358" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="358" width="44" height="44"/>
+      </g>
+      <g class="c6">
+        <rect class="glow" x="168" y="278" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="278" width="44" height="44"/>
+      </g>
+      <g class="c7">
+        <rect class="glow" x="168" y="198" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="168" y="198" width="44" height="44"/>
+      </g>
+      <g class="c8">
+        <rect class="glow" x="248" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="248" y="118" width="44" height="44"/>
+      </g>
+      <g class="c9">
+        <rect class="glow" x="329" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="329" y="118" width="44" height="44"/>
+      </g>
+      <g class="c10">
+        <rect class="glow" x="409" y="118" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="409" y="118" width="44" height="44"/>
+      </g>
+      <g class="c11">
+        <rect class="glow" x="489" y="198" width="44" height="44" filter="url(#soft)"/>
+        <rect class="grn"  x="489" y="198" width="44" height="44"/>
+      </g>
+  </g>
+
+  <!-- query dot -->
+    <circle class="qpulse pulse" r="6" filter="url(#soft)">
+      <animateMotion dur="6.0s" begin="1.7s" repeatCount="indefinite"
+        path="M190 300 L511 300" keyPoints="0;1;1;0" keyTimes="0;0.16;0.84;1"
+        calcMode="spline" keySplines="0.4 0 0.2 1; 0 0 1 1; 0.4 0 0.2 1"/>
+    </circle>
+
+  <!-- wordmark -->
+    <g class="wordmark">
+      <g class="ink" transform="translate(661,245) scale(0.249579)">
+        <g transform="translate(-24.085142,595.789232) scale(0.100000,-0.100000)" stroke="none">
+        <path d="M12970 5950 l-385 -5 -3 -479 c-1 -334 -6 -483 -13 -493 -9 -10 -99 -13 -469 -13 -375 0 -460 -2 -469 -14 -8 -9 -11 -116 -9 -372 l3 -359 468 -5 c401 -4 469 -7 477 -20 6 -9 10 -357 10 -890 1 -907 7 -1090 44 -1185 8 -22 15 -49 16 -60 0 -37 99 -219 157 -292 55 -68 190 -185 243 -211 14 -6 32 -16 40 -20 102 -59 264 -104 440 -122 144 -15 1143 -13 1158 2 18 18 17 711 -1 726 -8 7 -196 11 -544 14 l-531 3 -31 23 c-16 12 -35 22 -40 22 -15 0 -80 81 -104 130 l-22 45 -3 904 c-2 671 0 907 9 917 10 12 120 14 670 14 643 0 659 0 669 20 7 12 9 140 8 372 l-3 353 -675 5 -675 5 -3 485 c-2 442 -4 486 -19 498 -9 6 -19 11 -22 10 -3 -2 -179 -5 -391 -8z"/>
+        <path d="M1285 5009 c-60 -5 -139 -18 -175 -29 -36 -10 -81 -23 -100 -29 -55 -15 -106 -36 -121 -48 -8 -6 -40 -24 -71 -41 -96 -51 -237 -174 -292 -255 -19 -29 -55 -81 -80 -117 -25 -36 -46 -71 -46 -78 0 -8 -7 -26 -14 -40 -63 -114 -116 -322 -136 -528 -12 -127 -12 -917 0 -1054 5 -57 15 -129 21 -160 23 -114 62 -263 76 -293 9 -18 24 -49 34 -69 11 -20 19 -43 19 -50 0 -13 10 -29 102 -166 48 -71 217 -236 266 -259 15 -7 45 -24 67 -37 68 -41 143 -76 162 -76 10 0 41 -9 68 -19 78 -29 311 -55 435 -48 182 11 297 40 440 110 70 35 102 60 185 142 87 86 107 113 148 195 26 52 47 104 47 115 0 11 5 27 10 35 26 39 30 -22 25 -365 -6 -394 -11 -486 -29 -565 -32 -142 -115 -238 -251 -296 -104 -45 -143 -47 -740 -53 l-570 -6 -3 -334 c-2 -261 1 -336 10 -343 19 -12 1018 -10 1165 3 175 14 309 34 362 53 24 9 54 16 68 16 13 0 41 9 61 19 61 31 132 61 145 61 7 0 44 22 82 50 39 27 90 64 115 81 78 54 194 189 229 264 5 12 16 27 25 34 9 7 16 19 16 25 1 6 9 29 20 51 11 22 20 47 20 55 0 8 9 33 20 55 11 22 20 54 20 70 0 17 9 68 20 115 19 83 19 137 20 1907 0 1643 -2 1823 -16 1837 -13 14 -63 16 -397 16 -210 0 -388 -4 -396 -9 -11 -7 -12 -49 -3 -251 6 -133 8 -248 5 -256 -8 -22 -22 -16 -29 14 -4 15 -27 65 -52 112 -58 112 -140 208 -232 274 -42 30 -209 116 -226 116 -6 0 -38 8 -70 19 -54 17 -121 25 -289 35 -33 2 -109 0 -170 -5z m561 -723 c143 -25 280 -108 356 -213 41 -58 92 -162 106 -218 21 -82 32 -266 32 -544 0 -309 -16 -519 -45 -586 -72 -166 -149 -257 -273 -322 -45 -24 -90 -43 -102 -43 -11 0 -37 -7 -58 -16 -52 -22 -269 -22 -331 0 -24 9 -52 16 -61 16 -53 0 -197 99 -261 179 -121 152 -149 296 -149 776 0 480 27 622 148 773 47 59 80 90 122 113 19 10 42 23 50 29 98 61 298 85 466 56z"/>
+        <path d="M9675 5005 c-71 -7 -150 -20 -174 -29 -24 -9 -53 -16 -64 -16 -31 0 -186 -79 -242 -124 -77 -61 -125 -107 -151 -146 -13 -19 -36 -53 -51 -75 -34 -48 -63 -111 -72 -156 -4 -20 -13 -34 -21 -34 -13 0 -16 40 -20 253 -5 236 -6 255 -24 268 -16 11 -84 14 -374 14 -224 0 -360 -4 -373 -10 -19 -11 -19 -41 -19 -1765 0 -1586 2 -1755 16 -1769 14 -14 62 -16 412 -14 l397 3 5 1190 c5 1184 5 1190 27 1265 28 97 58 163 108 231 39 55 125 132 161 145 10 4 26 13 34 20 8 7 51 24 95 38 70 23 98 26 220 26 117 0 151 -4 205 -21 36 -12 74 -27 85 -32 11 -6 36 -19 56 -29 48 -23 145 -112 177 -163 91 -141 112 -219 119 -440 6 -169 7 -180 29 -202 l23 -23 400 0 c386 0 401 1 411 19 13 25 13 230 0 381 -13 156 -29 253 -51 329 -10 35 -19 72 -19 82 0 18 -59 154 -102 234 -52 97 -154 220 -247 297 -53 44 -110 86 -127 93 -17 7 -35 18 -38 24 -4 6 -14 11 -23 11 -9 0 -24 7 -33 15 -18 16 -149 65 -175 65 -8 0 -41 9 -72 19 -35 11 -102 22 -165 25 -59 3 -131 8 -160 10 -29 2 -111 -2 -183 -9z"/>
+        <path d="M16955 5009 c-239 -16 -451 -76 -650 -185 -110 -61 -110 -61 -195 -131 -142 -116 -256 -260 -327 -413 -55 -118 -63 -138 -63 -157 0 -10 -9 -38 -20 -62 -11 -24 -20 -59 -20 -78 0 -19 -8 -63 -17 -97 -16 -55 -18 -122 -18 -706 0 -584 2 -651 18 -706 9 -34 17 -78 17 -97 0 -19 9 -54 20 -78 11 -24 20 -52 20 -62 0 -37 82 -205 146 -302 122 -184 287 -329 484 -425 132 -65 148 -70 340 -124 56 -16 170 -30 336 -41 124 -9 421 12 510 36 38 10 83 19 98 19 15 0 44 9 66 20 22 11 46 20 54 20 23 0 168 67 251 116 22 13 51 29 65 36 21 10 124 90 140 108 3 4 14 13 26 21 32 22 165 180 199 235 45 75 85 155 85 171 0 8 8 30 19 51 10 20 22 56 26 79 4 24 11 45 16 49 18 11 9 44 -13 49 -13 3 -196 4 -407 3 l-384 -3 -28 -50 c-15 -27 -28 -58 -28 -67 -1 -20 -159 -158 -181 -158 -9 0 -24 -6 -35 -13 -11 -7 -51 -24 -90 -37 -60 -20 -95 -24 -250 -27 -162 -4 -186 -2 -244 16 -35 12 -71 21 -81 21 -10 0 -23 6 -29 14 -7 8 -24 17 -38 21 -64 16 -253 206 -253 254 0 9 -7 26 -15 38 -8 12 -27 65 -40 118 -24 90 -25 111 -23 293 l3 197 1069 3 c828 2 1072 5 1084 14 13 11 14 71 10 443 -6 463 -7 470 -70 680 -51 172 -173 370 -313 510 -47 47 -187 155 -230 178 -258 138 -433 188 -715 206 -91 6 -172 10 -180 10 -8 -1 -73 -6 -145 -10z m433 -672 c38 -13 76 -28 83 -34 8 -6 30 -18 49 -26 70 -31 170 -142 213 -237 64 -142 63 -134 81 -340 11 -119 11 -149 1 -166 -13 -20 -22 -21 -407 -28 -528 -8 -945 -9 -958 -1 -6 4 -10 58 -10 140 0 111 4 152 25 231 14 52 32 105 40 117 8 12 15 29 15 38 0 45 161 216 245 259 123 64 216 80 416 74 107 -3 152 -9 207 -27z"/>
+        <path d="M5345 5000 c-60 -4 -141 -15 -180 -24 -123 -30 -219 -57 -260 -76 -96 -43 -202 -97 -233 -117 -18 -13 -35 -23 -38 -23 -4 0 -41 -29 -83 -64 -137 -115 -256 -264 -322 -405 -62 -132 -69 -148 -69 -162 0 -8 -9 -41 -19 -74 -21 -64 -38 -155 -51 -275 -11 -98 -11 -1102 0 -1200 13 -120 30 -211 51 -275 10 -33 19 -66 19 -73 0 -14 9 -37 63 -152 94 -202 292 -419 482 -526 143 -81 271 -128 475 -176 87 -20 121 -22 390 -22 268 0 304 2 390 22 117 27 222 59 275 82 22 10 65 28 95 41 30 13 66 31 80 40 14 9 45 29 70 45 185 119 331 287 431 494 49 101 75 177 111 330 23 94 23 102 23 770 0 668 0 676 -23 770 -36 152 -62 229 -106 320 -125 259 -317 454 -571 578 -135 66 -216 93 -381 128 -127 26 -428 38 -619 24z m469 -745 c91 -30 132 -52 197 -104 49 -39 149 -166 149 -190 0 -6 9 -28 20 -48 11 -21 20 -47 20 -58 0 -11 7 -52 15 -90 12 -57 15 -168 15 -585 0 -417 -3 -528 -15 -585 -8 -38 -15 -79 -15 -90 0 -11 -9 -37 -20 -58 -11 -20 -20 -42 -20 -47 0 -24 -95 -148 -143 -188 -54 -44 -136 -88 -222 -118 -40 -14 -85 -17 -225 -17 -158 -1 -181 2 -240 23 -91 32 -137 56 -195 104 -95 76 -157 170 -197 298 -23 73 -23 76 -23 678 0 602 0 605 23 678 76 241 258 394 502 423 112 13 294 0 374 -26z"/>
+        <path d="M19365 4950 c-4 -6 15 -42 42 -81 26 -38 59 -87 73 -109 14 -21 52 -78 85 -125 33 -48 65 -94 70 -103 6 -9 23 -34 38 -56 47 -69 81 -120 92 -138 5 -9 61 -92 124 -185 133 -195 329 -485 351 -518 8 -13 68 -102 133 -198 127 -189 135 -213 94 -264 -23 -28 -101 -141 -147 -213 -14 -21 -70 -105 -125 -185 -55 -81 -105 -155 -110 -165 -6 -10 -17 -26 -25 -35 -8 -9 -19 -25 -25 -35 -9 -17 -96 -145 -326 -483 -52 -77 -98 -146 -104 -155 -5 -8 -23 -34 -38 -56 -42 -61 -80 -119 -92 -137 -13 -22 -93 -139 -149 -218 -24 -35 -42 -70 -39 -77 4 -12 86 -14 459 -14 420 0 455 1 470 18 16 17 104 151 104 157 0 2 22 36 49 77 43 65 98 150 165 258 13 19 41 63 64 98 23 34 42 66 42 71 0 5 7 15 16 22 9 7 20 22 25 34 5 11 32 54 59 95 28 41 53 82 57 90 3 8 12 22 19 30 7 9 25 38 40 65 81 151 104 197 104 208 0 7 4 18 9 26 15 23 37 -2 83 -93 57 -116 118 -226 156 -280 17 -26 32 -51 32 -55 0 -4 9 -16 20 -26 11 -10 20 -22 20 -27 0 -4 26 -48 57 -96 68 -102 72 -109 97 -152 10 -19 34 -55 52 -82 19 -26 34 -50 34 -53 0 -3 8 -18 18 -33 49 -72 102 -153 102 -157 0 -5 85 -135 110 -168 l22 -27 451 2 452 3 3 23 c2 13 -5 34 -15 45 -17 20 -156 223 -223 327 -14 21 -52 78 -85 125 -33 48 -65 94 -70 103 -6 10 -24 37 -40 61 -17 24 -46 67 -65 96 -19 29 -48 72 -65 96 -16 24 -34 52 -40 61 -9 15 -69 104 -409 606 -72 107 -136 202 -142 213 -6 10 -18 27 -27 37 -19 21 -22 57 -7 67 9 6 28 32 75 106 5 9 23 36 40 60 16 24 34 51 40 61 5 9 55 82 110 163 55 80 111 163 125 185 14 21 124 186 245 365 121 180 227 337 235 350 8 13 66 98 128 191 71 106 112 175 110 188 -3 21 -6 21 -454 24 l-451 2 -25 -37 c-22 -34 -57 -89 -123 -193 -12 -19 -40 -63 -63 -98 -23 -34 -42 -65 -42 -67 0 -3 -15 -27 -34 -53 -18 -27 -42 -63 -52 -82 -26 -45 -81 -133 -134 -210 -9 -14 -19 -32 -23 -40 -4 -8 -20 -35 -36 -60 -17 -25 -44 -74 -62 -110 -18 -36 -37 -72 -44 -80 -7 -8 -15 -26 -18 -40 -15 -60 -77 -102 -77 -52 0 16 -67 153 -116 237 -13 22 -34 57 -46 79 -13 21 -28 47 -34 57 -6 11 -18 27 -27 37 -10 10 -17 22 -17 26 0 4 -18 34 -40 67 -22 33 -40 62 -40 64 0 3 -19 33 -42 67 -23 35 -51 79 -63 98 -13 19 -39 62 -60 95 -21 33 -46 72 -56 87 -11 15 -19 30 -19 33 0 3 -8 18 -19 33 -10 15 -33 50 -51 79 -18 28 -42 54 -54 57 -40 11 -904 7 -911 -4z"/>
+        </g>
+      </g>
+    </g>
+</svg>

@@ -1,0 +1,413 @@
+package indexer
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/resolver"
+)
+
+// MultiWatcher manages file watchers across multiple repositories.
+type MultiWatcher struct {
+	watchers    map[string]*Watcher    // repoPrefix → file watcher
+	gitWatchers map[string]*GitWatcher // repoPrefix → .git ref watcher
+	started     map[string]bool        // tracks which watchers have been started
+	multi       *MultiIndexer
+	resolver    *resolver.CrossRepoResolver
+	logger      *zap.Logger
+	events      chan GraphChangeEvent
+	done        chan struct{}
+	mu          sync.Mutex
+
+	// symbolChangeCb is the OnSymbolChange callback registered by the
+	// MCP server (or any other consumer). It's fanned out to every
+	// per-repo Watcher and re-applied at AddRepo time so newly-tracked
+	// repos pick it up without a second registration call. Guarded by
+	// callbackMu so registration and per-repo apply don't race.
+	callbackMu     sync.Mutex
+	symbolChangeCb SymbolChangeCallback
+}
+
+// NewMultiWatcher creates a MultiWatcher that watches all configured repos.
+// Each repo gets its own Watcher with repo-specific exclude patterns.
+func NewMultiWatcher(
+	mi *MultiIndexer,
+	configs map[string]config.WatchConfig,
+	logger *zap.Logger,
+) (*MultiWatcher, error) {
+	mw := &MultiWatcher{
+		watchers:    make(map[string]*Watcher),
+		gitWatchers: make(map[string]*GitWatcher),
+		started:     make(map[string]bool),
+		multi:       mi,
+		resolver:    resolver.NewCrossRepo(mi.Graph()),
+		logger:      logger,
+		events:      make(chan GraphChangeEvent, 128),
+		done:        make(chan struct{}),
+	}
+	// Wire the cross-workspace boundary check into the resolver so
+	// cross-repo edges are only resolved when the source workspace
+	// declared the target via `cross_workspace_deps`.
+	mw.resolver.SetCrossWorkspaceDepLookup(mi.crossWorkspaceLookup())
+	// Resolve JS/TS imports declared through an npm alias to their
+	// locally-vendored real package.
+	mw.resolver.SetNpmAliasResolver(mi.npmAliasResolver())
+	// Break same-named import collisions in favour of the importer's
+	// own package-manager workspace member.
+	mw.resolver.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	// Cross-daemon proxy-edge minting: mint proxy edges on incremental
+	// re-resolution too, when the daemon installed a prober (flag on).
+	mi.applyRemoteStitch(mw.resolver)
+
+	for prefix, cfg := range configs {
+		if err := mw.createWatcher(prefix, cfg); err != nil {
+			// Log warning and continue if a repo root is inaccessible.
+			logger.Warn("failed to create watcher for repo",
+				zap.String("prefix", prefix),
+				zap.Error(err),
+			)
+			continue
+		}
+	}
+
+	return mw, nil
+}
+
+// createWatcher creates a per-repo Watcher for the given prefix.
+func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) error {
+	meta := mw.multi.GetMetadata(prefix)
+	if meta == nil {
+		return fmt.Errorf("repository not found: %s", prefix)
+	}
+
+	// Verify the repo root is accessible.
+	if _, err := os.Stat(meta.RootPath); err != nil {
+		return fmt.Errorf("repo root inaccessible: %s: %w", meta.RootPath, err)
+	}
+
+	idx := mw.multi.GetIndexer(prefix)
+	if idx == nil {
+		return fmt.Errorf("no indexer for repo: %s", prefix)
+	}
+
+	w, err := NewWatcher(idx, cfg, mw.logger.With(zap.String("repo", prefix)))
+	if err != nil {
+		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
+	}
+
+	mw.watchers[prefix] = w
+	return nil
+}
+
+// Start begins watching all configured repos. Events from per-repo watchers
+// are merged into the single Events() channel.
+func (mw *MultiWatcher) Start() error {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+
+	// Per-repo watcher startup is independent, and each w.Start blocks
+	// ~150ms on macOS draining the FSEvents initial-replay storm (plus
+	// OS stream setup and a .git/HEAD watcher). Run them concurrently
+	// so an N-repo daemon pays one drain window instead of N serialised
+	// ones — on a 20-repo install this cuts ~3.4s of warmup to ~0.4s.
+	//
+	// Each goroutine writes only its own slot in results[] (no shared
+	// write), and mw's started/gitWatchers maps plus the forwardEvents
+	// goroutines are folded in serially after the wait. mw.mu stays
+	// held for the whole call so Start/Stop can't interleave; the
+	// concurrency here is purely within one Start.
+	type startResult struct {
+		prefix string
+		w      *Watcher
+		gw     *GitWatcher
+		ok     bool
+	}
+	prefixes := make([]string, 0, len(mw.watchers))
+	for prefix := range mw.watchers {
+		prefixes = append(prefixes, prefix)
+	}
+	results := make([]startResult, len(prefixes))
+	var wg sync.WaitGroup
+	for i, prefix := range prefixes {
+		w := mw.watchers[prefix]
+		meta := mw.multi.GetMetadata(prefix)
+		if meta == nil {
+			mw.logger.Warn("skipping watcher start: repo metadata not found",
+				zap.String("prefix", prefix))
+			continue
+		}
+
+		// Verify root is still accessible before starting.
+		if _, err := os.Stat(meta.RootPath); err != nil {
+			mw.logger.Warn("repo root inaccessible, skipping watcher",
+				zap.String("prefix", prefix),
+				zap.String("root", meta.RootPath),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		wg.Add(1)
+		go func(slot int, prefix string, w *Watcher, rootPath string) {
+			defer wg.Done()
+			if err := w.Start([]string{rootPath}); err != nil {
+				mw.logger.Warn("failed to start watcher for repo",
+					zap.String("prefix", prefix),
+					zap.Error(err),
+				)
+				return
+			}
+			res := startResult{prefix: prefix, w: w, ok: true}
+
+			// Start the .git/HEAD watcher alongside the file watcher.
+			// It's best-effort — repos without a .git dir (uninitialised
+			// worktrees, tarball checkouts) simply skip it.
+			if idx := mw.multi.GetIndexer(prefix); idx != nil {
+				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
+				if err != nil {
+					mw.logger.Debug("git-watcher: init failed",
+						zap.String("prefix", prefix), zap.Error(err))
+				} else if err := gw.Start(); err != nil {
+					mw.logger.Debug("git-watcher: start failed",
+						zap.String("prefix", prefix), zap.Error(err))
+					_ = gw.Stop()
+				} else {
+					res.gw = gw
+				}
+			}
+			results[slot] = res
+		}(i, prefix, w, meta.RootPath)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if !res.ok {
+			continue
+		}
+		mw.started[res.prefix] = true
+		if res.gw != nil {
+			mw.gitWatchers[res.prefix] = res.gw
+		}
+		// Forward events from this watcher and trigger cross-repo resolution.
+		go mw.forwardEvents(res.prefix, res.w)
+	}
+
+	return nil
+}
+
+// forwardEvents reads events from a per-repo watcher and forwards them
+// to the merged events channel. After each event, it triggers cross-repo
+// resolution for the owning repo.
+func (mw *MultiWatcher) forwardEvents(prefix string, w *Watcher) {
+	for {
+		select {
+		case <-mw.done:
+			return
+		case ev, ok := <-w.Events():
+			if !ok {
+				return
+			}
+
+			// After re-indexing, trigger cross-repo resolution — scoped
+			// to the file that changed, not the whole repo. ResolveForRepo
+			// materialised the repo's entire edge set on every save (the
+			// per-edit allocation flood); ResolveForFile only re-resolves
+			// the changed file's out-edges. The watcher path is absolute,
+			// so convert it to the repo-relative graph key first.
+			if mw.multi.IsMultiRepo() {
+				relPath := ev.FilePath
+				if w.indexer != nil {
+					relPath = w.indexer.RelKey(ev.FilePath)
+				}
+				stats := mw.resolver.ResolveForFile(prefix, relPath)
+				if stats.CrossRepoEdges > 0 {
+					mw.logger.Debug("cross-repo edges updated after file change",
+						zap.String("repo", prefix),
+						zap.String("file", ev.FilePath),
+						zap.Int("cross_repo_edges", stats.CrossRepoEdges),
+					)
+				}
+			}
+
+			// Non-blocking send to merged channel.
+			select {
+			case mw.events <- ev:
+			default:
+			}
+		}
+	}
+}
+
+// Stop halts all per-repo watchers and cleans up resources.
+func (mw *MultiWatcher) Stop() error {
+	close(mw.done)
+
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+
+	var firstErr error
+	for prefix, w := range mw.watchers {
+		// Only stop watchers that were actually started.
+		if !mw.started[prefix] {
+			continue
+		}
+		if err := w.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+			mw.logger.Warn("error stopping watcher",
+				zap.String("prefix", prefix),
+				zap.Error(err),
+			)
+		}
+		if gw, ok := mw.gitWatchers[prefix]; ok {
+			_ = gw.Stop()
+		}
+	}
+
+	return firstErr
+}
+
+// Events returns a read-only channel of merged graph change events from all repos.
+func (mw *MultiWatcher) Events() <-chan GraphChangeEvent {
+	return mw.events
+}
+
+// History returns the union of per-repo histories, sorted newest-first.
+// Implements the same surface as Watcher.History so the MCP server can
+// consume either a single Watcher or a MultiWatcher through the same
+// interface and `get_recent_changes` lights up under the daemon.
+func (mw *MultiWatcher) History() []GraphChangeEvent {
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	var out []GraphChangeEvent
+	for _, w := range watchers {
+		out = append(out, w.History()...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
+	return out
+}
+
+// HistorySince returns the union of per-repo events strictly after the
+// given timestamp, sorted newest-first.
+func (mw *MultiWatcher) HistorySince(since time.Time) []GraphChangeEvent {
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	var out []GraphChangeEvent
+	for _, w := range watchers {
+		out = append(out, w.HistorySince(since)...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
+	return out
+}
+
+// OnSymbolChange registers the callback against every current per-repo
+// Watcher and stores it so AddRepo applies it to future watchers too.
+// Replaces any previously registered callback (matches Watcher.OnSymbolChange
+// semantics).
+func (mw *MultiWatcher) OnSymbolChange(cb SymbolChangeCallback) {
+	mw.callbackMu.Lock()
+	mw.symbolChangeCb = cb
+	mw.callbackMu.Unlock()
+
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, w := range mw.watchers {
+		watchers = append(watchers, w)
+	}
+	mw.mu.Unlock()
+
+	for _, w := range watchers {
+		w.OnSymbolChange(cb)
+	}
+}
+
+// AddRepo creates and starts a watcher for a newly tracked repo.
+func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+
+	if _, exists := mw.watchers[repoPrefix]; exists {
+		return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
+	}
+
+	if err := mw.createWatcher(repoPrefix, cfg); err != nil {
+		mw.logger.Warn("failed to add watcher for repo",
+			zap.String("prefix", repoPrefix),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	w := mw.watchers[repoPrefix]
+	meta := mw.multi.GetMetadata(repoPrefix)
+	if meta == nil {
+		return fmt.Errorf("repository metadata not found: %s", repoPrefix)
+	}
+
+	if err := w.Start([]string{meta.RootPath}); err != nil {
+		delete(mw.watchers, repoPrefix)
+		return fmt.Errorf("starting watcher for %s: %w", repoPrefix, err)
+	}
+
+	mw.started[repoPrefix] = true
+	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
+		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
+			if err := gw.Start(); err == nil {
+				mw.gitWatchers[repoPrefix] = gw
+			} else {
+				_ = gw.Stop()
+			}
+		}
+	}
+
+	// Apply any previously-registered symbol-change callback so a repo
+	// added at runtime contributes to get_symbol_history just like the
+	// repos created at MultiWatcher construction time.
+	mw.callbackMu.Lock()
+	cb := mw.symbolChangeCb
+	mw.callbackMu.Unlock()
+	if cb != nil {
+		w.OnSymbolChange(cb)
+	}
+
+	go mw.forwardEvents(repoPrefix, w)
+	return nil
+}
+
+// RemoveRepo stops and removes the watcher for a repo.
+func (mw *MultiWatcher) RemoveRepo(repoPrefix string) error {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+
+	w, exists := mw.watchers[repoPrefix]
+	if !exists {
+		return fmt.Errorf("no watcher for repo: %s", repoPrefix)
+	}
+
+	var err error
+	if mw.started[repoPrefix] {
+		err = w.Stop()
+	}
+	if gw, ok := mw.gitWatchers[repoPrefix]; ok {
+		_ = gw.Stop()
+		delete(mw.gitWatchers, repoPrefix)
+	}
+	delete(mw.watchers, repoPrefix)
+	delete(mw.started, repoPrefix)
+	return err
+}

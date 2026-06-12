@@ -1,0 +1,79 @@
+name: ARM Benchmarks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-arm64:
+    name: Benchmark (ARM64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -count=3 -benchtime=2s -timeout=20m \
+            -run='^$' \
+            ./internal/graph/ \
+            ./internal/search/ \
+            ./internal/parser/languages/ \
+            ./internal/resolver/ \
+            ./internal/query/ \
+            ./internal/indexer/ \
+            ./internal/analysis/ \
+            | tee bench-arm64.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-arm64-${{ github.sha }}
+          path: bench-arm64.txt
+          retention-days: 90
+
+      - name: Compare with main (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260409210113-8e83ce0f7b1c
+          # Download baseline from main branch artifact if available
+          echo "Benchmark results uploaded. Compare manually with benchstat."
+
+  bench-amd64:
+    name: Benchmark (AMD64 baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -count=3 -benchtime=2s -timeout=20m \
+            -run='^$' \
+            ./internal/graph/ \
+            ./internal/search/ \
+            ./internal/parser/languages/ \
+            ./internal/resolver/ \
+            ./internal/query/ \
+            ./internal/indexer/ \
+            ./internal/analysis/ \
+            | tee bench-amd64.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-amd64-${{ github.sha }}
+          path: bench-amd64.txt
+          retention-days: 90

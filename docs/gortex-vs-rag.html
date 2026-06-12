@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Граф кода против RAG — Gortex</title>
+<style>
+  :root{
+    --bg:#0a0b10;
+    --bg2:#0e1018;
+    --ink:#e7e9f0;
+    --muted:#8b90a6;
+    --line:#1c1f2e;
+    --card:#11131d;
+    --acc:#7c5cff;      /* фиолет */
+    --acc2:#22d3ee;     /* циан */
+    --good:#34d399;     /* зелёный */
+    --bad:#fb7185;      /* красный */
+    --warn:#fbbf24;     /* жёлтый */
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+    --sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* фоновая сетка + свечение */
+  body::before{
+    content:"";position:fixed;inset:0;z-index:0;
+    background:
+      radial-gradient(900px 600px at 82% -10%, rgba(124,92,255,.18), transparent 60%),
+      radial-gradient(700px 500px at 0% 110%, rgba(34,211,238,.12), transparent 55%),
+      linear-gradient(transparent 31px, rgba(255,255,255,.018) 32px) 0 0/32px 32px,
+      linear-gradient(90deg, transparent 31px, rgba(255,255,255,.018) 32px) 0 0/32px 32px;
+    pointer-events:none;
+  }
+  .deck{position:relative;z-index:1;height:100vh;width:100vw}
+  .slide{
+    position:absolute;inset:0;
+    display:none;
+    flex-direction:column;
+    justify-content:center;
+    padding:5.5vh 7vw;
+    animation:fade .45s ease both;
+  }
+  .slide.active{display:flex}
+  @keyframes fade{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+
+  .kicker{
+    font-family:var(--mono);
+    font-size:.82rem;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--acc2);margin-bottom:1.1rem;
+    display:flex;align-items:center;gap:.7rem;
+  }
+  .kicker::before{content:"";width:26px;height:2px;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:2px}
+
+  h1{font-size:clamp(2.2rem,5.4vw,4.4rem);line-height:1.04;font-weight:800;letter-spacing:-.02em}
+  h2{font-size:clamp(1.7rem,3.6vw,2.9rem);line-height:1.1;font-weight:800;letter-spacing:-.015em;margin-bottom:1.6rem}
+  h2 .em{background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{font-size:clamp(1rem,1.7vw,1.35rem);color:var(--muted);max-width:60ch;line-height:1.5}
+  p{line-height:1.55}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.4rem;margin-top:.4rem}
+  .card{
+    background:linear-gradient(180deg,var(--card),var(--bg2));
+    border:1px solid var(--line);border-radius:16px;
+    padding:1.4rem 1.5rem;
+  }
+  .card h3{font-size:1.05rem;margin-bottom:.9rem;display:flex;align-items:center;gap:.5rem;font-weight:700}
+  .tag{font-family:var(--mono);font-size:.72rem;padding:.2rem .55rem;border-radius:999px;border:1px solid var(--line)}
+  .tag.good{color:var(--good);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.07)}
+  .tag.bad{color:var(--bad);border-color:rgba(251,113,133,.35);background:rgba(251,113,133,.07)}
+
+  ul{list-style:none;display:flex;flex-direction:column;gap:.62rem}
+  li{position:relative;padding-left:1.5rem;line-height:1.45;font-size:1rem;color:#cfd2e0}
+  li b{color:var(--ink)}
+  li.g::before{content:"+";position:absolute;left:0;color:var(--good);font-weight:800;font-family:var(--mono)}
+  li.b::before{content:"−";position:absolute;left:0;color:var(--bad);font-weight:800;font-family:var(--mono)}
+  li.n::before{content:"▸";position:absolute;left:0;color:var(--acc);font-size:.8rem;top:.18rem}
+
+  .big-quote{font-size:clamp(1.5rem,3.4vw,2.8rem);font-weight:800;line-height:1.18;letter-spacing:-.01em;max-width:24ch}
+  .big-quote .g{color:var(--good)} .big-quote .b{color:var(--bad)} .big-quote .a{color:var(--acc2)}
+
+  code,.mono{font-family:var(--mono)}
+  .chip{font-family:var(--mono);font-size:.85rem;color:var(--acc2);background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.25);padding:.12rem .45rem;border-radius:7px}
+
+  table{width:100%;border-collapse:collapse;font-size:clamp(.74rem,1.15vw,.98rem)}
+  th,td{padding:.6rem .7rem;text-align:left;border-bottom:1px solid var(--line)}
+  thead th{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+  td.c{text-align:center;font-weight:700}
+  .y{color:var(--good)} .r{color:var(--bad)} .w{color:var(--warn)}
+  tbody tr:hover{background:rgba(124,92,255,.05)}
+  .gx{background:rgba(124,92,255,.06)}
+
+  .two{display:grid;grid-template-columns:1.05fr .95fr;gap:2.4rem;align-items:center}
+  .codeblk{
+    font-family:var(--mono);font-size:.86rem;line-height:1.7;
+    background:#070810;border:1px solid var(--line);border-radius:14px;padding:1.2rem 1.3rem;color:#aab0c8;
+  }
+  .codeblk .k{color:var(--acc)} .codeblk .s{color:var(--acc2)} .codeblk .c{color:#5a6178} .codeblk .ok{color:var(--good)} .codeblk .no{color:var(--bad)}
+
+  .pills{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:1.3rem}
+  .pill{font-family:var(--mono);font-size:.8rem;padding:.4rem .75rem;border-radius:10px;border:1px solid var(--line);background:var(--card);color:#cfd2e0}
+  .pill b{color:var(--acc2)}
+
+  .verdict{margin-top:1.4rem;padding:.9rem 1.2rem;border-left:3px solid var(--acc);background:rgba(124,92,255,.06);border-radius:0 12px 12px 0;font-size:1.02rem}
+  .verdict.bad{border-color:var(--bad);background:rgba(251,113,133,.06)}
+  .verdict.good{border-color:var(--good);background:rgba(52,211,153,.06)}
+
+  /* прогресс + счётчик */
+  .pbar{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--acc),var(--acc2));z-index:5;transition:width .35s ease}
+  .count{position:fixed;bottom:18px;right:24px;font-family:var(--mono);font-size:.78rem;color:var(--muted);z-index:5}
+  .count b{color:var(--ink)}
+  .hint{position:fixed;bottom:18px;left:24px;font-family:var(--mono);font-size:.72rem;color:#4a4f63;z-index:5}
+  .dots{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:5}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--line);transition:.3s}
+  .dot.on{background:var(--acc);width:18px;border-radius:6px}
+
+  .footer-brand{position:fixed;top:20px;right:26px;font-family:var(--mono);font-size:.78rem;color:var(--muted);z-index:5;letter-spacing:.04em}
+  .footer-brand b{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="pbar" id="pbar"></div>
+<div class="footer-brand"><b>gortex</b> · граф кода</div>
+
+<div class="deck" id="deck">
+
+  <!-- 1 -->
+  <section class="slide active">
+    <div class="kicker">честное сравнение · 2026</div>
+    <h1>Граф кода против&nbsp;RAG</h1>
+    <p class="lead" style="margin-top:1.6rem">
+      Чем <b style="color:var(--ink)">Gortex</b> отличается от двух подходов, которые вы, скорее всего,
+      уже собрали руками:
+    </p>
+    <div class="pills">
+      <span class="pill">①&nbsp; <b>вся кодовая база → векторный RAG</b></span>
+      <span class="pill">②&nbsp; <b>зеркало репы в Obsidian-.md → RAG</b></span>
+      <span class="pill">③&nbsp; <b>типизированный граф кода</b></span>
+    </div>
+    <p class="lead" style="margin-top:1.8rem;font-size:1rem">
+      Аудитория — бэкендеры и архитекторы, строящие ИИ-инфру сами. Поэтому без рекламы: где каждый выигрывает,
+      где проигрывает и за что вы платите.
+    </p>
+  </section>
+
+  <!-- 2 -->
+  <section class="slide">
+    <div class="kicker">постановка</div>
+    <h2>Вы это уже строили</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Что обычно делают</h3>
+        <ul>
+          <li class="n">Берут repo, режут на чанки, гонят в эмбеддинги, втыкают векторную БД — <b>«агент, который знает наш код»</b>.</li>
+          <li class="n">Кто умнее — генерит <b>.md-зеркало</b> со ссылками «кто кого вызывает» и кормит этим RAG.</li>
+          <li class="n">И то и другое <b>работает на демо</b> и разваливается на реальных вопросах.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Где разваливается</h3>
+        <ul>
+          <li class="b">«Найди <b>всех</b> вызывающих <code>X</code>» — RAG возвращает <b>часть</b>.</li>
+          <li class="b">«Что сломается, если поменять сигнатуру» — RAG не знает.</li>
+          <li class="b">«Что читает <code>$AWS_SECRET</code>» — RAG ищет по словам, а не по факту чтения.</li>
+          <li class="b">Через неделю индекс <b>устарел</b>, а ответы всё ещё уверенные.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict">Это не баги вашей реализации. Это <b>потолок самого подхода</b> — об этом и доклад.</div>
+  </section>
+
+  <!-- 3 -->
+  <section class="slide">
+    <div class="kicker">тезис · к нему всё сводится</div>
+    <div class="two">
+      <div>
+        <p class="big-quote">
+          RAG отвечает по&nbsp;<span class="b">похожести</span>.<br>
+          Граф кода отвечает по&nbsp;<span class="g">структуре</span>.
+        </p>
+        <p class="lead" style="margin-top:1.6rem">
+          Это <b style="color:var(--ink)">разные задачи</b>. Похожесть вероятностна:
+          recall ≈ «обычно находит». Структура детерминирована:
+          recall = «находит всё — или явно говорит, что не разрешил».
+        </p>
+      </div>
+      <div class="card">
+        <h3>Два разных вопроса</h3>
+        <div class="codeblk" style="margin-top:.2rem">
+<span class="c"># RAG (similarity)</span><br>
+<span class="k">retrieve</span>(<span class="s">"где ретраи?"</span>) →<br>
+&nbsp;&nbsp;top-k чанков <span class="c">// похожих по смыслу</span><br><br>
+<span class="c"># Граф (reachability)</span><br>
+<span class="k">callers_of</span>(<span class="s">"RetryPolicy.Do"</span>) →<br>
+&nbsp;&nbsp;<span class="ok">точное множество рёбер</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section class="slide">
+    <div class="kicker">подход ① · как устроен</div>
+    <h2>Вся база → <span class="em">векторный RAG</span></h2>
+    <div class="two">
+      <div class="codeblk">
+files <span class="k">→</span> chunks <span class="k">→</span> embeddings<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vector DB (top-k cosine)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;LLM ← <span class="s">retrieved chunks</span>
+      </div>
+      <div>
+        <p class="lead">Никакого парсинга, никакой сборки. Текст → числа → поиск ближайших.
+        Простой, дешёвый, язык-агностичный конвейер.</p>
+        <p class="lead" style="margin-top:1rem">Именно поэтому это <b style="color:var(--ink)">дефолт</b> — и именно поэтому его потолок так часто принимают за потолок ИИ-агентов по коду.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section class="slide">
+    <div class="kicker">подход ① · честно о хорошем</div>
+    <h2>RAG: плюсы <span class="tag good">они реальны</span></h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Цена и охват</h3>
+        <ul>
+          <li class="g"><b>Минимальный вход.</b> Нет парсера, нет грамматик, нет демона.</li>
+          <li class="g"><b>Язык-агностично.</b> Go, COBOL, README, тикеты — всё один пайплайн.</li>
+          <li class="g"><b>Масштабируется тривиально</b> — это просто ещё одна БД.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Где реально силён</h3>
+        <ul>
+          <li class="g"><b>Нечёткие/семантические</b> вопросы: «где мы обрабатываем ретраи?» — найдёт по смыслу, даже если слова не совпали.</li>
+          <li class="g"><b>Проза.</b> Доки, вики, ADR, обсуждения — родная стихия эмбеддингов.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict good">Как <b>семантический grep по тексту</b> — отличный инструмент. Запомним это; в конце он вернётся.</div>
+  </section>
+
+  <!-- 6 -->
+  <section class="slide">
+    <div class="kicker">подход ① · честно о плохом</div>
+    <h2>RAG: минусы</h2>
+    <div class="grid2">
+      <div class="card">
+        <ul>
+          <li class="b"><b>Чанкинг рушит структуру.</b> Граница режет функцию: сигнатура в одном куске, тело в другом. Ретривер не знает, что это одна сущность.</li>
+          <li class="b"><b>Нет графа вызовов.</b> «Все вызывающие <code>X</code>» — это достижимость, а не близость → <b>пропуски и ложные срабатывания</b>.</li>
+          <li class="b"><b>Дрейф.</b> Эмбеддинги — снимок. Поменял код — RAG врёт уверенно, пока не переиндексируешь.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <ul>
+          <li class="b"><b>Токен-расточителен.</b> Тащит целые чанки; нет «сигнатура без тела».</li>
+          <li class="b"><b>Только чтение.</b> Ни правок, ни переименований, ни проверки сломанных вызовов.</li>
+          <li class="b"><b>Галлюцинации ретривера.</b> Достанет правдоподобный, но не тот фрагмент — модель уверенно строит на нём.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict bad">Корень один: <b>близость ≠ связь</b>. Код — это граф, а вы запрашиваете облако точек.</div>
+  </section>
+
+  <!-- 7 -->
+  <section class="slide">
+    <div class="kicker">подход ② · как устроен</div>
+    <h2>Зеркало в <span class="em">Obsidian-.md</span> → RAG</h2>
+    <div class="two">
+      <div class="codeblk">
+<span class="c">// свой генератор обходит код</span><br>
+<span class="k">for</span> sym <span class="k">in</span> symbols:<br>
+&nbsp;&nbsp;write <span class="s">"Foo.md"</span>:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;## Foo<br>
+&nbsp;&nbsp;&nbsp;&nbsp;вызывает <span class="s">[[Bar]]</span>, <span class="s">[[Baz]]</span><br><br>
+<span class="c">// бэклинки = рёбра → псевдо-граф</span><br>
+md files <span class="k">→</span> тот же RAG
+      </div>
+      <div>
+        <p class="lead">Идея умнее: вы <b style="color:var(--ink)">явно кодируете структуру</b> в ссылки <code>[[...]]</code>,
+        получаете «граф вызовов для бедных» и читаемую вики в придачу.</p>
+        <p class="lead" style="margin-top:1rem">Звучит как шаг вперёд. И тут начинается самая честная часть доклада.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8 -->
+  <section class="slide">
+    <div class="kicker">подход ② · плюсы</div>
+    <h2>.md-зеркало: что выигрываешь</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Структура появилась</h3>
+        <ul>
+          <li class="g"><b>Ссылки = рёбра.</b> Псевдо-граф вызовов, которого у сырого RAG нет вовсе.</li>
+          <li class="g"><b>Лучше на «что с чем связано»</b> — <i>если</i> генератор точен.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Бонус для людей</h3>
+        <ul>
+          <li class="g"><b>Человекочитаемо.</b> Obsidian-бэклинки = навигируемая вики для команды.</li>
+          <li class="g"><b>Полный контроль формата</b> — пишешь ровно то, что считаешь важным.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict">Реальный плюс — ровно один: вы <b>начали мыслить код как граф</b>. Проблема в том, <b>как</b> вы его строите.</div>
+  </section>
+
+  <!-- 9 -->
+  <section class="slide">
+    <div class="kicker">подход ② · главный минус — концептуальный</div>
+    <div class="two">
+      <p class="big-quote">
+        Вы вручную строите движок интеллекта&nbsp;кода&nbsp;— и&nbsp;строите его&nbsp;<span class="b">хуже</span>.
+      </p>
+      <div class="card">
+        <ul>
+          <li class="b"><b>Точность = точность вашего экстрактора.</b> Динамическая диспетчеризация, интерфейсы, рефлексия, кодоген — поддерживаешь сам или <b>молча теряешь рёбра</b>.</li>
+          <li class="b"><b>Гарантированный дрейф.</b> Это снимок. Нет демона, нет инкрементальных апдейтов. Каждый коммит → регенерация всего, иначе расхождение с кодом.</li>
+          <li class="b"><b>Грубая гранулярность.</b> <code>[[link]]</code> схлопывает <code>calls</code> / <code>implements</code> / <code>reads_env</code> в одно безликое ребро.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide">
+    <div class="kicker">подход ② · добивающие минусы</div>
+    <h2>.md-зеркало: остальное</h2>
+    <div class="grid2">
+      <div class="card">
+        <ul>
+          <li class="b"><b>Двойная ирония чанкинга.</b> Вы закодировали структуру в .md — а RAG при индексации <b>снова рубит её на чанки</b>. Граф собрали руками, потеряли автоматом.</li>
+          <li class="b"><b>Двойное хранение, двойное устаревание.</b> Код и зеркало расходятся — теперь врать могут <b>двое</b>.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <ul>
+          <li class="b"><b>Огромная стоимость владения.</b> Большие разовые + постоянные затраты на генератор, который дублирует то, что парсер даёт бесплатно.</li>
+          <li class="b"><b>Всё ещё только чтение.</b> Ни правок, ни <code>verify_change</code>, ни анализа влияния.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict bad">Худшее из двух миров: платишь за <b>низкоточный, мгновенно устаревающий</b> граф — и уничтожаешь его чанкингом. Это «Gortex, собранный руками и хуже».</div>
+  </section>
+
+  <!-- 11 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · как устроен</div>
+    <h2>Gortex — <span class="em">типизированный граф кода</span></h2>
+    <div class="two">
+      <div class="codeblk">
+tree-sitter (14+ langs)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+<span class="ok">knowledge graph</span><br>
+&nbsp;&nbsp;nodes = symbols<br>
+&nbsp;&nbsp;edges = <span class="s">calls</span> · <span class="s">implements</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="s">reads_env</span> · <span class="s">executes_process</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="s">accesses_field</span> · …<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+live daemon · <span class="ok">инкрементально</span>
+      </div>
+      <div>
+        <p class="lead">Не чанки. <b style="color:var(--ink)">Узлы и типизированные рёбра.</b>
+        Ребро знает <i>чем</i> оно является — вызов это, реализация интерфейса или чтение переменной окружения.</p>
+        <p class="lead" style="margin-top:1rem">Демон держит граф в синхроне с кодом — это <b style="color:var(--ink)">не снимок</b>, а живая модель.</p>
+        <div class="pills">
+          <span class="pill">~31k <b>узлов</b></span>
+          <span class="pill">~206k <b>рёбер</b></span>
+          <span class="pill"><b>на этом</b> репозитории</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 12 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · архитектура</div>
+    <h2>Конвейер: от файла до <span class="em">графа</span></h2>
+    <div class="two">
+      <div class="codeblk">
+<span class="ok">1. PARSE</span>&nbsp;&nbsp;tree-sitter, per-lang extractors<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;file → конкретное AST<br><br>
+<span class="ok">2. EXTRACT</span>&nbsp;symbols → <span class="s">nodes</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;синтаксические рёбра<br><br>
+<span class="ok">3. RESOLVE</span>&nbsp;<span class="no">36 проходов</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;имя «Bar» → <i>тот самый</i> Bar<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cross-package · cross-repo<br><br>
+<span class="ok">4. SYNTH</span>&nbsp;&nbsp;capability + framework-рёбра<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;DI · event bus · gRPC · dataflow<br><br>
+<span class="ok">5. INDEX</span>&nbsp;&nbsp;BM25 + вектор → hybrid
+      </div>
+      <div>
+        <p class="lead">RAG останавливается на стадии 1 («есть текст — эмбеддь»). Вся ценность — в стадиях <b style="color:var(--ink)">3 и 4</b>: разрешить, чьё это имя, и синтезировать рёбра, которых в синтаксисе нет.</p>
+        <p class="lead" style="margin-top:1rem">Именно поэтому «сделать .md-зеркало» так дорого: вы вручную пытаетесь воспроизвести <b style="color:var(--ink)">resolve + synth</b> — самую сложную часть компилятора.</p>
+        <div class="pills">
+          <span class="pill">parser · resolver · indexer</span>
+          <span class="pill">graph · search · llm</span>
+          <span class="pill"><b>~40</b> внутренних пакетов</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 13 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · модель данных</div>
+    <h2>Это не «calls + contains». Это <span class="em">онтология</span></h2>
+    <div class="grid2" style="grid-template-columns:1fr 1fr;gap:1.2rem">
+      <div class="card">
+        <h3><span class="tag good">~38</span> видов узлов</h3>
+        <p style="color:#9aa0b8;font-family:var(--mono);font-size:.8rem;line-height:1.9">
+          Function · Method · Type · Interface · Field · Param · Constant · Macro · Closure · Package · Module · Import &nbsp;|&nbsp; <span style="color:var(--acc2)">Table · Column · Migration · Topic · Event · Flag · ConfigKey · Route · Resource</span> &nbsp;|&nbsp; <span style="color:var(--warn)">Artifact · Doc · Image · Test · Fixture · Team · License · Release</span>
+        </p>
+      </div>
+      <div class="card">
+        <h3><span class="tag good">~70</span> типов рёбер</h3>
+        <p style="color:#9aa0b8;font-family:var(--mono);font-size:.78rem;line-height:1.85">
+          <b style="color:var(--ink)">структура:</b> Contains · Defines · MemberOf · Imports<br>
+          <b style="color:var(--ink)">поведение:</b> Calls · Implements · Extends · Overrides · Instantiates<br>
+          <b style="color:var(--ink)">данные:</b> ValueFlow · Reads · Writes · Returns · TypedAs · AccessesField<br>
+          <b style="color:var(--acc2)">capability:</b> ReadsEnv · ExecutesProcess · Spawns · TogglesFlag<br>
+          <b style="color:var(--warn)">инфра:</b> ProducesTopic · ConsumesTopic · HandlesRoute · Queries · ModelsTable · ReadsCol/WritesCol<br>
+          <b style="color:var(--bad)">кросс-репо:</b> CrossRepoCalls · CrossRepoImplements
+        </p>
+      </div>
+    </div>
+    <div class="verdict">Запрос «что пишет в эту колонку БД и кто это вызывает по HTTP-роуту» — это <b>обход по типам рёбер</b>. У RAG для этого нет даже словаря.</div>
+  </section>
+
+  <!-- 14 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · «а модель под капотом есть?»</div>
+    <h2>Да. Их <span class="em">две</span> — и обе локальные</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>① Embedding-модель <span class="tag good">семантика</span></h3>
+        <ul>
+          <li class="n"><b>MiniLM-L6-v2</b> (384-dim) — базовая; <b>BGE</b>, в т.ч. <code>bge-code-v1</code> — под код.</li>
+          <li class="n">Бэкенды <span class="chip">ONNX</span> <span class="chip">hugot</span> <span class="chip">gomlx/XLA</span> — <b>в процессе</b>, без внешнего сервиса.</li>
+          <li class="n">Даёт <b>векторный канал</b> — ту самую «похожесть», что и наивный RAG.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>② LLM <span class="tag good">опционально</span></h3>
+        <ul>
+          <li class="n"><b>llama.cpp in-process</b> (CGO, <code>.gguf</code>) <i>или</i> хостед: Anthropic · OpenAI · Gemini · Bedrock · Ollama · CLI-провайдеры.</li>
+          <li class="n">Питает <span class="chip">ask</span> и <span class="chip">assist</span>: расширение NL-запроса + реранк.</li>
+          <li class="n"><b>Не нужен для структуры</b> — граф работает и без единого токена LLM.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict good"><b>Hybrid retrieval:</b> BM25 (лексика) ⊕ вектор (семантика) ⊕ граф (структура) — auto-alpha сам блендит каналы под запрос. Эмбеддинги — <b>внутри</b>, как один из трёх, а не вместо остального.</div>
+  </section>
+
+  <!-- 15 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · сердце движка</div>
+    <div class="two">
+      <div>
+        <h2 style="margin-bottom:1.1rem">Резолвер: <span class="em">36 проходов</span></h2>
+        <p class="lead">Синтаксис говорит «здесь вызов чего-то с именем <code>Bar</code>». Резолвер отвечает <b style="color:var(--ink)">какого именно</b> Bar — через scope-binding, типы, дженерики, перегрузки, receiver-rebind, и сшивку <b style="color:var(--ink)">через границы пакетов и репозиториев</b>.</p>
+        <p class="lead" style="margin-top:1rem"><b style="color:var(--ink)">Framework-synth</b> добавляет рёбра, которых нет в тексте: DI-контейнеры, event-bus подписки, gRPC-стабы, HTTP-роуты, внешние вызовы.</p>
+        <p class="lead" style="margin-top:1rem"><span class="chip">resolution_outcomes</span> — если ребро не сшилось, граф <b style="color:var(--ink)">скажет почему</b>, а не подсунет похожее. Это и есть «честно, когда не знает».</p>
+      </div>
+      <div class="codeblk">
+<span class="c">// то, что .md-зеркало не потянет</span><br>
+cross_repo_edges<br>
+method_receiver_rebind<br>
+generic_param_bind<br>
+cpp_overload<br>
+grpc_stub_calls<br>
+event_channel_calls<br>
+framework_synth&nbsp;&nbsp;<span class="c">// DI, bus, routes</span><br>
+external_call_attribution<br>
+federation_stitch&nbsp;&nbsp;<span class="c">// сшивка репо</span><br>
+<span class="c">// … 36 проходов всего</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 16 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · чего RAG не может в принципе</div>
+    <h2>Capability-рёбра: аудит <span class="em">за один хоп</span></h2>
+    <div class="two">
+      <div class="codeblk">
+<span class="c">// детерминированный recall</span><br>
+<span class="k">find_usages</span>(<span class="s">"Bar"</span>) → <span class="ok">ВСЕ вызывающие</span><br>
+<span class="k">implementors</span>(<span class="s">"io.Writer"</span>) → <span class="ok">точно</span><br><br>
+<span class="c">// capability-рёбра (синтез после resolve)</span><br>
+<span class="k">ReadsEnv</span>(<span class="s">"$AWS_SECRET"</span>) → кто читает<br>
+<span class="k">ExecutesProcess</span>() → кто шеллит наружу<br>
+<span class="k">AccessesField</span>(<span class="s">"User.token"</span>) → кто трогает<br>
+<span class="k">Queries</span> / <span class="k">WritesCol</span> → кто пишет в БД
+      </div>
+      <div>
+        <p class="lead"><b style="color:var(--ink)">Capability-рёбра</b> — это то, что не выразить «похожими чанками» вообще никак: они синтезируются <i>после</i> разрешения, из фактов о коде.</p>
+        <p class="lead" style="margin-top:1rem">Supply-chain / least-privilege аудит из «спроси LLM и надейся» превращается в <b style="color:var(--ink)">детерминированный запрос к графу</b>.</p>
+        <p class="lead" style="margin-top:1rem">Плюс анализаторы поверх: <span class="chip">SAST · 190 правил</span> <span class="chip">bottlenecks</span> <span class="chip">health-score</span> <span class="chip">review</span>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 17 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · почему «схавал за 2 минуты» и не устаревает</div>
+    <h2>Инкрементальный движок на <span class="em">Merkle-дереве</span></h2>
+    <div class="two">
+      <div>
+        <p class="lead"><b style="color:var(--ink)">BLAKE3 Merkle-дерево</b> (<code>.gortex/merkle.json</code>) хеширует контент, а не mtime. При изменении переиндексируется <b style="color:var(--ink)">только реально изменившееся поддерево</b> — не весь репозиторий.</p>
+        <p class="lead" style="margin-top:1rem">Демон <b style="color:var(--ink)">смотрит git + ФС</b>, держит граф горячим в памяти и пушит <span class="chip">graph_invalidated</span> при hot-reload. Никакого «переэмбеддь всё раз в сутки».</p>
+        <p class="lead" style="margin-top:1rem">Вот откуда разрыв: наивный RAG неделю перемалывал чанки и эмбеддинги, Gortex взял репо <b style="color:var(--ink)">за минуты</b> — и, в отличие от снимка, <b style="color:var(--ink)">остаётся свежим</b> на каждом коммите.</p>
+      </div>
+      <div class="card">
+        <h3>Что это даёт на практике</h3>
+        <ul>
+          <li class="g"><b>Свежесть бесплатно</b> — граф = текущее состояние, а не вчерашний индекс.</li>
+          <li class="g"><b>Overlay-сессии</b> — редактор пушит несохранённые буферы как теневой граф; запросы читают сквозь него, база не мутирует.</li>
+          <li class="g"><b>Спекуляция</b> — <span class="chip">preview_edit</span> <span class="chip">simulate_chain</span>: диф графа и сломанные вызывающие <i>до</i> записи на диск.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 18 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · больше чем чтение</div>
+    <h2>RAG читает. Граф <span class="em">меняет и проверяет</span></h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Правки и рефакторинг</h3>
+        <ul>
+          <li class="g"><span class="chip">edit_symbol</span> <span class="chip">rename_symbol</span> <span class="chip">batch_edit</span> — атомарно, в порядке зависимостей.</li>
+          <li class="g"><span class="chip">verify_change</span> — до правки ловит сломанные вызовы и реализаторов интерфейса (в т.ч. кросс-репо).</li>
+          <li class="g"><b>Анализ влияния</b> — «что сломается от смены сигнатуры» за один вызов.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Память, которая копится</h3>
+        <ul>
+          <li class="g"><span class="chip">compress_bodies</span> — сигнатуры + доки, тела → заглушки (~30–40% токенов).</li>
+          <li class="g"><b>Session notes</b> — переживают компакцию контекста.</li>
+          <li class="g"><b>Development memories</b> — кросс-сессионные инварианты/решения, привязанные к символам, всплывают <b>проактивно</b>, когда символ входит в рабочий набор.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict good">RAG отдаёт текст в контекст. Граф — <b>исполняемая модель</b>, по которой правят, проверяют, считают риск и накапливают знание команды.</div>
+  </section>
+
+  <!-- 19 -->
+  <section class="slide">
+    <div class="kicker">реврейм · самое важное</div>
+    <div class="two">
+      <p class="big-quote" style="max-width:26ch">
+        Gortex не <span class="b">конкурент</span> RAG.<br>
+        Он <span class="g">включает</span> RAG&nbsp;в&nbsp;себя — и добавляет то, чего у RAG нет.
+      </p>
+      <div class="card">
+        <h3>Вектор-канал живёт внутри</h3>
+        <ul>
+          <li class="n">Та же <b>семантическая похожесть</b> (локальные эмбеддинги) — есть.</li>
+          <li class="n">Плюс <b>BM25</b> лексика, плюс <b>структурный обход</b> графа.</li>
+          <li class="n"><b>Auto-alpha</b> блендит каналы под конкретный запрос.</li>
+        </ul>
+        <div class="verdict good" style="margin-top:1.1rem">Поэтому Gortex <b>строго доминирует</b> наивный RAG: у него есть всё, что у RAG, и сверху — resolve, synth, capability, правки, свежесть.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 20 -->
+  <section class="slide">
+    <div class="kicker">подход ③ · честные границы — для архитекторов, без рекламы</div>
+    <h2>Где у графа <span class="em">пределы</span></h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Статика видит не всё</h3>
+        <ul>
+          <li class="n"><b>Чисто рантаймовое связывание</b> (рефлексия, полностью динамический dispatch, конфиг-драйв) — часть рёбер синтезаторы восстанавливают, часть нет.</li>
+          <li class="g"><b>Но:</b> вместо тихого пропуска — <code>resolution_outcomes</code> с причиной. Граф <b>честен про незнание</b>, а не угадывает.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Сознательные размены</h3>
+        <ul>
+          <li class="n"><b>Граф в RAM</b> — плата за обход за суб-миллисекунды (на этом репо 31k/206k узлов/рёбер держатся легко).</li>
+          <li class="n"><b>Проза без структуры</b> (длинные обсуждения, ADR) — иногда вотчина чистых эмбеддингов; здесь работает встроенный вектор-канал + LLM-assist.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="verdict">Это не «минусы», а <b>граница применимости</b>: граф моделирует код как систему. Там, где вопрос не про систему, он честно отдаёт работу своему же вектор-каналу.</div>
+  </section>
+
+  <!-- 15 -->
+  <section class="slide">
+    <div class="kicker">всё на одном экране</div>
+    <h2>Сравнительная матрица</h2>
+    <table>
+      <thead>
+        <tr><th>Свойство</th><th class="c">① RAG</th><th class="c">② .md → RAG</th><th class="c gx">③ Gortex</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Цена входа</td><td class="c y">низкая</td><td class="c r">пишешь генератор</td><td class="c gx y">бинарь+демон</td></tr>
+        <tr><td>Скорость до готового индекса</td><td class="c r">долго (чанк+эмбед)</td><td class="c r">долго+генерация</td><td class="c gx y">минуты</td></tr>
+        <tr><td>«Все вызывающие <code>X</code>»</td><td class="c r">вероятностно</td><td class="c w">грубо</td><td class="c gx y">точно</td></tr>
+        <tr><td>Тип ребра (calls/implements)</td><td class="c r">нет</td><td class="c w">схлопнут</td><td class="c gx y">типизирован</td></tr>
+        <tr><td>Свежесть</td><td class="c r">снимок</td><td class="c r">снимок</td><td class="c gx y">живой демон</td></tr>
+        <tr><td>Нечёткий семантический вопрос</td><td class="c y">силён</td><td class="c w">ок</td><td class="c gx w">LLM-assist</td></tr>
+        <tr><td>Токен-эффективность</td><td class="c r">целые чанки</td><td class="c r">целые чанки</td><td class="c gx y">сжатие тел</td></tr>
+        <tr><td>Capability-аудит (что читает секрет)</td><td class="c r">нет</td><td class="c r">нет</td><td class="c gx y">1 хоп</td></tr>
+        <tr><td>Правки / рефакторинг / verify</td><td class="c r">нет</td><td class="c r">нет</td><td class="c gx y">есть</td></tr>
+        <tr><td>Анализ влияния / SAST</td><td class="c r">нет</td><td class="c r">нет</td><td class="c gx y">есть</td></tr>
+        <tr><td>Стоимость владения</td><td class="c y">низкая</td><td class="c r">высокая</td><td class="c gx w">средняя</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 16 -->
+  <section class="slide">
+    <div class="kicker">глубокий срез · почему так</div>
+    <div class="two">
+      <div>
+        <h2 style="margin-bottom:1.1rem">Retrieval против <span class="em">Reachability</span></h2>
+        <p class="lead"><b style="color:var(--ink)">Retrieval</b> ранжирует по близости в векторном пространстве. У него нет понятия «правильного ответа» — только «похожего».</p>
+        <p class="lead" style="margin-top:1rem"><b style="color:var(--ink)">Reachability</b> — это обход графа. Ответ либо полон, либо явно частичен. Полнота — свойство, а не удача.</p>
+        <p class="lead" style="margin-top:1rem">Вопросы об <b style="color:var(--ink)">архитектуре</b> («кто зависит», «что сломается», «что трогает секрет») — это всегда reachability. RAG отвечает на них не тем инструментом.</p>
+      </div>
+      <div class="card">
+        <h3>Почему .md-подход не спасает</h3>
+        <p style="color:#cfd2e0;line-height:1.6">Он пытается закодировать reachability <b>текстом</b>, а потом отдаёт его инструменту retrieval. Структура есть на входе и теряется на выходе — чанкинг и косинус не умеют ходить по рёбрам.</p>
+        <div class="verdict" style="margin-top:1.2rem">Нельзя получить обход графа, спрятав граф внутрь поиска по сходству.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 17 -->
+  <section class="slide">
+    <div class="kicker">не «или-или» · честно</div>
+    <h2>Гибрид — это <span class="em">правильный</span> ответ</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Где оставить RAG</h3>
+        <ul>
+          <li class="g"><b>Проза:</b> доки, ADR, вики, тикеты, обсуждения.</li>
+          <li class="g"><b>Нечёткий вход:</b> «что-то про идемпотентность платежей» без знания имён.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Где нужен граф</h3>
+        <ul>
+          <li class="g"><b>Структурные вопросы:</b> вызывающие, реализаторы, влияние, capability.</li>
+          <li class="g"><b>Правки с проверкой</b> и свежесть на меняющемся коде.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="lead" style="margin-top:1.4rem">Gortex это и делает: <b style="color:var(--ink)">BM25 + опциональный LLM-assist</b> поверх графа. Семантика похожести там, где она к месту — поверх структуры, а не вместо неё.</p>
+  </section>
+
+  <!-- 18 -->
+  <section class="slide">
+    <div class="kicker">решение · по-инженерному</div>
+    <h2>Что выбирать</h2>
+    <div class="grid2" style="grid-template-columns:1fr 1fr 1fr">
+      <div class="card">
+        <h3 style="color:var(--good)">Чистый RAG</h3>
+        <p style="color:#cfd2e0;line-height:1.55">Корпус — в основном <b>текст</b>, вопросы нечёткие, точность вызовов не нужна. Дёшево и достаточно.</p>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--bad)">.md → RAG</h3>
+        <p style="color:#cfd2e0;line-height:1.55">Почти <b>никогда для кода</b> как источника истины для агента. Оправдан только как читаемая вики для людей.</p>
+      </div>
+      <div class="card gx" style="border-color:rgba(124,92,255,.4)">
+        <h3 style="color:var(--acc2)">Gortex</h3>
+        <p style="color:#cfd2e0;line-height:1.55">Вопросы <b>структурные</b>, нужны правки/рефакторинг с проверкой, важна <b>свежесть</b>. Платишь сборкой и RAM — получаешь детерминизм.</p>
+      </div>
+    </div>
+    <div class="verdict">Простое правило: <b>проза → RAG. Код как система → граф.</b> Остальное — гибрид.</div>
+  </section>
+
+  <!-- 19 -->
+  <section class="slide" style="align-items:flex-start">
+    <div class="kicker">итог · одной строкой</div>
+    <p class="big-quote" style="max-width:30ch">
+      RAG <span class="b">угадывает</span> по похожести.<br>
+      .md-зеркало угадывает по <span class="b">устаревшему</span> самодельному графу.<br>
+      Gortex <span class="g">знает</span> — из живого типизированного графа — и честно говорит, когда <span class="a">не знает</span>.
+    </p>
+    <p class="lead" style="margin-top:2rem">Для прозы берите RAG. Для <b style="color:var(--ink)">кода как системы</b> — граф.</p>
+  </section>
+
+  <!-- 20 -->
+  <section class="slide">
+    <div class="kicker">спасибо</div>
+    <h1 style="font-size:clamp(2rem,4.6vw,3.6rem)">Вопросы → к&nbsp;<span class="em">графу</span></h1>
+    <p class="lead" style="margin-top:1.4rem">Если вы строили ИИ-инфру по коду сами — вы прошли подходы ① и ②.
+    Gortex — это вывод: <b style="color:var(--ink)">перестать чанкать структуру и начать по ней ходить.</b></p>
+    <div class="pills">
+      <span class="pill">tree-sitter <b>· 14+ langs</b></span>
+      <span class="pill">MCP <b>· 120+ tools</b></span>
+      <span class="pill">live daemon <b>· инкрементально</b></span>
+      <span class="pill">capability edges <b>· аудит за хоп</b></span>
+    </div>
+    <p class="lead" style="margin-top:1.8rem;font-size:.95rem;color:#5a6178">
+      ← → или пробел — навигация · F — полный экран
+    </p>
+  </section>
+
+</div>
+
+<div class="dots" id="dots"></div>
+<div class="count" id="count"></div>
+<div class="hint">← →&nbsp; навигация &nbsp;·&nbsp; F&nbsp; fullscreen</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const pbar=document.getElementById('pbar');
+  const count=document.getElementById('count');
+  const dotsWrap=document.getElementById('dots');
+  let i=0;
+  slides.forEach((_,n)=>{const d=document.createElement('div');d.className='dot';d.onclick=()=>go(n);dotsWrap.appendChild(d)});
+  const dots=[...document.querySelectorAll('.dot')];
+  function render(){
+    slides.forEach((s,n)=>s.classList.toggle('active',n===i));
+    dots.forEach((d,n)=>d.classList.toggle('on',n===i));
+    pbar.style.width=((i+1)/slides.length*100)+'%';
+    count.innerHTML='<b>'+(i+1)+'</b> / '+slides.length;
+  }
+  function go(n){i=Math.max(0,Math.min(slides.length-1,n));render()}
+  document.addEventListener('keydown',e=>{
+    if(['ArrowRight','ArrowDown',' ','PageDown'].includes(e.key)){e.preventDefault();go(i+1)}
+    if(['ArrowLeft','ArrowUp','PageUp'].includes(e.key)){e.preventDefault();go(i-1)}
+    if(e.key==='Home')go(0); if(e.key==='End')go(slides.length-1);
+    if(e.key==='f'||e.key==='F'){if(!document.fullscreenElement)document.documentElement.requestFullscreen();else document.exitFullscreen()}
+  });
+  let sx=0;
+  document.addEventListener('touchstart',e=>sx=e.touches[0].clientX,{passive:true});
+  document.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx;if(Math.abs(dx)>50)go(i+(dx<0?1:-1))},{passive:true});
+  render();
+</script>
+</body>
+</html>

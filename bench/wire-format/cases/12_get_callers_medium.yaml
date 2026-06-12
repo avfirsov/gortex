@@ -1,0 +1,29 @@
+tool: get_callers
+description: callers subgraph with 8 nodes and 10 edges
+input: |
+  {
+    "nodes": [
+      {"id":"internal/mcp/server.go::Server.Start","kind":"method","name":"Start","file_path":"internal/mcp/server.go","start_line":118},
+      {"id":"internal/mcp/tools_core.go::registerCoreTools","kind":"method","name":"registerCoreTools","file_path":"internal/mcp/tools_core.go","start_line":307},
+      {"id":"internal/mcp/tools_coding.go::registerCodingTools","kind":"method","name":"registerCodingTools","file_path":"internal/mcp/tools_coding.go","start_line":1},
+      {"id":"internal/mcp/tools_enhancements.go::registerEnhancementTools","kind":"method","name":"registerEnhancementTools","file_path":"internal/mcp/tools_enhancements.go","start_line":42},
+      {"id":"internal/mcp/tools_multi.go::registerMultiRepoTools","kind":"method","name":"registerMultiRepoTools","file_path":"internal/mcp/tools_multi.go","start_line":18},
+      {"id":"internal/mcp/tools_outline.go::registerOutlineTool","kind":"method","name":"registerOutlineTool","file_path":"internal/mcp/tools_outline.go","start_line":8},
+      {"id":"internal/mcp/tools_planning.go::registerPlanningTools","kind":"method","name":"registerPlanningTools","file_path":"internal/mcp/tools_planning.go","start_line":10},
+      {"id":"internal/mcp/tools_untested.go::registerUntestedTool","kind":"method","name":"registerUntestedTool","file_path":"internal/mcp/tools_untested.go","start_line":12}
+    ],
+    "edges": [
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_core.go::registerCoreTools","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_coding.go::registerCodingTools","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_enhancements.go::registerEnhancementTools","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_multi.go::registerMultiRepoTools","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_outline.go::registerOutlineTool","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_planning.go::registerPlanningTools","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/server.go::Server.Start","to":"internal/mcp/tools_untested.go::registerUntestedTool","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/tools_core.go::registerCoreTools","to":"internal/mcp/server.go::Server.mcpServer","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/tools_coding.go::registerCodingTools","to":"internal/mcp/server.go::Server.mcpServer","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/tools_enhancements.go::registerEnhancementTools","to":"internal/mcp/server.go::Server.mcpServer","kind":"references","confidence":1.0,"origin":"ast_resolved"}
+    ],
+    "total_nodes": 8,
+    "truncated": false
+  }

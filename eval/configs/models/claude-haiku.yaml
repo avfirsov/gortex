@@ -1,0 +1,9 @@
+# Claude Haiku 3.5 — fast, cheap, good baseline
+# Via Anthropic directly (set ANTHROPIC_API_KEY in .env)
+# For OpenRouter, change to: openrouter/anthropic/claude-3.5-haiku
+model:
+  model_name: 'anthropic/claude-3-5-haiku-20241022'
+  cost_tracking: 'ignore_errors'
+  model_kwargs:
+    max_tokens: 8192
+    temperature: 0

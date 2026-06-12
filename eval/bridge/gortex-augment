@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# gortex-augment — grep output augmentation helper via eval-server
+# Usage: gortex-augment <search_pattern> [raw_output]
+# Internal helper for native_augment mode — enriches grep results with graph context.
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+AUGMENT_TIMEOUT="${GORTEX_AUGMENT_TIMEOUT:-5}"
+
+pattern="${1:-}"
+raw_output="${2:-}"
+
+if [ -z "$pattern" ]; then
+    echo "Usage: gortex-augment <search_pattern> [raw_output]"
+    echo "Enrich grep/rg output with graph annotations (callers, callees, flows)."
+    echo "Typically called automatically in native_augment mode."
+    echo ""
+    echo "Examples:"
+    echo '  gortex-augment "ValidateToken"'
+    echo '  grep -rn "ValidateToken" src/ | gortex-augment "ValidateToken" "$(cat)"'
+    exit 1
+fi
+
+# Skip augmentation for very short patterns
+if [ "${#pattern}" -lt "${GORTEX_AUGMENT_MIN_PATTERN:-3}" ]; then
+    [ -n "$raw_output" ] && echo "$raw_output"
+    exit 0
+fi
+
+# Escape pattern for JSON
+escaped_pattern=$(printf '%s' "$pattern" | sed 's/\\/\\\\/g; s/"/\\"/g')
+payload="{\"pattern\":\"$escaped_pattern\""
+if [ -n "$raw_output" ]; then
+    escaped_output=$(printf '%s' "$raw_output" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | head -c 8192)
+    payload="$payload,\"raw_output\":\"$escaped_output\""
+fi
+payload="$payload}"
+
+# Try eval-server with timeout (augmentation must be fast)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/augment" \
+    -H "Content-Type: application/json" \
+    --max-time "$AUGMENT_TIMEOUT" \
+    -d "$payload" 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    if command -v jq &>/dev/null; then
+        augmented=$(echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif .augmented_output then
+                .augmented_output
+            elif type == "object" and .error then
+                empty
+            else
+                tostring
+            end
+        ' 2>/dev/null)
+
+        if [ -n "$augmented" ]; then
+            echo "$augmented"
+        elif [ -n "$raw_output" ]; then
+            echo "$raw_output"
+        fi
+    else
+        # Without jq, try to use the response directly
+        if echo "$response" | grep -q '"error"'; then
+            [ -n "$raw_output" ] && echo "$raw_output"
+        else
+            echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+        fi
+    fi
+else
+    # Timeout or server unavailable — return original output unmodified
+    [ -n "$raw_output" ] && echo "$raw_output"
+fi

@@ -1,0 +1,684 @@
+package lsp
+
+import (
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/semantic"
+)
+
+// Router is a daemon-managed pool of LSP providers keyed by ServerSpec.
+// It routes requests to the right provider by file extension, spawns
+// providers lazily on first touch, and reaps idle ones to bound the
+// number of subprocesses kept alive.
+//
+// Usage shape:
+//
+//	r := NewRouter(workspaceRoot, logger).WithIdleTimeout(10*time.Minute)
+//	p, err := r.For("path/to/file.rs") // provider for rust-analyzer
+//	if err != nil { ... }
+//	d, _ := p.LastDiagnostics(absPath)
+//
+// Lifecycle:
+//   - First For() call per spec: ServerSpec.Command must be on PATH
+//     or one of AlternativeCommands must resolve. Failure returns the
+//     unresolvable spec name in the error.
+//   - Subsequent For() calls reuse the cached provider.
+//   - Close() shuts every provider down deterministically.
+//   - Reap() (best-effort, called from a tick goroutine when
+//     WithReaperInterval is set) closes providers idle longer than
+//     IdleTimeout.
+type Router struct {
+	// defaultWorkspace is the workspace root used by For / ForSpec
+	// when the caller doesn't supply one explicitly. Multi-repo
+	// daemons override per request via ForWorkspace / ForSpecWorkspace.
+	defaultWorkspace string
+	logger           *zap.Logger
+
+	// additionalWorkspaceFolders are extra directory roots advertised
+	// to every LSP server's initialize request (alongside the primary
+	// root) so a server can resolve cross-package imports.
+	additionalWorkspaceFolders []string
+
+	mu        sync.Mutex
+	providers map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
+	enabled   map[string]*ServerSpec          // spec.Name → spec marked enabled by config (no spawn until For/ForSpec)
+
+	// limits — zero means "no limit / no reaping".
+	idleTimeout    time.Duration
+	reaperInterval time.Duration
+	maxAlive       int
+
+	stopReaper chan struct{}
+
+	// availability cache — checking exec.LookPath has measurable
+	// overhead on Windows / WSL filesystems, and the answer is
+	// stable for the life of the process.
+	availMu sync.RWMutex
+	avail   map[string]bool // spec.Name → resolved on PATH
+
+	// diagHookMu / diagHook installs a single persistent
+	// publishDiagnostics subscriber across every spawned provider —
+	// current and future. The MCP server registers itself here at
+	// boot to forward LSP diagnostics as `notifications/diagnostics`.
+	diagHookMu sync.RWMutex
+	diagHook   func(specName, absPath string, diags []Diagnostic)
+}
+
+type routedProvider struct {
+	spec      *ServerSpec
+	workspace string
+	provider  *Provider
+	lastUsed  time.Time
+}
+
+// providerKey identifies a (spec, workspace) pair in the cache. Each
+// (spec, workspace) combination gets its own LSP subprocess so a
+// multi-repo daemon doesn't conflate which workspace a server was
+// initialised against (Provider.EnsureClient is idempotent — only the
+// first call's workspace root sticks).
+type providerKey struct {
+	specName  string
+	workspace string
+}
+
+// NewRouter constructs an empty Router. defaultWorkspace is the
+// directory passed to LSP servers as `rootUri` when the caller uses
+// For / ForSpec without specifying a workspace. Multi-repo daemons
+// override on a per-request basis via ForWorkspace / ForSpecWorkspace.
+func NewRouter(defaultWorkspace string, logger *zap.Logger) *Router {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	abs, _ := filepath.Abs(defaultWorkspace)
+	return &Router{
+		defaultWorkspace: abs,
+		logger:           logger,
+		providers:        make(map[providerKey]*routedProvider),
+		enabled:          make(map[string]*ServerSpec),
+		avail:            make(map[string]bool),
+	}
+}
+
+// RegisterSpec marks spec as enabled — the Router will return it from
+// EnabledSpecs and accept it as a target for ForSpec, but no LSP
+// subprocess is spawned until the first For/ForSpec call. Call this at
+// boot for every server the user has opted into via config.
+//
+// Idempotent — re-registering the same spec is a no-op.
+func (r *Router) RegisterSpec(spec *ServerSpec) {
+	if spec == nil {
+		return
+	}
+	r.mu.Lock()
+	r.enabled[spec.Name] = spec
+	r.mu.Unlock()
+}
+
+// RegisterAvailable iterates every spec in the global registry and
+// registers each one whose command (or any AlternativeCommands entry)
+// resolves on the daemon's PATH. The `disabled` set is checked first
+// — listed names are skipped unconditionally so users keep precise
+// per-spec opt-out without needing to know the registry contents.
+//
+// Returns the list of names that were actually registered, in
+// registration order. Idempotent against RegisterSpec — re-running
+// over already-registered specs is a no-op.
+//
+// Why this is safe-by-default: RegisterSpec only marks the spec as
+// eligible — no subprocess is spawned until something calls
+// ForSpec / ForSpecWorkspace. Routers that no caller queries cost
+// the daemon nothing beyond a cached PATH lookup.
+func (r *Router) RegisterAvailable(disabled map[string]bool) []string {
+	specs := AllSpecs()
+	var registered []string
+	for _, spec := range specs {
+		if spec == nil {
+			continue
+		}
+		if disabled[spec.Name] {
+			continue
+		}
+		// An explicit .gortex.yaml entry may have already registered a
+		// SpecWithOverrides copy of this spec (a different pointer)
+		// carrying custom command / args / env. The auto-pass must
+		// defer to that override rather than clobber it with the
+		// pristine built-in spec. A spec already registered as the
+		// built-in itself is harmless to re-register.
+		r.mu.Lock()
+		existing, already := r.enabled[spec.Name]
+		r.mu.Unlock()
+		if already && existing != spec {
+			continue
+		}
+		if !r.specAvailable(spec) {
+			continue
+		}
+		r.RegisterSpec(spec)
+		registered = append(registered, spec.Name)
+	}
+	sort.Strings(registered)
+	return registered
+}
+
+// EnabledSpecs returns every spec previously registered via
+// RegisterSpec, sorted by name. The slice may include specs whose
+// command is not on PATH — call Available(spec) to filter.
+func (r *Router) EnabledSpecs() []*ServerSpec {
+	r.mu.Lock()
+	out := make([]*ServerSpec, 0, len(r.enabled))
+	for _, s := range r.enabled {
+		out = append(out, s)
+	}
+	r.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// EnabledSpecNames returns just the names of enabled specs. Used by the
+// semantic.Manager interface bridge so the package boundary stays clean
+// (semantic.Manager can't import lsp without a cycle).
+func (r *Router) EnabledSpecNames() []string {
+	specs := r.EnabledSpecs()
+	out := make([]string, len(specs))
+	for i, s := range specs {
+		out[i] = s.Name
+	}
+	return out
+}
+
+// ProviderForSpec returns the lazy-spawned LSP provider as a
+// semantic.Provider interface. Used by semantic.Manager.EnrichAll to
+// drive batch enrichment without taking a hard dependency on the lsp
+// package. Returns an error if the spec is not enabled or not on PATH.
+func (r *Router) ProviderForSpec(name string) (semantic.Provider, error) {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("LSP spec %q not registered", name)
+	}
+	return r.ForSpec(spec)
+}
+
+// SpecAvailable reports whether the named spec is registered AND its
+// command resolves on PATH. Pure read — no subprocess spawn. Caches
+// the PATH-lookup result like specAvailable does for ForSpec.
+func (r *Router) SpecAvailable(name string) bool {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return r.specAvailable(spec)
+}
+
+// SpecLanguages returns the language codes the named spec serves.
+// Pure metadata read — never spawns a subprocess. Returns nil for
+// unregistered specs.
+func (r *Router) SpecLanguages(name string) []string {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok || spec == nil {
+		return nil
+	}
+	out := make([]string, len(spec.Languages))
+	copy(out, spec.Languages)
+	return out
+}
+
+// SpecPriority returns the spec's default priority (lower number wins
+// when multiple specs serve the same language). Returns 99 (a
+// fallback "any provider beats unknown") for unregistered specs.
+func (r *Router) SpecPriority(name string) int {
+	r.mu.Lock()
+	spec, ok := r.enabled[name]
+	r.mu.Unlock()
+	if !ok || spec == nil {
+		return 99
+	}
+	return spec.Priority
+}
+
+// WithIdleTimeout sets how long a provider can be idle before Reap()
+// will shut it down.
+func (r *Router) WithIdleTimeout(d time.Duration) *Router {
+	r.idleTimeout = d
+	return r
+}
+
+// WithAdditionalWorkspaceFolders sets extra directory roots advertised
+// to every LSP server's initialize request alongside the primary
+// workspace root, enabling cross-package resolution. Builder-style.
+func (r *Router) WithAdditionalWorkspaceFolders(folders []string) *Router {
+	r.additionalWorkspaceFolders = folders
+	return r
+}
+
+// WithReaperInterval starts a background reaper that calls Reap() at
+// the given cadence. Idempotent — calling twice replaces the previous
+// reaper. A zero duration disables reaping.
+func (r *Router) WithReaperInterval(d time.Duration) *Router {
+	r.mu.Lock()
+	if r.stopReaper != nil {
+		close(r.stopReaper)
+		r.stopReaper = nil
+	}
+	if d > 0 {
+		stop := make(chan struct{})
+		r.stopReaper = stop
+		go r.reaperLoop(d, stop)
+	}
+	r.reaperInterval = d
+	r.mu.Unlock()
+	return r
+}
+
+// WithMaxAlive caps the number of concurrent live providers. When
+// exceeded, the least-recently-used provider is evicted.
+func (r *Router) WithMaxAlive(n int) *Router {
+	r.maxAlive = n
+	return r
+}
+
+// For returns the provider responsible for the given file path under
+// the router's defaultWorkspace. Convenience wrapper for single-
+// workspace callers; multi-repo daemons should use ForWorkspace and
+// pass the per-file workspace root.
+func (r *Router) For(relPath string) (*Provider, error) {
+	return r.ForWorkspace(relPath, r.defaultWorkspace)
+}
+
+// ForWorkspace returns the provider responsible for the given file
+// path under the given workspace root. Cache key is (spec, workspace)
+// so the same LSP spec gets a separate subprocess per workspace —
+// preventing the multi-repo bug where Provider.EnsureClient (which is
+// idempotent) would otherwise leave every workspace pinned to the
+// rootURI of whichever request happened to spawn the server first.
+func (r *Router) ForWorkspace(relPath, workspace string) (*Provider, error) {
+	spec := SpecForPath(relPath)
+	if spec == nil {
+		return nil, fmt.Errorf("no LSP server registered for %s", filepath.Ext(relPath))
+	}
+	return r.ForSpecWorkspace(spec, workspace)
+}
+
+// ForSpec returns the provider for a named spec under the router's
+// defaultWorkspace. Convenience wrapper.
+func (r *Router) ForSpec(spec *ServerSpec) (*Provider, error) {
+	return r.ForSpecWorkspace(spec, r.defaultWorkspace)
+}
+
+// ForSpecWorkspace returns the provider for a named spec under the
+// given workspace root, spawning it on first call. The (spec,
+// workspace) tuple uniquely identifies the cached Provider.
+func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider, error) {
+	if !r.specAvailable(spec) {
+		return nil, fmt.Errorf("LSP server %q not available on PATH", spec.Name)
+	}
+	if workspace == "" {
+		workspace = r.defaultWorkspace
+	}
+	if abs, err := filepath.Abs(workspace); err == nil {
+		workspace = abs
+	}
+	key := providerKey{specName: spec.Name, workspace: workspace}
+
+	r.mu.Lock()
+	rp, ok := r.providers[key]
+	if ok {
+		rp.lastUsed = time.Now()
+		r.mu.Unlock()
+		return rp.provider, nil
+	}
+	r.mu.Unlock()
+
+	// Spawn outside the lock — initialize() blocks on stdio I/O.
+	p := NewProviderFromSpec(spec, r.logger)
+	p.workspaceFolders = r.additionalWorkspaceFolders
+	if err := p.EnsureClient(workspace); err != nil {
+		return nil, fmt.Errorf("spawn %s: %w", spec.Name, err)
+	}
+	// Attach the diagnostics hook (if any) before publishing to the
+	// providers map so we don't drop the first publishDiagnostics
+	// burst some servers emit during workspace warmup.
+	r.attachDiagnosticsHook(spec.Name, p)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Race: another goroutine may have spawned it while we were
+	// initializing. Prefer the existing one and shut down our duplicate.
+	if existing, ok := r.providers[key]; ok {
+		existing.lastUsed = time.Now()
+		go func() { _ = p.Close() }()
+		return existing.provider, nil
+	}
+	r.providers[key] = &routedProvider{
+		spec:      spec,
+		workspace: workspace,
+		provider:  p,
+		lastUsed:  time.Now(),
+	}
+	r.maybeEvictLRULocked()
+	return p, nil
+}
+
+// SetDiagnosticsHook installs a persistent subscriber called for every
+// `textDocument/publishDiagnostics` any router-managed provider emits.
+// Pass nil to detach.
+//
+// Calling SetDiagnosticsHook on a router that already owns providers
+// re-attaches the new hook to every existing provider in addition to
+// installing it for future spawns. Passing nil clears the per-provider
+// hook on every existing provider.
+//
+// The hook MUST NOT block — it runs on the LSP client message-pump
+// goroutine.
+func (r *Router) SetDiagnosticsHook(hook func(specName, absPath string, diags []Diagnostic)) {
+	r.diagHookMu.Lock()
+	r.diagHook = hook
+	r.diagHookMu.Unlock()
+
+	// Re-attach to every live provider so the change takes effect
+	// without requiring a restart.
+	r.mu.Lock()
+	live := make([]*routedProvider, 0, len(r.providers))
+	for _, rp := range r.providers {
+		live = append(live, rp)
+	}
+	r.mu.Unlock()
+	for _, rp := range live {
+		r.attachDiagnosticsHook(rp.spec.Name, rp.provider)
+	}
+}
+
+// attachDiagnosticsHook installs the router-level hook on a single
+// provider, capturing the spec name in the closure so subscribers can
+// distinguish the source LSP. No-ops when the router has no hook set.
+func (r *Router) attachDiagnosticsHook(specName string, p *Provider) {
+	r.diagHookMu.RLock()
+	hook := r.diagHook
+	r.diagHookMu.RUnlock()
+	if hook == nil {
+		p.SetDiagnosticsHook(nil)
+		return
+	}
+	p.SetDiagnosticsHook(func(absPath string, diags []Diagnostic) {
+		hook(specName, absPath, diags)
+	})
+}
+
+// DiagnosticsEntry is one (spec, file, diagnostics) row in a snapshot.
+type DiagnosticsEntry struct {
+	SpecName    string
+	AbsPath     string
+	Diagnostics []Diagnostic
+}
+
+// DiagnosticsSnapshot returns the most recent publishDiagnostics
+// payload across every alive provider, flattened into a single slice.
+// Used to replay current state to a freshly-subscribed MCP client.
+func (r *Router) DiagnosticsSnapshot() []DiagnosticsEntry {
+	r.mu.Lock()
+	live := make([]*routedProvider, 0, len(r.providers))
+	for _, rp := range r.providers {
+		live = append(live, rp)
+	}
+	r.mu.Unlock()
+
+	var out []DiagnosticsEntry
+	for _, rp := range live {
+		snap := rp.provider.DiagnosticsSnapshot()
+		for path, diags := range snap {
+			out = append(out, DiagnosticsEntry{
+				SpecName:    rp.spec.Name,
+				AbsPath:     path,
+				Diagnostics: diags,
+			})
+		}
+	}
+	return out
+}
+
+// Available reports whether at least one of the spec's commands is on
+// PATH. Negative results are cached, but a future PATH change between
+// calls is the caller's problem.
+func (r *Router) Available(spec *ServerSpec) bool {
+	return r.specAvailable(spec)
+}
+
+// AvailableSpecs lists every spec resolvable on the current PATH. Use
+// at startup to log which servers will spin up later.
+func (r *Router) AvailableSpecs() []*ServerSpec {
+	out := make([]*ServerSpec, 0)
+	for _, s := range AllSpecs() {
+		if r.specAvailable(s) {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// specAvailable returns true when one of spec.Command +
+// spec.AlternativeCommands resolves on PATH, or — for a passive spec
+// — when the connect block validates (Validate() == nil). A passive
+// spec has no binary to look up; its "availability" is whether the
+// configured endpoint is well-formed (the actual dial happens on
+// first ensureClient).
+func (r *Router) specAvailable(spec *ServerSpec) bool {
+	if spec == nil {
+		return false
+	}
+	r.availMu.RLock()
+	v, cached := r.avail[spec.Name]
+	r.availMu.RUnlock()
+	if cached {
+		return v
+	}
+	avail := false
+	switch {
+	case spec.Connect != nil:
+		// Passive attach — no binary to find. Treat as available
+		// when the connect block validates; the dial is exercised
+		// lazily on first ensureClient.
+		avail = spec.Connect.Validate() == nil
+	default:
+		if _, err := exec.LookPath(spec.Command); err == nil {
+			avail = true
+		} else {
+			for _, alt := range spec.AlternativeCommands {
+				if _, err := exec.LookPath(alt.Command); err == nil {
+					avail = true
+					break
+				}
+			}
+		}
+	}
+	r.availMu.Lock()
+	r.avail[spec.Name] = avail
+	r.availMu.Unlock()
+	return avail
+}
+
+// LanguageIDForPath proxies to the package-level helper for callers
+// that hold a router but not a Provider.
+func (r *Router) LanguageIDForPath(path string) string { return LanguageIDForPath(path) }
+
+// Reap closes any provider idle for longer than IdleTimeout. Returns
+// "spec@workspace" identifiers for reaped entries.
+func (r *Router) Reap() []string {
+	if r.idleTimeout <= 0 {
+		return nil
+	}
+	cut := time.Now().Add(-r.idleTimeout)
+	r.mu.Lock()
+	var victims []*routedProvider
+	for key, rp := range r.providers {
+		if rp.lastUsed.Before(cut) {
+			victims = append(victims, rp)
+			delete(r.providers, key)
+		}
+	}
+	r.mu.Unlock()
+	names := make([]string, 0, len(victims))
+	for _, v := range victims {
+		names = append(names, formatProviderKey(v.spec.Name, v.workspace))
+		_ = v.provider.Close()
+	}
+	if len(names) > 0 {
+		r.logger.Info("LSP router reaped idle providers", zap.Strings("names", names))
+	}
+	return names
+}
+
+// maybeEvictLRULocked evicts the least-recently-used provider if
+// providers exceed maxAlive. Caller must hold r.mu.
+func (r *Router) maybeEvictLRULocked() {
+	if r.maxAlive <= 0 || len(r.providers) <= r.maxAlive {
+		return
+	}
+	var oldest *routedProvider
+	var oldestKey providerKey
+	for key, rp := range r.providers {
+		if oldest == nil || rp.lastUsed.Before(oldest.lastUsed) {
+			oldest = rp
+			oldestKey = key
+		}
+	}
+	if oldest != nil {
+		delete(r.providers, oldestKey)
+		go func() { _ = oldest.provider.Close() }()
+		r.logger.Info("LSP router evicted LRU provider",
+			zap.String("name", formatProviderKey(oldestKey.specName, oldestKey.workspace)))
+	}
+}
+
+// formatProviderKey renders a (spec, workspace) pair into a stable
+// human-readable identifier used in logs, Stats, and Names.
+func formatProviderKey(specName, workspace string) string {
+	if workspace == "" {
+		return specName
+	}
+	return specName + "@" + workspace
+}
+
+func (r *Router) reaperLoop(d time.Duration, stop chan struct{}) {
+	t := time.NewTicker(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			r.Reap()
+		case <-stop:
+			return
+		}
+	}
+}
+
+// Close shuts down every active provider. Safe to call multiple times.
+func (r *Router) Close() error {
+	r.mu.Lock()
+	if r.stopReaper != nil {
+		close(r.stopReaper)
+		r.stopReaper = nil
+	}
+	provs := r.providers
+	r.providers = make(map[providerKey]*routedProvider)
+	r.mu.Unlock()
+
+	var firstErr error
+	for _, rp := range provs {
+		if err := rp.provider.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// Stats reports the live provider names and their last-used times.
+// Intended for debug / status endpoints. Spec is the LSP server name;
+// Workspace is the rootURI the server is initialised against.
+type RouterStat struct {
+	Spec      string    `json:"spec"`
+	Workspace string    `json:"workspace"`
+	LastUsed  time.Time `json:"last_used"`
+}
+
+// Stats returns one entry per live (spec, workspace) provider.
+func (r *Router) Stats() []RouterStat {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]RouterStat, 0, len(r.providers))
+	for key, rp := range r.providers {
+		out = append(out, RouterStat{
+			Spec:      key.specName,
+			Workspace: key.workspace,
+			LastUsed:  rp.lastUsed,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Spec != out[j].Spec {
+			return out[i].Spec < out[j].Spec
+		}
+		return out[i].Workspace < out[j].Workspace
+	})
+	return out
+}
+
+// Names returns "spec@workspace" identifiers for live providers
+// (helper for tests + status output). Sorted for stable output.
+func (r *Router) Names() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	names := make([]string, 0, len(r.providers))
+	for k := range r.providers {
+		names = append(names, formatProviderKey(k.specName, k.workspace))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// SupportedLanguages returns the set of languages the router can serve
+// (any spec with at least one alt command on PATH). Used to advertise
+// capability to MCP clients on startup.
+func (r *Router) SupportedLanguages() []string {
+	seen := make(map[string]bool)
+	for _, s := range r.AvailableSpecs() {
+		for _, l := range s.Languages {
+			seen[l] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for l := range seen {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// MarshalDescription returns a human-readable status for one router,
+// used by the daemon's `gortex daemon status` command.
+func (r *Router) MarshalDescription() string {
+	stats := r.Stats()
+	var b strings.Builder
+	fmt.Fprintf(&b, "lsp-router default=%s alive=%d\n", r.defaultWorkspace, len(stats))
+	for _, s := range stats {
+		fmt.Fprintf(&b, "  %s@%s last_used=%s\n", s.Spec, s.Workspace, s.LastUsed.Format(time.RFC3339))
+	}
+	return b.String()
+}
+
+// DefaultWorkspace returns the workspace root used by For / ForSpec
+// when the caller doesn't supply one explicitly. Exposed for status /
+// debug surfaces.
+func (r *Router) DefaultWorkspace() string { return r.defaultWorkspace }

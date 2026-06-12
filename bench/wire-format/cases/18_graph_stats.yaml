@@ -1,0 +1,10 @@
+tool: graph_stats
+description: compact graph_stats record
+input: |
+  {
+    "total_nodes":85387,
+    "total_edges":544823,
+    "by_kind":{"contract":703,"file":11279,"function":22314,"interface":3335,"method":11972,"type":11386,"variable":24398},
+    "by_language":{"bash":293,"c":5509,"contract":703,"css":448,"dart":2585,"go":35473,"hcl":4120,"html":421,"javascript":874,"markdown":5269,"protobuf":511,"python":341,"ruby":2,"sql":69,"swift":1026,"toml":41,"typescript":25688,"yaml":2014},
+    "token_savings":{"calls_counted":0,"tokens_returned":0,"tokens_saved":0,"efficiency_ratio":0}
+  }

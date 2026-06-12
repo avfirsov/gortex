@@ -1,0 +1,939 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/blame"
+	"github.com/zzet/gortex/internal/churn"
+	"github.com/zzet/gortex/internal/cochange"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/coverage"
+	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/releases"
+	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic/lsp"
+)
+
+// realController is the production daemon.Controller implementation. It
+// wraps the MultiIndexer and ConfigManager so track/untrack/reload/status
+// operations go through the same code paths the current `gortex mcp`
+// command uses.
+//
+// Methods are serialized via a mutex — track/reload can race with status
+// otherwise. The mutex is coarse; finer locking is a later optimization.
+type realController struct {
+	mu            sync.Mutex
+	graph         graph.Store
+	indexer       *indexer.Indexer
+	multiIndexer  *indexer.MultiIndexer
+	configManager *config.ConfigManager
+	multiWatcher  *indexer.MultiWatcher
+	logger        *zap.Logger
+
+	// liveRouter is the multi-server Router currently wired into the
+	// dispatch path (nil for a local-only daemon with no roster).
+	// localExecute + publishRouter let ReloadServers build and publish
+	// a router live when the first remote is added after startup, or
+	// tear it down when the last remote is removed — all without a
+	// daemon restart. Guarded by mu.
+	liveRouter    *daemon.Router
+	localExecute  daemon.LocalExecutor
+	publishRouter func(*daemon.Router)
+
+	// onShutdown is invoked by the Shutdown method. Used by the daemon
+	// main to flush savings, close the snapshot store, etc.
+	onShutdown func() error
+
+	// ready flips to true once warmup (per-repo re-index + watcher
+	// startup) finishes. The socket accepts connections before this —
+	// queries against not-yet-indexed repos return partial results
+	// until ready is true. warmupSeconds records how long warmup took
+	// so status can surface it.
+	ready         atomic.Bool
+	warmupSeconds atomic.Int64
+}
+
+// Track indexes a new repository and persists it to the global config.
+// Path is resolved to an absolute form before the MultiIndexer sees it.
+func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+	absPath, err := filepath.Abs(p.Path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve path: %w", err)
+	}
+	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree}
+	result, err := c.multiIndexer.TrackRepoCtx(ctx, entry)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		// Already tracked — idempotent.
+		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
+	}
+	// TrackRepoCtx may have derived a worktree-instance prefix that the
+	// by-value entry above can't see — read the prefix it actually
+	// registered under for the watcher attach and the response.
+	prefix := result.RepoPrefix
+	if prefix == "" {
+		prefix = config.ResolvePrefix(entry)
+	}
+
+	// Project association from TrackParams.Project isn't wired yet — the
+	// config package doesn't expose an AddRepoToProject helper. Callers
+	// who need project scoping can edit ~/.gortex/config.yaml and
+	// run `gortex daemon reload`; track from the daemon-v1 surface just
+	// adds to the top-level repo list.
+
+	// Attach a watcher to the newly-tracked repo so file edits in it
+	// flow back into the graph live without a manual reload. Failures
+	// here are logged but don't fail the track — an indexed-but-
+	// unwatched repo is still queryable, just stale if edited.
+	if c.multiWatcher != nil && c.configManager != nil {
+		wcfg := c.configManager.GetRepoConfig(prefix).Watch
+		if err := c.multiWatcher.AddRepo(prefix, wcfg); err != nil {
+			c.logger.Warn("track: attach watcher failed",
+				zap.String("prefix", prefix), zap.Error(err))
+		}
+	}
+
+	// Persist the config change. TrackRepoCtx mutates the in-memory
+	// GlobalConfig via AddRepo but does not flush to disk; without this
+	// Save the new repo vanishes on daemon restart. Mirrors Untrack.
+	if c.configManager != nil {
+		if err := c.configManager.Global().Save(); err != nil {
+			c.logger.Warn("track: save config failed", zap.Error(err))
+		}
+	}
+
+	return json.Marshal(map[string]any{
+		"status":     "tracked",
+		"path":       absPath,
+		"prefix":     prefix,
+		"file_count": result.FileCount,
+		"node_count": result.NodeCount,
+		"edge_count": result.EdgeCount,
+	})
+}
+
+// EnrichChurn runs the churn enricher in-process against the daemon's
+// graph. We hold c.mu for the duration so a concurrent Track/Untrack
+// can't reshape the set of files while the enricher walks them. The
+// caller (CLI / git hook) picks the params; an empty Path means "every
+// tracked repo", an empty Branch means "resolve each repo's default
+// branch from its working tree".
+func (c *realController) EnrichChurn(ctx context.Context, p daemon.EnrichChurnParams) (daemon.EnrichChurnResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.graph == nil {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	// Resolve the set of repo roots the call targets. Empty Path =
+	// every tracked repo. A path or prefix narrows to one.
+	type target struct {
+		prefix string
+		root   string
+	}
+	var targets []target
+	want := strings.TrimSpace(p.Path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return daemon.EnrichChurnResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichChurnResult
+	for _, t := range targets {
+		branch := strings.TrimSpace(p.Branch)
+		if branch == "" {
+			branch = gitDefaultBranch(t.root)
+		}
+		if branch == "" {
+			c.logger.Warn("enrich churn: no default branch resolved",
+				zap.String("prefix", t.prefix), zap.String("root", t.root))
+			continue
+		}
+		res, err := churn.EnrichGraph(ctx, c.graph, t.root, churn.Options{Branch: branch})
+		if err != nil {
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Files += res.Files
+		combined.Symbols += res.Symbols
+		combined.Branch = res.Branch
+		combined.HeadSHA = res.HeadSHA
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichReleases runs the per-file release enricher against the
+// daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration,
+// targets resolve via the multi-indexer, and an empty Branch lets
+// each repo's default branch be resolved on demand (so feature-branch
+// tags don't leak into the timeline).
+func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichReleasesParams) (daemon.EnrichReleasesResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.graph == nil {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	type target struct {
+		prefix string
+		root   string
+	}
+	var targets []target
+	want := strings.TrimSpace(p.Path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return daemon.EnrichReleasesResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
+	}
+	_ = ctx // graph mutation is synchronous; no cancellation surface today
+
+	started := time.Now()
+	var combined daemon.EnrichReleasesResult
+	for _, t := range targets {
+		branch := strings.TrimSpace(p.Branch)
+		if branch == "" {
+			branch = gitDefaultBranch(t.root)
+			// Empty branch is still legal — releases.EnrichGraphForBranch
+			// treats "" as "every tag", which is the right default when
+			// no default branch can be resolved (e.g. a clone without
+			// origin/HEAD set yet).
+		}
+		count, err := releases.EnrichGraphForBranch(c.graph, t.root, t.prefix, branch)
+		if err != nil {
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Files += count
+		combined.Branch = branch
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// enrichTarget is one (prefix, root) pair the enrichers run against.
+type enrichTarget struct {
+	prefix string
+	root   string
+}
+
+// resolveEnrichTargets maps the caller-supplied path scope onto the set
+// of tracked repos to enrich. An empty path means "every tracked repo";
+// a non-empty path narrows to the one repo whose prefix or root matches.
+// Returns an error when nothing matches so the control caller gets a
+// clear "no tracked repo" message rather than a silent zero-count
+// success. Caller must hold c.mu.
+func (c *realController) resolveEnrichTargets(path string) ([]enrichTarget, error) {
+	if c.graph == nil {
+		return nil, fmt.Errorf("graph not initialized")
+	}
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+	var targets []enrichTarget
+	want := strings.TrimSpace(path)
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if meta == nil || meta.RootPath == "" {
+			continue
+		}
+		if want != "" && want != prefix && want != meta.RootPath {
+			continue
+		}
+		targets = append(targets, enrichTarget{prefix: prefix, root: meta.RootPath})
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no tracked repo matches %q", path)
+	}
+	return targets, nil
+}
+
+// EnrichBlame runs the git-blame authorship enricher against the
+// daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration
+// and targets resolve via the multi-indexer.
+func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichBlameResult{}, err
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichBlameResult
+	for _, t := range targets {
+		count, err := blame.EnrichGraph(c.graph, t.root)
+		if err != nil {
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Nodes += count
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichCoverage projects the caller-parsed cover-profile segments onto
+// the daemon's graph. The CLI parses the profile (the path is relative
+// to the caller's cwd, not the daemon's), so the daemon only needs the
+// segments and resolves each repo's module path from its working tree.
+func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichCoverageResult{}, err
+	}
+
+	segments := make([]coverage.Segment, len(p.Segments))
+	for i, s := range p.Segments {
+		segments[i] = coverage.Segment{
+			File:      s.File,
+			StartLine: s.StartLine,
+			EndLine:   s.EndLine,
+			NumStmt:   s.NumStmt,
+			Count:     s.Count,
+		}
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichCoverageResult
+	combined.Segments = len(segments)
+	for _, t := range targets {
+		modulePath := coverage.ReadModulePath(t.root)
+		combined.Symbols += coverage.EnrichGraph(c.graph, segments, modulePath)
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// EnrichCochange mines co-change edges against the daemon's graph.
+// Mirrors EnrichChurn — c.mu is held for the duration and targets
+// resolve via the multi-indexer. The repo prefix scopes the file-node
+// match in multi-repo graphs.
+func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCochangeParams) (daemon.EnrichCochangeResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichCochangeResult{}, err
+	}
+	_ = ctx // mining is synchronous; no cancellation surface today
+
+	started := time.Now()
+	var combined daemon.EnrichCochangeResult
+	for _, t := range targets {
+		count, err := cochange.EnrichGraph(c.graph, t.root, t.prefix)
+		if err != nil {
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Edges += count
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
+// Untrack evicts a repo from the graph and drops it from config.
+// PathOrPrefix accepts either an absolute path or a repo prefix.
+func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.multiIndexer == nil {
+		return nil, fmt.Errorf("multi-repo indexer not initialized")
+	}
+
+	prefix := p.PathOrPrefix
+	// Resolve path → prefix if an absolute or relative path was given.
+	if filepath.IsAbs(p.PathOrPrefix) {
+		for pfx, meta := range c.multiIndexer.AllMetadata() {
+			if meta.RootPath == p.PathOrPrefix {
+				prefix = pfx
+				break
+			}
+		}
+	}
+
+	// Detach the watcher before evicting from the graph — otherwise a
+	// late fsnotify event could race the eviction and try to re-index
+	// files whose nodes are already gone.
+	if c.multiWatcher != nil {
+		if err := c.multiWatcher.RemoveRepo(prefix); err != nil {
+			c.logger.Debug("untrack: detach watcher",
+				zap.String("prefix", prefix), zap.Error(err))
+		}
+	}
+
+	nodesRemoved, edgesRemoved := c.multiIndexer.UntrackRepo(prefix)
+
+	// Persist the config change.
+	if c.configManager != nil {
+		_ = c.configManager.Global().RemoveRepo(prefix)
+		if err := c.configManager.Global().Save(); err != nil {
+			c.logger.Warn("untrack: save config failed", zap.Error(err))
+		}
+	}
+
+	return json.Marshal(map[string]any{
+		"status":        "untracked",
+		"prefix":        prefix,
+		"nodes_removed": nodesRemoved,
+		"edges_removed": edgesRemoved,
+	})
+}
+
+// Reload re-reads the global config, indexes new repos that were added
+// via direct config-file edits, and untracks any that were removed.
+// Existing, unchanged tracked repos keep their current state.
+// ReloadServers re-reads servers.toml and applies the change to the
+// running daemon's Router without a restart: an in-place atomic swap
+// when a router already exists, a fresh build-and-publish when the first
+// remote is added after a router-less startup, or a teardown when the
+// last remote is removed.
+func (c *realController) ReloadServers(_ context.Context) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	scfg, err := daemon.LoadServersConfig("")
+	if err != nil {
+		return nil, fmt.Errorf("reload servers.toml: %w", err)
+	}
+	count := 0
+	if scfg != nil {
+		count = len(scfg.Server)
+	}
+
+	wired := false
+	switch {
+	case count == 0 && c.liveRouter != nil:
+		// Last remote removed — tear the router down so local dispatch
+		// returns to the direct in-process path.
+		c.liveRouter = nil
+		if c.publishRouter != nil {
+			c.publishRouter(nil)
+		}
+	case count == 0:
+		// No router and no remotes — nothing to wire.
+	case c.liveRouter != nil:
+		// In-place atomic swap; the stable *Router pointer keeps every
+		// dispatch site (and any in-flight call) consistent.
+		c.liveRouter.ReloadConfig(scfg, daemon.NewWorkspaceRosterCache(60*time.Second))
+		wired = true
+	default:
+		// First remote added after a router-less startup — build and
+		// publish a fresh router into the dispatch path.
+		c.liveRouter = daemon.NewRouter(daemon.RouterConfig{
+			Servers:      scfg,
+			Rosters:      daemon.NewWorkspaceRosterCache(60 * time.Second),
+			LocalSlug:    daemon.LocalServerSentinel,
+			LocalExecute: c.localExecute,
+			Logger:       c.logger,
+			Federation:   resolveFederationConfig(),
+		})
+		if c.publishRouter != nil {
+			c.publishRouter(c.liveRouter)
+		}
+		wired = true
+	}
+	return json.Marshal(map[string]any{"servers": count, "router_wired": wired})
+}
+
+func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.configManager == nil {
+		return nil, fmt.Errorf("config manager not initialized")
+	}
+	if err := c.configManager.Reload(); err != nil {
+		return nil, fmt.Errorf("reload config: %w", err)
+	}
+
+	var added, removed int
+
+	// Match configured entries to currently-tracked instances by ROOT
+	// PATH, not by a recomputed prefix. A worktree tracked as an
+	// independent instance registers under a derived `<base>@<workspace>`
+	// prefix, so keying the diff on config.ResolvePrefix(entry) (the bare
+	// basename) would fail to recognise it as wanted and untrack it on
+	// every reload. The root path is the stable identity of a checkout.
+	trackedByRoot := make(map[string]string) // absolute RootPath → prefix
+	for prefix, meta := range c.multiIndexer.AllMetadata() {
+		if meta != nil {
+			trackedByRoot[meta.RootPath] = prefix
+		}
+	}
+
+	wantedPrefixes := make(map[string]bool)
+	for _, entry := range c.configManager.Global().Repos {
+		abs, err := filepath.Abs(entry.Path)
+		if err != nil {
+			abs = entry.Path
+		}
+		if prefix, ok := trackedByRoot[abs]; ok {
+			// Already tracked (under whatever prefix it registered) — keep it.
+			wantedPrefixes[prefix] = true
+			continue
+		}
+		res, trackErr := c.multiIndexer.TrackRepoCtx(ctx, entry)
+		if trackErr != nil {
+			c.logger.Warn("reload: track failed",
+				zap.String("path", entry.Path), zap.Error(trackErr))
+			continue
+		}
+		added++
+		if res != nil && res.RepoPrefix != "" {
+			wantedPrefixes[res.RepoPrefix] = true
+		}
+	}
+
+	for prefix := range c.multiIndexer.AllMetadata() {
+		if wantedPrefixes[prefix] {
+			continue
+		}
+		c.multiIndexer.UntrackRepo(prefix)
+		removed++
+	}
+
+	return json.Marshal(map[string]any{
+		"added":   added,
+		"removed": removed,
+	})
+}
+
+// searchBackendInfo bundles the daemon.SearchBackendStats payload with
+// the separate text/vector byte counts we need to split per-repo.
+type searchBackendInfo struct {
+	daemon.SearchBackendStats
+	vectorBytes uint64
+}
+
+// resolveSearchBackend inspects the live search backend and produces
+// the stats needed by status rendering: which backend is active, total
+// document count, its heap footprint, and (for disk-backed Bleve) the
+// on-disk size.
+//
+// Real-world unwrap order: Swappable → HybridBackend → (text, vector).
+// The text side is itself a concrete BM25/Bleve. Both layers have to
+// be peeled; if we stop early we fall into the default branch and the
+// status reports "unknown" — which was the bug users saw.
+func resolveSearchBackend(b search.Backend) searchBackendInfo {
+	out := searchBackendInfo{}
+	if b == nil {
+		return out
+	}
+
+	// 1) Unwrap Swappable so we see the currently-active inner.
+	inner := b
+	if sw, ok := inner.(*search.Swappable); ok {
+		inner = sw.Inner()
+	}
+	// 2) If Hybrid is in play, split its text/vector sizes and keep
+	//    drilling into the text side for name/doc-count identification.
+	if hyb, ok := inner.(*search.HybridBackend); ok {
+		out.vectorBytes = hyb.VectorSizeBytes()
+		inner = hyb.TextBackend()
+		// TextBackend() itself could be a Swappable in some setups —
+		// unlikely today but cheap to guard.
+		if sw, ok := inner.(*search.Swappable); ok {
+			inner = sw.Inner()
+		}
+	}
+
+	switch back := inner.(type) {
+	case *search.BleveBackend:
+		if path := back.DiskPath(); path != "" {
+			out.Name = "bleve-disk"
+			out.DiskPath = path
+			out.DiskBytes = back.DiskBytes()
+		} else {
+			out.Name = "bleve-memory"
+		}
+		out.DocCount = back.Count()
+		out.Bytes = back.SizeBytes()
+	case *search.BM25Backend:
+		out.Name = "bm25"
+		out.DocCount = back.Count()
+		out.Bytes = back.SizeBytes()
+	default:
+		out.Name = "unknown"
+		out.DocCount = b.Count()
+		out.Bytes = search.BackendSize(b)
+	}
+	return out
+}
+
+// Status gathers per-repo stats and basic process metrics. Daemon-level
+// fields (PID, uptime, socket, session count) are filled in by the
+// daemon itself before the response goes out.
+func (c *realController) Status(_ context.Context) (daemon.StatusResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var (
+		tracked                  []daemon.TrackedRepoStatus
+		searchBackendForResponse daemon.SearchBackendStats
+		totalNodes               int
+	)
+	if c.multiIndexer != nil {
+		// Pull every repo's running counters (node/edge counts + byte
+		// estimates) in one pass — O(shard count · repo count), no
+		// graph walk. This used to call c.graph.RepoStats() which
+		// walked every edge to attribute by source-repo (the per-edge
+		// fromNode lookup), and then c.graph.RepoMemoryEstimate(prefix)
+		// inside the per-repo loop — combined cost ~1.2s on a 1.1M-edge
+		// graph and the single biggest source of writer-lock blocking
+		// during warmup.
+		var memEstimates map[string]graph.RepoMemoryEstimate
+		if c.graph != nil {
+			memEstimates = c.graph.AllRepoMemoryEstimates()
+		}
+
+		// Diagnostic: when AllMetadata has tracked repos but
+		// AllRepoMemoryEstimates returns nothing (or a much smaller
+		// set), some path has cleared the per-repo counters without
+		// clearing the underlying nodes. The meta fallback below keeps
+		// the table usable in the meantime.
+		if c.logger != nil {
+			tracked := len(c.multiIndexer.AllMetadata())
+			counted := len(memEstimates)
+			if tracked > 0 && counted < tracked {
+				c.logger.Warn("daemon: per-repo counters below tracked-repo count — graph mutation cleared per-repo index?",
+					zap.Int("tracked_repos", tracked),
+					zap.Int("counter_buckets", counted),
+					zap.Int("graph_total_nodes", c.graph.NodeCount()))
+			}
+		}
+
+		// Search and vector backends are process-wide (one shared index
+		// across all repos), so we compute the global size once and
+		// split it proportionally to each repo's node share. Not exact,
+		// but it's the best attribution we can make without indexing
+		// per-repo which would double storage for the sake of a status
+		// breakdown.
+		backendStats := resolveSearchBackend(c.multiIndexer.Search())
+		for _, est := range memEstimates {
+			totalNodes += est.NodeCount
+		}
+		// totalNodes drives the SearchBytes share split below. When
+		// the per-repo counters are empty for every prefix (the
+		// post-warmup-wipe case described above), fall back to summing
+		// per-repo meta so the share denominator stays nonzero and the
+		// search budget gets attributed instead of falling on the floor.
+		if totalNodes == 0 {
+			for _, meta := range c.multiIndexer.AllMetadata() {
+				if meta != nil {
+					totalNodes += meta.NodeCount
+				}
+			}
+		}
+
+		for prefix, meta := range c.multiIndexer.AllMetadata() {
+			nodes := meta.NodeCount
+			edges := meta.EdgeCount
+			var mem daemon.MemoryBreakdown
+			if est, ok := memEstimates[prefix]; ok {
+				nodes = est.NodeCount
+				edges = est.EdgeCount
+				mem.NodesBytes = est.NodeBytes
+				mem.EdgesBytes = est.EdgeBytes
+			}
+			if totalNodes > 0 && nodes > 0 {
+				share := float64(nodes) / float64(totalNodes)
+				mem.SearchBytes = uint64(float64(backendStats.Bytes) * share)
+				mem.VectorsBytes = uint64(float64(backendStats.vectorBytes) * share)
+				mem.DiskBytes = uint64(float64(backendStats.DiskBytes) * share)
+			}
+			mem.TotalBytes = mem.NodesBytes + mem.EdgesBytes + mem.SearchBytes + mem.VectorsBytes
+
+			// Pull the workspace/project slugs straight off the
+			// per-repo Indexer — that's the source of truth that
+			// stamps every node emitted by this repo. Falls back to
+			// the prefix on legacy setups where no .gortex.yaml
+			// declares them (the resolveWorkspaceID default).
+			var ws, wsProj string
+			if idx := c.multiIndexer.GetIndexer(prefix); idx != nil {
+				ws = idx.WorkspaceID()
+				wsProj = idx.ProjectID()
+			}
+			if ws == "" {
+				ws = prefix
+			}
+			if wsProj == "" {
+				wsProj = prefix
+			}
+
+			tracked = append(tracked, daemon.TrackedRepoStatus{
+				Prefix:           prefix,
+				Path:             meta.RootPath,
+				Workspace:        ws,
+				WorkspaceProject: wsProj,
+				Files:            meta.FileCount,
+				Nodes:            nodes,
+				Edges:            edges,
+				LastIndex:        meta.LastIndexTime.Unix(),
+				Memory:           mem,
+			})
+		}
+		searchBackendForResponse = backendStats.SearchBackendStats
+	}
+
+	// Aggregate per-workspace stats so the renderer can emit a
+	// "workspaces" block. Hidden when every repo defaults to its own
+	// slug (the legacy single-workspace-per-repo case where the
+	// summary just duplicates the table).
+	wsAgg := make(map[string]*daemon.WorkspaceSummary)
+	wsKeys := make([]string, 0)
+	for _, r := range tracked {
+		s, ok := wsAgg[r.Workspace]
+		if !ok {
+			s = &daemon.WorkspaceSummary{Slug: r.Workspace}
+			wsAgg[r.Workspace] = s
+			wsKeys = append(wsKeys, r.Workspace)
+		}
+		s.Repos = append(s.Repos, r.Prefix)
+		seenProj := false
+		for _, p := range s.Projects {
+			if p == r.WorkspaceProject {
+				seenProj = true
+				break
+			}
+		}
+		if !seenProj {
+			s.Projects = append(s.Projects, r.WorkspaceProject)
+		}
+		s.Files += r.Files
+		s.Nodes += r.Nodes
+		s.Edges += r.Edges
+	}
+	// Always populate the per-workspace rollup — even when every
+	// workspace is a default singleton. Hiding it on legacy setups
+	// makes the boundary feature invisible, which is the opposite
+	// of what users want when they're trying to migrate. Renderer-
+	// side compaction (single-line hint vs full table) keeps the
+	// output tidy when there's nothing meaningful to summarise.
+	sort.Strings(wsKeys)
+	workspaces := make([]daemon.WorkspaceSummary, 0, len(wsKeys))
+	for _, k := range wsKeys {
+		workspaces = append(workspaces, *wsAgg[k])
+	}
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	return daemon.StatusResponse{
+		TrackedRepos:  tracked,
+		MemoryBytes:   mem.Alloc,
+		SearchBackend: searchBackendForResponse,
+		Runtime: daemon.RuntimeStats{
+			Alloc:        mem.Alloc,
+			Sys:          mem.Sys,
+			HeapInuse:    mem.HeapInuse,
+			HeapIdle:     mem.HeapIdle,
+			HeapReleased: mem.HeapReleased,
+			StackInuse:   mem.StackInuse,
+			NumGC:        mem.NumGC,
+			NumGoroutine: runtime.NumGoroutine(),
+		},
+		PProfAddr:         daemonPProfAddr(),
+		Ready:             c.ready.Load(),
+		WarmupSeconds:     c.warmupSeconds.Load(),
+		Workspaces:        workspaces,
+		ConfiguredServers: c.collectConfiguredServers(),
+		LocalServerSlug:   c.localServerSlug(),
+		LSPRouter:         c.collectLSPRouterStatus(),
+	}, nil
+	// MCPSessions is populated by the daemon Server (it owns the
+	// SessionRegistry — the controller doesn't have a back-pointer).
+	// See internal/daemon/server.go around the ControlStatus handler.
+}
+
+// collectConfiguredServers reads `~/.gortex/servers.toml` (best
+// effort — a missing or malformed file just returns nil) and
+// projects it onto the status response. Auth tokens are NOT
+// included; the HasAuth flag is enough for the human-facing
+// "yes/no" decision.
+func (c *realController) collectConfiguredServers() []daemon.ConfiguredServerStatus {
+	cfg, err := daemon.LoadServersConfig("")
+	if err != nil || cfg == nil || len(cfg.Server) == 0 {
+		return nil
+	}
+	local := c.localServerSlug()
+	out := make([]daemon.ConfiguredServerStatus, 0, len(cfg.Server))
+	for _, s := range cfg.Server {
+		out = append(out, daemon.ConfiguredServerStatus{
+			Slug:       s.Slug,
+			URL:        s.URL,
+			Default:    s.Default,
+			Local:      s.Slug == local,
+			Workspaces: s.Workspaces,
+			HasAuth:    s.AuthToken != "" || s.AuthTokenEnv != "",
+		})
+	}
+	return out
+}
+
+// localServerSlug returns the reserved sentinel identifying the
+// daemon's own in-process graph. It is intentionally NOT derived from
+// DefaultServer().Slug: a roster row is always a remote now, so no
+// roster entry is ever "local" (the status Local flag is false for
+// every row), and a remote marked default=true is still proxied.
+func (c *realController) localServerSlug() string {
+	return daemon.LocalServerSentinel
+}
+
+// collectLSPRouterStatus reflects the daemon's LSP router (when
+// wired) into a status payload. Returns nil when no router is wired
+// (semantic enrichment disabled in `.gortex.yaml`).
+func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
+	if c.indexer == nil {
+		return nil
+	}
+	semMgr := c.indexer.SemanticManager()
+	if semMgr == nil {
+		return nil
+	}
+	router, ok := semMgr.LSPRouter().(*lsp.Router)
+	if !ok || router == nil {
+		return nil
+	}
+	out := &daemon.LSPRouterStatus{
+		DefaultWorkspace: router.DefaultWorkspace(),
+	}
+	for _, name := range router.EnabledSpecNames() {
+		out.EnabledSpecs = append(out.EnabledSpecs, daemon.LSPSpecStatus{
+			Name:      name,
+			Available: router.SpecAvailable(name),
+			Languages: strings.Join(router.SpecLanguages(name), ","),
+		})
+	}
+	for _, s := range router.Stats() {
+		out.ActiveProviders = append(out.ActiveProviders, daemon.LSPActiveProvider{
+			Spec:      s.Spec,
+			Workspace: s.Workspace,
+			LastUsed:  s.LastUsed.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+// SearchSymbols runs a substring match over node names and returns the
+// matching symbols. It's the cheap probe path for clients (notably the
+// Grep-redirect hook) that need a fast yes/no without setting up a full
+// MCP session. File and Import nodes are excluded — the hook only cares
+// about real symbol matches.
+func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+	c.mu.Lock()
+	g := c.graph
+	c.mu.Unlock()
+
+	if g == nil || p.Query == "" {
+		return daemon.SearchSymbolsResult{}, nil
+	}
+
+	limit := p.Limit
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	needle := strings.ToLower(p.Query)
+	hits := make([]daemon.SymbolHit, 0, limit)
+	for _, n := range g.AllNodes() {
+		if n == nil {
+			continue
+		}
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		if p.Repo != "" && n.RepoPrefix != p.Repo {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(n.Name), needle) {
+			continue
+		}
+		hits = append(hits, daemon.SymbolHit{
+			Name:     n.Name,
+			Kind:     string(n.Kind),
+			FilePath: n.FilePath,
+			Line:     n.StartLine,
+		})
+		if len(hits) >= limit {
+			break
+		}
+	}
+	return daemon.SearchSymbolsResult{Hits: hits}, nil
+}
+
+// AttachWatcher is called by warmup to hand over the MultiWatcher once
+// it has been initialized. Until this is called, realController.Track
+// skips the per-repo watcher attach — a newly-tracked repo gets its
+// watcher when the warmup-constructed MultiWatcher iterates
+// mi.AllMetadata() at startup.
+func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.multiWatcher = mw
+}
+
+// MarkReady flips the ready flag and records how long warmup took.
+// Safe to call concurrently with Status (atomic loads on the read side).
+func (c *realController) MarkReady(d time.Duration) {
+	c.warmupSeconds.Store(int64(d.Seconds()))
+	c.ready.Store(true)
+}
+
+// IsReady reports whether warmup has completed. Used by background
+// timers (snapshotter, janitor, savings flush, etc.) to skip work
+// that would fight the warmup pipeline for shard locks and GC budget.
+func (c *realController) IsReady() bool {
+	return c.ready.Load()
+}
+
+// Shutdown gives the caller (the daemon main) a chance to flush any
+// per-instance stores. The actual socket teardown is the Server's job.
+func (c *realController) Shutdown(_ context.Context) error {
+	c.mu.Lock()
+	hook := c.onShutdown
+	c.mu.Unlock()
+	if hook != nil {
+		return hook()
+	}
+	return nil
+}

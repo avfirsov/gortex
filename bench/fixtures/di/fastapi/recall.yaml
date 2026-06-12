@@ -1,0 +1,124 @@
+# FastAPI DI-recall fixture
+#
+# FastAPI's dependency injection is less "magic" than NestJS — every
+# dependency is the default value of a parameter, either via
+# `= Depends(target)` or `Annotated[T, Depends(target)]`. Target can be
+# a callable (function) or a class. Static analysis CAN see the target
+# because it's a value expression at the call site.
+#
+# Tiers (same as the nestjs fixture):
+#   exact   — symbol-name text queries
+#   concept — natural-language paraphrases
+#   di      — shapes that a type-aware Python resolver would already
+#             resolve (explicit class parameter types)
+#   di_gap  — shapes that require Depends-aware extraction to traverse
+#             (nested Depends, function-wrapped Depends, Annotated)
+#
+# Expected IDs use the repo-stripped path form the Gortex TypeScript
+# and Python extractors produce, e.g.
+#   app/users/router.py::get_user
+#   app/users/service.py::UserService.find_one
+name: gortex-fastapi-di
+cases:
+
+  # ------------------------------------------------------------------
+  # Tier 1 — exact: can the Python extractor find named symbols?
+  # ------------------------------------------------------------------
+  - id: exact-UserService
+    tier: exact
+    query: UserService
+    expected: [app/users/service.py::UserService]
+  - id: exact-AuthService
+    tier: exact
+    query: AuthService
+    expected: [app/auth/service.py::AuthService]
+  - id: exact-get_settings
+    tier: exact
+    query: get_settings
+    expected: [app/config/settings.py::get_settings]
+  - id: exact-require_auth
+    tier: exact
+    query: require_auth
+    expected: [app/auth/deps.py::require_auth]
+  - id: exact-find_one
+    tier: exact
+    query: find_one
+    expected: [app/users/service.py::UserService.find_one]
+
+  # ------------------------------------------------------------------
+  # Tier 2 — concept: paraphrase queries
+  # ------------------------------------------------------------------
+  - id: concept-look-up-user
+    tier: concept
+    query: look up a user by their id
+    expected: [app/users/service.py::UserService.find_one]
+  - id: concept-validate-token
+    tier: concept
+    query: validate an auth token
+    expected: [app/auth/service.py::AuthService.validate]
+  - id: concept-application-settings
+    tier: concept
+    query: application settings
+    expected: [app/config/settings.py::Settings]
+
+  # ------------------------------------------------------------------
+  # Tier 3 — di: class-based Depends with explicit types
+  # ------------------------------------------------------------------
+  # AuthService's constructor has `users: UserService = Depends(UserService)`.
+  # The declared type `UserService` is explicit Python, so a type-aware
+  # resolver can link `self._users.find_one(...)` to UserService.find_one.
+  - id: di-call_chain-AuthService-validate
+    tier: di
+    query: "call_chain:app/auth/service.py::AuthService.validate"
+    expected: [app/users/service.py::UserService.find_one]
+
+  # Handler with class Depends — `users: UserService = Depends(UserService)`.
+  # Same class-type annotation shape.
+  - id: di-call_chain-list_users
+    tier: di
+    query: "call_chain:app/users/router.py::list_users"
+    expected: [app/users/service.py::UserService.find_all]
+
+  # ------------------------------------------------------------------
+  # Tier 4 — di_gap: shapes requiring Depends-aware extraction
+  # ------------------------------------------------------------------
+  # Function-wrapped Depends: the handler gets AuthService via a
+  # require_auth dependency that itself returns whatever its own
+  # Depends yields. The call chain from get_user should reach both
+  # require_auth and the nested AuthService.validate.
+  - id: di_gap-call_chain-get_user
+    tier: di_gap
+    query: "call_chain:app/users/router.py::get_user"
+    expected:
+      # Body calls (explicit invocation on the injected instance).
+      - app/users/service.py::UserService.find_one
+      - app/auth/service.py::AuthService.validate
+      # Depends chain — the handler effectively calls each target at
+      # request time via FastAPI's resolver.
+      - app/auth/deps.py::require_auth
+
+  # require_auth → AuthService → UserService (two hops of Depends).
+  - id: di_gap-callers-AuthService-validate
+    tier: di_gap
+    query: "callers:app/auth/service.py::AuthService.validate"
+    expected: [app/users/router.py::get_user]
+
+  # Annotated[T, Depends(target)] — modern FastAPI shorthand. The
+  # handler declares `users: Annotated[UserService, Depends(UserService)]`
+  # and calls users.create(...). The Depends target is a class; its
+  # type is resolvable from the annotation; the method call should
+  # link to UserService.create.
+  - id: di_gap-call_chain-create_user
+    tier: di_gap
+    query: "call_chain:app/users/router.py::create_user"
+    expected:
+      - app/users/service.py::UserService.create
+      - app/config/settings.py::get_settings
+
+  # Factory-function Depends: `settings: Annotated[Settings, Depends(get_settings)]`.
+  # get_settings returns Settings; the handler then touches settings.database_url.
+  # With Depends-aware extraction, callers of get_settings should include the handler.
+  - id: di_gap-callers-get_settings
+    tier: di_gap
+    query: "callers:app/config/settings.py::get_settings"
+    expected: [app/users/router.py::create_user]

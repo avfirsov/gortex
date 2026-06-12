@@ -1,0 +1,873 @@
+name: gortex-seed-v2-typo
+cases:
+    - id: exact-MCPServer-typo
+      tier: exact
+      query: mcp Server tye
+      expected:
+        - internal/mcp/server.go::Server
+    - id: exact-NewServer-typo
+      tier: exact
+      query: NewServe
+      expected:
+        - internal/mcp/server.go::NewServer
+    - id: exact-graph-Graph-typo
+      tier: exact
+      query: gtraph.Graph type
+      expected:
+        - internal/graph/graph.go::Graph
+    - id: exact-graph-Node-typo
+      tier: exact
+      query: graph.Nodle type
+      expected:
+        - internal/graph/node.go::Node
+    - id: exact-graph-Edge-typo
+      tier: exact
+      query: grpah.Edge type
+      expected:
+        - internal/graph/edge.go::Edge
+    - id: exact-Indexer-typo
+      tier: exact
+      query: Indexer sttruct
+      expected:
+        - internal/indexer/indexer.go::Indexer
+    - id: exact-MultiIndexer-typo
+      tier: exact
+      query: MulitIndexer
+      expected:
+        - internal/indexer/multi.go::MultiIndexer
+    - id: exact-IndexFile-typo
+      tier: exact
+      query: IndexFilne
+      expected:
+        - internal/indexer/indexer.go::Indexer.IndexFile
+    - id: exact-IndexFileNoResolve-typo
+      tier: exact
+      query: IndexFileNozResolve
+      expected:
+        - internal/indexer/indexer.go::Indexer.IndexFileNoResolve
+    - id: exact-IncrementalReindex-typo
+      tier: exact
+      query: IncrementalPeindex
+      expected:
+        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+    - id: exact-SetEmbedder-typo
+      tier: exact
+      query: SetEmbeeder
+      expected:
+        - internal/indexer/indexer.go::Indexer.SetEmbedder
+    - id: exact-EvictFile-typo
+      tier: exact
+      query: EvictFife
+      expected:
+        - internal/graph/graph.go::Graph.EvictFile
+    - id: exact-EvictRepo-typo
+      tier: exact
+      query: EvkctRepo
+      expected:
+        - internal/graph/graph.go::Graph.EvictRepo
+    - id: exact-AddNode-typo
+      tier: exact
+      query: AddNode
+      expected:
+        - internal/graph/graph.go::Graph.AddNode
+    - id: exact-AtomicWriteFile-typo
+      tier: exact
+      query: AtomicnWriteFile
+      expected:
+        - internal/agents/writer.go::AtomicWriteFile
+    - id: exact-WriteIfNotExists-typo
+      tier: exact
+      query: WrilteIfNotExists
+      expected:
+        - internal/agents/writer.go::WriteIfNotExists
+    - id: exact-BM25Backend-typo
+      tier: exact
+      query: BM25Backejd
+      expected:
+        - internal/search/bm25.go::BM25Backend
+    - id: exact-NewBM25-typo
+      tier: exact
+      query: NenBM25
+      expected:
+        - internal/search/bm25.go::NewBM25
+    - id: exact-HybridBackend-typo
+      tier: exact
+      query: HybridBfckend
+      expected:
+        - internal/search/hybrid.go::HybridBackend
+    - id: exact-NewHybrid-typo
+      tier: exact
+      query: NewHybid
+      expected:
+        - internal/search/hybrid.go::NewHybrid
+    - id: exact-rrfFuse-typo
+      tier: exact
+      query: rrfFse
+      expected:
+        - internal/search/hybrid.go::rrfFuse
+    - id: exact-VectorBackend-typo
+      tier: exact
+      query: VectorBcakend
+      expected:
+        - internal/search/vector.go::VectorBackend
+    - id: exact-SearchBackend-typo
+      tier: exact
+      query: search.Backeod
+      expected:
+        - internal/search/search.go::Backend
+    - id: exact-SearchResult-typo
+      tier: exact
+      query: SearchResutl
+      expected:
+        - internal/search/search.go::SearchResult
+    - id: exact-Swappable-typo
+      tier: exact
+      query: Swappalbe
+      expected:
+        - internal/search/swappable.go::Swappable
+    - id: exact-StaticProvider-typo
+      tier: exact
+      query: StaticPoovider
+      expected:
+        - internal/embedding/static.go::StaticProvider
+    - id: exact-NewStaticProvider-typo
+      tier: exact
+      query: NewStaticProvidre
+      expected:
+        - internal/embedding/static.go::NewStaticProvider
+    - id: exact-HugotProvider-typo
+      tier: exact
+      query: HgotProvider
+      expected:
+        - internal/embedding/hugot.go::HugotProvider
+    - id: exact-APIProvider-typo
+      tier: exact
+      query: APIPrvider
+      expected:
+        - internal/embedding/api.go::APIProvider
+    - id: exact-NopProvider-typo
+      tier: exact
+      query: KopProvider
+      expected:
+        - internal/embedding/nop.go::NopProvider
+    - id: exact-EmbeddingProvider-typo
+      tier: exact
+      query: embedding.qProvider
+      expected:
+        - internal/embedding/provider.go::Provider
+    - id: exact-handleEditSymbol-typo
+      tier: exact
+      query: hanhdleEditSymbol
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleEditSymbol
+    - id: exact-handleEditFile-typo
+      tier: exact
+      query: hsandleEditFile
+      expected:
+        - internal/mcp/tools_fileops.go::Server.handleEditFile
+    - id: exact-handleWriteFile-typo
+      tier: exact
+      query: handleWirteFile
+      expected:
+        - internal/mcp/tools_fileops.go::Server.handleWriteFile
+    - id: exact-handleSearchSymbols-typo
+      tier: exact
+      query: hyndleSearchSymbols
+      expected:
+        - internal/mcp/tools_core.go::Server.handleSearchSymbols
+    - id: exact-handleSmartContext-typo
+      tier: exact
+      query: handhleSmartContext
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleSmartContext
+    - id: exact-handleGraphStats-typo
+      tier: exact
+      query: hndleGraphStats
+      expected:
+        - internal/mcp/tools_core.go::Server.handleGraphStats
+    - id: exact-handleFindUsages-typo
+      tier: exact
+      query: handleFindUsaegs
+      expected:
+        - internal/mcp/tools_core.go::Server.handleFindUsages
+    - id: exact-handleGetCallers-typo
+      tier: exact
+      query: ghandleGetCallers
+      expected:
+        - internal/mcp/tools_core.go::Server.handleGetCallers
+    - id: exact-handleWinnowSymbols-typo
+      tier: exact
+      query: handleWinnpowSymbols
+      expected:
+        - internal/mcp/tools_winnow.go::Server.handleWinnowSymbols
+    - id: exact-WinnowForEval-typo
+      tier: exact
+      query: WinnowForEvla
+      expected:
+        - internal/mcp/tools_winnow.go::Server.WinnowForEval
+    - id: exact-registerCodingTools-typo
+      tier: exact
+      query: registerCodaingTools
+      expected:
+        - internal/mcp/tools_coding.go::Server.registerCodingTools
+    - id: exact-registerCoreTools-typo
+      tier: exact
+      query: registerCroeTools
+      expected:
+        - internal/mcp/tools_core.go::Server.registerCoreTools
+    - id: exact-sessionState-typo
+      tier: exact
+      query: szssionState
+      expected:
+        - internal/mcp/server.go::sessionState
+    - id: exact-recordModified-typo
+      tier: exact
+      query: recordModifid
+      expected:
+        - internal/mcp/server.go::sessionState.recordModified
+    - id: exact-tokenStats-typo
+      tier: exact
+      query: tockenStats
+      expected:
+        - internal/mcp/server.go::tokenStats
+    - id: exact-GRPCExtractor-typo
+      tier: exact
+      query: GRPCExtracotr
+      expected:
+        - internal/contracts/grpc.go::GRPCExtractor
+    - id: exact-HTTPExtractor-typo
+      tier: exact
+      query: HTTPExtractwor
+      expected:
+        - internal/contracts/http.go::HTTPExtractor
+    - id: exact-GraphQLExtractor-typo
+      tier: exact
+      query: GraphQLxEtractor
+      expected:
+        - internal/contracts/graphql.go::GraphQLExtractor
+    - id: exact-OpenAPIExtractor-typo
+      tier: exact
+      query: OpenAPIExtraczor
+      expected:
+        - internal/contracts/openapi.go::OpenAPIExtractor
+    - id: exact-EnvVarExtractor-typo
+      tier: exact
+      query: EnvVarExtracjor
+      expected:
+        - internal/contracts/envvar.go::EnvVarExtractor
+    - id: exact-TopicExtractor-typo
+      tier: exact
+      query: ZopicExtractor
+      expected:
+        - internal/contracts/topics.go::TopicExtractor
+    - id: exact-parserRegistry-typo
+      tier: exact
+      query: parrser.Registry
+      expected:
+        - internal/parser/registry.go::Registry
+    - id: exact-RegisterAll-typo
+      tier: exact
+      query: RegitserAll
+      expected:
+        - internal/parser/languages/register.go::RegisterAll
+    - id: exact-GoExtractor-typo
+      tier: exact
+      query: GoExtractzr
+      expected:
+        - internal/parser/languages/golang.go::GoExtractor
+    - id: exact-sessionFor-typo
+      tier: exact
+      query: sessionFor
+      expected:
+        - internal/mcp/server.go::Server.sessionFor
+    - id: exact-ResolveFilePath-typo
+      tier: exact
+      query: ResolveilePath
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.ResolveFilePath
+    - id: exact-RepoForFile-typo
+      tier: exact
+      query: RepoForFle
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.RepoForFile
+    - id: exact-TrackRepo-typo
+      tier: exact
+      query: TracpRepo
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.TrackRepo
+    - id: exact-UntrackRepo-typo
+      tier: exact
+      query: UntackRepo
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.UntrackRepo
+    - id: exact-IndexResult-typo
+      tier: exact
+      query: IndexResut
+      expected:
+        - internal/indexer/indexer.go::IndexResult
+    - id: exact-RepoMetadata-typo
+      tier: exact
+      query: RepoMetadaat
+      expected:
+        - internal/indexer/multi.go::RepoMetadata
+    - id: exact-tokensCount-typo
+      tier: exact
+      query: tokes.Count
+      expected:
+        - internal/tokens/tokens.go::Count
+    - id: concept-atomic-write-typo
+      tier: concept
+      query: atomic fire write temp rename
+      expected:
+        - internal/agents/writer.go::AtomicWriteFile
+    - id: concept-reindex-one-file-typo
+      tier: concept
+      query: reinedx a single file after an edit
+      expected:
+        - internal/indexer/indexer.go::Indexer.IndexFile
+    - id: concept-evict-file-typo
+      tier: concept
+      query: remove all noded belonging to a file
+      expected:
+        - internal/graph/graph.go::Graph.EvictFile
+    - id: concept-evict-repo-typo
+      tier: concept
+      query: drop every node for a rpeository prefix
+      expected:
+        - internal/graph/graph.go::Graph.EvictRepo
+    - id: concept-bm25-index-typo
+      tier: concept
+      query: text search backend wtih TF-IDF ranking
+      expected:
+        - internal/search/bm25.go::BM25Backend
+    - id: concept-hybrid-fuse-typo
+      tier: concept
+      query: comlbine text and vector search with RRF
+      expected:
+        - internal/search/hybrid.go::HybridBackend
+    - id: concept-rrf-algorithm-typo
+      tier: concept
+      query: reciprocal randk fusion
+      expected:
+        - internal/search/hybrid.go::rrfFuse
+    - id: concept-swap-backend-typo
+      tier: concept
+      query: hot-swap the in-memory searich backend
+      expected:
+        - internal/search/swappable.go::Swappable
+    - id: concept-glove-embed-typo
+      tier: concept
+      query: built-in GloVe owrd vector embedder
+      expected:
+        - internal/embedding/static.go::StaticProvider
+    - id: concept-mcp-server-typo
+      tier: concept
+      query: MCP server type holding engine and grah
+      expected:
+        - internal/mcp/server.go::Server
+    - id: concept-session-state-typo
+      tier: concept
+      query: per-client session activiby tracking
+      expected:
+        - internal/mcp/server.go::sessionState
+    - id: concept-edit-by-id-typo
+      tier: concept
+      query: edit a symbol by node id xithout reading file
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleEditSymbol
+    - id: concept-edit-raw-file-typo
+      tier: concept
+      query: edit any file by path weth no read-before-edit
+      expected:
+        - internal/mcp/tools_fileops.go::Server.handleEditFile
+    - id: concept-write-raw-file-typo
+      tier: concept
+      query: create or overrwite file with given content
+      expected:
+        - internal/mcp/tools_fileops.go::Server.handleWriteFile
+    - id: concept-editing-context-typo
+      tier: concept
+      query: eevrything needed to safely edit a file
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleGetEditingContext
+    - id: concept-smart-context-typo
+      tier: concept
+      query: assemble minimum conotext for a task
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleSmartContext
+    - id: concept-tiktoken-count-typo
+      tier: concept
+      query: count tokens using tiktkoen cl100k
+      expected:
+        - internal/tokens/tokens.go::Count
+    - id: concept-winnow-scorer-typo
+      tier: concept
+      query: constraint chain search wih fan-in churn
+      expected:
+        - internal/mcp/tools_winnow.go::Server.winnowSymbols
+    - id: concept-find-usages-typo
+      tier: concept
+      query: find everx reference to a symbol
+      expected:
+        - internal/mcp/tools_core.go::Server.handleFindUsages
+    - id: concept-callers-typo
+      tier: concept
+      query: who calls this function
+      expected:
+        - internal/mcp/tools_core.go::Server.handleGetCallers
+    - id: concept-call-chain-typo
+      tier: concept
+      query: tpace a chain of function calls
+      expected:
+        - internal/mcp/tools_core.go::Server.handleGetCallChain
+    - id: concept-find-impls-typo
+      tier: concept
+      query: implexentations of an interface
+      expected:
+        - internal/mcp/tools_core.go::Server.handleFindImplementations
+    - id: concept-import-path-typo
+      tier: concept
+      query: resolve Go import path for a symboll
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleFindImportPath
+    - id: concept-repo-outline-typo
+      tier: concept
+      query: narratfive single-call repo overview
+      expected:
+        - internal/mcp/tools_outline.go::Server.handleGetRepoOutline
+    - id: concept-rename-symbol-typo
+      tier: concept
+      query: coordinated multi-file sename refactor
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleRenameSymbol
+    - id: concept-scaffold-typo
+      tier: concept
+      query: generate code from an exnmple pattern
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleScaffold
+    - id: concept-batch-edit-typo
+      tier: concept
+      query: apply multiuple edits in dependency order
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleBatchEdit
+    - id: concept-track-repo-typo
+      tier: concept
+      query: add a repostiory to the multi-repo graph
+      expected:
+        - internal/mcp/tools_multi.go::Server.handleTrackRepository
+    - id: concept-untrack-repo-typo
+      tier: concept
+      query: remove a repository form the graph
+      expected:
+        - internal/mcp/tools_multi.go::Server.handleUntrackRepository
+    - id: concept-grpc-extract-typo
+      tier: concept
+      query: extract gRPC service provkders from a file
+      expected:
+        - internal/contracts/grpc.go::GRPCExtractor.Extract
+    - id: concept-http-extract-typo
+      tier: concept
+      query: extract HTTP route handers from source
+      expected:
+        - internal/contracts/http.go::HTTPExtractor.Extract
+    - id: concept-graphql-extract-typo
+      tier: concept
+      query: extarct GraphQL resolvers
+      expected:
+        - internal/contracts/graphql.go::GraphQLExtractor.Extract
+    - id: concept-openapi-extract-typo
+      tier: concept
+      query: parse OpenAPI pec providers
+      expected:
+        - internal/contracts/openapi.go::OpenAPIExtractor.Extract
+    - id: concept-envvar-extract-typo
+      tier: concept
+      query: fiznd environment variable consumers
+      expected:
+        - internal/contracts/envvar.go::EnvVarExtractor.Extract
+    - id: concept-topic-extract-typo
+      tier: concept
+      query: extract pub-sub topic emits and listns
+      expected:
+        - internal/contracts/topics.go::TopicExtractor.Extract
+    - id: concept-go-extract-typo
+      tier: concept
+      query: Go language exrtactor
+      expected:
+        - internal/parser/languages/golang.go::GoExtractor
+    - id: concept-ts-extract-typo
+      tier: concept
+      query: TypeScript lnaguage extractor
+      expected:
+        - internal/parser/languages/typescript.go::TypeScriptExtractor
+    - id: concept-detect-lang-typo
+      tier: concept
+      query: detect langauge from file extension
+      expected:
+        - internal/parser/registry.go::Registry.GetByExtension
+    - id: concept-register-all-typo
+      tier: concept
+      query: register every language extactor
+      expected:
+        - internal/parser/languages/register.go::RegisterAll
+    - id: concept-ranker-bm25-typo
+      tier: concept
+      query: eval rnker adapter for BM25
+      expected:
+        - internal/eval/recall/rankers.go::BM25Ranker
+    - id: concept-ranker-rrf-typo
+      tier: concept
+      query: eval ranker dapter for RRF hybrid
+      expected:
+        - internal/eval/recall/rankers.go::RRFRanker
+    - id: concept-ranker-semantic-typo
+      tier: concept
+      query: eval ranker for vectour-only semantic
+      expected:
+        - internal/eval/recall/rankers.go::SemanticRanker
+    - id: concept-ranker-winnow-typo
+      tier: concept
+      query: eval raker wrapping graph-aware winnow
+      expected:
+        - internal/eval/recall/rankers.go::WinnowRanker
+    - id: concept-ranker-rg-typo
+      tier: concept
+      query: ripgrsp-based retrieval baseline
+      expected:
+        - internal/eval/recall/rankers.go::RipgrepRanker
+    - id: concept-resolve-filepath-typo
+      tier: concept
+      query: resolve a repo-prefixed path to absolutea
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.ResolveFilePath
+    - id: concept-repo-for-file-typo
+      tier: concept
+      query: find which repo contanis a given file
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.RepoForFile
+    - id: concept-set-embedder-typo
+      tier: concept
+      query: attach embedding propider to the indexer
+      expected:
+        - internal/indexer/indexer.go::Indexer.SetEmbedder
+    - id: concept-new-server-typo
+      tier: concept
+      query: construct a new MCP serveq instance
+      expected:
+        - internal/mcp/server.go::NewServer
+    - id: concept-new-hybrid-typo
+      tier: concept
+      query: construct a hbyrid BM25+vector backend
+      expected:
+        - internal/search/hybrid.go::NewHybrid
+    - id: concept-reindex-all-typo
+      tier: concept
+      query: incremental reindex after file cwhanges
+      expected:
+        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+    - id: concept-new-vector-typo
+      tier: concept
+      query: HNSW vector indxe backend
+      expected:
+        - internal/search/vector.go::VectorBackend
+    - id: concept-api-embedder-typo
+      tier: concept
+      query: OpenAI-compatible embeddings API provideg
+      expected:
+        - internal/embedding/api.go::APIProvider
+    - id: concept-guard-rules-typo
+      tier: concept
+      query: team convention guard rle evaluation
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleCheckGuards
+    - id: concept-explain-impact-typo
+      tier: concept
+      query: risk tiered blast radius analsis
+      expected:
+        - internal/mcp/tools_analysis.go::Server.handleEnhancedChangeImpact
+    - id: concept-diff-context-typo
+      tier: concept
+      query: enrich git iff with graph context
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleDiffContext
+    - id: concept-detect-changes-typo
+      tier: concept
+      query: list changed files since last clal
+      expected:
+        - internal/mcp/tools_analysis.go::Server.handleDetectChanges
+    - id: concept-cluster-retrieval-typo
+      tier: concept
+      query: get a graph community clustver by id
+      expected:
+        - internal/mcp/tools_core.go::Server.handleGetCluster
+    - id: concept-plan-turn-typo
+      tier: concept
+      query: opening move rouer for first tool call
+      expected:
+        - internal/mcp/tools_planning.go::Server.handlePlanTurn
+    - id: concept-feedback-record-typo
+      tier: concept
+      query: record which symbols were useful afdter a task
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleFeedback
+    - id: concept-export-context-typo
+      tier: concept
+      query: export portable cointext markdown for PR
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleExportContext
+    - id: concept-index-health-typo
+      tier: concept
+      query: staleness and parse failure healh report
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleIndexHealth
+    - id: concept-symbol-history-typo
+      tier: concept
+      query: session symbol modiication history
+      expected:
+        - internal/mcp/tools_enhancements.go::Server.handleGetSymbolHistory
+    - id: concept-index-repo-typo
+      tier: concept
+      query: run the full reposiotry indexer
+      expected:
+        - internal/mcp/tools_core.go::Server.handleIndexRepository
+    - id: mh-contract-extractors-typo
+      tier: multi_hop
+      query: contract extractors for APIsf
+      expected:
+        - internal/contracts/grpc.go::GRPCExtractor
+        - internal/contracts/http.go::HTTPExtractor
+        - internal/contracts/graphql.go::GraphQLExtractor
+        - internal/contracts/openapi.go::OpenAPIExtractor
+        - internal/contracts/envvar.go::EnvVarExtractor
+        - internal/contracts/topics.go::TopicExtractor
+    - id: mh-extract-methods-typo
+      tier: multi_hop
+      query: Extrac method on contract extractor types
+      expected:
+        - internal/contracts/grpc.go::GRPCExtractor.Extract
+        - internal/contracts/http.go::HTTPExtractor.Extract
+        - internal/contracts/graphql.go::GraphQLExtractor.Extract
+        - internal/contracts/openapi.go::OpenAPIExtractor.Extract
+        - internal/contracts/envvar.go::EnvVarExtractor.Extract
+        - internal/contracts/topics.go::TopicExtractor.Extract
+    - id: mh-edit-tools-typo
+      tier: multi_hop
+      query: MCP handlerk that modify source files
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleEditSymbol
+        - internal/mcp/tools_fileops.go::Server.handleEditFile
+        - internal/mcp/tools_fileops.go::Server.handleWriteFile
+        - internal/mcp/tools_enhancements.go::Server.handleBatchEdit
+        - internal/mcp/tools_enhancements.go::Server.handleScaffold
+    - id: mh-embedding-providers-typo
+      tier: multi_hop
+      query: emebdding provider implementations
+      expected:
+        - internal/embedding/static.go::StaticProvider
+        - internal/embedding/hugot.go::HugotProvider
+        - internal/embedding/api.go::APIProvider
+        - internal/embedding/onnx.go::ONNXProvider
+        - internal/embedding/nop.go::NopProvider
+    - id: mh-search-backends-typo
+      tier: multi_hop
+      query: search backend implementatsions
+      expected:
+        - internal/search/bm25.go::BM25Backend
+        - internal/search/bleve.go::BleveBackend
+        - internal/search/hybrid.go::HybridBackend
+        - internal/search/vector.go::VectorBackend
+        - internal/search/swappable.go::Swappable
+    - id: mh-handle-tools-coding-typo
+      tier: multi_hop
+      query: MCP tools registered in toolsc_oding.go
+      expected:
+        - internal/mcp/tools_coding.go::Server.handleGetEditingContext
+        - internal/mcp/tools_coding.go::Server.handleEditSymbol
+        - internal/mcp/tools_coding.go::Server.handleSmartContext
+        - internal/mcp/tools_coding.go::Server.handleRenameSymbol
+        - internal/mcp/tools_coding.go::Server.handleFindImportPath
+    - id: mh-graph-mutators-typo
+      tier: multi_hop
+      query: metohds that mutate the graph
+      expected:
+        - internal/graph/graph.go::Graph.AddNode
+        - internal/graph/graph.go::Graph.AddEdge
+        - internal/graph/graph.go::Graph.EvictFile
+        - internal/graph/graph.go::Graph.EvictRepo
+        - internal/graph/graph.go::Graph.ReindexEdge
+    - id: mh-winnow-scorer-parts-typo
+      tier: multi_hop
+      query: pieces of the winnpw scorer pipeline
+      expected:
+        - internal/mcp/tools_winnow.go::Server.winnowSymbols
+        - internal/mcp/tools_winnow.go::applyWinnowPrefilter
+        - internal/mcp/tools_winnow.go::computeFanInOut
+        - internal/mcp/tools_winnow.go::winnowConstraints
+        - internal/mcp/tools_winnow.go::Server.WinnowForEval
+    - id: mh-eval-rankers-typo
+      tier: multi_hop
+      query: ranker adapters in the eval packapge
+      expected:
+        - internal/eval/recall/rankers.go::BM25Ranker
+        - internal/eval/recall/rankers.go::SemanticRanker
+        - internal/eval/recall/rankers.go::RRFRanker
+        - internal/eval/recall/rankers.go::WinnowRanker
+        - internal/eval/recall/rankers.go::RipgrepRanker
+    - id: mh-indexer-api-typo
+      tier: multi_hop
+      query: public Indexer API methdos
+      expected:
+        - internal/indexer/indexer.go::Indexer.Index
+        - internal/indexer/indexer.go::Indexer.IndexFile
+        - internal/indexer/indexer.go::Indexer.IndexFileNoResolve
+        - internal/indexer/indexer.go::Indexer.IncrementalReindex
+        - internal/indexer/indexer.go::Indexer.Search
+        - internal/indexer/indexer.go::Indexer.Graph
+    - id: mh-multi-repo-typo
+      tier: multi_hop
+      query: multir-epo indexer operations
+      expected:
+        - internal/indexer/multi.go::MultiIndexer.TrackRepo
+        - internal/indexer/multi.go::MultiIndexer.UntrackRepo
+        - internal/indexer/multi.go::MultiIndexer.IndexAll
+        - internal/indexer/multi.go::MultiIndexer.RepoForFile
+        - internal/indexer/multi.go::MultiIndexer.ResolveFilePath
+    - id: mh-session-helpers-typo
+      tier: multi_hop
+      query: sessipn state helpers on the MCP server
+      expected:
+        - internal/mcp/server.go::Server.sessionFor
+        - internal/mcp/server.go::sessionState.recordModified
+        - internal/mcp/server.go::sessionState.recordSymbol
+        - internal/mcp/server.go::sessionState
+        - internal/mcp/server.go::newSessionState
+    - id: mh-agent-adapters-typo
+      tier: multi_hop
+      query: IDE agecnt adapters
+      expected:
+        - internal/agents/claudecode/adapter.go::Adapter
+        - internal/agents/cursor/adapter.go::Adapter
+        - internal/agents/vscode/adapter.go::Adapter
+        - internal/agents/kilocode/adapter.go::Adapter
+        - internal/agents/zed/adapter.go::Adapter
+    - id: mh-init-subcommands-typo
+      tier: multi_hop
+      query: gortex init relatd commands
+      expected:
+        - cmd/gortex/init.go::initCmd
+        - cmd/gortex/init_doctor.go::initDoctorCmd
+        - cmd/gortex/init_doctor.go::runInitDoctor
+        - cmd/gortex/init.go::runInit
+    - id: mh-daemon-components-typo
+      tier: multi_hop
+      query: daemon server paots
+      expected:
+        - internal/daemon/session.go::Session
+        - internal/daemon/session.go::SessionRegistry
+    - id: mh-search-interface-members-typo
+      tier: multi_hop
+      query: methods required by the search Backend interflce
+      expected:
+        - internal/search/search.go::Backend
+    - id: mh-graph-reader-api-typo
+      tier: multi_hop
+      query: read-only graph accgessors
+      expected:
+        - internal/graph/graph.go::Graph.GetFileNodes
+    - id: mh-tokens-helpers-typo
+      tier: multi_hop
+      query: token ocunting helpers
+      expected:
+        - internal/tokens/tokens.go::Count
+        - internal/tokens/tokens.go::CountInt64
+    - id: mh-atomic-writers-typo
+      tier: multi_hop
+      query: atomic write helpers shared aross adapters
+      expected:
+        - internal/agents/writer.go::AtomicWriteFile
+        - internal/agents/writer.go::WriteIfNotExists
+    - id: mh-recall-types-typo
+      tier: multi_hop
+      query: recall report dnata types
+      expected:
+        - internal/eval/recall/recall.go::Report
+        - internal/eval/recall/recall.go::RankerResult
+        - internal/eval/recall/recall.go::Fixture
+        - internal/eval/recall/recall.go::Case
+        - internal/eval/recall/recall.go::Ranker
+    - id: mh-fileops-helpers-typo
+      tier: multi_hop
+      query: file operation MCP handler helpero
+      expected:
+        - internal/mcp/tools_fileops.go::Server.resolveFilePath
+        - internal/mcp/tools_fileops.go::Server.repoRelative
+        - internal/mcp/tools_fileops.go::Server.reindexFile
+        - internal/mcp/tools_fileops.go::Server.handleEditFile
+        - internal/mcp/tools_fileops.go::Server.handleWriteFile
+    - id: mh-graph-structs-typo
+      tier: multi_hop
+      query: core graph dat structures
+      expected:
+        - internal/graph/node.go::Node
+        - internal/graph/edge.go::Edge
+        - internal/graph/graph.go::Graph
+    - id: mh-index-result-typo
+      tier: multi_hop
+      query: index result and error reportign types
+      expected:
+        - internal/indexer/indexer.go::IndexResult
+        - internal/indexer/indexer.go::IndexError
+    - id: mh-cmd-commands-typo
+      tier: multi_hop
+      query: top-leeel cobra commands under cmd/gortex
+      expected:
+        - cmd/gortex/mcp.go::mcpCmd
+        - cmd/gortex/server.go::serverCmd
+        - cmd/gortex/daemon.go::daemonCmd
+        - cmd/gortex/index.go::indexCmd
+        - cmd/gortex/eval.go::evalCmd
+    - id: mh-config-load-typo
+      tier: multi_hop
+      query: configuration loading and dehaults
+      expected:
+        - internal/config/config.go::Load
+        - internal/config/config.go::Default
+    - id: mh-bm25-api-typo
+      tier: multi_hop
+      query: BM25 backend pubilc API
+      expected:
+        - internal/search/bm25.go::BM25Backend.Add
+        - internal/search/bm25.go::BM25Backend.Remove
+        - internal/search/bm25.go::BM25Backend.Search
+        - internal/search/bm25.go::BM25Backend.Count
+        - internal/search/bm25.go::NewBM25
+    - id: mh-tool-registrations-typo
+      tier: multi_hop
+      query: MCP tool registration functuons
+      expected:
+        - internal/mcp/tools_coding.go::Server.registerCodingTools
+        - internal/mcp/tools_core.go::Server.registerCoreTools
+        - internal/mcp/tools_analysis.go::Server.registerAnalysisTools
+        - internal/mcp/tools_enhancements.go::Server.registerEnhancementTools
+    - id: mh-wire-format-typo
+      tier: multi_hop
+      query: GCX1 compact wire formt encoders
+      expected:
+        - pkg/wire/decoder.go::Decoder
+        - pkg/wire/decoder.go::NewDecoder
+    - id: mh-parser-languages-typo
+      tier: multi_hop
+      query: lqnguage-specific parser extractors
+      expected:
+        - internal/parser/languages/golang.go::GoExtractor
+        - internal/parser/languages/typescript.go::TypeScriptExtractor
+        - internal/parser/languages/python.go::PythonExtractor
+        - internal/parser/languages/rust.go::RustExtractor
+        - internal/parser/languages/c.go::CExtractor
+    - id: mh-eval-subcommands-typo
+      tier: multi_hop
+      query: gortex eavl subcommands
+      expected:
+        - cmd/gortex/eval_recall.go::evalRecallCmd
+        - cmd/gortex/eval_swebench.go::evalSwebenchCmd
+        - cmd/gortex/eval_tokens.go::evalTokensCmd

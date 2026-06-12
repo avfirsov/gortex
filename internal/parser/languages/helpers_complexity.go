@@ -1,0 +1,374 @@
+package languages
+
+import (
+	"github.com/zzet/gortex/internal/graph"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+)
+
+// CyclomaticComplexity returns the McCabe cyclomatic complexity of a
+// function body — 1 plus the number of decision points (branches that
+// can take more than one path). The body is walked once recursively;
+// nested function/class definitions are skipped because their
+// complexity belongs to their own nodes, not to the enclosing scope.
+//
+// The decision-point set is the cross-language overlap of common
+// branch nodes, plus per-language extensions. Each language passes
+// its own table of node-type names; tree-sitter grammars vary
+// (`if_statement` vs `if_expression`, etc.) so we don't hardcode a
+// single set here.
+//
+// Returns 1 for an empty / nil body — the canonical "no branches"
+// score.
+func CyclomaticComplexity(body *sitter.Node, decisionTypes map[string]bool, skipDescent map[string]bool) int {
+	score := 1
+	if body == nil || len(decisionTypes) == 0 {
+		return score
+	}
+	walkComplexity(body, decisionTypes, skipDescent, &score)
+	return score
+}
+
+func walkComplexity(n *sitter.Node, decisionTypes, skipDescent map[string]bool, score *int) {
+	if n == nil {
+		return
+	}
+	t := n.Type()
+	if decisionTypes[t] {
+		*score++
+	}
+	if skipDescent != nil && skipDescent[t] {
+		return
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		walkComplexity(n.NamedChild(i), decisionTypes, skipDescent, score)
+	}
+}
+
+// Cross-language decision-point tables. Each value is a map for O(1)
+// lookup. Tree-sitter grammars vary on AST node names — Go uses
+// `if_statement`, Rust uses `if_expression`, Python uses
+// `if_statement`, etc. Each language's complexity counter passes the
+// table that matches its grammar.
+//
+// Boolean operator nodes (`&&`/`||`/`and`/`or`) are intentionally NOT
+// in these tables today. Counting them double-counts conditions and
+// makes scores noisy on guards like `if a && b && c`. If a project
+// wants strict McCabe parity later, add `binary_expression` plus a
+// post-filter that checks the operator text.
+
+var goComplexityNodes = map[string]bool{
+	"if_statement":       true,
+	"for_statement":      true,
+	"expression_switch_statement": true,
+	"type_switch_statement":       true,
+	"select_statement":            true,
+	"case_clause":                 true,
+	"communication_case":          true,
+	"type_case":                   true,
+}
+
+var goComplexitySkip = map[string]bool{
+	"func_literal":         true, // closures
+	"function_declaration": true, // nested defs (rare in Go)
+	"method_declaration":   true,
+}
+
+var tsComplexityNodes = map[string]bool{
+	"if_statement":          true,
+	"for_statement":         true,
+	"for_in_statement":      true,
+	"for_of_statement":      true,
+	"while_statement":       true,
+	"do_statement":          true,
+	"switch_case":           true,
+	"switch_default":        true,
+	"catch_clause":          true,
+	"ternary_expression":    true,
+	"conditional_expression": true,
+}
+
+var tsComplexitySkip = map[string]bool{
+	"function_declaration": true,
+	"function_expression":  true,
+	"arrow_function":       true,
+	"method_definition":    true,
+	"class_declaration":    true,
+}
+
+var pyComplexityNodes = map[string]bool{
+	"if_statement":          true,
+	"elif_clause":           true,
+	"for_statement":         true,
+	"while_statement":       true,
+	"except_clause":         true,
+	"match_statement":       true,
+	"case_clause":           true,
+	"conditional_expression": true,
+	"list_comprehension":    true,
+	"dictionary_comprehension": true,
+	"set_comprehension":     true,
+	"generator_expression":  true,
+}
+
+var pyComplexitySkip = map[string]bool{
+	"function_definition":  true,
+	"class_definition":     true,
+	"lambda":               true,
+	"decorated_definition": true,
+}
+
+var rustComplexityNodes = map[string]bool{
+	"if_expression":      true,
+	"if_let_expression":  true,
+	"for_expression":     true,
+	"while_expression":   true,
+	"loop_expression":    true,
+	"match_arm":          true,
+	"match_expression":   true,
+}
+
+var rustComplexitySkip = map[string]bool{
+	"function_item":     true,
+	"closure_expression": true,
+}
+
+var javaComplexityNodes = map[string]bool{
+	"if_statement":         true,
+	"for_statement":        true,
+	"enhanced_for_statement": true,
+	"while_statement":      true,
+	"do_statement":         true,
+	"switch_label":         true,
+	"switch_block_statement_group": true,
+	"catch_clause":         true,
+	"ternary_expression":   true,
+}
+
+var javaComplexitySkip = map[string]bool{
+	"method_declaration":      true,
+	"constructor_declaration": true,
+	"lambda_expression":       true,
+	"class_declaration":       true,
+}
+
+// GoComplexity / TSComplexity / PyComplexity / RustComplexity /
+// JavaComplexity — convenience wrappers picking the right table.
+// Pass the function/method's body block (not the whole declaration)
+// so the count excludes any header-side noise.
+func GoComplexity(body *sitter.Node) int {
+	return CyclomaticComplexity(body, goComplexityNodes, goComplexitySkip)
+}
+
+func TSComplexity(body *sitter.Node) int {
+	return CyclomaticComplexity(body, tsComplexityNodes, tsComplexitySkip)
+}
+
+func PyComplexity(body *sitter.Node) int {
+	return CyclomaticComplexity(body, pyComplexityNodes, pyComplexitySkip)
+}
+
+func RustComplexity(body *sitter.Node) int {
+	return CyclomaticComplexity(body, rustComplexityNodes, rustComplexitySkip)
+}
+
+func JavaComplexity(body *sitter.Node) int {
+	return CyclomaticComplexity(body, javaComplexityNodes, javaComplexitySkip)
+}
+
+// --- Cognitive complexity & loop depth (NEW-CBM-1) ------------------
+//
+// Cyclomatic complexity counts decision points flatly; cognitive
+// complexity additionally penalises *nesting*, so deeply-nested control
+// flow (the kind that is genuinely hard to follow and often hides
+// quadratic behaviour) scores higher than the same number of flat
+// branches. Loop depth is the maximum syntactic nesting of loops in a
+// body — the per-function input the interprocedural bottleneck analyzer
+// propagates along the call graph to surface hidden-O(n^2) chains.
+
+// nestingTypes — control-flow nodes that increase the cognitive nesting
+// level. A subset of the decision tables: the statement-level constructs
+// (loops, if, switch, try/catch, match) but not their clause sub-nodes.
+var goNestingTypes = map[string]bool{
+	"if_statement": true, "for_statement": true,
+	"expression_switch_statement": true, "type_switch_statement": true,
+	"select_statement": true,
+}
+var tsNestingTypes = map[string]bool{
+	"if_statement": true, "for_statement": true, "for_in_statement": true,
+	"for_of_statement": true, "while_statement": true, "do_statement": true,
+	"switch_statement": true, "catch_clause": true,
+}
+var pyNestingTypes = map[string]bool{
+	"if_statement": true, "for_statement": true, "while_statement": true,
+	"try_statement": true, "match_statement": true,
+}
+var rustNestingTypes = map[string]bool{
+	"if_expression": true, "if_let_expression": true, "for_expression": true,
+	"while_expression": true, "loop_expression": true, "match_expression": true,
+}
+var javaNestingTypes = map[string]bool{
+	"if_statement": true, "for_statement": true, "enhanced_for_statement": true,
+	"while_statement": true, "do_statement": true, "switch_statement": true,
+	"switch_expression": true, "catch_clause": true, "try_statement": true,
+}
+
+// loopTypes — nodes that are loops, for max-loop-depth measurement.
+var goLoopTypes = map[string]bool{"for_statement": true}
+var tsLoopTypes = map[string]bool{
+	"for_statement": true, "for_in_statement": true, "for_of_statement": true,
+	"while_statement": true, "do_statement": true,
+}
+var pyLoopTypes = map[string]bool{
+	"for_statement": true, "while_statement": true,
+	"list_comprehension": true, "dictionary_comprehension": true,
+	"set_comprehension": true, "generator_expression": true,
+}
+var rustLoopTypes = map[string]bool{
+	"for_expression": true, "while_expression": true, "loop_expression": true,
+}
+var javaLoopTypes = map[string]bool{
+	"for_statement": true, "enhanced_for_statement": true,
+	"while_statement": true, "do_statement": true,
+}
+
+// CognitiveComplexity returns a nesting-weighted complexity score: every
+// decision point costs 1 plus the control-nesting level it sits at.
+// nestingTypes is the set of nodes that raise the nesting level for
+// their descendants. Returns 0 for an empty body (no cognitive load).
+func CognitiveComplexity(body *sitter.Node, decisionTypes, nestingTypes, skipDescent map[string]bool) int {
+	score := 0
+	if body == nil || len(decisionTypes) == 0 {
+		return score
+	}
+	var walk func(n *sitter.Node, nesting int)
+	walk = func(n *sitter.Node, nesting int) {
+		if n == nil {
+			return
+		}
+		t := n.Type()
+		if decisionTypes[t] {
+			score += 1 + nesting
+		}
+		if skipDescent != nil && skipDescent[t] {
+			return
+		}
+		childNesting := nesting
+		if nestingTypes[t] {
+			childNesting++
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i), childNesting)
+		}
+	}
+	walk(body, 0)
+	return score
+}
+
+// MaxLoopDepth returns the deepest syntactic nesting of loops in a body.
+// A function with a loop inside a loop returns 2; one with no loops, 0.
+func MaxLoopDepth(body *sitter.Node, loopTypes, skipDescent map[string]bool) int {
+	maxDepth := 0
+	if body == nil || len(loopTypes) == 0 {
+		return 0
+	}
+	var walk func(n *sitter.Node, depth int)
+	walk = func(n *sitter.Node, depth int) {
+		if n == nil {
+			return
+		}
+		t := n.Type()
+		d := depth
+		if loopTypes[t] {
+			d++
+			if d > maxDepth {
+				maxDepth = d
+			}
+		}
+		if skipDescent != nil && skipDescent[t] {
+			return
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i), d)
+		}
+	}
+	walk(body, 0)
+	return maxDepth
+}
+
+// complexityTables bundles the per-language node-type tables so a single
+// stamping helper can serve every extractor.
+type complexityTables struct {
+	decision map[string]bool
+	nesting  map[string]bool
+	loop     map[string]bool
+	skip     map[string]bool
+}
+
+var langComplexityTables = map[string]complexityTables{
+	"go":         {goComplexityNodes, goNestingTypes, goLoopTypes, goComplexitySkip},
+	"typescript": {tsComplexityNodes, tsNestingTypes, tsLoopTypes, tsComplexitySkip},
+	"tsx":        {tsComplexityNodes, tsNestingTypes, tsLoopTypes, tsComplexitySkip},
+	"javascript": {tsComplexityNodes, tsNestingTypes, tsLoopTypes, tsComplexitySkip},
+	"jsx":        {tsComplexityNodes, tsNestingTypes, tsLoopTypes, tsComplexitySkip},
+	"python":     {pyComplexityNodes, pyNestingTypes, pyLoopTypes, pyComplexitySkip},
+	"rust":       {rustComplexityNodes, rustNestingTypes, rustLoopTypes, rustComplexitySkip},
+	"java":       {javaComplexityNodes, javaNestingTypes, javaLoopTypes, javaComplexitySkip},
+}
+
+// StampFunctionMetrics computes cyclomatic + cognitive complexity and max
+// loop depth for a function/method body and stamps them on the node's
+// Meta — complexity / cognitive only when > 1, loop_depth only when > 0,
+// matching the existing cyclomatic convention so consumers (analyze
+// kind=impact / bottlenecks) read a single shape. A no-op for languages
+// without a complexity table or a nil body.
+func StampFunctionMetrics(node *graph.Node, body *sitter.Node, lang string) {
+	if node == nil || body == nil {
+		return
+	}
+	tbl, ok := langComplexityTables[lang]
+	if !ok {
+		return
+	}
+	cyc := CyclomaticComplexity(body, tbl.decision, tbl.skip)
+	cog := CognitiveComplexity(body, tbl.decision, tbl.nesting, tbl.skip)
+	loop := MaxLoopDepth(body, tbl.loop, tbl.skip)
+	if cyc <= 1 && cog <= 1 && loop == 0 {
+		return
+	}
+	if node.Meta == nil {
+		node.Meta = map[string]any{}
+	}
+	ApplyComplexityMeta(node.Meta, cyc, cog, loop)
+}
+
+// BodyComplexityMetrics returns cyclomatic, cognitive, and max-loop-depth
+// for a body — for extractors (Python, Rust) that compute metrics into
+// locals before the node Meta exists. Returns zeros for an unknown
+// language or nil body.
+func BodyComplexityMetrics(body *sitter.Node, lang string) (cyc, cognitive, loopDepth int) {
+	tbl, ok := langComplexityTables[lang]
+	if !ok || body == nil {
+		return 0, 0, 0
+	}
+	return CyclomaticComplexity(body, tbl.decision, tbl.skip),
+		CognitiveComplexity(body, tbl.decision, tbl.nesting, tbl.skip),
+		MaxLoopDepth(body, tbl.loop, tbl.skip)
+}
+
+// ApplyComplexityMeta stamps the three metric keys onto a Meta map with
+// the canonical thresholds (complexity / cognitive only when > 1,
+// loop_depth only when > 0).
+func ApplyComplexityMeta(meta map[string]any, cyc, cognitive, loopDepth int) {
+	if meta == nil {
+		return
+	}
+	if cyc > 1 {
+		meta["complexity"] = cyc
+	}
+	if cognitive > 1 {
+		meta["cognitive"] = cognitive
+	}
+	if loopDepth > 0 {
+		meta["loop_depth"] = loopDepth
+	}
+}

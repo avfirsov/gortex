@@ -1,0 +1,2058 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/zzet/gortex/internal/analysis"
+	"github.com/zzet/gortex/internal/artifacts"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/llm"
+	"github.com/zzet/gortex/internal/llm/registry"
+	"github.com/zzet/gortex/internal/llm/svc"
+	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/review"
+	"github.com/zzet/gortex/internal/savings"
+	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic"
+	"github.com/zzet/gortex/internal/server/hub"
+)
+
+// Version is set at build time.
+var Version = "dev"
+
+// SymbolModification records a single modification event for a symbol.
+type SymbolModification struct {
+	Timestamp        time.Time `json:"timestamp"`
+	SignatureChanged bool      `json:"signature_changed"`
+}
+
+// symbolHistory tracks symbol modifications during the current session.
+type symbolHistory struct {
+	mu      sync.Mutex
+	entries map[string][]SymbolModification // symbolID → modifications
+}
+
+// Record adds a modification entry for the given symbol.
+func (sh *symbolHistory) Record(symbolID string, signatureChanged bool) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.entries[symbolID] = append(sh.entries[symbolID], SymbolModification{
+		Timestamp:        time.Now(),
+		SignatureChanged: signatureChanged,
+	})
+}
+
+// Get returns the modification history for a specific symbol.
+func (sh *symbolHistory) Get(symbolID string) []SymbolModification {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	mods := sh.entries[symbolID]
+	out := make([]SymbolModification, len(mods))
+	copy(out, mods)
+	return out
+}
+
+// All returns a copy of the entire modification history.
+func (sh *symbolHistory) All() map[string][]SymbolModification {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	out := make(map[string][]SymbolModification, len(sh.entries))
+	for k, v := range sh.entries {
+		cp := make([]SymbolModification, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+// Server wraps the MCP server with Gortex-specific tools.
+type Server struct {
+	mcpServer     *server.MCPServer
+	engine        *query.Engine
+	graph         graph.Store
+	indexer       *indexer.Indexer
+	watcher       watcherHistory
+	multiIndexer  *indexer.MultiIndexer
+	configManager *config.ConfigManager
+	activeProject string
+	// testIndexProbe caches, per repo prefix, which test-path fragments the
+	// graph carries symbols for (see testFragmentsIndexed). The answer only
+	// changes with a reindex under a different exclude set, so
+	// daemon-lifetime caching is safe.
+	testIndexProbe sync.Map
+	// scopeWorkspace / scopeProject default-scope every query at this
+	// server instance to a single (workspace, project) tuple. Set by
+	// `gortex server --workspace <slug> [--scope-project <slug>]`.
+	// Tool handlers consult these via the QueryScope() helper rather
+	// than reading the fields directly.
+	scopeWorkspace string
+	scopeProject   string
+	logger         *zap.Logger
+	communities    *analysis.CommunityResult
+	processes      *analysis.ProcessResult
+	pageRank       *analysis.PageRankResult
+	// hits holds the HITS authority/hub scores over the call graph.
+	// Authority measures "depended on by load-bearing code"; the
+	// search rerank consumes it as a complement to raw fan-in.
+	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
+	hits *analysis.HITSResult
+	// autoConcepts is the per-repo, LLM-free concept vocabulary mined
+	// from symbol names -- the deterministic complement to LLM query
+	// expansion. Rebuilt on every RunAnalysis pass; guarded by
+	// analysisMu and read via getAutoConcepts.
+	autoConcepts *search.AutoConcepts
+	// leidenCache carries the last Leiden partition between
+	// `analyze kind=clusters` calls so a re-run after only a couple
+	// of packages changed re-partitions just those packages instead
+	// of the whole graph. nil until the first clusters request;
+	// guarded by analysisMu.
+	leidenCache *analysis.LeidenPartitionCache
+	// communitiesToken snapshots the graph identity that backed
+	// s.communities — (NodeCount, EdgeCount, EdgeIdentityRevisions).
+	// handleAnalyzeClusters reads this before calling the incremental
+	// detector: if the token still matches the live graph, the cached
+	// communities are reused without scanning AllNodes / AllEdges to
+	// fingerprint packages. On a disk backend the fingerprint scan alone is
+	// ~140s; the cache check is three scalar reads.
+	communitiesToken communityCacheToken
+	// hotspots is the default-threshold (mean + 2*stddev) hotspot
+	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
+	// the wall clock of get_repo_outline / get_architecture /
+	// gortex_wakeup / the analyze(hotspots) resource — caching it
+	// once per RunAnalysis turn turns repeat calls into a map lookup.
+	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
+	hotspots []analysis.HotspotEntry
+	// adjacency is the compact CSR snapshot of the call / reference
+	// graph, built once per RunAnalysis pass so seeded random-walk
+	// queries (context_closure proximity ranking) never re-scan
+	// AllNodes / AllEdges. nil until the first RunAnalysis; guarded by
+	// analysisMu and read via getAdjacency.
+	adjacency *analysis.AdjacencySnapshot
+	// adjacencyToken snapshots the graph identity that backed
+	// s.adjacency, on the same (NodeCount, EdgeCount,
+	// EdgeIdentityRevisions) discipline as communitiesToken — so a
+	// consumer can tell whether the snapshot still matches the live
+	// graph before trusting it.
+	adjacencyToken communityCacheToken
+	analysisMu     sync.RWMutex
+
+	// cochange caches the git-history co-change graph. cochangeByFile
+	// maps a file path to its co-changing file paths and association
+	// scores (0..1); cochangeCount holds the matching commit-overlap
+	// counts. Lazily populated once per daemon lifetime by
+	// ensureCoChange — mining git log and materialising EdgeCoChange
+	// edges. The find_co_changing_symbols tool reads both maps; the
+	// search rerank pipeline consumes cochangeByFile as the co_change
+	// signal via buildRerankContext.
+	cochangeOnce   sync.Once
+	cochangeMu     sync.RWMutex
+	cochangeByFile map[string]map[string]float64
+	cochangeCount  map[string]map[string]int
+
+	// artifacts caches the materialised `.gortex.yaml::artifacts`
+	// manifest. artifactEntries is the configured manifest (installed
+	// via SetArtifacts); artifactList is the result of materialising
+	// it into KindArtifact nodes + EdgeReferences edges, lazily and
+	// once per daemon lifetime, by ensureArtifacts.
+	artifactsOnce   sync.Once
+	artifactsMu     sync.RWMutex
+	artifactEntries []config.ArtifactEntry
+	artifactList    []artifacts.Artifact
+
+	// namedQueries holds the config-defined `queries:` bundles —
+	// reusable detector selections runnable via analyze kind=named.
+	// Installed via SetNamedQueries; merged with the built-in
+	// bundles at call time.
+	namedQueries []config.NamedQuery
+
+	// session / symHistory / tokenStats are the shared-default per-client
+	// state for the embedded stdio path (one implicit client per process).
+	// Tool handlers reach per-session activity via sessionFor(ctx); that
+	// helper returns this default when ctx carries no session ID.
+	session    *sessionState
+	symHistory *symbolHistory
+	tokenStats *tokenStats
+
+	// sessions multiplexes per-client sessionLocal for the daemon
+	// transport. When ctx carries a session ID (WithSessionID), handlers
+	// resolve through this map; otherwise the shared fields above are
+	// used.
+	sessions *sessionMap
+
+	guardRules   []config.GuardRule
+	architecture config.ArchitectureConfig
+	// searchCfg carries the `.gortex.yaml::search` block — rerank
+	// weights plus the search-behaviour knobs (keyword-soup rewrite,
+	// equivalence-class expansion, prose indexing). Installed via
+	// SetSearchConfig right after NewServer; the zero value keeps
+	// every knob at its documented default.
+	searchCfg config.SearchConfig
+	// equivalence is the curated software-concept synonym table
+	// (plus any repo-custom classes from searchCfg.EquivalenceExtra).
+	// Built once by SetSearchConfig; immutable thereafter so no lock
+	// is needed. Nil until SetSearchConfig runs -- callers nil-check.
+	equivalence      *search.EquivalenceTable
+	contractRegistry *contracts.Registry
+	semanticMgr      *semantic.Manager
+	feedback         *feedbackManager
+	notes            *notesManager
+	memories         *memoryManager
+	// globalMemories holds the user-level memory store shared across
+	// every workspace this user touches — lives at ~/.gortex/memories/.
+	// Tools default to the workspace store; `scope:"global"` routes
+	// to this one. Nil when InitMemories was called with the legacy
+	// single-arg surface or when the user-home cannot be resolved.
+	globalMemories *memoryManager
+	// notebook is the repository-local persistent notebook —
+	// .gortex/notebook/<id>.md files committed alongside the repo.
+	// Nil until InitNotebook fires; tools surface a clear error.
+	notebook *notebookManager
+	combo    *comboManager
+	frecency *frecencyTracker
+	// suppressions holds the durable per-repo review-finding FP suppression
+	// store (sidecar-backed). The review gate consults it to drop known false
+	// positives by stable identity; the suppress_finding tool mutates it. Nil
+	// until InitSuppressions fires; the review flow tolerates a nil store.
+	suppressions *suppressionManager
+
+	// packCache retains recent smart_context pack views keyed by pack
+	// root so a later call with delta_from=<root> returns only the
+	// added/removed/changed symbols vs that prior pack. Always non-nil
+	// after NewServer.
+	packCache *packDeltaCache
+
+	// pprCache memoizes seeded Random-Walk-with-Restart (Personalized
+	// PageRank) results, keyed by content-addressed per-package Merkle
+	// roots so only walks touching a changed package recompute. Shared
+	// by the rerank ProximitySignal and context_closure. Always
+	// non-nil after NewServer.
+	pprCache *pprWalkCache
+
+	// queryLog is the append-only retrieval query log (JSONL). It
+	// records every retrieval-shaped tool call so offline recall
+	// tuning and the eval harness have a substrate to measure. Always
+	// non-nil after NewServer; a disabled logger is a cheap no-op.
+	queryLog *queryLogger
+
+	// prCache is a short-TTL cache of fetched forge.PR values keyed by
+	// (repo, number), shared across the PR data tools so a triage
+	// fan-out plus a follow-up impact call reuse one fetch. Always
+	// non-nil after NewServer.
+	prCache *prCache
+
+	// diagBroadcaster forwards LSP `publishDiagnostics` payloads to
+	// MCP clients as `notifications/diagnostics`. Lazy-initialised by
+	// SetLSPDiagnosticsBroadcasting; nil until then.
+	diagBroadcaster *diagnosticsBroadcaster
+
+	// readinessBroadcaster fans `notifications/workspace_readiness`
+	// at each warmup phase transition + re-index completion. Eagerly
+	// constructed in NewServer; the publisher (daemon entrypoint)
+	// calls Server.PublishReadiness at each phase.
+	readinessBroadcaster *readinessBroadcaster
+
+	// healthBroadcaster fans `notifications/daemon_health` on a
+	// periodic ticker. Eagerly constructed in NewServer; the daemon
+	// entrypoint wires the snapshot fn via AttachHealthSnapshot.
+	healthBroadcaster *healthBroadcaster
+
+	// staleRefsBroadcaster fans `notifications/stale_refs` per session
+	// when the watcher reports symbol churn in a file the session has
+	// touched. Eagerly constructed in NewServer; wired to the
+	// watcher's symbol-change callback via SetWatcher.
+	staleRefsBroadcaster *staleRefsBroadcaster
+
+	// graphInvalidatedBroadcaster fans `notifications/graph_invalidated`
+	// to subscribers whenever the graph is rebuilt — a coarse
+	// "drop your caches" signal. Fired from RunAnalysis.
+	graphInvalidatedBroadcaster *graphInvalidatedBroadcaster
+
+	// sanitizeInjection gates the prompt-injection screening
+	// middleware (see sanitize.go). Set from GORTEX_MCP_SANITIZE in
+	// NewServer; on by default.
+	sanitizeInjection bool
+
+	// llmService is the optional LLM service backing the `ask` MCP tool
+	// and the `search_symbols` assist modes. nil until SetLLMService is
+	// called by the daemon entrypoint. The service wraps whichever
+	// provider `llm.provider` selects (local llama.cpp / Anthropic /
+	// OpenAI / Ollama); when the provider can't be constructed it
+	// reports Enabled() == false and the dependent tools stay absent.
+	llmService *svc.Service
+
+	// resourcesNotifier overrides the live mcpServer when pushing
+	// `notifications/resources/updated`. Test-only: production code
+	// leaves it nil so the live server is used.
+	resourcesNotifier resourcesUpdatedNotifier
+
+	// reviewLLMGenOverride substitutes the review tool's plain (non-usage) LLM
+	// re-location seam. Test-only: production leaves it nil and
+	// reviewLLMGenWithUsage builds the closure over llmService.GenerateWithUsage.
+	// A non-nil override is adapted up to the usage-aware shape (reporting zero
+	// usage) so a test that only needs to drive the LLM review phase — without
+	// asserting cost — can still do so without constructing a real provider.
+	reviewLLMGenOverride func() review.LLMGen
+
+	// reviewLLMGenWithUsageOverride substitutes the review tool's usage-aware
+	// LLM seam (the one that feeds the per-review CostBreakdown). Test-only:
+	// production leaves it nil and reviewLLMGenWithUsage builds the closure
+	// over llmService.GenerateWithUsage. A non-nil override is returned
+	// directly (gated on use_llm) so a test can drive the cost-bearing review
+	// path — and assert the returned usage shows up in the response — without
+	// constructing a real provider.
+	reviewLLMGenWithUsageOverride func() review.LLMGenWithUsage
+
+	// reviewPricingOverride substitutes the rate card the review cost block
+	// prices token usage against. Test-only: production reads it from the LLM
+	// service (Pricing). A non-nil override lets a test assert a deterministic
+	// USD estimate from a stubbed usage seam.
+	reviewPricingOverride *llm.ProviderPricing
+
+	// critiqueLLMGenOverride substitutes the critique_review tool's LLM seam.
+	// Test-only: production leaves it nil and the handler builds the closure
+	// over llmService.Generate. A non-nil override stands in for the real
+	// provider so a test can drive the self-critique pass without constructing
+	// a backend.
+	critiqueLLMGenOverride func() review.LLMGen
+
+	// proxyHydrate is the cross-daemon proxy-edge lazy hydration hook.
+	// nil unless the daemon installed one (federation.edges on); the
+	// traversal tools call it to pull a proxy node's neighbour ring before
+	// crossing into it. See proxy_hydrate.go.
+	proxyHydrate func(ctx context.Context, proxyID string) (int, error)
+
+	// toolScopes is the per-Server tool-name → ToolScope registry.
+	// Populated by registerToolWithScope as tools are added; consulted
+	// by ResolveToolScope before each handler runs.
+	toolScopes *scopeRegistry
+
+	// agentReg is the in-memory multi-agent coordination registry backing
+	// the agent_registry tool (presence, cursors, advisory path locks).
+	agentReg *agentRegistry
+
+	// overlays is the optional editor-overlay manager. When non-nil,
+	// every `tools/call` whose session carries overlay buffers is
+	// wrapped (via s.addTool → wrapToolHandler) with the per-request
+	// shadow-graph middleware that builds an OverlaidView over the
+	// immutable base graph. Wired post-construction by
+	// SetOverlayManager.
+	overlays *daemon.OverlayManager
+
+	// overlayLayerCache memoises per-session parsed overlay layers
+	// keyed by (sessionID, content-hash sum). Cache hits avoid the
+	// per-request re-parse when an editor pushes the same buffer to a
+	// long sequence of tool calls. Entries are dropped on overlay
+	// session Drop / Push / Delete via overlayCacheInvalidate.
+	overlayLayerCache   sync.Map // map[string]*overlayLayerCacheEntry; key = layerCacheKey
+	overlayLayerBuildMu sync.Mutex
+
+	// registerOverlayToolsOnce gates the overlay MCP tool family
+	// (overlay_register / overlay_push / overlay_list /
+	// overlay_delete / overlay_drop / compare_with_overlay) so a
+	// second SetOverlayManager call doesn't double-register them.
+	registerOverlayToolsOnce sync.Once
+
+	// remoteOverrides bridges the session proxy-toggle tools
+	// (proxy_enable / proxy_disable / proxy_status) to the daemon's
+	// per-session remote-override state. nil in embedded mode (no
+	// per-connection daemon session). registerProxyToolsOnce gates the
+	// tool registration the way the overlay family is gated.
+	remoteOverrides        RemoteOverrideSink
+	registerProxyToolsOnce sync.Once
+
+	// lazy owns the deferred-tool catalog backing the tools_search
+	// discovery tool. Tools whose names are not in hotEagerTools land
+	// here instead of in the live MCP server; tools_search returns
+	// their schemas on demand and promotes them via lazy.promote (a
+	// closure wired in attachLazyRegistry). Nil only when the registry
+	// is explicitly disabled — see lazyEnabledFromEnv.
+	lazy *lazyToolRegistry
+
+	// toolBudgetOnce / toolBudgetCached memoise the project-size-scaled
+	// exploration-call budget appended to navigation tools' descriptions
+	// (see tool_budget.go). Computed once from the graph node count.
+	toolBudgetOnce   sync.Once
+	toolBudgetCached string
+
+	// scopesOnce / scopes is the lazily-initialised, JSON-file-backed
+	// saved-scope store (see scopes.go).
+	scopesOnce sync.Once
+	scopes     *scopeStore
+}
+
+// sessionFor returns the session-scoped state for the current request.
+// If ctx was wrapped with WithSessionID, the per-session entry is used
+// (created on first access). Otherwise the shared default is returned,
+// preserving embedded-mode behavior exactly.
+//
+// Never returns nil — callers can chain `.recordFile(...)` etc.
+// unconditionally.
+func (s *Server) sessionFor(ctx context.Context) *sessionState {
+	id := SessionIDFromContext(ctx)
+	if id == "" || s.sessions == nil {
+		return s.session
+	}
+	return s.sessions.get(id).session
+}
+
+// ReleaseSession drops per-session state for id. Called by the daemon
+// when a proxy disconnects, so idle entries don't accumulate for the
+// lifetime of the daemon process. Cascades into the diagnostics
+// broadcaster so a disconnecting subscriber's slot is reclaimed.
+func (s *Server) ReleaseSession(id string) {
+	if id == "" {
+		return
+	}
+	if s.sessions != nil {
+		s.sessions.release(id)
+	}
+	if s.diagBroadcaster != nil {
+		s.diagBroadcaster.unsubscribe(id)
+	}
+	if s.readinessBroadcaster != nil {
+		s.readinessBroadcaster.unsubscribe(id)
+	}
+	if s.healthBroadcaster != nil {
+		s.healthBroadcaster.unsubscribe(id)
+	}
+	if s.staleRefsBroadcaster != nil {
+		s.staleRefsBroadcaster.unsubscribe(id)
+	}
+	if s.graphInvalidatedBroadcaster != nil {
+		s.graphInvalidatedBroadcaster.unsubscribe(id)
+	}
+	// Editor-overlay sessions are pinned to the MCP session that
+	// registered them. When the MCP session ends — for any reason —
+	// the overlay must die immediately. Holding overlay state past
+	// the disconnect would (a) leak unsaved buffer content into the
+	// daemon's address space indefinitely and (b) let a future
+	// connection that learns or guesses the same session ID re-
+	// attach to abandoned buffers; that's a credential / data-leak
+	// vector we don't want. The TTL is a fail-safe for "client
+	// crashed and we never observed the disconnect"; this is the
+	// fast path that closes the window when we DO observe it.
+	if s.overlays != nil {
+		s.overlays.Drop(id)
+	}
+	s.overlayCacheInvalidate(id)
+}
+
+// sessionState tracks recent agent activity for context recovery after compaction.
+type sessionState struct {
+	mu             sync.Mutex
+	viewedSymbols  []string // recently viewed symbol IDs (most recent first)
+	viewedFiles    []string // recently viewed file paths
+	modifiedFiles  []string // files modified via edit_symbol
+	recentSearches []string // recent search queries
+	// clientName is the MCP client identifier (claude-code / cursor / vscode /
+	// zed / …) captured from the protocol's `initialize.clientInfo.name`
+	// field by the daemon dispatcher. Drives the per-session default
+	// wire format: known-decoder clients get `gcx` by default, others
+	// fall back to JSON. Empty until the dispatcher sees the
+	// `initialize` frame.
+	clientName string
+	// lastSearch captures the most recent search_symbols call so that a
+	// subsequent get_symbol_source / get_editing_context on one of its
+	// results can be attributed back to the query — this is the raw input
+	// to the combo tracker. Reset on every search.
+	lastSearch lastSearchState
+
+	// Workspace scope for this session, resolved lazily from the
+	// session cwd on first query and cached here. scopeResolved
+	// guards the one-time resolution. scopeBound is true when the
+	// session has a cwd: query handlers then confine every result to
+	// scopeWorkspaceID — the hard, un-widenable workspace boundary.
+	// When scopeBound is true and scopeWorkspaceID names no real
+	// workspace, the cwd matched no tracked repo and handlers fail
+	// closed rather than widening to the global graph. scopeRepoPrefix
+	// / scopeProjectID feed relevance ranking (same-repo > same-project
+	// > same-workspace); they never relax the boundary.
+	scopeResolved    bool
+	scopeBound       bool
+	scopeWorkspaceID string
+	scopeProjectID   string
+	scopeRepoPrefix  string
+
+	// planningMode, when true, removes every editing tool from this
+	// session's tool surface and hard-blocks edit calls — a runtime
+	// no-writes guarantee toggled by set_planning_mode (tools_mode.go).
+	planningMode bool
+
+	// workflow, when non-nil, is the active phase-enforcement state
+	// machine for this session (see tools_workflow.go).
+	workflow *workflowState
+
+	// responses is the ring of recent large tool responses captured
+	// for the post-filter tools (ctx_grep / ctx_slice / …). Allocated
+	// lazily on first capture.
+	responses *responseBuffer
+
+	// cursor is the per-session stateful navigation cursor used by the
+	// nav tool — a current symbol plus a back-history. Allocated lazily
+	// on the first nav call and freed with the rest of sessionState on
+	// disconnect.
+	cursor *navCursor
+}
+
+type lastSearchState struct {
+	query string
+	// returned is the result IDs in rank order (0 = top); returnedIDs
+	// maps an ID to its rank for O(1) membership + rank lookup. consumed
+	// tracks which returned IDs the agent went on to use, so a later
+	// search can record an implicit "skip-above" negative for the
+	// higher-ranked results that were passed over.
+	returned    []string
+	returnedIDs map[string]int
+	consumed    map[string]struct{}
+	at          time.Time
+}
+
+// tokenStats tracks estimated token savings for the current session. When a
+// savings.Store is attached, each record() call also increments the persistent
+// cumulative totals so "Gortex saved $X this month"-style narratives survive
+// server restarts.
+//
+// parent, when non-nil, is the process-wide aggregate (s.tokenStats) that
+// every per-session counter feeds. Without the fan-out, a fresh session's
+// counter is zero-initialised and graph_stats called from any new session
+// always reports `token_savings.calls_counted: 0` even when the daemon has
+// served thousands of source-fetching calls — the shared default never
+// receives observations because every real call carries a session ID. The
+// parent link aggregates so graph_stats shows a meaningful live total.
+type tokenStats struct {
+	mu             sync.Mutex
+	tokensSaved    int64 // cumulative tokens saved vs reading full files
+	tokensReturned int64 // cumulative tokens actually returned
+	callCount      int64 // number of source-reading tool invocations
+	persistent     *savings.Store
+	parent         *tokenStats // process-wide aggregate (nil for the root)
+	repoPath       string      // forwarded to savings for per-repo aggregation
+	sessionID      string      // rides on persisted events; "" for the shared default
+}
+
+// record adds a single savings observation. node is the symbol whose
+// source was returned — its RepoPrefix and Language are folded into the
+// per-repo / per-language buckets in the persistent store. node may be
+// nil for code paths that don't have a node handle, in which case the
+// observation only contributes to top-line totals. tool is the MCP tool
+// name that produced the call (e.g. "get_symbol_source") and is recorded
+// in the JSONL event log for the dashboard's per-tool breakdown.
+//
+// returned and fullFile are token counts (cl100k_base via internal/tokens).
+func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile int64) {
+	ts.mu.Lock()
+	saved := max(fullFile-returned, 0)
+	ts.tokensSaved += saved
+	ts.tokensReturned += returned
+	ts.callCount++
+	store := ts.persistent
+	parent := ts.parent
+	fallbackRepo := ts.repoPath
+	sessionID := ts.sessionID
+	ts.mu.Unlock()
+
+	// Fan out to the process-wide aggregate so graph_stats called
+	// outside this session — or from a freshly-created session that
+	// has not itself made a recorded call yet — sees a live counter
+	// that reflects daemon-wide activity. The parent never has a
+	// further parent (we only nest one level deep), so this is bounded.
+	if parent != nil {
+		parent.mu.Lock()
+		parent.tokensSaved += saved
+		parent.tokensReturned += returned
+		parent.callCount++
+		parent.mu.Unlock()
+	}
+
+	// Repo: prefer the node's RepoPrefix so multi-repo daemons attribute
+	// correctly to the actual repo the symbol lives in. Fall back to the
+	// rootPath captured at InitSavings only when the node has no prefix
+	// (single-repo mode).
+	repo := fallbackRepo
+	var language string
+	if node != nil {
+		if node.RepoPrefix != "" {
+			repo = node.RepoPrefix
+		}
+		language = node.Language
+	}
+
+	// Forward to the persistent store outside our lock — its own
+	// synchronization guards concurrent writers, and the ledger write
+	// shouldn't block new record() calls on the hot path.
+	if store != nil {
+		store.AddObservation(savings.Observation{
+			Repo:      repo,
+			Language:  language,
+			Tool:      tool,
+			SessionID: sessionID,
+			Returned:  returned,
+			Saved:     saved,
+		})
+	}
+}
+
+// snapshot returns a copy of the current counters for inclusion in responses.
+func (ts *tokenStats) snapshot() map[string]any {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ratio := 0.0
+	if ts.tokensReturned > 0 {
+		ratio = float64(ts.tokensSaved+ts.tokensReturned) / float64(ts.tokensReturned)
+	}
+	return map[string]any{
+		"tokens_saved":     ts.tokensSaved,
+		"tokens_returned":  ts.tokensReturned,
+		"calls_counted":    ts.callCount,
+		"efficiency_ratio": math.Round(ratio*10) / 10,
+	}
+}
+
+const maxSessionItems = 20
+
+func newSessionState() *sessionState {
+	return &sessionState{}
+}
+
+func (ss *sessionState) recordSymbol(id string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.viewedSymbols = prependUnique(ss.viewedSymbols, id, maxSessionItems)
+}
+
+func (ss *sessionState) recordFile(path string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.viewedFiles = prependUnique(ss.viewedFiles, path, maxSessionItems)
+}
+
+func (ss *sessionState) recordModified(path string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.modifiedFiles = prependUnique(ss.modifiedFiles, path, maxSessionItems)
+}
+
+func (ss *sessionState) recordSearch(query string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.recentSearches = prependUnique(ss.recentSearches, query, 10)
+}
+
+// recordClientName captures the MCP client name from the `initialize`
+// frame. Idempotent — re-init overwrites. Empty input is ignored so a
+// late env-var fallback can't clobber a prior authoritative value.
+func (ss *sessionState) recordClientName(name string) {
+	if name == "" {
+		return
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.clientName = name
+}
+
+// snapshotClientName returns the captured client name under the
+// session lock. Returns empty when the `initialize` frame hasn't
+// arrived yet (very early tool calls — rare but possible during
+// boot races).
+func (ss *sessionState) snapshotClientName() string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.clientName
+}
+
+// NoteSessionClient is called by the daemon dispatcher after it
+// snoops the MCP `initialize.clientInfo.name` value, so the per-
+// session sessionState can default tool wire-format based on the
+// client's decoder capability. Idempotent and safe to call before
+// the session is registered (no-op until sessionFor materialises
+// the entry).
+func (s *Server) NoteSessionClient(sessionID, name, version string) {
+	if s == nil || sessionID == "" || name == "" {
+		return
+	}
+	if s.sessions == nil {
+		// Embedded mode — single shared session; just record on the
+		// shared state.
+		if s.session != nil {
+			s.session.recordClientName(name)
+		}
+		return
+	}
+	s.sessions.get(sessionID).session.recordClientName(name)
+	_ = version // reserved for per-version capability gates
+}
+
+// defaultFormatForClient returns the most-compressed wire format the
+// named MCP client is known to decode. Resolution order is gcx >
+// toon > json:
+//
+//   - GCX-capable: claude-code, cursor, vscode (via the @gortex/wire
+//     extension that ships with the IDE plugin), zed (gortex-zed
+//     plugin links gcx-go), aider, kilocode, opencode, openclaw,
+//     codex (Anthropic CLI bundles the gcx decoder).
+//   - TOON-capable but no GCX: kept for forward compat; today there
+//     is no client we know to be in this bucket. Listed for the
+//     mapping shape and as a placeholder — clients can be promoted
+//     here when their plugin ships a TOON-only decoder.
+//   - Everything else: empty string → JSON (the safe legacy default).
+//
+// Lower-cased client name is matched. Unknown clients are not a
+// failure — they just keep the JSON default until they're added.
+func defaultFormatForClient(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "claude-code",
+		"cursor",
+		"vscode",
+		"zed",
+		"aider",
+		"kilocode",
+		"opencode",
+		"openclaw",
+		"codex":
+		return "gcx"
+	}
+	return ""
+}
+
+// resolveSessionFormat returns the format the current session prefers
+// when a tool's `format` arg is absent. Pure read — used by isGCX /
+// isTOON when the caller didn't pin a format explicitly.
+func (s *Server) resolveSessionFormat(ctx context.Context) string {
+	if s == nil {
+		return ""
+	}
+	sess := s.sessionFor(ctx)
+	if sess == nil {
+		return ""
+	}
+	return defaultFormatForClient(sess.snapshotClientName())
+}
+
+// comboWindow is how long after a search_symbols the session will still
+// attribute a consume call (get_symbol_source / get_editing_context) back
+// to that search's query for combo tracking. FFF uses a similar concept
+// with a T-second window; 5 minutes is long enough for agents that
+// interleave many tool calls but short enough that an unrelated later
+// consume doesn't get mis-attributed.
+const comboWindow = 5 * time.Minute
+
+// recordLastSearch captures the query + the IDs it returned so a later
+// consume call can be credited to this query. Truncating to the top N
+// results keeps the map small — only symbols the agent can plausibly
+// have seen are eligible.
+func (ss *sessionState) recordLastSearch(query string, ids []string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	set := make(map[string]int, len(ids))
+	for i, id := range ids {
+		set[id] = i
+	}
+	ss.lastSearch = lastSearchState{
+		query:       query,
+		returned:    append([]string(nil), ids...),
+		returnedIDs: set,
+		consumed:    make(map[string]struct{}),
+		at:          time.Now(),
+	}
+}
+
+// attributedQuery returns the query string that should receive credit for
+// consuming symbolID, or "" if no recent search eligibly returned it.
+// Cleared from the caller's perspective but not from state — a single
+// search can legitimately credit several consume calls.
+func (ss *sessionState) attributedQuery(symbolID string) string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.lastSearch.query == "" || symbolID == "" {
+		return ""
+	}
+	if time.Since(ss.lastSearch.at) > comboWindow {
+		return ""
+	}
+	if _, ok := ss.lastSearch.returnedIDs[symbolID]; !ok {
+		return ""
+	}
+	if ss.lastSearch.consumed == nil {
+		ss.lastSearch.consumed = make(map[string]struct{})
+	}
+	ss.lastSearch.consumed[symbolID] = struct{}{}
+	return ss.lastSearch.query
+}
+
+// attributedConsumptionBatch credits a set of symbol IDs to the recent
+// search in one pass: it returns the search's query and the subset of
+// ids that the search returned within the attribution window (marking
+// each consumed). Used by the tool-call observer when the agent opens a
+// file — every symbol in it that the search surfaced is credited at
+// once. Returns ("", nil) when no fresh search is attributable.
+func (ss *sessionState) attributedConsumptionBatch(ids []string) (string, []string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.lastSearch.query == "" || time.Since(ss.lastSearch.at) > comboWindow {
+		return "", nil
+	}
+	if ss.lastSearch.consumed == nil {
+		ss.lastSearch.consumed = make(map[string]struct{})
+	}
+	var matched []string
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := ss.lastSearch.returnedIDs[id]; !ok {
+			continue
+		}
+		ss.lastSearch.consumed[id] = struct{}{}
+		matched = append(matched, id)
+	}
+	return ss.lastSearch.query, matched
+}
+
+// hasFreshSearch reports whether a search is recent enough to attribute
+// a consume to. A cheap gate so file-open handlers skip the work of
+// enumerating a file's symbols when nothing could be credited anyway.
+func (ss *sessionState) hasFreshSearch() bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.lastSearch.query != "" && time.Since(ss.lastSearch.at) <= comboWindow
+}
+
+// drainSkippedNegatives computes the implicit "skip-above" negatives for
+// the current last-search: the results ranked above the deepest one the
+// agent actually consumed but that were themselves never consumed — i.e.
+// passed over. Called when a search is about to be superseded (the state
+// is overwritten right after), so each skip is emitted at most once.
+// Returns ("", nil) when the agent consumed nothing or only the top hit.
+func (ss *sessionState) drainSkippedNegatives() (string, []string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ls := &ss.lastSearch
+	if ls.query == "" || len(ls.consumed) == 0 || len(ls.returned) == 0 {
+		return "", nil
+	}
+	maxRank := -1
+	for id := range ls.consumed {
+		if r, ok := ls.returnedIDs[id]; ok && r > maxRank {
+			maxRank = r
+		}
+	}
+	if maxRank <= 0 {
+		return "", nil // top pick (or nothing) — nothing was skipped over
+	}
+	var skipped []string
+	for i := 0; i < maxRank && i < len(ls.returned); i++ {
+		id := ls.returned[i]
+		if _, ok := ls.consumed[id]; ok {
+			continue
+		}
+		skipped = append(skipped, id)
+	}
+	return ls.query, skipped
+}
+
+func (ss *sessionState) snapshot() map[string]any {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return map[string]any{
+		"viewed_symbols":  ss.viewedSymbols,
+		"viewed_files":    ss.viewedFiles,
+		"modified_files":  ss.modifiedFiles,
+		"recent_searches": ss.recentSearches,
+	}
+}
+
+func prependUnique(slice []string, item string, maxLen int) []string {
+	// Remove existing occurrence.
+	for i, s := range slice {
+		if s == item {
+			slice = append(slice[:i], slice[i+1:]...)
+			break
+		}
+	}
+	// Prepend.
+	slice = append([]string{item}, slice...)
+	if len(slice) > maxLen {
+		slice = slice[:maxLen]
+	}
+	return slice
+}
+
+// MultiRepoOptions holds optional multi-repo components for the Server.
+// When nil or zero-valued, the server operates in single-repo mode.
+type MultiRepoOptions struct {
+	MultiIndexer  *indexer.MultiIndexer
+	ConfigManager *config.ConfigManager
+	ActiveProject string
+	// ScopeWorkspace is the workspace slug filter applied as the
+	// default scope on every query. Set by `gortex server --workspace
+	// <slug>`. Empty disables the filter.
+	ScopeWorkspace string
+	// ScopeProject narrows further inside ScopeWorkspace (no effect
+	// without it).
+	ScopeProject string
+}
+
+// serverInstructions is the server-level `instructions` field returned
+// in the MCP initialize response. MCP clients surface it to the agent
+// as guidance on how to drive this server — the place to say "prefer
+// the graph tools over raw file reads, and where to start."
+const serverInstructions = `Gortex is a code-intelligence graph server — it indexes repositories into a queryable knowledge graph. Prefer its graph tools over raw file reads and text search:
+
+- Start any task with smart_context: it assembles the minimal relevant working set (symbols, sources, edit plan) in one call.
+- Use search_symbols (BM25, camelCase-aware) instead of grep; find_usages / get_callers for references and callers; get_symbol_source to read one symbol without its whole file.
+- Before editing, call get_editing_context on the file; for refactors use edit_symbol / rename_symbol / batch_edit.
+- The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
+- Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).`
+
+// NewServer creates an MCP server with all Gortex tools registered.
+func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watcher *indexer.Watcher, logger *zap.Logger, guardRules []config.GuardRule, opts ...MultiRepoOptions) *Server {
+	s := &Server{
+		engine:     engine,
+		graph:      g,
+		indexer:    idx,
+		logger:     logger,
+		session:    newSessionState(),
+		tokenStats: &tokenStats{},
+		symHistory: &symbolHistory{
+			entries: make(map[string][]SymbolModification),
+		},
+		sessions:   newSessionMap(),
+		guardRules: guardRules,
+		toolScopes: newScopeRegistry(),
+		agentReg:   newAgentRegistry(),
+		queryLog:   newQueryLogger(),
+		pprCache:   newPPRWalkCache(),
+		packCache:  newPackDeltaCache(),
+		prCache:    newPRCache(prCacheTTL),
+	}
+	// Wire the process-wide tokenStats as the parent of every
+	// per-session counter so record() fanout aggregates daemon-wide.
+	s.sessions.setParentTokenStats(s.tokenStats)
+	// mcpServer is constructed after s exists so the per-session tool
+	// filter can close over s — toolSurfaceFilter varies the tools/list
+	// surface by the session's planning mode (see tools_mode.go).
+	s.mcpServer = server.NewMCPServer("gortex", Version,
+		// Surface "how to drive this server" to MCP clients in the
+		// initialize response — see serverInstructions.
+		server.WithInstructions(serverInstructions),
+		// listChanged=true: tools_search promotes deferred tools into
+		// the live MCP server on demand, and a planning-mode flip
+		// re-filters the surface — both rely on tools/list_changed.
+		server.WithToolCapabilities(true),
+		// subscribe=true lets clients call resources/subscribe for
+		// bootstrap URIs and receive notifications/resources/updated
+		// after each graph re-warm. listChanged=false — the resource
+		// set is static for the server's lifetime.
+		server.WithResourceCapabilities(true, false),
+		server.WithRecovery(),
+		// Per-session tools/list filter — hides editing tools while a
+		// session is in planning mode (see tools_mode.go).
+		server.WithToolFilter(s.toolSurfaceFilter),
+	)
+
+	// Assign the watcher only when the caller actually supplied one.
+	// Storing a typed-nil *indexer.Watcher in the watcherHistory
+	// interface field would produce a non-nil interface wrapping a
+	// nil pointer — `s.watcher == nil` checks in handlers would then
+	// pass through to method calls and panic.
+	if watcher != nil {
+		s.watcher = watcher
+	}
+
+	// Apply multi-repo options if provided.
+	if len(opts) > 0 {
+		o := opts[0]
+		s.multiIndexer = o.MultiIndexer
+		s.configManager = o.ConfigManager
+		s.activeProject = o.ActiveProject
+		s.scopeWorkspace = o.ScopeWorkspace
+		s.scopeProject = o.ScopeProject
+	}
+
+	// Proactive-notification broadcasters. Constructed up-front so
+	// subscribe handlers can register listeners as soon as the first
+	// session connects; the *publishers* are wired by the daemon
+	// entrypoint (PublishReadiness at warmup phases,
+	// AttachHealthSnapshot for the periodic ticker) and by
+	// SetWatcher (stale_refs hooks into the symbol-change callback).
+	s.readinessBroadcaster = newReadinessBroadcaster(s.mcpServer, logger)
+	s.healthBroadcaster = newHealthBroadcaster(s.mcpServer, nil, logger)
+	s.staleRefsBroadcaster = newStaleRefsBroadcaster(s.mcpServer, s.sessions, s.session, logger)
+	s.graphInvalidatedBroadcaster = newGraphInvalidatedBroadcaster(s.mcpServer, logger)
+
+	// Lazy-tool registry MUST be installed before any addTool calls so
+	// non-hot tools land in the deferred catalog instead of the live
+	// MCP server. attachLazyRegistry wires the promotion closure that
+	// tools_search uses to migrate a tool from deferred → live on
+	// first use. See lazy_tools.go for the hot-set selection rules.
+	s.sanitizeInjection = sanitizeEnabledFromEnv()
+	s.lazy = newLazyToolRegistry(lazyEnabledFromEnv())
+	s.attachLazyRegistry()
+	s.registerToolsSearch()
+
+	s.registerCoreTools()
+	s.registerCodingTools()
+	s.registerMoveInlineTools()
+	s.registerPostFilterTools()
+	s.registerPlanningModeTool()
+	s.registerWorkflowTool()
+	s.registerScopeTools()
+	s.registerAnalysisTools()
+	s.registerEnhancementTools()
+	s.registerLSPTools()
+	s.registerLintTools()
+	s.registerAgentRegistryTools()
+	s.registerDiagnosticsTools()
+	s.registerReadinessTools()
+	s.registerHealthTools()
+	s.registerStaleRefsTools()
+	s.registerGraphInvalidatedTools()
+	s.registerToolProfileTool()
+	s.registerDataflowTools()
+	s.registerASTTools()
+	s.registerCloneTools()
+	s.registerSimulationTools()
+	s.registerNotesTools()
+	s.registerMemoriesTools()
+	s.registerNotebookTools()
+	s.registerCitationTools()
+	s.registerKnowledgeGapsTool()
+	s.registerSurprisingConnectionsTool()
+	s.registerReviewQuestionsTool()
+	s.registerPRReviewContextTool()
+	s.registerCritiqueReviewTool()
+	s.registerArchitectureTool()
+	s.registerReplayEpisodeTool()
+	s.registerSafeDeleteSymbolTool()
+	s.registerGenerateSkillTool()
+	s.registerInspectionsTools()
+	s.registerChurnRateTool()
+	s.registerEnrichChurnTool()
+	s.registerEnrichReleasesTool()
+	s.registerCoChangeTool()
+	s.registerArtifactTools()
+	s.registerCouplingMetricsTool()
+	s.registerExtractionCandidatesTool()
+	s.registerCheckReferencesTool()
+	s.registerWakeupTool()
+	s.registerGraphCompletionTool()
+	s.registerWikiTools()
+	s.registerExportTools()
+	s.registerAuditTool()
+	s.registerWalkGraphTool()
+	s.registerContextClosureTool()
+	s.registerGraphQueryTool()
+	s.registerNavTool()
+	s.registerFindDeclarationTool()
+	s.registerPRRiskTool()
+	s.registerSuggestReviewersTool()
+	s.registerReviewTools()
+	s.registerPRTools()
+	s.registerConflictsPRTool()
+	s.registerResources()
+	s.registerPrompts()
+
+	// Register multi-repo tools when multi-repo components are available.
+	if s.multiIndexer != nil || s.configManager != nil {
+		s.registerMultiRepoTools()
+	}
+
+	// Workspace-scope bootstrap tools (list_repos, workspace_info).
+	// Always registered — they degrade cleanly in single-project mode
+	// to a one-member view.
+	s.registerWorkspaceTools()
+
+	// LLM-backed tools (`ask`) are NOT registered here — they're
+	// gated on SetLLMService being called with an enabled service,
+	// which happens post-construction from the daemon entrypoint.
+
+	s.applyDefaultToolScopes()
+
+	return s
+}
+
+// SetLLMService attaches the LLM service to the server and registers
+// the `ask` MCP tool. Call after NewServer; without this, the `ask`
+// MCP tool is not registered (clean degradation for deployments
+// without an LLM).
+//
+// Safe to call with a disabled service (no provider configured, or
+// provider construction failed) — registerLLMTools gates on
+// Service.Enabled() and skips registration in that case.
+//
+// Lifecycle: the server does NOT take ownership of the service; the
+// daemon entrypoint that constructed the service is responsible for
+// calling svc.Close() on shutdown.
+func (s *Server) SetLLMService(service *svc.Service) {
+	s.llmService = service
+	s.registerLLMTools()
+}
+
+// SetupLLM is the convenience constructor used by daemon entrypoints.
+// It builds an in-process backend wired to this server's engine +
+// contract registry, constructs the service from cfg, and attaches
+// it. A zero or disabled cfg is a no-op — safe to call
+// unconditionally.
+//
+// The provider is chosen by cfg.Provider. Selecting "local" in a
+// binary built without `-tags llama` — or any provider with a missing
+// model / API key — leaves the service disabled; the construction
+// error is logged as a warning rather than failing daemon startup, so
+// a misconfigured `llm:` block degrades cleanly (the `ask` tool and
+// `search_symbols` assist modes are simply absent).
+func (s *Server) SetupLLM(cfg llm.Config) {
+	cfg = cfg.MergeEnv()
+	var customWarnings []string
+	cfg, customWarnings = registry.Augment(cfg)
+	for _, w := range customWarnings {
+		s.logger.Warn("custom LLM provider", zap.String("warning", w))
+	}
+	if !cfg.IsEnabled() {
+		return
+	}
+	backend := svc.NewInProcessBackend(s.engine, s.effectiveContractRegistry)
+	service := svc.NewService(cfg, backend)
+	s.SetLLMService(service)
+	if err := service.ProviderErr(); err != nil {
+		s.logger.Warn("LLM provider unavailable — `ask` tool and search assist disabled",
+			zap.String("provider", cfg.ProviderName()),
+			zap.Error(err))
+	}
+}
+
+// InitFeedback initializes the feedback manager for cross-session feedback persistence.
+// Call after NewServer with the cache directory and primary repo path.
+func (s *Server) InitFeedback(cacheDir, repoPath string) {
+	s.feedback = newFeedbackManager(cacheDir, repoPath)
+}
+
+// InitNotes initializes the session-memory manager used by the
+// save_note / query_notes / distill_session tools. Call after
+// NewServer with the cache directory and primary repo path.
+// Empty arguments yield an in-memory-only manager (still wired
+// to the tools, just doesn't flush to disk).
+func (s *Server) InitNotes(cacheDir, repoPath string) {
+	s.notes = newNotesManager(cacheDir, repoPath)
+}
+
+// InitMemories initializes the cross-session development-memory
+// manager used by the store_memory / query_memories /
+// surface_memories tools. Call after NewServer with the cache
+// directory and primary repo path. Empty arguments yield an
+// in-memory-only manager (still wired to the tools, just doesn't
+// flush to disk).
+//
+// Memories persist across daemon restarts and context compactions
+// and are workspace-wide — every agent in the same workspace
+// shares the store.
+// InitNotebook mounts the repository-local persistent notebook
+// store at <repoPath>/.gortex/notebook/. Empty repoPath leaves
+// s.notebook nil; tools surface that as "notebook not initialised".
+// Distinct from notes (per-session) and memories (cache-dir cross-
+// session) — notebook entries are committed to git so they travel
+// with the repo and surface in PR reviews.
+func (s *Server) InitNotebook(repoPath string) {
+	s.notebook = newNotebookManager(repoPath)
+}
+
+// InitSuppressions initializes the durable per-repo review-finding
+// false-positive suppression store used by the review gate and the
+// suppress_finding tool. Call after NewServer with the cache directory and
+// primary repo path. Empty arguments yield an in-memory-only store (still wired
+// to the tools, just doesn't flush to disk). Suppressions persist across daemon
+// restarts and are per-repo, scoped by the same cache key as notes / memories.
+func (s *Server) InitSuppressions(cacheDir, repoPath string) {
+	s.suppressions = newSuppressionManager(cacheDir, repoPath)
+}
+
+func (s *Server) InitMemories(cacheDir, repoPath string) {
+	s.memories = newMemoryManager(cacheDir, repoPath)
+	// Mount the user-level global store. Defaults to ~/.gortex/memories;
+	// an absolute $XDG_DATA_HOME relocates it to
+	// <XDG_DATA_HOME>/gortex/memories. Failures (no $HOME, unreadable
+	// home) leave globalMemories nil; tools detect that and surface a
+	// clear error rather than silently dropping global writes.
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		s.globalMemories = newMemoryManager(platform.MemoriesDir(), "global")
+	}
+}
+
+// resolveMemoryStore picks the right memoryManager for the requested
+// scope. Defaults to the workspace store; "global" returns the
+// user-level store mounted at ~/.gortex/memories-cache/. Unknown
+// scope values fall through to workspace so callers don't have to
+// guard against typos.
+func (s *Server) resolveMemoryStore(scope string) *memoryManager {
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case "global":
+		return s.globalMemories
+	default:
+		return s.memories
+	}
+}
+
+// resolveMemoryStores returns every memoryManager that matches the
+// scope argument. `both` returns workspace + global; `workspace`
+// (default) returns just workspace; `global` returns just global.
+// Nil managers are excluded from the result so callers can rely on
+// the slice being non-empty before iterating.
+func (s *Server) resolveMemoryStores(scope string) []*memoryManager {
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case "both":
+		stores := []*memoryManager{}
+		if s.memories != nil {
+			stores = append(stores, s.memories)
+		}
+		if s.globalMemories != nil {
+			stores = append(stores, s.globalMemories)
+		}
+		return stores
+	case "global":
+		if s.globalMemories != nil {
+			return []*memoryManager{s.globalMemories}
+		}
+		return nil
+	default:
+		if s.memories != nil {
+			return []*memoryManager{s.memories}
+		}
+		return nil
+	}
+}
+
+// WorkspaceScope returns the default workspace slug filter applied
+// to every query (set by `gortex server --workspace`). Empty
+// means no scope; tools that consult it should fall back to the
+// global multi-workspace view.
+func (s *Server) WorkspaceScope() string { return s.scopeWorkspace }
+
+// ProjectScope returns the project slug filter; meaningful only
+// when WorkspaceScope() is non-empty.
+func (s *Server) ProjectScope() string { return s.scopeProject }
+
+// unresolvedWorkspacePrefix marks a session whose cwd is non-empty but
+// resolves to no tracked repo. Used as a QueryOptions.WorkspaceID
+// sentinel: it can never equal a real node's WorkspaceID/RepoPrefix,
+// so every node is rejected and the session fails closed instead of
+// widening to the global graph.
+const unresolvedWorkspacePrefix = "\x00gortex-unresolved-workspace:"
+
+// sessionScope resolves the workspace/project boundary for the current
+// request. When bound is true the session is confined to workspaceID
+// and query handlers MUST NOT return data outside it; an empty (or
+// sentinel) workspaceID with bound==true means the cwd resolved to no
+// tracked repo and handlers fail closed. When bound is false the
+// session is unbound (embedded stdio / control client / `gortex
+// server --workspace`) and callers fall back to the server-default
+// scope.
+//
+// Resolution happens once per session — derived from the immutable
+// session cwd — and is cached on sessionState. repoPrefix is the
+// session's home repo, used only for relevance ranking.
+func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID string, bound bool) {
+	ss := s.sessionFor(ctx)
+	if ss == nil {
+		return "", "", false
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.scopeResolved {
+		return ss.scopeWorkspaceID, ss.scopeProjectID, ss.scopeBound
+	}
+	ss.scopeResolved = true
+
+	cwd := SessionCWDFromContext(ctx)
+	if cwd == "" || s.multiIndexer == nil {
+		// No cwd (embedded stdio, control clients) or no multi-repo
+		// indexer: unbound — the server-default scope applies.
+		return "", "", false
+	}
+
+	ss.scopeBound = true
+	ws, proj, repoPrefix, ok := s.multiIndexer.ScopeForCWD(cwd)
+	if ok {
+		ss.scopeWorkspaceID = ws
+		ss.scopeProjectID = proj
+		ss.scopeRepoPrefix = repoPrefix
+	} else {
+		// cwd is non-empty but maps to no tracked repo. The daemon
+		// dispatcher rejects unreachable cwds before dispatch, so
+		// this is defensive: the sentinel matches no node, so the
+		// session sees nothing rather than the whole global graph.
+		ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd
+	}
+	return ss.scopeWorkspaceID, ss.scopeProjectID, true
+}
+
+// sessionLocality returns the session's home repo prefix and project
+// slug for relevance ranking — same-repo hits rank above same-project
+// above same-workspace. Both empty for unbound sessions.
+func (s *Server) sessionLocality(ctx context.Context) (repoPrefix, projectID string) {
+	ss := s.sessionFor(ctx)
+	if ss == nil {
+		return "", ""
+	}
+	// Ensure scope is resolved (populates scopeRepoPrefix).
+	s.sessionScope(ctx)
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.scopeRepoPrefix, ss.scopeProjectID
+}
+
+// sessionWorkspaceRepos returns {name, path} for every repo in the
+// current session's workspace, sorted by name. Empty for an unbound
+// session or when the multi-repo indexer is unavailable. Used by the
+// introspection tools so they report the session's real boundary.
+func (s *Server) sessionWorkspaceRepos(ctx context.Context) []map[string]string {
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound || s.multiIndexer == nil {
+		return nil
+	}
+	prefixes := s.multiIndexer.ReposInWorkspace(sessWS)
+	meta := s.multiIndexer.AllMetadata()
+	out := make([]map[string]string, 0, len(prefixes))
+	for p := range prefixes {
+		entry := map[string]string{"name": p}
+		if m := meta[p]; m != nil {
+			entry["path"] = m.RootPath
+		}
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["name"] < out[j]["name"] })
+	return out
+}
+
+// nodeInSessionScope reports whether a node may be surfaced to the
+// current session. For a workspace-bound session only nodes inside
+// the session's workspace pass; for an unbound session every node
+// passes (the server-default scope applies). This is the universal
+// per-node enforcement of the workspace boundary — used by by-id and
+// whole-graph handlers that don't route through the engine's scoped
+// traversal.
+func (s *Server) nodeInSessionScope(ctx context.Context, n *graph.Node) bool {
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return true
+	}
+	if n == nil {
+		return false
+	}
+	return query.QueryOptions{WorkspaceID: sessWS}.ScopeAllows(n)
+}
+
+// scopedNodes returns the graph nodes visible to the current session:
+// every node for an unbound session, only the session workspace's
+// nodes for a bound one. Whole-graph handlers (analyze, outline,
+// untested, resource rollups, …) iterate this instead of
+// graph.AllNodes() so a workspace-bound session can never observe
+// another workspace's nodes — not even in aggregate counts.
+func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
+	all := s.graph.AllNodes()
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return all
+	}
+	opts := query.QueryOptions{WorkspaceID: sessWS}
+	out := make([]*graph.Node, 0, len(all))
+	for _, n := range all {
+		if opts.ScopeAllows(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// scopedNodesByKinds is the kind-pushdown sibling of scopedNodes for
+// handlers that only need a specific kind set. When the backend
+// implements graph.NodesByKindsScanner the kind predicate runs server-
+// side (one kind-filtered scan over the node table) instead of
+// the legacy AllNodes()-then-Go-side filter. The metadata analyzers
+// (todos, stale_code, stale_flags, ownership, coverage_gaps,
+// coverage_summary, cgo_users, wasm_users, orphan_tables,
+// unreferenced_tables) each keep one or two kinds out of the whole
+// node table; pushing that filter is the entire win.
+//
+// Workspace-bound sessions still narrow Go-side: the capability does
+// not know about ScopeAllows, and adding workspace_id to every analyze
+// query would tie the capability to the session-scope concept. The
+// secondary filter is cheap because the kind pushdown already shrank
+// the row count by 1-2 orders of magnitude.
+//
+// Empty kinds returns nil — defensive against caller bugs that would
+// otherwise drop into the full-AllNodes fallback path.
+func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind) []*graph.Node {
+	if len(kinds) == 0 {
+		return nil
+	}
+	var nodes []*graph.Node
+	if scan, ok := s.graph.(graph.NodesByKindsScanner); ok {
+		nodes = scan.NodesByKinds(kinds)
+	} else {
+		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
+		all := s.graph.AllNodes()
+		allowed := make(map[graph.NodeKind]struct{}, len(kinds))
+		for _, k := range kinds {
+			allowed[k] = struct{}{}
+		}
+		nodes = make([]*graph.Node, 0, len(all))
+		for _, n := range all {
+			if _, ok := allowed[n.Kind]; ok {
+				nodes = append(nodes, n)
+			}
+		}
+	}
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return nodes
+	}
+	opts := query.QueryOptions{WorkspaceID: sessWS}
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if opts.ScopeAllows(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// scopedNodeSlice filters an existing node slice to the session's
+// workspace. Convenience for handlers that already hold a node list
+// (engine list methods that don't take QueryOptions).
+func (s *Server) scopedNodeSlice(ctx context.Context, nodes []*graph.Node) []*graph.Node {
+	sessWS, _, bound := s.sessionScope(ctx)
+	if !bound {
+		return nodes
+	}
+	opts := query.QueryOptions{WorkspaceID: sessWS}
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if opts.ScopeAllows(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// resolveQueryScope resolves the (workspace, project) scope for a
+// query. For a workspace-bound session the session's workspace is an
+// immovable ceiling: a `workspace` arg can never widen it (cross-
+// workspace values are rejected up front in resolveRepoFilter), while
+// a `project` arg may narrow within it. For an unbound session it
+// merges the server-level default scope with caller-supplied arg
+// overrides — the legacy `gortex server --workspace` behaviour.
+func (s *Server) resolveQueryScope(ctx context.Context, argWorkspace, argProject string) (workspace, project string) {
+	if sessWS, sessProj, bound := s.sessionScope(ctx); bound {
+		workspace = sessWS
+		project = sessProj
+		if argProject != "" {
+			project = argProject
+		}
+		return
+	}
+	workspace = s.scopeWorkspace
+	if argWorkspace != "" {
+		workspace = argWorkspace
+	}
+	project = s.scopeProject
+	if argProject != "" {
+		project = argProject
+	}
+	return
+}
+
+// scopeFromRequest pulls `workspace` / `project` arg overrides off
+// the MCP request and resolves them against the session boundary.
+// Convenience wrapper around resolveQueryScope for handlers that take
+// the request directly.
+func (s *Server) scopeFromRequest(ctx context.Context, req scopeArgGetter) (workspace, project string) {
+	return s.resolveQueryScope(ctx, req.GetString("workspace", ""), req.GetString("project", ""))
+}
+
+// scopeArgGetter is the minimum interface for reading MCP string
+// args; mirrors mcp.CallToolRequest's GetString without forcing
+// every caller to import the mcp pkg here.
+type scopeArgGetter interface {
+	GetString(key, fallback string) string
+}
+
+// InitCombo initializes the query→symbol combo tracker. Persists per-repo,
+// same cache directory as feedback; zero-effect no-op when either argument
+// is empty. mode selects the max-age reap schedule (AI: 7 days, human: 30).
+func (s *Server) InitCombo(cacheDir, repoPath string, mode AgentMode) {
+	s.combo = newComboManager(cacheDir, repoPath, mode)
+}
+
+// InitFrecency initializes the implicit symbol frecency tracker. mode
+// selects the decay regime — ModeAI (3-day half-life) for MCP server use;
+// ModeHuman (10-day) for interactive sessions.
+func (s *Server) InitFrecency(cacheDir, repoPath string, mode AgentMode) {
+	s.frecency = newFrecencyTracker(cacheDir, repoPath, mode)
+}
+
+// InitSavings wires the persistent token-savings store into tokenStats so
+// every source-reading tool call accumulates cumulative totals. Call once
+// after NewServer; safe to skip when persistence isn't desired.
+//
+// Propagates to the sessionMap too so per-session counters (daemon path)
+// also flush to the shared persistent store. Without this propagation a
+// proxy that connects before InitSavings runs would hold a tokenStats
+// with nil persistent and silently drop observations.
+func (s *Server) InitSavings(store *savings.Store, repoPath string) {
+	if store == nil || s.tokenStats == nil {
+		return
+	}
+	s.tokenStats.mu.Lock()
+	s.tokenStats.persistent = store
+	s.tokenStats.repoPath = repoPath
+	s.tokenStats.mu.Unlock()
+	if s.sessions != nil {
+		s.sessions.setPersistent(store, repoPath)
+	}
+}
+
+// tokenStatsFor returns the tokenStats for the current request. Mirrors
+// sessionFor: when ctx carries a session ID the per-session counter is
+// returned, otherwise the shared default. Per-session counters share
+// the same persistent store so disk totals accumulate across clients.
+func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
+	id := SessionIDFromContext(ctx)
+	if id == "" || s.sessions == nil {
+		return s.tokenStats
+	}
+	return s.sessions.get(id).tokenStats
+}
+
+// FlushSavings is kept for shutdown-path compatibility. The sidecar-backed
+// ledger commits every observation as it is recorded, so there is nothing
+// buffered to write.
+func (s *Server) FlushSavings() error {
+	store := s.savingsStore()
+	if store == nil {
+		return nil
+	}
+	return store.Flush()
+}
+
+// savingsStore extracts the persistent savings store via tokenStats. Returns
+// nil when persistence isn't initialized.
+func (s *Server) savingsStore() *savings.Store {
+	if s == nil || s.tokenStats == nil {
+		return nil
+	}
+	s.tokenStats.mu.Lock()
+	store := s.tokenStats.persistent
+	s.tokenStats.mu.Unlock()
+	return store
+}
+
+// cumulativeSavingsSnapshot exposes the persistent savings state for
+// inclusion in graph_stats. Returns nil when persistence isn't wired so
+// single-shot CLI calls don't emit confusing empty totals.
+func (s *Server) cumulativeSavingsSnapshot() map[string]any {
+	if s.tokenStats == nil {
+		return nil
+	}
+	s.tokenStats.mu.Lock()
+	store := s.tokenStats.persistent
+	s.tokenStats.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+
+	snap, err := store.Snapshot()
+	if err != nil && s.logger != nil {
+		s.logger.Warn("cumulative savings snapshot failed", zap.Error(err))
+	}
+	costs := savings.CostAvoidedAll(snap.Totals.TokensSaved)
+	out := map[string]any{
+		"first_seen":       snap.FirstSeen.Format(time.RFC3339),
+		"last_updated":     snap.LastUpdated.Format(time.RFC3339),
+		"tokens_saved":     snap.Totals.TokensSaved,
+		"tokens_returned":  snap.Totals.TokensReturned,
+		"calls_counted":    snap.Totals.CallsCounted,
+		"cost_avoided_usd": costs,
+	}
+	if snap.DroppedObservations > 0 {
+		out["dropped_observations"] = snap.DroppedObservations
+	}
+	return out
+}
+
+// ExportContext generates a portable context briefing for the given task.
+// This is the public API for the CLI command, delegating to the MCP handler.
+func (s *Server) ExportContext(ctx context.Context, task, entryPoint, format string, maxSymbols, tokenBudget int) (*mcp.CallToolResult, error) {
+	args := map[string]any{
+		"task":         task,
+		"format":       format,
+		"max_symbols":  float64(maxSymbols),
+		"token_budget": float64(tokenBudget),
+	}
+	if entryPoint != "" {
+		args["entry_point"] = entryPoint
+	}
+	argsJSON, _ := json.Marshal(args)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "export_context"
+	_ = json.Unmarshal(argsJSON, &req.Params.Arguments)
+	return s.handleExportContext(ctx, req)
+}
+
+// RegisterToolScope records the ToolScope for toolName so the
+// dispatcher can validate `repo` per call. Tools that don't register a
+// scope behave as if unscoped — legacy single-repo behavior — until
+// every tool is migrated.
+func (s *Server) RegisterToolScope(toolName string, scope ToolScope) {
+	s.toolScopes.set(toolName, scope)
+}
+
+// ToolScope returns the registered scope for toolName and whether one
+// has been declared. Used by tests asserting that every tool has a
+// scope, and by the dispatcher.
+func (s *Server) ToolScope(toolName string) (ToolScope, bool) {
+	return s.toolScopes.get(toolName)
+}
+
+// ToolScopeMap returns a snapshot of every registered tool name →
+// scope-name mapping. Used for diagnostics and for the
+// `workspace_info`-style introspection tool (scope: workspace).
+func (s *Server) ToolScopeMap() map[string]string {
+	return s.toolScopes.snapshot()
+}
+
+// RegisteredScopedTools returns the registered tool names sorted
+// lexically. Test convenience.
+func (s *Server) RegisteredScopedTools() []string {
+	return s.toolScopes.allTools()
+}
+
+// ResolveToolScope is the public entry point used by the dispatcher:
+// looks up the tool's scope, then validates the request's `repo`
+// argument against it. Returns either the resolved repo set or a
+// structured protocol error suitable for the caller to surface
+// verbatim.
+//
+// When the tool isn't in the registry, returns a nil ScopedRepos and
+// nil error — callers treat this as "unscoped, do not enforce" so
+// gradual migration doesn't break anything.
+func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp.CallToolResult) {
+	scope, ok := s.toolScopes.get(toolName)
+	if !ok {
+		return nil, nil
+	}
+	return ResolveScopedRepos(scope, repo)
+}
+
+// communityCacheToken is the per-graph identity tuple
+// handleAnalyzeClusters checks before re-running the incremental
+// detector. EdgeIdentity moves on any structural mutation; NodeCount
+// and EdgeCount cover pure additions / removals that leave the
+// identity counter alone. A zero token is "never populated".
+type communityCacheToken struct {
+	edgeIdentity int
+	nodeCount    int
+	edgeCount    int
+}
+
+func (s *Server) currentCommunityToken() communityCacheToken {
+	return communityCacheToken{
+		edgeIdentity: s.graph.EdgeIdentityRevisions(),
+		nodeCount:    s.graph.NodeCount(),
+		edgeCount:    s.graph.EdgeCount(),
+	}
+}
+
+// RunAnalysis performs community detection and process discovery on
+// the current graph, then pushes a `notifications/resources/updated`
+// for every bootstrap resource so subscribed clients can refresh
+// without polling.
+func (s *Server) RunAnalysis() {
+	s.analysisMu.Lock()
+	// Detect communities through the incremental path, threading the
+	// partition cache. When a re-warm only touched a few packages
+	// this recomputes just those; the cache is also left warm so the
+	// next `analyze kind=clusters` call inherits it. The result is
+	// shape-identical to a full DetectCommunities run.
+	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.communities = communities
+	s.leidenCache = cache
+	s.communitiesToken = s.currentCommunityToken()
+	// Feed the freshly computed per-package fingerprints to the
+	// backend's bundle cache so it retires bundles for packages whose
+	// content changed since the last pass and keeps the rest. The
+	// fingerprints are edge-aware (DetectCommunitiesLeidenIncremental
+	// folds each package's nodes and the edges touching them), so this
+	// is the correct staleness signal for cached node + in/out edges.
+	// A backend without a bundle cache simply doesn't satisfy the
+	// interface and this no-ops.
+	if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && cache != nil {
+		sink.SetBundleFingerprints(cache.PackageFingerprints())
+	}
+	s.processes = analysis.DiscoverProcesses(s.graph)
+	s.pageRank = analysis.ComputePageRank(s.graph)
+	// Compact CSR adjacency over the same call / reference edge set
+	// PageRank uses — the substrate for seeded random-walk proximity
+	// queries. Built once here so per-query walks never re-scan the
+	// graph; stamped with the current graph identity for the same
+	// invalidation discipline as the community cache.
+	s.adjacency = analysis.BuildAdjacencySnapshot(s.graph)
+	s.adjacencyToken = s.currentCommunityToken()
+	// Auto-concept vocabulary: mine domain phrases from symbol names
+	// so equivalence-class expansion can bridge repo-specific terms
+	// even with no LLM provider configured.
+	s.autoConcepts = search.BuildAutoConcepts(s.graph)
+	// HITS authority/hub scores -- fed into the search rerank as an
+	// authority signal that complements raw fan-in.
+	s.hits = analysis.ComputeHITS(s.graph)
+	// Default-threshold hotspot ranking — cached because FindHotspots
+	// triggers ComputeBetweenness which is the shared wall-clock
+	// floor for outline / architecture / wakeup / the resource view.
+	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
+	s.analysisMu.Unlock()
+
+	// Bootstrap-resource payloads (graph_stats, index_health, etc.)
+	// can change after re-warm even when the analysis itself didn't
+	// — node counts move on every reindex. Fire updates regardless.
+	s.notifyBootstrapResourcesUpdated()
+
+	// Coarse hot-reload signal: the graph has just been rebuilt, so
+	// any cached query result a long-lived client holds may be stale.
+	if s.graphInvalidatedBroadcaster != nil && s.graph != nil {
+		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
+	}
+}
+
+func (s *Server) getCommunities() *analysis.CommunityResult {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.communities
+}
+
+// incrementalCommunities runs Leiden community detection through the
+// incremental path, threading the per-server partition cache so a
+// re-run after only a few packages changed re-partitions just those
+// packages. The cache it returns is stored back under analysisMu so
+// the next clusters request can build on it. The accompanying stats
+// describe whether the fast path or a full recompute ran.
+//
+// Short-circuits when the cached communities are still valid for the
+// live graph: the (NodeCount, EdgeCount, EdgeIdentityRevisions) token
+// captured by the last detector run is compared against the current
+// graph identity in three scalar reads. On a disk backend a match skips the
+// AllNodes / AllEdges fingerprint scan that otherwise dominates the
+// call (~140s on a fresh daemon) and serves the existing partition
+// straight from the cache. The reported stats describe a no-op
+// incremental run (no changed packages, no repartitioned nodes) so
+// callers see the cache hit on the wire.
+func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
+	s.analysisMu.Lock()
+	defer s.analysisMu.Unlock()
+	cur := s.currentCommunityToken()
+	if s.communities != nil && s.communitiesToken == cur {
+		stats := analysis.IncrementalCommunityStats{
+			Incremental: true,
+		}
+		if s.leidenCache != nil {
+			stats.TotalPackages = len(s.leidenCache.PackageFingerprints())
+		}
+		if s.logger != nil {
+			s.logger.Debug("incrementalCommunities cache hit",
+				zap.Int("nodes", cur.nodeCount),
+				zap.Int("edges", cur.edgeCount),
+				zap.Int("edge_identity_rev", cur.edgeIdentity))
+		}
+		return s.communities, stats
+	}
+	if s.logger != nil {
+		// INFO-level on the miss path so a regression that re-introduces
+		// a steady-state cache miss is visible without flipping the
+		// daemon to debug. The full token diff is here precisely to
+		// catch background-mutation regressions (some pass keeps drifting
+		// the edge count under the cache and the Leiden walk runs every
+		// call). A real first-call miss is a single line in the log.
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", s.communities == nil),
+			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", s.communitiesToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
+	}
+	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
+	s.communities = result
+	s.leidenCache = cache
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	s.communitiesToken = s.currentCommunityToken()
+	return result, stats
+}
+
+func (s *Server) getProcesses() *analysis.ProcessResult {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.processes
+}
+
+func (s *Server) getPageRank() *analysis.PageRankResult {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.pageRank
+}
+
+// getAdjacency returns the cached CSR adjacency snapshot built by the
+// last RunAnalysis pass, or nil before the first pass. The snapshot is
+// immutable after construction, so the caller may run seeded walks over
+// it after releasing the read lock.
+func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.adjacency
+}
+
+// getAutoConcepts returns the per-repo auto-mined concept
+// vocabulary. Nil until the first RunAnalysis pass; callers
+// nil-check (AutoConcepts.Expand is itself nil-safe).
+func (s *Server) getAutoConcepts() *search.AutoConcepts {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.autoConcepts
+}
+
+// getHITS returns the HITS authority/hub result. Nil until the
+// first RunAnalysis pass; callers nil-check (HITSResult accessors
+// are themselves nil-safe).
+func (s *Server) getHITS() *analysis.HITSResult {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.hits
+}
+
+// getHotspots returns the default-threshold hotspot ranking computed
+// by the most recent RunAnalysis pass. Nil/empty until the first
+// pass; callers use the live FindHotspots(threshold) path when they
+// need a non-default threshold. Returned slice is shared and must
+// not be mutated by the caller.
+func (s *Server) getHotspots() []analysis.HotspotEntry {
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
+	return s.hotspots
+}
+
+// SetArchitecture installs the declarative architecture-rules DSL so
+// check_guards evaluates layered violations alongside the flat guard
+// rules. Called by the server / daemon entrypoint right after
+// NewServer; a no-op effect when the config carries no layers.
+func (s *Server) SetArchitecture(arch config.ArchitectureConfig) {
+	s.architecture = arch
+}
+
+// WatchForReanalysis subscribes to hub events and re-runs analysis after
+// a debounce period of inactivity. It runs in a background goroutine.
+func (s *Server) WatchForReanalysis(h *hub.Hub, debounceMs int) {
+	subID, events := h.Subscribe()
+	debounce := time.Duration(debounceMs) * time.Millisecond
+
+	go func() {
+		var timer *time.Timer
+		for ev := range events {
+			_ = ev // any event triggers reanalysis
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.AfterFunc(debounce, func() {
+				s.logger.Info("re-running analysis after graph change")
+				s.RunAnalysis()
+			})
+		}
+		// Channel closed — hub is shutting down.
+		if timer != nil {
+			timer.Stop()
+		}
+		_ = subID
+	}()
+}
+
+// ServeStdio starts the MCP server on stdin/stdout.
+func (s *Server) ServeStdio() error {
+	return server.ServeStdio(s.mcpServer)
+}
+
+// MCPServer returns the underlying MCP server instance.
+// This is used by the eval-server to wire tool dispatch into an HTTP handler.
+func (s *Server) MCPServer() *server.MCPServer {
+	return s.mcpServer
+}
+
+// addTool registers a tool whose handler is wrapped with the overlay
+// apply/revert middleware (see overlay.go::wrapToolHandler). Every
+// tool added through this helper picks up overlay-aware behaviour
+// transparently — graph-walking tools see the editor-buffer view,
+// source-reading tools see overlay content. Tools registered the old
+// way (s.mcpServer.AddTool) still work but bypass the middleware.
+//
+// Routing every internal registration through this helper means both
+// the daemon-dispatched path (HandleMessage) and the in-process HTTP
+// path (Handler.CallToolStrict) get identical overlay semantics — the
+// latter bypasses mcp-go's Hooks, so handler-level wrapping is the
+// only place that covers both transports.
+//
+// Lazy-tool routing (N50): when the registry is enabled and the tool
+// name is not in hotEagerTools, the (tool, handler) pair is stashed
+// in s.lazy instead of registered with the live MCP server. The
+// tools_search discovery tool returns the schema on demand and calls
+// lazy.Promote(name), which lands the tool in mcpServer via the
+// closure wired in attachLazyRegistry. Net effect: the initial
+// tools/list payload drops from ~88 tools to ~25, reducing per-
+// session context burn for token-economical clients while keeping
+// the full surface reachable through a one-call discovery hop.
+func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
+	// Scrub control characters / ANSI escapes out of the tool's text
+	// before it reaches any client's tools/list rendering. tool is a
+	// value copy, so this mutates only the registered instance.
+	scrubToolText(&tool)
+	// Embed a project-size-scaled exploration-call budget in navigation
+	// tools' descriptions so the model self-throttles. Runs before the
+	// deferred-vs-live split so a tool keeps the hint after promotion.
+	s.annotateToolBudget(&tool)
+	if s.lazy != nil && s.lazy.IsDeferred(tool.Name) {
+		s.lazy.Register(tool, handler)
+		return
+	}
+	s.mcpServer.AddTool(tool, s.wrapToolHandler(handler))
+}
+
+// attachLazyRegistry wires the deferred catalog to the live MCP
+// server so a tools_search-driven promotion lands the tool in
+// mcpServer (which then fires notifications/tools/list_changed for
+// subscribed clients). Safe to call multiple times; the latest
+// closure wins.
+func (s *Server) attachLazyRegistry() {
+	if s.lazy == nil {
+		return
+	}
+	s.lazy.promote = func(dt *deferredTool) {
+		s.mcpServer.AddTool(dt.tool, s.wrapToolHandler(dt.handler))
+	}
+}
+
+// SetContractRegistry sets an explicit contract registry override for the MCP
+// server. Used by single-indexer callers and tests. In multi-repo mode the
+// server prefers a freshly-merged registry from MultiIndexer (see
+// effectiveContractRegistry) so that repos tracked or re-indexed at runtime
+// are visible immediately.
+func (s *Server) SetContractRegistry(r *contracts.Registry) {
+	s.contractRegistry = r
+}
+
+// effectiveContractRegistry resolves the current contract registry. It prefers
+// a live view over any snapshot: in multi-repo mode it re-merges per-repo
+// registries on every call so that track_repository / index_repository at
+// runtime take effect without a restart. Falls back to the single indexer,
+// then to the explicit override.
+func (s *Server) effectiveContractRegistry() *contracts.Registry {
+	if s.multiIndexer != nil {
+		return s.multiIndexer.MergedContractRegistry()
+	}
+	if s.indexer != nil {
+		if cr := s.indexer.ContractRegistry(); cr != nil {
+			return cr
+		}
+	}
+	return s.contractRegistry
+}
+
+// SetSemanticManager sets the semantic enrichment manager for the MCP server.
+func (s *Server) SetSemanticManager(m *semantic.Manager) {
+	s.semanticMgr = m
+}
+
+// SemanticManager returns the semantic enrichment manager.
+func (s *Server) SemanticManager() *semantic.Manager {
+	return s.semanticMgr
+}
+
+// watcherHistory is the subset of indexer.Watcher / indexer.MultiWatcher
+// the MCP server consumes. Defined as an interface so the server can
+// accept either a single-repo Watcher (legacy `gortex mcp --watch` path)
+// or a MultiWatcher (daemon path) through one SetWatcher call. The two
+// concrete types already expose the same surface; this interface just
+// names it.
+type watcherHistory interface {
+	History() []indexer.GraphChangeEvent
+	HistorySince(since time.Time) []indexer.GraphChangeEvent
+	OnSymbolChange(cb indexer.SymbolChangeCallback)
+}
+
+// SetWatcher sets the watcher after background initialization and registers
+// a symbol change callback to record modifications in symbolHistory.
+// Accepts either a single-repo *indexer.Watcher or a multi-repo
+// *indexer.MultiWatcher — both satisfy watcherHistory.
+func (s *Server) SetWatcher(w watcherHistory) {
+	s.watcher = w
+
+	// Register callback to track symbol modifications for
+	// get_symbol_history AND fan stale_refs notifications to any
+	// subscribed sessions whose working set intersects the change.
+	w.OnSymbolChange(func(filePath string, oldSymbols, newSymbols []*graph.Node) {
+		// stale_refs broadcaster runs first so a slow notification
+		// path (e.g. a clogged session channel) can't delay the
+		// in-process symbol history bookkeeping below.
+		if s.staleRefsBroadcaster != nil {
+			s.staleRefsBroadcaster.handleSymbolChange(filePath, oldSymbols, newSymbols)
+		}
+		oldMap := make(map[string]string, len(oldSymbols)) // ID → signature
+		for _, n := range oldSymbols {
+			sig, _ := n.Meta["signature"].(string)
+			oldMap[n.ID] = sig
+		}
+
+		newMap := make(map[string]string, len(newSymbols)) // ID → signature
+		for _, n := range newSymbols {
+			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+				continue
+			}
+			sig, _ := n.Meta["signature"].(string)
+			newMap[n.ID] = sig
+		}
+
+		// Detect modified symbols (present in both old and new with changed signature).
+		for id, oldSig := range oldMap {
+			if newSig, exists := newMap[id]; exists {
+				sigChanged := oldSig != newSig
+				s.symHistory.Record(id, sigChanged)
+			}
+		}
+
+		// Detect removed symbols (in old but not in new).
+		for id := range oldMap {
+			if _, exists := newMap[id]; !exists {
+				s.symHistory.Record(id, true)
+			}
+		}
+
+		// Detect added symbols (in new but not in old).
+		for id := range newMap {
+			if _, exists := oldMap[id]; !exists {
+				s.symHistory.Record(id, false)
+			}
+		}
+	})
+}

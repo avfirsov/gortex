@@ -1,0 +1,11 @@
+tool: get_editing_context
+description: target symbol plus callers + deps + tests (flattened rows)
+input: |
+  [
+    {"section":"target","id":"internal/query/engine.go::Engine.GetCallers","kind":"method","name":"GetCallers","path":"internal/query/engine.go","line":255,"signature":"func (e *Engine) GetCallers(id string, opts QueryOptions) *SubGraph"},
+    {"section":"caller","id":"internal/mcp/tools_core.go::handleGetCallers","kind":"method","name":"handleGetCallers","path":"internal/mcp/tools_core.go","line":698},
+    {"section":"caller","id":"internal/mcp/tools_coding.go::handleGetEditingContext","kind":"method","name":"handleGetEditingContext","path":"internal/mcp/tools_coding.go","line":161},
+    {"section":"dep","id":"internal/graph/graph.go::Graph.GetNode","kind":"method","name":"GetNode","path":"internal/graph/graph.go","line":155},
+    {"section":"dep","id":"internal/query/subgraph.go::NewSubGraph","kind":"function","name":"NewSubGraph","path":"internal/query/subgraph.go","line":22},
+    {"section":"test","path":"internal/query/engine_test.go"}
+  ]

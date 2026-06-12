@@ -1,0 +1,26 @@
+tool: find_usages
+description: 18 usages of a widely-used helper
+input: |
+  {
+    "edges": [
+      {"from":"a.go::F1","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"a.go::F2","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"a.go::F3","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"a.go::F4","to":"util.go::Get","kind":"calls","confidence":0.95,"origin":"ast_inferred"},
+      {"from":"b.go::F5","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"lsp_resolved"},
+      {"from":"b.go::F6","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"lsp_resolved"},
+      {"from":"c.go::F7","to":"util.go::Get","kind":"calls","confidence":0.9,"origin":"ast_inferred"},
+      {"from":"c.go::F8","to":"util.go::Get","kind":"calls","confidence":0.9,"origin":"ast_inferred"},
+      {"from":"c.go::F9","to":"util.go::Get","kind":"calls","confidence":0.9,"origin":"ast_inferred"},
+      {"from":"d.go::F10","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"d.go::F11","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"d.go::F12","to":"util.go::Get","kind":"calls","confidence":0.7,"origin":"text_matched"},
+      {"from":"e.go::F13","to":"util.go::Get","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"e.go::F14","to":"util.go::Get","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"e.go::F15","to":"util.go::Get","kind":"references","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"f.go::F16","to":"util.go::Get","kind":"calls","confidence":0.95,"origin":"ast_inferred"},
+      {"from":"f.go::F17","to":"util.go::Get","kind":"calls","confidence":0.95,"origin":"ast_inferred"},
+      {"from":"g.go::F18","to":"util.go::Get","kind":"calls","confidence":1.0,"origin":"lsp_resolved"}
+    ],
+    "total_edges": 18
+  }

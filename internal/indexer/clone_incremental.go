@@ -1,0 +1,308 @@
+package indexer
+
+import (
+	"sync"
+
+	"github.com/zzet/gortex/internal/clones"
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// incrementalCloneIndex maintains the clone-detection state (CMS +
+// length-stratified LSH) live across single-file edits so a (re)index of
+// one file updates EdgeSimilarTo edges in O(edited file) instead of the
+// whole-graph detectClonesAndEmitEdges recompute. It is the steady-state
+// counterpart of the batch pass: the batch pass re-baselines (corrects CMS
+// drift) and runs diffusion; this index keeps the direct similar_to edges
+// in step between batch passes.
+//
+// Source of truth in-session is the in-memory shingles cache; the durable
+// copy lives in the CloneShingle* sidecar so Rebuild can reseed the CMS
+// after a warm restart without re-parsing. Signatures are computed through
+// the same kernel the batch pass uses (computeCloneSigFromShingles), so at
+// a given corpus the incremental and batch edge sets are identical.
+//
+// It is NOT goroutine-safe beyond its own mutex — every method takes the
+// lock — and is driven under the indexer's write path (one goroutine at a
+// time), the same single-writer discipline the underlying clones.CMS /
+// clones.StratifiedIndex assume.
+type incrementalCloneIndex struct {
+	mu       sync.Mutex
+	cms      *clones.CMS
+	lsh      *clones.StratifiedIndex
+	shingles map[string][]uint64 // node id -> raw shingle set (cache)
+	corpus   int
+	built    bool
+}
+
+// newIncrementalCloneIndex returns an empty, un-built index. built stays
+// false until a batch pass or Rebuild seeds it from the graph / sidecar;
+// while un-built the indexer falls back to the whole-graph clone pass.
+func newIncrementalCloneIndex() *incrementalCloneIndex {
+	return &incrementalCloneIndex{
+		cms:      clones.NewCMS(65536, 4),
+		lsh:      clones.NewStratifiedIndex(),
+		shingles: make(map[string][]uint64),
+	}
+}
+
+// tokensFromMeta reads a node's stamped normalised-token count, tolerating
+// the int / int64 / float64 shapes a backend round-trip may produce.
+// Mirrors the switch in detectClonesAndEmitEdgesCtx so the LSH length
+// classes match the batch pass.
+func tokensFromMeta(n *graph.Node) int {
+	if n == nil || n.Meta == nil {
+		return 0
+	}
+	switch v := n.Meta[cloneTokensMetaKey].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// cloneFuncNodes filters a node slice to the function/method nodes that
+// participate in clone detection.
+func cloneFuncNodes(nodes []*graph.Node) []*graph.Node {
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// Rebuild resets the index and reseeds it from the graph's current
+// signatures plus the persisted shingle sidecar. It is the warmup /
+// post-batch / warm-restart path: after the whole-graph clone pass has
+// stamped clone_sig on the surviving bodies (and finaliseCloneSignatures
+// has persisted clone_shingles for EVERY eligible body — survivors and
+// boilerplate-dropped alike — to the sidecar), Rebuild walks this repo's
+// bodies, rebuilds the CMS + corpus from the persisted shingles, banks
+// each surviving signature into the live LSH index, and marks built=true
+// so subsequent edits go incremental.
+//
+// The CMS and corpus MUST mirror finaliseCloneSignatures' bodies set: that
+// pass builds its CMS and useFilter/threshold from ALL eligible bodies
+// (every func/method node that had clone_shingles), including the ones it
+// then drops as boilerplate-dominated (no clone_sig). Seeding the CMS /
+// corpus only from survivors (clone_sig present) would under-count the
+// sketch and shrink the corpus, so the incremental path would filter
+// against a different threshold than the batch finalise and stamp
+// different signatures on the edited file. We therefore seed CMS + corpus
+// from every body with persisted shingles and gate ONLY the LSH Add on a
+// decodable clone_sig (survivors). This makes Rebuild's CMS/corpus
+// byte-match what the batch finalise produced.
+//
+// Repo-scoped: it walks AllNodes filtered to n.RepoPrefix == repoPrefix so
+// each per-repo index's corpus counts only that repo's bodies — matching
+// its repo-scoped LoadCloneShingles seed. An unfiltered AllNodes walk would
+// count every repo's bodies into a single repo's corpus and skew its
+// threshold. (GetRepoNodes can't be used here: in single-repo / in-memory
+// mode repoPrefix is "" and nodes with an empty RepoPrefix are not tracked
+// in the byRepo buckets GetRepoNodes reads, so GetRepoNodes("") is always
+// empty — the AllNodes+filter form is the one that works for both regimes,
+// since "" == "" matches every node.)
+//
+// Tolerant of a missing/partial sidecar: a body with a clone_sig but no
+// persisted shingle row still enters the LSH index (so its edges are
+// maintained) — that body just contributes nothing to the CMS / corpus,
+// which at the re-baseline corpus is corrected at the next batch pass.
+func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
+	if ci == nil || g == nil {
+		return
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+
+	ci.cms = clones.NewCMS(65536, 4)
+	ci.lsh = clones.NewStratifiedIndex()
+	ci.shingles = make(map[string][]uint64)
+	ci.corpus = 0
+
+	var load map[string][]uint64
+	if r, ok := g.(graph.CloneShingleReader); ok {
+		if rows, err := r.LoadCloneShingles(repoPrefix); err == nil {
+			load = rows
+		}
+	}
+
+	for _, n := range g.AllNodes() {
+		if n == nil {
+			continue
+		}
+		if n.RepoPrefix != repoPrefix {
+			continue
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		// Seed CMS + corpus from every eligible body that has persisted
+		// shingles — survivors AND boilerplate-dropped bodies — so the
+		// sketch and corpus mirror finaliseCloneSignatures' bodies set.
+		sh := load[n.ID]
+		if len(sh) > 0 {
+			for _, s := range sh {
+				ci.cms.Add(s)
+			}
+			ci.shingles[n.ID] = sh
+			ci.corpus++
+		}
+		// Only survivors (a decodable clone_sig) enter the LSH index —
+		// dropped bodies have no signature and never produce edges.
+		if n.Meta == nil {
+			continue
+		}
+		enc, ok := n.Meta[cloneSigMetaKey].(string)
+		if !ok || enc == "" {
+			continue
+		}
+		sig, ok := clones.DecodeSignature(enc)
+		if !ok {
+			continue
+		}
+		ci.lsh.Add(clones.Item{ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n)})
+	}
+	ci.built = true
+}
+
+// EvictFuncs removes a set of function/method nodes from the index: it
+// decrements their shingles out of the CMS, drops them from the LSH index
+// and the in-memory cache, and deletes their rows from the persisted
+// sidecar. Called with the OLD function ids of a file just before that
+// file's fresh nodes are added (UpdateFuncs), so a re-index is an
+// evict-then-add of only the edited file's bodies.
+func (ci *incrementalCloneIndex) EvictFuncs(g graph.Store, ids []string) {
+	if ci == nil || len(ids) == 0 {
+		return
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	for _, id := range ids {
+		sh, ok := ci.shingles[id]
+		if !ok {
+			// Not a tracked clone body (no signature / never added) —
+			// still remove from the LSH index in case it was banked,
+			// then move on.
+			ci.lsh.Remove(id)
+			continue
+		}
+		for _, s := range sh {
+			ci.cms.Decrement(s)
+		}
+		delete(ci.shingles, id)
+		ci.lsh.Remove(id)
+		ci.corpus--
+	}
+	if w, ok := g.(graph.CloneShingleWriter); ok {
+		_ = w.DeleteCloneShingles(ids)
+	}
+}
+
+// UpdateFuncs banks the freshly-parsed function/method nodes of one file
+// into the index and emits the EdgeSimilarTo edges their signatures imply.
+// funcNodes carry the raw shingle set on Meta (cloneShinglesMetaKey,
+// stamped by applyCloneSignatures during parse) — this method computes
+// their signatures through the same kernel the batch pass uses, so the two
+// paths agree exactly.
+//
+// Two phases. First every new body's shingles are folded into the CMS,
+// cached, persisted, and the corpus count bumped — so the boilerplate
+// threshold the signature kernel sees reflects the new corpus, matching
+// finaliseCloneSignatures. Then each body's signature is computed, stamped
+// on the node, banked into the LSH index, and queried for clone pairs;
+// surviving pairs are materialised as symmetric EdgeSimilarTo edges (both
+// directions, mirroring detectClonesAndEmitEdgesCtx).
+func (ci *incrementalCloneIndex) UpdateFuncs(g graph.Store, repoPrefix string, funcNodes []*graph.Node, threshold float64) {
+	if ci == nil || g == nil {
+		return
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+
+	// Phase 1: fold every new body into the CMS + cache + sidecar and
+	// bump the corpus count, so the boilerplate gate below sees the same
+	// corpus the batch finalise would.
+	rows := make(map[string][]uint64)
+	type pending struct {
+		node     *graph.Node
+		shingles []uint64
+	}
+	var todo []pending
+	for _, n := range funcNodes {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		sh, ok := n.Meta[cloneShinglesMetaKey].([]uint64)
+		if !ok {
+			continue
+		}
+		for _, s := range sh {
+			ci.cms.Add(s)
+		}
+		ci.shingles[n.ID] = sh
+		ci.corpus++
+		rows[n.ID] = sh
+		todo = append(todo, pending{node: n, shingles: sh})
+	}
+	if w, ok := g.(graph.CloneShingleWriter); ok && len(rows) > 0 {
+		_ = w.BulkSetCloneShingles(repoPrefix, rows)
+	}
+
+	// Corpus-based gate, matching finaliseCloneSignatures exactly.
+	useFilter := ci.corpus >= cmsMinCorpus
+	var thr uint32
+	if useFilter {
+		thr = uint32(float64(ci.corpus) * cmsBoilerplateRatio)
+		if thr < 1 {
+			thr = 1
+		}
+	}
+
+	// Phase 2: compute each signature, stamp it, bank it into the LSH
+	// index, and remember the banked Item so we can query for pairs once
+	// every new body is in the index. clone_shingles is removed from Meta
+	// (the sidecar holds the durable copy) — mirrors finalise.
+	added := make([]clones.Item, 0, len(todo))
+	for _, p := range todo {
+		n := p.node
+		sig, ok := computeCloneSigFromShingles(ci.cms, thr, useFilter, p.shingles)
+		delete(n.Meta, cloneShinglesMetaKey)
+		if !ok {
+			delete(n.Meta, cloneSigMetaKey)
+			continue
+		}
+		n.Meta[cloneSigMetaKey] = clones.EncodeSignature(sig)
+		item := clones.Item{ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n)}
+		ci.lsh.Add(item)
+		added = append(added, item)
+	}
+
+	// Emit edges for every clone pair touching a newly-added body. Both
+	// endpoints are looked up and a symmetric EdgeSimilarTo pair is
+	// emitted, mirroring detectClonesAndEmitEdgesCtx's emit. AddEdge
+	// dedupes by edge key, so a pair surfaced from both of its endpoints
+	// (when two new bodies in the same file are clones of each other)
+	// collapses to one symmetric pair.
+	for _, item := range added {
+		for _, p := range ci.lsh.QueryPairs(item, threshold) {
+			from := g.GetNode(p.A)
+			to := g.GetNode(p.B)
+			if from == nil || to == nil {
+				continue
+			}
+			emitSimilarEdge(g, from, to, p.Similarity)
+			emitSimilarEdge(g, to, from, p.Similarity)
+		}
+	}
+}

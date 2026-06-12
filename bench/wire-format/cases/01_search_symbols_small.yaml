@@ -1,0 +1,10 @@
+tool: search_symbols
+description: 5 search hits, typical small result set
+input: |
+  [
+    {"id":"internal/mcp/server.go::NewServer","kind":"function","name":"NewServer","file_path":"internal/mcp/server.go","start_line":62},
+    {"id":"internal/mcp/server.go::Server.Start","kind":"method","name":"Start","file_path":"internal/mcp/server.go","start_line":118},
+    {"id":"internal/mcp/server.go::Server.Shutdown","kind":"method","name":"Shutdown","file_path":"internal/mcp/server.go","start_line":140},
+    {"id":"internal/mcp/tools_core.go::registerCoreTools","kind":"method","name":"registerCoreTools","file_path":"internal/mcp/tools_core.go","start_line":307},
+    {"id":"internal/mcp/tools_coding.go::registerCodingTools","kind":"method","name":"registerCodingTools","file_path":"internal/mcp/tools_coding.go","start_line":1}
+  ]

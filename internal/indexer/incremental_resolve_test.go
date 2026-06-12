@@ -1,0 +1,124 @@
+package indexer
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search"
+)
+
+// fnNodeID returns the function/method node ID named `name` defined in
+// graph file `file`, failing the test if it is absent.
+func fnNodeID(t *testing.T, g graph.Store, file, name string) string {
+	t.Helper()
+	for _, n := range g.GetFileNodes(file) {
+		if n.Name == name && (n.Kind == graph.KindFunction || n.Kind == graph.KindMethod) {
+			return n.ID
+		}
+	}
+	t.Fatalf("function %q in %s not found", name, file)
+	return ""
+}
+
+// callTargetFrom returns the To of the (single) EdgeCalls edge leaving
+// node `fromID`.
+func callTargetFrom(t *testing.T, g graph.Store, fromID string) string {
+	t.Helper()
+	for _, e := range g.GetOutEdges(fromID) {
+		if e.Kind == graph.EdgeCalls {
+			return e.To
+		}
+	}
+	t.Fatalf("no call edge from %s", fromID)
+	return ""
+}
+
+// TestIncrementalReindex_PreservesIncomingCallerEdges is the proof of
+// the reverse-resolution + un-resolve fix. When file A defines Foo and
+// file B calls it, B's call edge resolves to A.Foo. Re-indexing or
+// deleting A must NOT silently drop B's edge:
+//
+//   - re-indexing A (Foo unchanged): restubIncomingRefs re-stubs B's
+//     edge to unresolved::Foo before A is evicted, then
+//     ResolveIncomingForFile rebinds it to A's fresh Foo — so B's caller
+//     edge survives a definition edit.
+//   - deleting A: B's edge survives as an unresolved::Foo stub (the
+//     correct state for a call to a now-missing symbol), not dropped.
+//   - re-creating A: ResolveIncomingForFile rebinds the pending stub.
+//
+// Against the pre-fix code, step (1) FAILS: evicting A drops B's
+// incoming caller edge wholesale and ResolveFile(A) only touches A's
+// outgoing edges, so get_callers(Foo) goes blank until a cold reindex.
+func TestIncrementalReindex_PreservesIncomingCallerEdges(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.go")
+	bPath := filepath.Join(dir, "b.go")
+	writeFile(t, aPath, "package p\n\nfunc Foo() {}\n")
+	writeFile(t, bPath, "package p\n\nfunc Bar() { Foo() }\n")
+
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewBM25()
+	idx.SetRootPath(dir)
+	_, err := idx.IndexCtx(testCtx(), dir)
+	require.NoError(t, err)
+
+	fooID := fnNodeID(t, g, "a.go", "Foo")
+	barID := fnNodeID(t, g, "b.go", "Bar")
+
+	require.Equal(t, fooID, callTargetFrom(t, g, barID),
+		"baseline: Bar's call must resolve to Foo")
+
+	// (1) Re-index the DEFINITION file with Foo unchanged. The caller
+	// edge in b.go must survive.
+	require.NoError(t, idx.IndexFile(aPath))
+	assert.Equal(t, fooID, callTargetFrom(t, g, barID),
+		"re-indexing Foo's own file must not drop Bar's caller edge")
+
+	// (2) Delete the definition. Bar's edge must revert to an unresolved
+	// stub, not vanish.
+	idx.EvictFile(aPath)
+	deletedTarget := callTargetFrom(t, g, barID)
+	assert.True(t, graph.IsUnresolvedTarget(deletedTarget),
+		"deleting Foo must leave Bar's call as an unresolved stub, not drop it")
+	assert.Equal(t, "Foo", graph.UnresolvedName(deletedTarget),
+		"the re-stubbed target must carry Foo's name")
+
+	// (3) Re-create the definition. The pending stub must rebind.
+	require.NoError(t, idx.IndexFile(aPath))
+	rebound := fnNodeID(t, g, "a.go", "Foo")
+	assert.Equal(t, rebound, callTargetFrom(t, g, barID),
+		"re-adding Foo must rebind Bar's pending caller edge via the reverse pass")
+}
+
+// TestEvictFile_DropsEnrichmentSidecars proves the change-A eviction
+// cascade: deleting a file drops its nodes' churn/coverage/blame
+// sidecar rows, leaving no orphan enrichment.
+func TestEvictFile_DropsEnrichmentSidecars(t *testing.T) {
+	idx, _ := newToggleIndexer(t)
+	dir := t.TempDir()
+	idx.SetRootPath(dir)
+	g := idx.graph
+
+	g.AddBatch([]*graph.Node{
+		{ID: "main.fk", Kind: graph.KindFile, Name: "main.fk", FilePath: "main.fk"},
+		{ID: "main.fk::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "main.fk"},
+	}, nil)
+	require.NoError(t, g.(graph.ChurnEnrichmentWriter).BulkSetChurn("", []graph.ChurnEnrichment{{NodeID: "main.fk::Foo", CommitCount: 3}}))
+	require.NoError(t, g.(graph.CoverageEnrichmentWriter).BulkSetCoverage("", []graph.CoverageEnrichment{{NodeID: "main.fk::Foo", CoveragePct: 50}}))
+	require.NoError(t, g.(graph.BlameEnrichmentWriter).BulkSetBlame("", []graph.BlameEnrichment{{NodeID: "main.fk::Foo", Email: "x@y"}}))
+
+	require.NotEmpty(t, g.(graph.ChurnEnrichmentReader).ChurnRows(""), "churn seeded")
+
+	idx.EvictFile("main.fk")
+
+	assert.Empty(t, g.(graph.ChurnEnrichmentReader).ChurnRows(""), "churn rows must be evicted with the file")
+	assert.Empty(t, g.(graph.CoverageEnrichmentReader).CoverageRows(""), "coverage rows must be evicted")
+	assert.Empty(t, g.(graph.BlameEnrichmentReader).BlameRows(""), "blame rows must be evicted")
+}

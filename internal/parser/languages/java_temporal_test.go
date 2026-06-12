@@ -1,0 +1,119 @@
+package languages
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// Java extractor tests for the Temporal annotation surface. The
+// resolver-side tagging (`temporal_role`) is exercised in
+// internal/resolver/temporal_calls_test.go; this file pins the
+// extractor's contract that every @ActivityInterface /
+// @WorkflowInterface / @ActivityMethod / @SignalMethod / @QueryMethod
+// annotation is materialised as an EdgeAnnotated edge pointing at a
+// well-known synthetic annotation node.
+
+// hasAnnotationEdge reports whether the extraction emitted an
+// EdgeAnnotated edge from `fromID` to the canonical annotation node
+// for `annoName`.
+func hasAnnotationEdge(t *testing.T, edges []*graph.Edge, fromID, annoName string) bool {
+	t.Helper()
+	want := AnnotationNodeID("java", annoName)
+	for _, e := range edges {
+		if e.Kind == graph.EdgeAnnotated && e.From == fromID && e.To == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestJavaTemporal_ActivityInterfaceAnnotationEdge(t *testing.T) {
+	src := []byte(`@ActivityInterface
+public interface OrderActivities {
+    void chargeCard(String id);
+    void shipOrder(String id);
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderActivities.java", src)
+	require.NoError(t, err)
+
+	ifaces := nodesOfKind(result.Nodes, graph.KindInterface)
+	require.Len(t, ifaces, 1)
+	iface := ifaces[0]
+	assert.Equal(t, "OrderActivities", iface.Name)
+
+	assert.True(t, hasAnnotationEdge(t, result.Edges, iface.ID, "ActivityInterface"),
+		"interface must carry an EdgeAnnotated edge to annotation::java::ActivityInterface")
+}
+
+func TestJavaTemporal_WorkflowInterfaceAnnotationEdge(t *testing.T) {
+	src := []byte(`@WorkflowInterface
+public interface OrderWorkflow {
+    void processOrder(String id);
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderWorkflow.java", src)
+	require.NoError(t, err)
+
+	ifaces := nodesOfKind(result.Nodes, graph.KindInterface)
+	require.Len(t, ifaces, 1)
+	assert.True(t, hasAnnotationEdge(t, result.Edges, ifaces[0].ID, "WorkflowInterface"))
+}
+
+func TestJavaTemporal_MethodLevelAnnotationsCarried(t *testing.T) {
+	src := []byte(`public class OrderWorkflowImpl {
+    @SignalMethod
+    public void cancel() {}
+
+    @QueryMethod
+    public String status() { return null; }
+
+    @UpdateMethod
+    public void retry() {}
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderWorkflowImpl.java", src)
+	require.NoError(t, err)
+
+	methods := nodesOfKind(result.Nodes, graph.KindMethod)
+	byName := map[string]*graph.Node{}
+	for _, m := range methods {
+		byName[m.Name] = m
+	}
+	require.Contains(t, byName, "cancel")
+	require.Contains(t, byName, "status")
+	require.Contains(t, byName, "retry")
+
+	assert.True(t, hasAnnotationEdge(t, result.Edges, byName["cancel"].ID, "SignalMethod"))
+	assert.True(t, hasAnnotationEdge(t, result.Edges, byName["status"].ID, "QueryMethod"))
+	assert.True(t, hasAnnotationEdge(t, result.Edges, byName["retry"].ID, "UpdateMethod"))
+}
+
+func TestJavaTemporal_ActivityMethodAnnotation(t *testing.T) {
+	src := []byte(`@ActivityInterface
+public interface OrderActivities {
+    @ActivityMethod(name = "ChargeCard")
+    void chargeCard(String id);
+}
+`)
+	e := NewJavaExtractor()
+	result, err := e.Extract("OrderActivities.java", src)
+	require.NoError(t, err)
+
+	// The method-level @ActivityMethod annotation must travel
+	// alongside the interface-level @ActivityInterface annotation —
+	// both edges are needed by the resolver, neither replaces the
+	// other.
+	methods := nodesOfKind(result.Nodes, graph.KindMethod)
+	require.Len(t, methods, 1)
+	method := methods[0]
+	assert.True(t, hasAnnotationEdge(t, result.Edges, method.ID, "ActivityMethod"),
+		"method-level @ActivityMethod must emit its own EdgeAnnotated edge")
+}

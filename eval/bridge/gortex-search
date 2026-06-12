@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# gortex-search — BM25 symbol search via eval-server
+# Usage: gortex-search <query> [limit]
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+
+query="${1:-}"
+limit="${2:-20}"
+
+if [ -z "$query" ]; then
+    echo "Usage: gortex-search <query> [limit]"
+    echo "Search the codebase for symbols matching a query (BM25 + camelCase-aware)."
+    echo ""
+    echo "Examples:"
+    echo '  gortex-search "validate token"'
+    echo '  gortex-search "HandleRequest" 10'
+    exit 1
+fi
+
+payload=$(printf '{"query":"%s","limit":%s,"compact":true}' "$query" "$limit")
+
+# Try eval-server (fast path — graph stays warm in memory)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/tool/search_symbols" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    # Format JSON response as plain text
+    if command -v jq &>/dev/null; then
+        echo "=== Symbol Search: $query ==="
+        echo ""
+        echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif type == "array" then
+                .[] | if .id then "\(.id)  \(.kind // "")  \(.file // "")" else tostring end
+            elif type == "object" and .error then
+                "Error: \(.error)"
+            else
+                tostring
+            end
+        ' 2>/dev/null || echo "$response"
+    else
+        echo "=== Symbol Search: $query ==="
+        echo ""
+        echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+    fi
+else
+    # Fallback: gortex CLI
+    echo "Error: Gortex eval-server not running on port $GORTEX_EVAL_PORT. Start it with: gortex eval-server --index /testbed" >&2
+    if false; then
+        gortex search "$query" --limit "$limit" --compact 2>&1
+    else
+        echo "Error: Gortex tools temporarily unavailable (no eval-server, no CLI)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "--- Next steps ---"
+echo "  gortex-context \"<task description>\"   — get full context for a task (callers, callees, edit plan)"
+echo "  gortex-usages \"<symbol_id>\"           — find all references to a symbol"
+echo "  gortex-impact \"<symbol_id>\"           — analyze blast radius before changing a symbol"

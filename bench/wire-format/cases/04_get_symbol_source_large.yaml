@@ -1,0 +1,15 @@
+tool: get_symbol_source
+description: one symbol with 80-line source body
+input: |
+  {
+    "id":"internal/indexer/indexer.go::Indexer.IndexCtx",
+    "kind":"method",
+    "name":"IndexCtx",
+    "file_path":"internal/indexer/indexer.go",
+    "start_line":116,
+    "end_line":193,
+    "from_line":113,
+    "signature":"func (i *Indexer) IndexCtx(ctx context.Context, root string) error",
+    "source":"func (i *Indexer) IndexCtx(ctx context.Context, root string) error {\n\treporter := progress.FromContext(ctx)\n\treporter.Stage(\"walking files\", 0)\n\tfiles, err := i.walker.Walk(root)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"walk %s: %w\", root, err)\n\t}\n\treporter.Stage(\"parsing\", 0)\n\tfor idx, f := range files {\n\t\tif idx%50 == 0 {\n\t\t\treporter.Tick(fmt.Sprintf(\"parsing %d/%d\", idx, len(files)))\n\t\t}\n\t\tparsed, err := i.parser.Parse(f)\n\t\tif err != nil {\n\t\t\ti.logger.Warn(\"parse failed\", zap.String(\"file\", f), zap.Error(err))\n\t\t\tcontinue\n\t\t}\n\t\tfor _, n := range parsed.Nodes {\n\t\t\ti.graph.AddNode(n)\n\t\t}\n\t\tfor _, e := range parsed.Edges {\n\t\t\ti.graph.AddEdge(e)\n\t\t}\n\t}\n\treporter.Stage(\"resolving references\", 0)\n\ti.resolver.Resolve(i.graph)\n\treporter.Stage(\"inferring interfaces\", 0)\n\ti.inferInterfaces()\n\treporter.Stage(\"semantic enrichment\", 0)\n\tif i.enricher != nil {\n\t\tif _, err := i.enricher.Enrich(ctx, i.graph); err != nil {\n\t\t\ti.logger.Warn(\"semantic enrich failed\", zap.Error(err))\n\t\t}\n\t}\n\treporter.Stage(\"building search index\", 0)\n\ti.searchIndex.Rebuild(i.graph)\n\treporter.Stage(\"extracting contracts\", 0)\n\ti.contractRegistry.Extract(i.graph)\n\treporter.Stage(\"upgrading search backend\", 0)\n\ti.searchIndex.MaybeUpgrade()\n\treporter.Stage(\"done\", 0)\n\treturn nil\n}",
+    "etag":"9d4f6a1c8e2b7f3e"
+  }

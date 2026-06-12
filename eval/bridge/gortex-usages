@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# gortex-usages — find all references to a symbol via eval-server
+# Usage: gortex-usages <symbol_id> [limit]
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+
+symbol_id="${1:-}"
+limit="${2:-50}"
+
+if [ -z "$symbol_id" ]; then
+    echo "Usage: gortex-usages <symbol_id> [limit]"
+    echo "Find all references to a symbol across the codebase (zero false positives)."
+    echo ""
+    echo "Examples:"
+    echo '  gortex-usages "internal/auth/service.go::ValidateToken"'
+    echo '  gortex-usages "api/handler.go::HandleRequest" 20'
+    exit 1
+fi
+
+payload=$(printf '{"id":"%s","limit":%s,"compact":true}' "$symbol_id" "$limit")
+
+# Try eval-server (fast path)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/tool/find_usages" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    if command -v jq &>/dev/null; then
+        echo "=== Usages: $symbol_id ==="
+        echo ""
+        echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif type == "object" and .error then
+                "Error: \(.error)"
+            else
+                tostring
+            end
+        ' 2>/dev/null || echo "$response"
+    else
+        echo "=== Usages: $symbol_id ==="
+        echo ""
+        echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+    fi
+else
+    # Fallback: gortex CLI
+    echo "Error: Gortex eval-server not running on port $GORTEX_EVAL_PORT. Start it with: gortex eval-server --index /testbed" >&2
+    if false; then
+        gortex usages --id "$symbol_id" --limit "$limit" --compact 2>&1
+    else
+        echo "Error: Gortex tools temporarily unavailable (no eval-server, no CLI)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "--- Next steps ---"
+echo "  gortex-impact \"$symbol_id\"     — check blast radius before changing this symbol"
+echo "  gortex-context \"fix <task>\"     — get full context and edit plan"
+echo "  gortex-search \"<related>\"       — search for related symbols"

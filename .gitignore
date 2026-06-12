@@ -1,0 +1,64 @@
+# Binary
+./gortex
+/gortex
+/gortex-linux
+/specs/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+__debug_bin*
+/debug/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+
+# Eval results (generated at runtime)
+eval/results/
+eval/scripts/
+eval/logs/
+
+internal_docs/
+
+# Ad-hoc bench/probe tooling — kept locally, not part of the repo.
+bench/all-tools-bench/
+bench/daemon-bench/
+bench/edge-diff/
+bench/multi-repo-bench/
+bench/node-diff/
+bench/store-bench/
+bench/unresolved-audit/
+bench/run-linux.sh
+bench/run-linux-rest.sh

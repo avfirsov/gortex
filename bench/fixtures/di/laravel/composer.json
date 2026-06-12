@@ -1,0 +1,8 @@
+{
+  "name": "gortex/di-laravel-fixture",
+  "type": "project",
+  "description": "Minimal Laravel fixture for Gortex DI recall — not installed.",
+  "require": {
+    "laravel/framework": "^11.0"
+  }
+}

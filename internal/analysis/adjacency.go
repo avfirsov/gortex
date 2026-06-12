@@ -1,0 +1,250 @@
+package analysis
+
+import (
+	"sort"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// AdjacencySnapshot is a compact, immutable CSR-style view of the
+// call / reference graph, built once per analysis pass and reused by
+// seeded random-walk queries so they never re-scan AllNodes / AllEdges.
+//
+// Only EdgeCalls and EdgeReferences participate — the same edge set
+// ComputePageRank walks — and each edge rides its graph.ProvenanceWeight
+// so a seeded walk attenuates over-represented LSP-dispatch fan-outs
+// identically to the global PageRank.
+//
+// Layout (forward adjacency, From -> To):
+//
+//   - ids[i]            the node ID at dense index i
+//   - offsets[i]..[i+1] the slice of out-neighbours of node i
+//   - neighbors[k]      dense index of the k-th out-neighbour
+//   - weights[k]        provenance weight of the edge to neighbors[k]
+//   - outWeight[i]      sum of weights of node i's out-edges
+//
+// The snapshot is read-only after construction; PersonalizedPageRank
+// allocates only its own score vectors, so concurrent walks over one
+// snapshot are safe without locking.
+type AdjacencySnapshot struct {
+	ids       []string
+	index     map[string]int
+	offsets   []int32
+	neighbors []int32
+	weights   []float64
+	outWeight []float64
+
+	// pkgRoots maps a package directory (the dir of a node's file path,
+	// ≈ a Go package) to a content hash of that package's contribution
+	// to the walk: every member node's stable ID plus its out-edges
+	// (neighbour IDs + weights). The hash is index-shift invariant — it
+	// uses string IDs, not dense indices — so a package whose subgraph
+	// did not change keeps the same root even when nodes are added or
+	// removed in OTHER packages. This is the per-package Merkle root the
+	// walk cache keys on, so only walks touching a changed package miss.
+	// Empty when the snapshot is empty.
+	pkgRoots map[string]uint64
+}
+
+// NodeCount returns the number of nodes in the snapshot.
+func (a *AdjacencySnapshot) NodeCount() int {
+	if a == nil {
+		return 0
+	}
+	return len(a.ids)
+}
+
+// EdgeCount returns the number of directed call / reference edges
+// captured in the snapshot.
+func (a *AdjacencySnapshot) EdgeCount() int {
+	if a == nil {
+		return 0
+	}
+	return len(a.neighbors)
+}
+
+// BuildAdjacencySnapshot constructs the CSR adjacency over the call /
+// reference graph. Nodes are densely indexed in sorted ID order so the
+// snapshot — and therefore every seeded walk over it — is deterministic
+// regardless of the backend's node / edge enumeration order. An edge
+// whose endpoint is not a real graph node (an unresolved or dangling
+// target) is skipped so the dense index stays consistent.
+func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
+	snap := &AdjacencySnapshot{index: map[string]int{}}
+	if g == nil {
+		return snap
+	}
+
+	nodes := g.AllNodes()
+	if len(nodes) == 0 {
+		return snap
+	}
+
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		ids = append(ids, n.ID)
+	}
+	sort.Strings(ids)
+	index := make(map[string]int, len(ids))
+	for i, id := range ids {
+		index[id] = i
+	}
+
+	// First pass: bucket out-edges per source so the CSR offsets can be
+	// laid out contiguously. Only call / reference edges with both
+	// endpoints in the dense index participate.
+	type link struct {
+		to int
+		w  float64
+	}
+	adj := make([][]link, len(ids))
+	for _, e := range g.AllEdges() {
+		if e == nil {
+			continue
+		}
+		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
+			continue
+		}
+		from, ok := index[e.From]
+		if !ok {
+			continue
+		}
+		to, ok := index[e.To]
+		if !ok {
+			continue
+		}
+		adj[from] = append(adj[from], link{to: to, w: graph.ProvenanceWeight(e)})
+	}
+
+	offsets := make([]int32, len(ids)+1)
+	var total int
+	for i := range adj {
+		offsets[i] = int32(total)
+		total += len(adj[i])
+	}
+	offsets[len(ids)] = int32(total)
+
+	neighbors := make([]int32, 0, total)
+	weights := make([]float64, 0, total)
+	outWeight := make([]float64, len(ids))
+	for i := range adj {
+		// Sort each node's out-neighbours by dense index so the CSR row
+		// order is deterministic (AllEdges order is backend-specific).
+		row := adj[i]
+		sort.Slice(row, func(a, b int) bool { return row[a].to < row[b].to })
+		for _, l := range row {
+			neighbors = append(neighbors, int32(l.to))
+			weights = append(weights, l.w)
+			outWeight[i] += l.w
+		}
+	}
+
+	snap.ids = ids
+	snap.index = index
+	snap.offsets = offsets
+	snap.neighbors = neighbors
+	snap.weights = weights
+	snap.outWeight = outWeight
+	snap.pkgRoots = computePackageRoots(ids, offsets, neighbors, weights)
+	return snap
+}
+
+// pprDefaultRestart is the restart probability a seeded walk uses when
+// the caller passes a non-positive value. 0.15 mirrors the canonical
+// 0.85 PageRank damping (restart = 1 - damping).
+const pprDefaultRestart = 0.15
+
+// pprIterations is fixed rather than convergence-tested: the graph is
+// small enough that the ranking order stabilises well within this many
+// power-iteration steps, and a fixed count keeps the result
+// deterministic and the cost bounded at O(iters * edges).
+const pprIterations = 40
+
+// PersonalizedPageRank runs a seeded random-walk-with-restart over the
+// snapshot. Restart mass returns to the seed set (not uniformly across
+// the graph), so the stationary distribution concentrates on nodes that
+// are reachable from the seeds along many short, high-provenance paths.
+//
+// restart is the per-step restart probability; a non-positive value
+// uses pprDefaultRestart. Score flows along an edge in proportion to
+// its weight / the source's out-weight — identical to ComputePageRank —
+// and dangling mass (a node with no out-edges) is returned to the seed
+// set so no probability leaks. The result maps node ID to its proximity
+// score; an empty map is returned when no seed resolves to a snapshot
+// node.
+func (a *AdjacencySnapshot) PersonalizedPageRank(seeds []string, restart float64) map[string]float64 {
+	if a == nil || len(a.ids) == 0 {
+		return map[string]float64{}
+	}
+	if restart <= 0 || restart >= 1 {
+		restart = pprDefaultRestart
+	}
+
+	n := len(a.ids)
+
+	// Restart distribution: uniform over the in-snapshot seeds. A seed
+	// absent from the snapshot contributes nothing.
+	seedIdx := make([]int, 0, len(seeds))
+	seen := make(map[int]bool, len(seeds))
+	for _, s := range seeds {
+		if i, ok := a.index[s]; ok && !seen[i] {
+			seen[i] = true
+			seedIdx = append(seedIdx, i)
+		}
+	}
+	if len(seedIdx) == 0 {
+		return map[string]float64{}
+	}
+	restartVec := make([]float64, n)
+	seedMass := 1.0 / float64(len(seedIdx))
+	for _, i := range seedIdx {
+		restartVec[i] = seedMass
+	}
+
+	// Initialise the walk at the seed distribution.
+	score := make([]float64, n)
+	copy(score, restartVec)
+
+	for iter := 0; iter < pprIterations; iter++ {
+		next := make([]float64, n)
+
+		// Push each node's score forward along its out-edges, weighted
+		// by w/outWeight. Dangling nodes pool their score and return it
+		// to the seed set, conserving total mass.
+		var dangling float64
+		for i := 0; i < n; i++ {
+			ow := a.outWeight[i]
+			if ow == 0 {
+				dangling += score[i]
+				continue
+			}
+			s := score[i]
+			if s == 0 {
+				continue
+			}
+			start, end := a.offsets[i], a.offsets[i+1]
+			for k := start; k < end; k++ {
+				next[a.neighbors[k]] += s * a.weights[k] / ow
+			}
+		}
+
+		// Combine the walk step, the restart, and the dangling pool.
+		// (1-restart) of the walked mass plus restart mass to the seeds;
+		// dangling mass also returns to the seeds so it never leaks.
+		for i := 0; i < n; i++ {
+			next[i] = (1-restart)*next[i] + (restart+(1-restart)*dangling)*restartVec[i]
+		}
+		score = next
+	}
+
+	out := make(map[string]float64, n)
+	for i := 0; i < n; i++ {
+		if score[i] != 0 {
+			out[a.ids[i]] = score[i]
+		}
+	}
+	return out
+}

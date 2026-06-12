@@ -1,0 +1,15 @@
+tool: analyze_hotspots
+description: 10 hotspot symbols ranked by score
+input: |
+  [
+    {"id":"internal/mcp/tools_coding.go::handleSmartContext","name":"handleSmartContext","path":"internal/mcp/tools_coding.go","line":1010,"fan_in":4,"fan_out":38,"cross_community":12,"score":87.4},
+    {"id":"internal/indexer/indexer.go::Indexer.Index","name":"Index","path":"internal/indexer/indexer.go","line":110,"fan_in":22,"fan_out":19,"cross_community":9,"score":81.3},
+    {"id":"internal/query/engine.go::Engine.GetCallChain","name":"GetCallChain","path":"internal/query/engine.go","line":298,"fan_in":18,"fan_out":6,"cross_community":7,"score":74.1},
+    {"id":"internal/graph/graph.go::Graph.AddNode","name":"AddNode","path":"internal/graph/graph.go","line":94,"fan_in":41,"fan_out":0,"cross_community":15,"score":70.6},
+    {"id":"internal/graph/graph.go::Graph.AddEdge","name":"AddEdge","path":"internal/graph/graph.go","line":128,"fan_in":38,"fan_out":0,"cross_community":14,"score":68.2},
+    {"id":"internal/mcp/server.go::NewServer","name":"NewServer","path":"internal/mcp/server.go","line":62,"fan_in":5,"fan_out":32,"cross_community":10,"score":66.8},
+    {"id":"internal/resolver/resolver.go::Resolver.Resolve","name":"Resolve","path":"internal/resolver/resolver.go","line":60,"fan_in":4,"fan_out":26,"cross_community":11,"score":63.1},
+    {"id":"internal/semantic/enricher.go::Enricher.Enrich","name":"Enrich","path":"internal/semantic/enricher.go","line":48,"fan_in":3,"fan_out":22,"cross_community":8,"score":58.7},
+    {"id":"internal/contracts/bind.go::Bridge","name":"Bridge","path":"internal/contracts/bind.go","line":33,"fan_in":6,"fan_out":18,"cross_community":9,"score":55.4},
+    {"id":"internal/daemon/server.go::Server.serve","name":"serve","path":"internal/daemon/server.go","line":122,"fan_in":2,"fan_out":17,"cross_community":6,"score":52.0}
+  ]

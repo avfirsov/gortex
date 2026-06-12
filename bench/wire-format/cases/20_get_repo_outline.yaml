@@ -1,0 +1,10 @@
+tool: get_repo_outline
+description: single-call repo overview
+input: |
+  {
+    "languages":[{"name":"go","nodes":35473},{"name":"typescript","nodes":25688},{"name":"c","nodes":5509},{"name":"markdown","nodes":5269},{"name":"hcl","nodes":4120}],
+    "communities":[{"id":0,"name":"core","size":1205,"modularity":0.42},{"id":1,"name":"daemon","size":812,"modularity":0.39},{"id":2,"name":"contracts","size":603,"modularity":0.36},{"id":3,"name":"mcp","size":588,"modularity":0.34},{"id":4,"name":"indexer","size":512,"modularity":0.32}],
+    "hotspots":[{"id":"internal/graph/graph.go::Graph.AddNode","score":70.6},{"id":"internal/graph/graph.go::Graph.AddEdge","score":68.2},{"id":"internal/mcp/server.go::NewServer","score":66.8}],
+    "most_imported":["internal/graph/graph.go","internal/graph/node.go","internal/config/config.go"],
+    "entry_points":["cmd/gortex/main.go::main"]
+  }

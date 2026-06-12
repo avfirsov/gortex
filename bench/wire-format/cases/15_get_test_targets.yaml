@@ -1,0 +1,13 @@
+tool: get_test_targets
+description: tests that cover a set of changed symbols
+input: |
+  [
+    {"test_file":"internal/mcp/gcx_test.go","test_symbol":"TestEncodeSearchSymbols_HeaderAndRows","covers":["internal/mcp/gcx.go::encodeSearchSymbols"]},
+    {"test_file":"internal/mcp/gcx_test.go","test_symbol":"TestEncodeGetSymbolSource_EmbeddedNewlinesRoundTrip","covers":["internal/mcp/gcx.go::encodeGetSymbolSource"]},
+    {"test_file":"internal/mcp/gcx_test.go","test_symbol":"TestEncodeBatchSymbols_IncludeSource","covers":["internal/mcp/gcx.go::encodeBatchSymbols"]},
+    {"test_file":"internal/mcp/gcx_test.go","test_symbol":"TestEncodeSubGraph_NodesAndEdgesSections","covers":["internal/mcp/gcx.go::encodeSubGraph"]},
+    {"test_file":"internal/mcp/gcx_test.go","test_symbol":"TestEncodeFindUsages_OneRowPerEdge","covers":["internal/mcp/gcx.go::encodeFindUsages"]},
+    {"test_file":"internal/wire/wire_test.go","test_symbol":"TestEncoder_WritesHeaderThenRows","covers":["internal/wire/encoder.go::NewEncoder","internal/wire/encoder.go::Encoder.WriteRow"]},
+    {"test_file":"internal/wire/wire_test.go","test_symbol":"TestDecoder_ParsesHeaderAndRows","covers":["internal/wire/decoder.go::NewDecoder","internal/wire/decoder.go::Decoder.Header"]},
+    {"test_file":"internal/wire/generic_test.go","test_symbol":"TestEncodeAny_RowList","covers":["internal/wire/generic.go::EncodeAny"]}
+  ]

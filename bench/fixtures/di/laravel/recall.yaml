@@ -1,0 +1,79 @@
+# Laravel DI-recall fixture
+#
+# Two DI gaps matter in real-world Laravel code:
+#   1. Controller middleware (`$this->middleware('auth')` in the ctor,
+#      optionally filtered with ->only([...]) / ->except([...])).
+#      Same decorator-dispatch shape as NestJS @UseGuards / Rails
+#      before_action / Phoenix plug. Framework invokes middleware's
+#      handle() before the action; no explicit call site.
+#   2. Service provider bindings (`$this->app->bind(Interface::class,
+#      Impl::class)` and ->singleton(...)). Container-registered
+#      interface-to-implementation or token-to-factory mappings —
+#      same shape as NestJS useClass / Spring @Bean.
+name: gortex-laravel-di
+cases:
+
+  # exact
+  - id: exact-UserController
+    tier: exact
+    query: UserController
+    expected: [app/Http/Controllers/UserController.php::UserController]
+  - id: exact-UserRepository
+    tier: exact
+    query: UserRepository
+    expected: [app/Repositories/UserRepository.php::UserRepository]
+  - id: exact-EloquentUserRepository
+    tier: exact
+    query: EloquentUserRepository
+    expected: [app/Repositories/EloquentUserRepository.php::EloquentUserRepository]
+  - id: exact-AuthenticateMiddleware
+    tier: exact
+    query: AuthenticateMiddleware
+    expected: [app/Http/Middleware/AuthenticateMiddleware.php::AuthenticateMiddleware]
+
+  # di — typed constructor injection. Should work via PHP type system
+  # if the extractor captures constructor param types.
+  - id: di-call_chain-index
+    tier: di
+    query: "call_chain:app/Http/Controllers/UserController.php::UserController.index"
+    expected:
+      - app/Repositories/UserRepository.php::UserRepository.all
+
+  # di_gap: middleware dispatch
+  - id: di_gap-callers-AuthenticateMiddleware-handle
+    tier: di_gap
+    query: "callers:app/Http/Middleware/AuthenticateMiddleware.php::AuthenticateMiddleware.handle"
+    expected:
+      - app/Http/Controllers/UserController.php::UserController.index
+      - app/Http/Controllers/UserController.php::UserController.show
+      - app/Http/Controllers/UserController.php::UserController.destroy
+
+  # Admin middleware is only: ['destroy'] — just one action binds it.
+  - id: di_gap-callers-AdminMiddleware-handle
+    tier: di_gap
+    query: "callers:app/Http/Middleware/AdminMiddleware.php::AdminMiddleware.handle"
+    expected:
+      - app/Http/Controllers/UserController.php::UserController.destroy
+
+  - id: di_gap-call_chain-UserController-show
+    tier: di_gap
+    query: "call_chain:app/Http/Controllers/UserController.php::UserController.show"
+    expected:
+      - app/Http/Middleware/AuthenticateMiddleware.php::AuthenticateMiddleware.handle
+
+  # di_gap: service provider bind(Interface, Impl)
+  # $this->app->bind(UserRepository::class, EloquentUserRepository::class)
+  # binds the interface to the impl. usages:UserRepository should
+  # include AppServiceProvider as the binding site.
+  - id: di_gap-usages-UserRepository
+    tier: di_gap
+    query: "usages:app/Repositories/UserRepository.php::UserRepository"
+    expected:
+      - app/Providers/AppServiceProvider.php::AppServiceProvider
+
+  # singleton binding — Clock is bound by a factory closure.
+  - id: di_gap-usages-Clock
+    tier: di_gap
+    query: "usages:app/Services/Clock.php::Clock"
+    expected:
+      - app/Providers/AppServiceProvider.php::AppServiceProvider

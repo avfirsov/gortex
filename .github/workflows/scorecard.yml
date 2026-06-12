@@ -1,0 +1,64 @@
+name: Scorecard supply-chain security
+
+# OpenSSF Scorecard — automated grading across ~18 security dimensions
+# (branch protection, pinned deps, SAST, code review, signed releases, etc.).
+# Runs weekly + on push to main. Publishes results as SARIF to the Security
+# tab and to the public api.scorecard.dev aggregator that feeds the badge
+# in README.md.
+#
+# Template source: https://github.com/ossf/scorecard-action
+
+on:
+  branch_protection_rule:
+  # Weekly schedule keeps the badge fresh and surfaces drift (new
+  # unpinned deps, missing branch protection changes, etc.)
+  schedule:
+    - cron: '32 5 * * 1'
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to upload SARIF results to the Security tab.
+      security-events: write
+      # Needed to publish results to the public Scorecard API so the
+      # shield badge in README.md resolves.
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # publish_results: true is what makes the public badge work.
+          # Requires the repo to be public; fails silently otherwise.
+          publish_results: true
+
+      # Upload to the Actions artifact store so the results are viewable
+      # even before the SARIF lands in the Security tab (GitHub batches
+      # SARIF ingestion on a ~15min cadence).
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      # SARIF into the Security tab so findings show up per-PR.
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          sarif_file: results.sarif

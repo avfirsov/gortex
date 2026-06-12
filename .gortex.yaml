@@ -1,0 +1,45 @@
+index:
+  languages:
+    - go
+    - typescript
+    - python
+    - rust
+    - java
+  exclude:
+    - "vendor/**"
+    - "node_modules/**"
+    - "**/*_test.go"
+    - "dist/**"
+    - "*.pb.go"
+    - ".venv"
+    - "venv"
+    - "env"
+    - ".pyenv"
+    - ".git"
+    - ".claude/worktrees/**"
+    - "results/**"
+  workers: 8
+
+watch:
+  enabled: false
+  paths:
+    - "."
+  debounce_ms: 150
+  exclude:
+    - "**/*.tmp"
+    - "**/*.swp"
+    - "**/.git/**"
+    - "**/node_modules/**"
+    - "**/.next/**"
+    - "**/.venv/**"
+    - "venv"
+    - "env"
+    - ".pyenv"
+
+query:
+  default_depth: 3
+  max_depth: 10
+
+mcp:
+  transport: stdio
+  port: 8765

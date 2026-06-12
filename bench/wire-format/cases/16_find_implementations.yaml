@@ -1,0 +1,11 @@
+tool: find_implementations
+description: 6 implementations of an interface
+input: |
+  [
+    {"id":"internal/persistence/file_store.go::FileStore","kind":"type","name":"FileStore","file_path":"internal/persistence/file_store.go","start_line":22},
+    {"id":"internal/persistence/memory_store.go::MemoryStore","kind":"type","name":"MemoryStore","file_path":"internal/persistence/memory_store.go","start_line":14},
+    {"id":"internal/persistence/nullstore.go::NullStore","kind":"type","name":"NullStore","file_path":"internal/persistence/nullstore.go","start_line":8},
+    {"id":"internal/daemon/snapshot_store.go::SnapshotStore","kind":"type","name":"SnapshotStore","file_path":"internal/daemon/snapshot_store.go","start_line":34},
+    {"id":"internal/persistence/sqlite_store.go::SQLiteStore","kind":"type","name":"SQLiteStore","file_path":"internal/persistence/sqlite_store.go","start_line":42},
+    {"id":"internal/eval/fixture_store.go::FixtureStore","kind":"type","name":"FixtureStore","file_path":"internal/eval/fixture_store.go","start_line":18}
+  ]

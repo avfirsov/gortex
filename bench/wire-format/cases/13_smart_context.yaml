@@ -1,0 +1,19 @@
+tool: smart_context
+description: smart_context response with 10 ranked symbols
+input: |
+  {
+    "task": "add a new MCP tool called list_files that returns paths in the index",
+    "symbols": [
+      {"id":"internal/mcp/tools_core.go::handleSearchSymbols","kind":"method","name":"handleSearchSymbols","path":"internal/mcp/tools_core.go","line":539,"score":0.94,"reason":"similar handler pattern"},
+      {"id":"internal/mcp/server.go::NewServer","kind":"function","name":"NewServer","path":"internal/mcp/server.go","line":62,"score":0.88,"reason":"constructor for server"},
+      {"id":"internal/mcp/tools_core.go::registerCoreTools","kind":"method","name":"registerCoreTools","path":"internal/mcp/tools_core.go","line":307,"score":0.87,"reason":"where tools are registered"},
+      {"id":"internal/graph/graph.go::Graph.AllNodes","kind":"method","name":"AllNodes","path":"internal/graph/graph.go","line":240,"score":0.85,"reason":"iterates all nodes"},
+      {"id":"internal/indexer/indexer.go::Indexer.Files","kind":"method","name":"Files","path":"internal/indexer/indexer.go","line":420,"score":0.82,"reason":"returns file list"},
+      {"id":"internal/mcp/server.go::Server","kind":"type","name":"Server","path":"internal/mcp/server.go","line":36,"score":0.80,"reason":"server type holding engine"},
+      {"id":"internal/mcp/session_ctx.go::sessionFor","kind":"function","name":"sessionFor","path":"internal/mcp/session_ctx.go","line":42,"score":0.70,"reason":"session state accessor"},
+      {"id":"internal/mcp/etag.go::computeETag","kind":"function","name":"computeETag","path":"internal/mcp/etag.go","line":22,"score":0.65,"reason":"response caching"},
+      {"id":"internal/graph/node.go::Node","kind":"type","name":"Node","path":"internal/graph/node.go","line":23,"score":0.62,"reason":"symbol node type"},
+      {"id":"internal/query/engine.go::Engine","kind":"type","name":"Engine","path":"internal/query/engine.go","line":30,"score":0.60,"reason":"query engine"}
+    ],
+    "total": 10
+  }

@@ -1,0 +1,15 @@
+tool: get_symbol_source
+description: one symbol with 20-line source body
+input: |
+  {
+    "id":"internal/graph/graph.go::Graph.AddNode",
+    "kind":"method",
+    "name":"AddNode",
+    "file_path":"internal/graph/graph.go",
+    "start_line":94,
+    "end_line":113,
+    "from_line":91,
+    "signature":"func (g *Graph) AddNode(n *Node)",
+    "source":"func (g *Graph) AddNode(n *Node) {\n\tg.mu.Lock()\n\tdefer g.mu.Unlock()\n\tif n == nil {\n\t\treturn\n\t}\n\tif existing, ok := g.nodes[n.ID]; ok {\n\t\tif existing.StartLine == n.StartLine {\n\t\t\treturn\n\t\t}\n\t}\n\tg.nodes[n.ID] = n\n\tif g.byFile == nil {\n\t\tg.byFile = map[string][]*Node{}\n\t}\n\tg.byFile[n.FilePath] = append(g.byFile[n.FilePath], n)\n\tif g.byName == nil {\n\t\tg.byName = map[string][]*Node{}\n\t}\n\tg.byName[n.Name] = append(g.byName[n.Name], n)\n}",
+    "etag":"7c3e1a9f8b2d4e6a"
+  }

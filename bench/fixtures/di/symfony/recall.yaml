@@ -1,0 +1,40 @@
+# Symfony attribute-based DI fixture
+#
+# Symfony's PHP-native DI shape is PHP 8 attributes: #[AsEventListener]
+# binds a method (or class) to an event, #[Route] maps a method to an
+# HTTP route (already handled by the HTTPExtractor), #[Autowire]
+# injects a specific service. This fixture focuses on event-listener
+# attributes — the clearest DI-as-attribute case.
+name: gortex-symfony-di
+cases:
+
+  # exact
+  - id: exact-UserCreated
+    tier: exact
+    query: UserCreated
+    expected: [src/Event/UserCreated.php::UserCreated]
+  - id: exact-WelcomeEmailListener
+    tier: exact
+    query: WelcomeEmailListener
+    expected: [src/EventListener/WelcomeEmailListener.php::WelcomeEmailListener]
+  - id: exact-AuditListener
+    tier: exact
+    query: AuditListener
+    expected: [src/EventListener/AuditListener.php::AuditListener]
+
+  # di_gap: #[AsEventListener] binds listener to event. Without
+  # attribute extraction, find_usages(UserCreated) misses the
+  # listener classes entirely — only the `new UserCreated(...)`
+  # construction site in the controller shows up.
+  - id: di_gap-usages-UserCreated
+    tier: di_gap
+    query: "usages:src/Event/UserCreated.php::UserCreated"
+    expected:
+      - src/EventListener/WelcomeEmailListener.php::WelcomeEmailListener.onCreated
+      - src/EventListener/AuditListener.php::AuditListener
+
+  - id: di_gap-usages-UserDeleted
+    tier: di_gap
+    query: "usages:src/Event/UserDeleted.php::UserDeleted"
+    expected:
+      - src/EventListener/WelcomeEmailListener.php::WelcomeEmailListener.onDeleted

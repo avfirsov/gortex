@@ -1,0 +1,8 @@
+tool: analyze_cycles
+description: three cycles detected by Tarjan's SCC
+input: |
+  [
+    {"size":3,"severity":"medium","nodes":["a.go::A","b.go::B","c.go::C"]},
+    {"size":2,"severity":"low","nodes":["d.go::D","e.go::E"]},
+    {"size":5,"severity":"high","nodes":["x.go::X1","y.go::Y1","z.go::Z1","x.go::X2","y.go::Y2"]}
+  ]

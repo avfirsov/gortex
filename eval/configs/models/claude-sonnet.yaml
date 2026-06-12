@@ -1,0 +1,9 @@
+# Claude Sonnet 4 — strong all-around model
+# Via Anthropic directly (set ANTHROPIC_API_KEY in .env)
+# For OpenRouter, change to: openrouter/anthropic/claude-sonnet-4
+model:
+  model_name: 'anthropic/claude-sonnet-4-20250514'
+  cost_tracking: 'ignore_errors'
+  model_kwargs:
+    max_tokens: 16384
+    temperature: 0

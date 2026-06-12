@@ -1,0 +1,695 @@
+package languages
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+	"github.com/zzet/gortex/internal/parser/tsitter/dart"
+)
+
+// DartExtractor extracts Dart source files.
+type DartExtractor struct {
+	lang *sitter.Language
+}
+
+func NewDartExtractor() *DartExtractor {
+	return &DartExtractor{lang: dart.GetLanguage()}
+}
+
+func (e *DartExtractor) Language() string     { return "dart" }
+func (e *DartExtractor) Extensions() []string { return []string{".dart"} }
+
+func (e *DartExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
+	tree, err := parser.ParseFile(src, e.lang)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	result := &parser.ExtractionResult{}
+
+	fileNode := &graph.Node{
+		ID: filePath, Kind: graph.KindFile, Name: filePath,
+		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
+		Language: "dart",
+	}
+	result.Nodes = append(result.Nodes, fileNode)
+
+	seen := make(map[string]bool)
+
+	// Classes, enums, mixins, extensions — walk the tree to distinguish types.
+	e.extractTypes(root, src, filePath, fileNode, result, seen)
+
+	// Methods inside class/mixin/enum/extension bodies.
+	e.extractMethods(root, src, filePath, fileNode, result, seen)
+
+	// Top-level functions (function_signature + function_body at program level).
+	e.extractTopLevelFunctions(root, src, filePath, fileNode, result, seen)
+
+	// Top-level variables.
+	e.extractTopLevelVariables(root, src, filePath, fileNode, result, seen)
+
+	// Imports — also returns the alias map (`import 'pkg:foo/bar.dart'
+	// as f;` → "f" → "package:foo/bar.dart") so the call walker can
+	// attribute alias-prefixed calls (`f.method()`) to the right URI.
+	imports := e.extractImports(root, src, filePath, fileNode, result)
+
+	// Call sites.
+	e.extractCalls(root, src, filePath, result, imports)
+
+	return result, nil
+}
+
+// extractTypes walks the root for class_definition, enum_declaration, mixin_declaration, extension_declaration.
+func (e *DartExtractor) extractTypes(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	walkNodes(root, func(node *sitter.Node) {
+		var name string
+		var kind graph.NodeKind
+
+		switch node.Type() {
+		case "class_definition":
+			nameNode := node.ChildByFieldName("name")
+			if nameNode == nil {
+				return
+			}
+			name = nameNode.Content(src)
+			kind = graph.KindType
+
+			// Check for abstract interface class → KindInterface.
+			if e.hasChildType(node, "abstract") && e.hasChildType(node, "interface") {
+				kind = graph.KindInterface
+			}
+
+		case "enum_declaration":
+			nameNode := node.ChildByFieldName("name")
+			if nameNode == nil {
+				return
+			}
+			name = nameNode.Content(src)
+			kind = graph.KindType
+
+		case "mixin_declaration":
+			// mixin_declaration has identifier as a child, not a named field.
+			name = e.findChildIdentifier(node, src)
+			if name == "" {
+				return
+			}
+			kind = graph.KindType
+
+		case "extension_declaration":
+			nameNode := node.ChildByFieldName("name")
+			if nameNode == nil {
+				// Anonymous extension — skip.
+				return
+			}
+			name = nameNode.Content(src)
+			kind = graph.KindType
+
+		default:
+			return
+		}
+
+		id := filePath + "::" + name
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+
+		startLine := int(node.StartPoint().Row) + 1
+		endLine := int(node.EndPoint().Row) + 1
+		meta := map[string]any{"visibility": VisibilityByUnderscore(name)}
+		if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangSlashSlash); doc != "" {
+			meta["doc"] = doc
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: kind, Name: name,
+			FilePath: filePath, StartLine: startLine, EndLine: endLine,
+			Language: "dart",
+			Meta:     meta,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+		})
+	})
+}
+
+// extractMethods finds method_signature nodes inside class_body, extension_body, enum_body.
+func (e *DartExtractor) extractMethods(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	// Collect type body ranges for ownership detection.
+	typeBodyRanges := e.collectTypeBodyRanges(root, src)
+
+	walkNodes(root, func(node *sitter.Node) {
+		if node.Type() != "method_signature" {
+			return
+		}
+
+		// Must be inside a body (class_body, extension_body, enum_body).
+		parent := node.Parent()
+		if parent == nil {
+			return
+		}
+		parentType := parent.Type()
+		if parentType != "class_body" && parentType != "extension_body" && parentType != "enum_body" {
+			return
+		}
+
+		name := e.extractMethodName(node, src)
+		if name == "" {
+			return
+		}
+
+		// Find enclosing type name.
+		typeName := ""
+		startLine := int(node.StartPoint().Row)
+		if tn, ok := e.findEnclosingType(typeBodyRanges, startLine); ok {
+			typeName = tn
+		}
+
+		methodID := filePath + "::" + typeName + "." + name
+		if seen[methodID] {
+			methodID = filePath + "::" + typeName + "." + name + "_L" + fmt.Sprint(startLine+1)
+		}
+		if seen[methodID] {
+			return
+		}
+		seen[methodID] = true
+		seen[filePath+"::_method_L"+fmt.Sprint(startLine+1)] = true
+
+		// Dart's tree-sitter grammar splits a method into a leading
+		// method_signature node (declaration line) and a following
+		// function_body sibling that carries the `{ ... }` block.
+		// Using method_signature.EndPoint alone makes every method
+		// one line long and breaks downstream tooling that wants to
+		// read the body (source viewer, shape extractor,
+		// brace-balancing fallbacks, coverage). Stretch EndLine to
+		// cover the adjacent function_body when present.
+		endLine := int(node.EndPoint().Row)
+		if body := nextDartFunctionBody(node); body != nil {
+			endLine = int(body.EndPoint().Row)
+		}
+
+		methodMeta := map[string]any{
+			"receiver":   typeName,
+			"visibility": VisibilityByUnderscore(name),
+		}
+		if doc := ExtractDocAbove(src, startLine, DocLangSlashSlash); doc != "" {
+			methodMeta["doc"] = doc
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: methodID, Kind: graph.KindMethod, Name: name,
+			FilePath: filePath, StartLine: startLine + 1, EndLine: endLine + 1,
+			Language: "dart",
+			Meta:     methodMeta,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: methodID, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine + 1,
+		})
+		if typeName != "" {
+			typeID := filePath + "::" + typeName
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: methodID, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine + 1,
+			})
+		}
+	})
+}
+
+// nextDartFunctionBody returns the function_body sibling that follows
+// a method_signature / function_signature node, walking through
+// immediate siblings (the Dart grammar occasionally interposes
+// whitespace / comment nodes between them). Returns nil when the
+// method is abstract or declared with `=>` without a brace block.
+func nextDartFunctionBody(sig *sitter.Node) *sitter.Node {
+	for s := sig.NextSibling(); s != nil; s = s.NextSibling() {
+		if s.Type() == "function_body" {
+			return s
+		}
+		// Stop if we've walked past the declaration grouping — the
+		// next signature wipes any chance of finding "this" one's
+		// body.
+		if s.Type() == "method_signature" || s.Type() == "function_signature" {
+			return nil
+		}
+	}
+	return nil
+}
+
+// extractTopLevelFunctions finds function_signature nodes that are direct children of program
+// (followed by function_body).
+func (e *DartExtractor) extractTopLevelFunctions(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	for i := 0; i < int(root.ChildCount()); i++ {
+		child := root.Child(i)
+		if child.Type() != "function_signature" {
+			continue
+		}
+		nameNode := child.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		startLine := int(child.StartPoint().Row) + 1
+
+		// Check if next sibling is function_body to get end line.
+		endLine := int(child.EndPoint().Row) + 1
+		if i+1 < int(root.ChildCount()) {
+			next := root.Child(i + 1)
+			if next.Type() == "function_body" {
+				endLine = int(next.EndPoint().Row) + 1
+			}
+		}
+
+		id := filePath + "::" + name
+		if seen[id] {
+			id = filePath + "::" + name + "_L" + fmt.Sprint(startLine)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		fnMeta := map[string]any{"visibility": VisibilityByUnderscore(name)}
+		if doc := ExtractDocAbove(src, startLine-1, DocLangSlashSlash); doc != "" {
+			fnMeta["doc"] = doc
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: name,
+			FilePath: filePath, StartLine: startLine, EndLine: endLine,
+			Language: "dart",
+			Meta:     fnMeta,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+		})
+	}
+}
+
+// extractTopLevelVariables finds top-level initialized_variable_definition and
+// static_final_declaration_list nodes at program level.
+func (e *DartExtractor) extractTopLevelVariables(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	for i := 0; i < int(root.ChildCount()); i++ {
+		child := root.Child(i)
+		switch child.Type() {
+		case "initialized_variable_definition":
+			nameNode := child.ChildByFieldName("name")
+			if nameNode == nil {
+				continue
+			}
+			name := nameNode.Content(src)
+			startLine := int(child.StartPoint().Row) + 1
+			id := filePath + "::" + name
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			result.Nodes = append(result.Nodes, &graph.Node{
+				ID: id, Kind: graph.KindVariable, Name: name,
+				FilePath: filePath, StartLine: startLine, EndLine: int(child.EndPoint().Row) + 1,
+				Language: "dart",
+			})
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+			})
+
+		case "static_final_declaration_list":
+			// Walk children for static_final_declaration nodes.
+			for j := 0; j < int(child.ChildCount()); j++ {
+				decl := child.Child(j)
+				if decl.Type() != "static_final_declaration" {
+					continue
+				}
+				name := e.findChildIdentifier(decl, src)
+				if name == "" {
+					continue
+				}
+				startLine := int(decl.StartPoint().Row) + 1
+				id := filePath + "::" + name
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				result.Nodes = append(result.Nodes, &graph.Node{
+					ID: id, Kind: graph.KindVariable, Name: name,
+					FilePath: filePath, StartLine: startLine, EndLine: int(decl.EndPoint().Row) + 1,
+					Language: "dart",
+				})
+				result.Edges = append(result.Edges, &graph.Edge{
+					From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+				})
+			}
+		}
+	}
+}
+
+// extractImports walks `import_or_export` nodes, emits the import
+// edge, and returns the per-file alias map captured from `as
+// <alias>` clauses. The map is consumed by `extractCalls` so calls
+// like `f.method(args)` (where `f` was bound by `import '…' as f;`)
+// attribute to the originating URI rather than landing as the
+// unresolved-method fallback.
+func (e *DartExtractor) extractImports(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult,
+) map[string]string {
+	imports := map[string]string{}
+	walkNodes(root, func(node *sitter.Node) {
+		if node.Type() != "import_or_export" {
+			return
+		}
+
+		text := node.Content(src)
+		uri := extractDartImportURI(text)
+		if uri == "" {
+			return
+		}
+
+		startLine := int(node.StartPoint().Row) + 1
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: "unresolved::import::" + uri,
+			Kind: graph.EdgeImports, FilePath: filePath, Line: startLine,
+		})
+
+		if alias := extractDartImportAlias(text); alias != "" {
+			// Re-binding the same alias to two different URIs in
+			// one file would be a Dart compile error; keep
+			// last-write-wins so a freshly-edited file with a
+			// half-typed import doesn't poison earlier state.
+			imports[alias] = uri
+		}
+	})
+	return imports
+}
+
+// extractCalls finds function/method call sites and emits EdgeCalls
+// edges to the resolver-stub target.
+//
+// Dart's tree-sitter grammar exposes both a flat `bareCall()` and a
+// chained `fl.runApp()` as siblings under the surrounding scope:
+//
+//	bareCall():
+//	  identifier "bareCall"
+//	  selector
+//	    argument_part(...)
+//
+//	fl.runApp():
+//	  identifier "fl"
+//	  selector
+//	    unconditional_assignable_selector
+//	      "."
+//	      identifier "runApp"
+//	  selector
+//	    argument_part(...)
+//
+// We anchor on the leading identifier (the one that is NOT itself a
+// child of a selector / unconditional_assignable_selector) and scan
+// forward through `selector` siblings, collecting `.method`
+// segments until a selector with `argument_part` confirms the
+// call. The trailing-most identifier is the call name; the leading
+// identifier is the receiver. When the receiver matches an import
+// alias the edge attributes to `unresolved::extern::<uri>::<name>`
+// so the resolver-side module-attribution pass can land it on a
+// KindModule; otherwise we fall back to the legacy name-only stub.
+func (e *DartExtractor) extractCalls(
+	root *sitter.Node, src []byte, filePath string,
+	result *parser.ExtractionResult,
+	imports map[string]string,
+) {
+	funcRanges := buildFuncRanges(result)
+
+	walkNodes(root, func(node *sitter.Node) {
+		if node.Type() != "identifier" {
+			return
+		}
+		// Skip identifiers that live inside a selector chain; the
+		// chain is reconstructed once from the leading identifier
+		// below. Without this guard we would emit duplicate
+		// edges (one per identifier in the chain).
+		if p := node.Parent(); p != nil {
+			switch p.Type() {
+			case "unconditional_assignable_selector",
+				"conditional_assignable_selector",
+				"selector":
+				return
+			}
+		}
+
+		methodChain := []string{node.Content(src)}
+		isCall := false
+		for sib := node.NextSibling(); sib != nil && !isCall; sib = sib.NextSibling() {
+			if sib.Type() != "selector" {
+				break
+			}
+			for j := 0; j < int(sib.ChildCount()); j++ {
+				child := sib.Child(j)
+				switch child.Type() {
+				case "argument_part", "arguments":
+					isCall = true
+				case "unconditional_assignable_selector",
+					"conditional_assignable_selector":
+					if id := firstIdentifierChild(child); id != nil {
+						methodChain = append(methodChain, id.Content(src))
+					}
+				}
+			}
+		}
+		if !isCall {
+			return
+		}
+
+		line := int(node.StartPoint().Row) + 1
+		callerID := findEnclosingFunc(funcRanges, line)
+		if callerID == "" {
+			return
+		}
+
+		callName := methodChain[len(methodChain)-1]
+		leadingReceiver := ""
+		if len(methodChain) > 1 {
+			leadingReceiver = methodChain[0]
+		}
+
+		target := "unresolved::*." + callName
+		if leadingReceiver != "" {
+			if uri, ok := imports[leadingReceiver]; ok {
+				target = "unresolved::extern::" + uri + "::" + callName
+			}
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: target,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+		})
+	})
+}
+
+// firstIdentifierChild returns the first direct child of node whose
+// type is "identifier", or nil. Used to pull the method name out of
+// a Dart selector wrapper.
+func firstIdentifierChild(node *sitter.Node) *sitter.Node {
+	if node == nil {
+		return nil
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		if c != nil && c.Type() == "identifier" {
+			return c
+		}
+	}
+	return nil
+}
+
+// --- helpers ---
+
+func (e *DartExtractor) hasChildType(node *sitter.Node, typeName string) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		if node.Child(i).Type() == typeName {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *DartExtractor) findChildIdentifier(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "identifier" {
+			return child.Content(src)
+		}
+	}
+	return ""
+}
+
+// extractMethodName extracts the name from a method_signature node.
+// method_signature wraps function_signature, getter_signature, setter_signature,
+// constructor_signature, operator_signature, factory_constructor_signature.
+func (e *DartExtractor) extractMethodName(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "function_signature":
+			nameNode := child.ChildByFieldName("name")
+			if nameNode != nil {
+				return nameNode.Content(src)
+			}
+		case "getter_signature":
+			nameNode := child.ChildByFieldName("name")
+			if nameNode != nil {
+				return nameNode.Content(src)
+			}
+		case "setter_signature":
+			nameNode := child.ChildByFieldName("name")
+			if nameNode != nil {
+				return "set " + nameNode.Content(src)
+			}
+		case "constructor_signature":
+			nameNode := child.ChildByFieldName("name")
+			if nameNode != nil {
+				return nameNode.Content(src)
+			}
+		case "factory_constructor_signature":
+			return e.findChildIdentifier(child, src)
+		case "operator_signature":
+			// operator + binary_operator child
+			for j := 0; j < int(child.ChildCount()); j++ {
+				c := child.Child(j)
+				if c.Type() == "binary_operator" || c.Type() == "tilde_operator" {
+					return "operator " + strings.TrimSpace(c.Content(src))
+				}
+			}
+		}
+	}
+	return ""
+}
+
+type dartTypeRange struct {
+	typeName  string
+	startLine int // 0-based
+	endLine   int // 0-based
+}
+
+func (e *DartExtractor) collectTypeBodyRanges(root *sitter.Node, src []byte) []dartTypeRange {
+	var ranges []dartTypeRange
+	walkNodes(root, func(node *sitter.Node) {
+		var name string
+		switch node.Type() {
+		case "class_definition":
+			n := node.ChildByFieldName("name")
+			if n != nil {
+				name = n.Content(src)
+			}
+		case "enum_declaration":
+			n := node.ChildByFieldName("name")
+			if n != nil {
+				name = n.Content(src)
+			}
+		case "mixin_declaration":
+			name = e.findChildIdentifier(node, src)
+		case "extension_declaration":
+			n := node.ChildByFieldName("name")
+			if n != nil {
+				name = n.Content(src)
+			}
+		default:
+			return
+		}
+		if name == "" {
+			return
+		}
+		ranges = append(ranges, dartTypeRange{
+			typeName:  name,
+			startLine: int(node.StartPoint().Row),
+			endLine:   int(node.EndPoint().Row),
+		})
+	})
+	return ranges
+}
+
+func (e *DartExtractor) findEnclosingType(ranges []dartTypeRange, line int) (string, bool) {
+	best := ""
+	bestSize := int(^uint(0) >> 1)
+	for _, r := range ranges {
+		if line >= r.startLine && line <= r.endLine {
+			size := r.endLine - r.startLine
+			if size < bestSize {
+				bestSize = size
+				best = r.typeName
+			}
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
+}
+
+// extractDartImportAlias pulls the prefix bound by ` as <ident>`
+// from an `import_or_export` statement's text. Returns empty when
+// the import has no alias clause. The Dart grammar guarantees
+// `as <ident>` follows the URI; we scan the suffix after the
+// closing quote so we don't confuse `as` inside the URI itself
+// (e.g. `package:as_a_string/...`).
+func extractDartImportAlias(text string) string {
+	closing := -1
+	for _, q := range []byte{'\'', '"'} {
+		start := strings.IndexByte(text, q)
+		if start < 0 {
+			continue
+		}
+		end := strings.IndexByte(text[start+1:], q)
+		if end < 0 {
+			continue
+		}
+		closing = start + 1 + end
+		break
+	}
+	if closing < 0 || closing+1 >= len(text) {
+		return ""
+	}
+	rest := text[closing+1:]
+	idx := strings.Index(rest, " as ")
+	if idx < 0 {
+		return ""
+	}
+	tail := strings.TrimLeft(rest[idx+len(" as "):], " \t")
+	end := 0
+	for end < len(tail) {
+		c := tail[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' {
+			end++
+			continue
+		}
+		break
+	}
+	return tail[:end]
+}
+
+// extractDartImportURI extracts the URI string from an import/export statement text.
+// e.g. "import 'package:flutter/material.dart';" → "package:flutter/material.dart"
+func extractDartImportURI(text string) string {
+	// Find content between quotes.
+	for _, q := range []byte{'\'', '"'} {
+		start := strings.IndexByte(text, q)
+		if start < 0 {
+			continue
+		}
+		end := strings.IndexByte(text[start+1:], q)
+		if end < 0 {
+			continue
+		}
+		return text[start+1 : start+1+end]
+	}
+	return ""
+}

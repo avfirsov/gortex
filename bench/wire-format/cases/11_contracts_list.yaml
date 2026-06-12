@@ -1,0 +1,17 @@
+tool: contracts
+description: 12 HTTP + gRPC contracts with producers/consumers
+input: |
+  [
+    {"id":"http::GET::/api/users/{id}","type":"http","method":"GET","path":"/api/users/{id}","service":"core-api","providers":["core-api/handlers.go::GetUser"],"consumers":["web/users.ts::fetchUser","mobile-app/api.dart::getUser"]},
+    {"id":"http::POST::/api/users","type":"http","method":"POST","path":"/api/users","service":"core-api","providers":["core-api/handlers.go::CreateUser"],"consumers":["web/users.ts::createUser"]},
+    {"id":"http::DELETE::/api/users/{id}","type":"http","method":"DELETE","path":"/api/users/{id}","service":"core-api","providers":["core-api/handlers.go::DeleteUser"],"consumers":["web/users.ts::deleteUser"]},
+    {"id":"grpc::offers.v1.Offers/GetOffer","type":"grpc","method":"GetOffer","path":"offers.v1.Offers","service":"offers","providers":["offers/server.go::GetOffer"],"consumers":["core-api/clients/offers.go::Get"]},
+    {"id":"grpc::offers.v1.Offers/ListOffers","type":"grpc","method":"ListOffers","path":"offers.v1.Offers","service":"offers","providers":["offers/server.go::ListOffers"],"consumers":["core-api/clients/offers.go::List","web/offers.ts::listOffers"]},
+    {"id":"topic::orders.created","type":"topic","path":"orders.created","service":"orders","providers":["orders/publisher.go::Publish"],"consumers":["email-worker/handler.ts::onOrder","analytics/consumer.go::OnOrder"]},
+    {"id":"topic::orders.failed","type":"topic","path":"orders.failed","service":"orders","providers":["orders/publisher.go::PublishFailed"],"consumers":["alerts/handler.go::OnFailed"]},
+    {"id":"ws::/ws/chat","type":"websocket","path":"/ws/chat","service":"chat","providers":["chat/server.go::HandleChat"],"consumers":["web/chat.ts::connect"]},
+    {"id":"graphql::Query.user","type":"graphql","method":"Query","path":"user","service":"gateway","providers":["gateway/resolvers.go::User"],"consumers":["web/graphql.ts::userQuery"]},
+    {"id":"env::DATABASE_URL","type":"env","path":"DATABASE_URL","service":"core-api","providers":["infra/terraform.tf"],"consumers":["core-api/main.go::main"]},
+    {"id":"env::REDIS_URL","type":"env","path":"REDIS_URL","service":"core-api","providers":["infra/terraform.tf"],"consumers":["core-api/main.go::main","worker/main.go::main"]},
+    {"id":"openapi::public-v1.yaml","type":"openapi","path":"public-v1.yaml","service":"gateway","providers":["gateway/spec.yaml"],"consumers":[]}
+  ]

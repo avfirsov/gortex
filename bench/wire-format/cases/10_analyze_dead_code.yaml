@@ -1,0 +1,12 @@
+tool: analyze_dead_code
+description: 7 symbols with zero incoming edges
+input: |
+  [
+    {"id":"internal/mcp/legacy.go::OldHelper","kind":"function","name":"OldHelper","path":"internal/mcp/legacy.go","line":14,"reason":"no incoming edges (exported but unused externally)"},
+    {"id":"internal/parser/tmp.go::scratchParse","kind":"function","name":"scratchParse","path":"internal/parser/tmp.go","line":42,"reason":"no incoming edges"},
+    {"id":"internal/query/experiments.go::benchFilter","kind":"function","name":"benchFilter","path":"internal/query/experiments.go","line":88,"reason":"no incoming edges"},
+    {"id":"internal/graph/attic.go::deprecatedWalk","kind":"method","name":"deprecatedWalk","path":"internal/graph/attic.go","line":120,"reason":"no incoming edges"},
+    {"id":"cmd/gortex/unused.go::debugDump","kind":"function","name":"debugDump","path":"cmd/gortex/unused.go","line":5,"reason":"no incoming edges"},
+    {"id":"internal/config/old.go::fromYAMLv1","kind":"function","name":"fromYAMLv1","path":"internal/config/old.go","line":210,"reason":"no incoming edges"},
+    {"id":"internal/savings/beta.go::legacyTotal","kind":"function","name":"legacyTotal","path":"internal/savings/beta.go","line":55,"reason":"no incoming edges"}
+  ]

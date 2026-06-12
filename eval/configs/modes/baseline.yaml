@@ -1,0 +1,12 @@
+# Baseline mode — no Gortex, pure bash tools (control group)
+agent:
+  agent_class: 'eval.agents.gortex_agent.GortexAgent'
+  gortex_mode: 'baseline'
+  step_limit: 30
+  cost_limit: 3.0
+
+environment:
+  environment_class: 'eval.environments.gortex_docker.GortexDockerEnvironment'
+  enable_gortex: false
+  # Set to 'podman' if using podman instead of docker
+  container_executable: 'podman'

@@ -1,0 +1,420 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # id-token: write is required for:
+  #   1. cosign keyless signing via GitHub's OIDC token
+  #   2. SLSA-3 provenance generation (the reusable workflow below also sets it)
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Expose sha256 hashes of every release artifact so the provenance job
+    # can feed them to the SLSA generator.
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          # goreleaser reads the tag list to build the changelog. Without
+          # full history the changelog section will be empty or wrong.
+          fetch-depth: 0
+
+      # cosign is installed on the host (outside the goreleaser-cross
+      # container) so keyless OIDC signing can use the runner's identity
+      # token directly — no need to plumb ACTIONS_ID_TOKEN_REQUEST_* vars
+      # through `docker run`.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.1
+
+      # Stage every artifact rcodesign needs (binary + Apple credentials)
+      # under one 0700 directory so the goreleaser-cross container — and
+      # the post-archive notarize step on the host — can read it via a
+      # single bind-mount. The dir is wiped unconditionally at the end of
+      # the job (see "Wipe macOS signing material").
+      - name: Stage macOS signing material
+        env:
+          P12_B64:    ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASS:   ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_B64: ${{ secrets.MACOS_NOTARY_API_KEY }}
+          KEY_ID:     ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER_ID:  ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          SIGNING_DIR=/tmp/macos-signing
+          mkdir -p "$SIGNING_DIR"
+          chmod 700 "$SIGNING_DIR"
+
+          echo "$P12_B64"     | base64 -d > "$SIGNING_DIR/cert.p12"
+          printf '%s' "$P12_PASS"        > "$SIGNING_DIR/cert.pass"
+          echo "$NOTARY_B64"  | base64 -d > "$SIGNING_DIR/notary.p8"
+
+          # Pin rcodesign to a known-good release. apple-codesign tags use
+          # `apple-codesign/X.Y.Z`; the slash is URL-escaped as %2F. Bump
+          # version + sha256 together — the release page publishes both.
+          RCODESIGN_VERSION=0.29.0
+          RCODESIGN_SHA256=dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+          RCODESIGN_TARBALL="apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/${RCODESIGN_TARBALL}" \
+            -o "$SIGNING_DIR/$RCODESIGN_TARBALL"
+          echo "$RCODESIGN_SHA256  $SIGNING_DIR/$RCODESIGN_TARBALL" | sha256sum -c -
+          tar -xzf "$SIGNING_DIR/$RCODESIGN_TARBALL" -C "$SIGNING_DIR" --strip-components=1
+          chmod +x "$SIGNING_DIR/rcodesign"
+          rm "$SIGNING_DIR/$RCODESIGN_TARBALL"
+
+          # rcodesign notary-submit wants a single JSON file with the
+          # issuer/key id and the .p8 contents pre-encoded — done once
+          # here so the post-archive step is just an upload.
+          "$SIGNING_DIR/rcodesign" encode-app-store-connect-api-key \
+            -o "$SIGNING_DIR/notary.json" \
+            "$ISSUER_ID" "$KEY_ID" "$SIGNING_DIR/notary.p8"
+
+          chmod 600 "$SIGNING_DIR"/cert.* "$SIGNING_DIR"/notary.*
+
+      - name: Run GoReleaser (cross-compile via Docker)
+        # goreleaser-cross ships osxcross + aarch64/x86_64 gcc toolchains
+        # so all 4 targets (linux/amd64, linux/arm64, darwin/amd64,
+        # darwin/arm64) cross-compile from one ubuntu runner — no matrix,
+        # no macOS minutes burned.
+        #
+        # Image tag is pinned to the Go major.minor; bump together with
+        # go.mod and the setup-go step elsewhere in the workflows.
+        #
+        # The /tmp/macos-signing bind-mount exposes rcodesign + the P12
+        # to the build hook in .goreleaser.yml, which signs each darwin
+        # Mach-O before the archive step.
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD":/go/src/gortex \
+            -v /tmp/macos-signing:/tmp/macos-signing:ro \
+            -w /go/src/gortex \
+            -e GITHUB_TOKEN \
+            -e HOMEBREW_TAP_TOKEN \
+            ghcr.io/goreleaser/goreleaser-cross:v1.26 \
+            release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Personal access token with `repo` scope on zzet/homebrew-tap.
+          # GITHUB_TOKEN can only push to the source repo, not the tap.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # (SCOOP_BUCKET_TOKEN is consumed by the release-windows job's
+          # "Publish Scoop manifest" step, not here — goreleaser builds no
+          # windows artifact, so it has no scoop manifest to push.)
+
+      # goreleaser-cross runs as root inside the container, so everything
+      # in dist/ is owned by root:root on the host. The subsequent cosign
+      # and SLSA steps run as the non-root `runner` user and need to write
+      # .sig / .pem files next to the artifacts — reclaim ownership now
+      # before any permission-denied errors surface.
+      - name: Reclaim ownership of dist/ from Docker
+        run: sudo chown -R "$(id -u):$(id -g)" dist
+
+      # The build hook already codesigned each darwin Mach-O. Notarization
+      # is Apple's blessing on that signature — they don't see the binary
+      # again, just hash + signature metadata, so the tarball on disk is
+      # left untouched. That means cosign signs and SLSA provenance covers
+      # the same bytes goreleaser already published, no checksum churn.
+      #
+      # Bare Mach-O can't be stapled (only .app/.pkg/.dmg can), so we
+      # don't pass --staple. Online macs fetch the ticket from Apple on
+      # first run; offline-first UX would require a signed .pkg.
+      - name: Notarize macOS binaries
+        run: |
+          set -euo pipefail
+          SIGNING_DIR=/tmp/macos-signing
+          shopt -s nullglob
+          for tgz in dist/gortex_darwin_*.tar.gz; do
+            workdir="$(mktemp -d)"
+            tar -xzf "$tgz" -C "$workdir"
+            (cd "$workdir" && zip -q notary.zip gortex)
+            "$SIGNING_DIR/rcodesign" notary-submit \
+              --api-key-file "$SIGNING_DIR/notary.json" \
+              --wait \
+              "$workdir/notary.zip"
+            rm -rf "$workdir"
+          done
+
+      # Keyless cosign signing: each artifact gets a `.sig` (signature) and
+      # `.pem` (certificate chain binding the signature to this workflow's
+      # GitHub OIDC identity). Consumers verify with:
+      #
+      #   cosign verify-blob \
+      #     --certificate gortex_linux_amd64.tar.gz.pem \
+      #     --signature   gortex_linux_amd64.tar.gz.sig \
+      #     --certificate-identity-regexp 'https://github\.com/zzet/gortex/.*' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     gortex_linux_amd64.tar.gz
+      - name: Sign release artifacts with cosign
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cd dist
+          shopt -s nullglob
+          for f in *.tar.gz *.zip *.deb *.rpm *.apk checksums.txt; do
+            echo "Signing $f..."
+            cosign sign-blob \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -la *.sig *.pem
+
+      # Goreleaser already created the release and uploaded the primary
+      # artifacts. Append .sig + .pem files to the same release so
+      # verification instructions in README point at a single URL set.
+      - name: Upload signatures to release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: |
+            dist/*.sig
+            dist/*.pem
+          # softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3 appends to an existing release
+          # when the tag already exists (it does — goreleaser made it a
+          # moment ago). Never fail_on_unmatched_files here — a failed
+          # signing step should surface as a signing error, not as a
+          # missing-files upload error.
+          fail_on_unmatched_files: false
+
+      - name: Compute artifact hashes for SLSA provenance
+        id: hash
+        run: |
+          cd dist
+          shopt -s nullglob
+          # SLSA reusable generator wants base64-encoded sha256sum output
+          # (one "hash  filename" line per artifact). We hash the primary
+          # artifacts only — .sig/.pem are attestations of these files,
+          # they don't need their own provenance.
+          HASHES=$(sha256sum *.tar.gz *.zip *.deb *.rpm *.apk | base64 -w0)
+          echo "hashes=$HASHES" >> "$GITHUB_OUTPUT"
+
+      # Always wipe signing material — even on failure — so a P12 / .p8
+      # never lingers on a runner image cache or in actions/upload-artifact
+      # debug bundles. shred clears the inode contents before unlink.
+      - name: Wipe macOS signing material
+        if: always()
+        run: |
+          if [ -d /tmp/macos-signing ]; then
+            find /tmp/macos-signing -type f -exec shred -uf {} \; 2>/dev/null || true
+            rm -rf /tmp/macos-signing
+          fi
+
+  # Windows is built on a NATIVE windows runner: the CGo tree-sitter
+  # bindings need a real C/C++ toolchain (mingw-w64 ships on PATH there),
+  # and goreleaser-cross targets unix only. This job builds a statically
+  # linked, self-contained .exe (no runtime DLLs to ship), zips it,
+  # cosign-signs, and appends the zip to the release the `release` job
+  # already created.
+  release-windows:
+    needs: release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.1
+
+      - name: Build gortex.exe (static mingw runtime)
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/}"
+          # -extldflags=-static folds the mingw C/C++ runtime (libstdc++,
+          # libgcc, libwinpthread) into the .exe so it ships as a single
+          # self-contained binary — nothing to bundle alongside. The C++
+          # stdlib is in the link at all because some tree-sitter grammars
+          # carry C++ external scanners (e.g. go-sitter-forest norg); static
+          # linking just puts it inside the .exe instead of a DLL.
+          go build \
+            -ldflags "-s -w -X main.version=${VER} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ) -extldflags=-static" \
+            -o gortex.exe ./cmd/gortex/
+
+      - name: Verify gortex.exe is self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The static link must leave no dependency on a mingw runtime DLL;
+          # a partially static .exe would fail to start where that DLL is
+          # absent. If objdump is available, fail the release on any leaked
+          # mingw runtime import.
+          objdump=""
+          for cand in objdump x86_64-w64-mingw32-objdump; do
+            command -v "$cand" >/dev/null 2>&1 && { objdump="$cand"; break; }
+          done
+          if [ -n "$objdump" ]; then
+            echo "imported DLLs:"; "$objdump" -p gortex.exe | grep -i 'DLL Name' || true
+            if "$objdump" -p gortex.exe | grep -iqE 'libstdc\+\+|libgcc_s|libwinpthread'; then
+              echo "FATAL: gortex.exe still imports a mingw runtime DLL — static link incomplete"
+              exit 1
+            fi
+            echo "ok: no mingw runtime DLL imports"
+          else
+            echo "WARN: objdump not found; skipping self-containment check"
+          fi
+
+      - name: Zip (gortex_windows_amd64.zip)
+        shell: pwsh
+        run: Compress-Archive -Path gortex.exe -DestinationPath gortex_windows_amd64.zip -Force
+
+      - name: Sign + upload to release
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --output-signature gortex_windows_amd64.zip.sig \
+            --output-certificate gortex_windows_amd64.zip.pem \
+            gortex_windows_amd64.zip
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release upload "$TAG" \
+            gortex_windows_amd64.zip \
+            gortex_windows_amd64.zip.sig \
+            gortex_windows_amd64.zip.pem \
+            --clobber
+
+          # Append the windows zip's sha256 to the release checksums.txt so
+          # the one-line installer (scripts/install.ps1, which verifies
+          # against checksums.txt) covers windows too — the unix goreleaser
+          # run only hashed its own artifacts. needs:release guarantees
+          # checksums.txt already exists.
+          sha="$(sha256sum gortex_windows_amd64.zip | awk '{print $1}')"
+          gh release download "$TAG" --pattern checksums.txt --clobber 2>/dev/null || : > checksums.txt
+          if ! grep -q "gortex_windows_amd64.zip" checksums.txt; then
+            printf '%s  gortex_windows_amd64.zip\n' "$sha" >> checksums.txt
+            gh release upload "$TAG" checksums.txt --clobber
+          fi
+
+      - name: Publish Scoop manifest
+        # Push a refreshed `gortex` manifest to gortexhq/scoop-bucket so
+        # `scoop install gortex` resolves this release. SCOOP_BUCKET_TOKEN is
+        # a PAT with `repo` scope on that bucket (GITHUB_TOKEN can only push
+        # to the source repo). Non-blocking + self-skipping: a bucket hiccup
+        # must not fail a release whose binary already shipped, and a
+        # token-less fork just skips it.
+        continue-on-error: true
+        shell: bash
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SCOOP_BUCKET_TOKEN:-}" ]; then
+            echo "SCOOP_BUCKET_TOKEN not set; skipping scoop manifest publish"
+            exit 0
+          fi
+          TAG="${GITHUB_REF#refs/tags/}"
+          VER="${TAG#v}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/gortex_windows_amd64.zip"
+          SHA="$(sha256sum gortex_windows_amd64.zip | awk '{print $1}')"
+
+          # Build the manifest with jq so escaping + validity are guaranteed.
+          # `bin` shims gortex.exe; checkver/autoupdate let scoop's tooling
+          # track future releases (the $version token is literal on purpose).
+          jq -n \
+            --arg version "$VER" \
+            --arg url "$URL" \
+            --arg hash "$SHA" \
+            --arg homepage "https://github.com/${GITHUB_REPOSITORY}" \
+            --arg autourl "https://github.com/${GITHUB_REPOSITORY}/releases/download/v\$version/gortex_windows_amd64.zip" \
+            '{
+               version: $version,
+               description: "Code intelligence engine that indexes repositories into an in-memory knowledge graph.",
+               homepage: $homepage,
+               license: "Apache-2.0",
+               architecture: { "64bit": { url: $url, hash: $hash } },
+               bin: "gortex.exe",
+               checkver: "github",
+               autoupdate: { architecture: { "64bit": { url: $autourl } } }
+             }' > gortex.json
+
+          # Token in the clone URL — GitHub Actions masks the secret in logs.
+          git clone "https://x-access-token:${SCOOP_BUCKET_TOKEN}@github.com/gortexhq/scoop-bucket.git" scoop-bucket
+          cd scoop-bucket
+          # Honour the bucket's layout: scoop reads manifests from the repo
+          # root or a bucket/ subdir. Update in place if one exists, else use
+          # the conventional bucket/ subdir.
+          if [ -f gortex.json ]; then dest="gortex.json"; else mkdir -p bucket; dest="bucket/gortex.json"; fi
+          cp ../gortex.json "$dest"
+          git add "$dest"
+          if git diff --cached --quiet; then
+            echo "scoop manifest already current for ${VER}"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "gortex: ${VER}"
+            git push
+            echo "published scoop manifest ${VER} -> $dest"
+          fi
+
+  # SLSA-3 provenance via the OpenSSF reusable workflow. This runs in a
+  # separate, isolated job that the `release` job can't tamper with —
+  # that isolation is what elevates us from SLSA-2 to SLSA-3. Output is
+  # a `multiple.intoto.jsonl` file attached to the release that
+  # consumers verify with https://github.com/slsa-framework/slsa-verifier.
+  provenance:
+    needs: release
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    # Pinned by tag, not SHA: the SLSA generator verifies its builder
+    # binary against the tag name in its workflow ref, so SHA pinning
+    # breaks the integrity check (exits 27 with SUCCESS=false). Scorecard
+    # exempts slsa-framework reusable workflows from the SHA-pin rule.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.release.outputs.hashes }}
+      upload-assets: true
+
+  # VirusTotal scan each primary artifact against ~72 AV engines and
+  # append a results badge to the release notes. Needs a VT_API_KEY
+  # repo secret (free tier, 500 requests/day). Non-blocking — VT
+  # outages shouldn't fail a release.
+  virustotal:
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${GITHUB_REF#refs/tags/}" --dir dist \
+            --pattern '*.tar.gz' \
+            --pattern '*.zip' \
+            --pattern '*.deb' \
+            --pattern '*.rpm' \
+            --pattern '*.apk'
+
+      - name: VirusTotal scan + update release body
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          files: |
+            ./dist/*.tar.gz
+            ./dist/*.zip
+            ./dist/*.deb
+            ./dist/*.rpm
+            ./dist/*.apk
+          update_release_body: true

@@ -1,0 +1,20 @@
+tool: find_usages
+description: 4 usages of an internal helper
+input: |
+  {
+    "nodes": [
+      {"id":"internal/mcp/server.go::Server.serve","kind":"method","name":"serve","file_path":"internal/mcp/server.go","start_line":88},
+      {"id":"internal/mcp/bridge.go::Bridge.Start","kind":"method","name":"Start","file_path":"internal/mcp/bridge.go","start_line":44},
+      {"id":"internal/mcp/tools_core.go::handleSearchSymbols","kind":"method","name":"handleSearchSymbols","file_path":"internal/mcp/tools_core.go","start_line":539},
+      {"id":"internal/mcp/tools_coding.go::handleGetSymbolSource","kind":"method","name":"handleGetSymbolSource","file_path":"internal/mcp/tools_coding.go","start_line":363}
+    ],
+    "edges": [
+      {"from":"internal/mcp/server.go::Server.serve","to":"internal/mcp/tools_core.go::sessionFor","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/bridge.go::Bridge.Start","to":"internal/mcp/tools_core.go::sessionFor","kind":"calls","confidence":1.0,"origin":"ast_resolved"},
+      {"from":"internal/mcp/tools_core.go::handleSearchSymbols","to":"internal/mcp/tools_core.go::sessionFor","kind":"calls","confidence":0.95,"origin":"ast_inferred"},
+      {"from":"internal/mcp/tools_coding.go::handleGetSymbolSource","to":"internal/mcp/tools_core.go::sessionFor","kind":"calls","confidence":0.95,"origin":"ast_inferred"}
+    ],
+    "total_nodes": 4,
+    "total_edges": 4,
+    "truncated": false
+  }

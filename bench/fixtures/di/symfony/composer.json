@@ -1,0 +1,9 @@
+{
+  "name": "gortex/di-symfony-fixture",
+  "type": "project",
+  "description": "Minimal Symfony fixture for Gortex DI recall — not installed.",
+  "require": {
+    "symfony/framework-bundle": "^6.3",
+    "symfony/event-dispatcher": "^6.3"
+  }
+}

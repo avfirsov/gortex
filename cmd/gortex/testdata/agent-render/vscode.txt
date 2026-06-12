@@ -1,0 +1,19 @@
+=== root/.github/copilot-instructions.md ===
+<!-- gortex:communities:start -->
+- [example-community](.claude/skills/example/SKILL.md) — example routing block
+
+<!-- gortex:communities:end -->
+=== root/.vscode/mcp.json ===
+{
+  "servers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex",
+      "env": {
+        "GORTEX_INDEX_WORKERS": "8"
+      }
+    }
+  }
+}

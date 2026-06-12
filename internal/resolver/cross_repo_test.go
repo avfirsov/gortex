@@ -1,0 +1,316 @@
+package resolver
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/graph"
+	"pgregory.net/rapid"
+)
+
+// --- Unit tests for CrossRepoResolver (Task 7.1) ---
+
+// wireImport adds a resolved EdgeImports edge from callerFile into a
+// file node in targetRepo, plus the target file node itself. This is
+// the import-reachability *evidence* CrossRepoResolver now requires
+// before it will resolve a name-only call across a repo boundary —
+// without it, a bare name like `Helper` could land on any repo that
+// happens to define a `Helper`, which is the exact name-collision
+// false-positive class this guards against.
+func wireImport(g graph.Store, callerFile, targetRepo, targetFile string) {
+	g.AddNode(&graph.Node{
+		ID: targetFile, Kind: graph.KindFile, Name: targetFile,
+		FilePath: targetFile, Language: "go", RepoPrefix: targetRepo,
+	})
+	g.AddEdge(&graph.Edge{
+		From: callerFile, To: targetFile,
+		Kind: graph.EdgeImports, FilePath: callerFile, Line: 1,
+	})
+}
+
+func TestCrossRepoResolveAll_SameRepoPreferred(t *testing.T) {
+	g := graph.New()
+
+	// Repo A: caller and a target function.
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/pkg/a.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoA/pkg/b.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoA/pkg/b.go", Language: "go", RepoPrefix: "repoA"})
+
+	// Repo B: same-named function.
+	g.AddNode(&graph.Node{ID: "repoB/lib/c.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoB/lib/c.go", Language: "go", RepoPrefix: "repoB"})
+
+	edge := &graph.Edge{From: "repoA/pkg/a.go::Caller", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a.go", Line: 5}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, 0, stats.CrossRepoEdges)
+	assert.Equal(t, "repoA/pkg/b.go::Helper", edge.To)
+	assert.False(t, edge.CrossRepo)
+}
+
+// With an import edge proving repoA reaches repoB, the cross-repo
+// fallback resolves — this is the legitimate cross-repo call case.
+func TestCrossRepoResolveAll_CrossRepoFallback(t *testing.T) {
+	g := graph.New()
+
+	// Repo A: caller, no matching function.
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/pkg/a.go", Language: "go", RepoPrefix: "repoA"})
+
+	// Repo B: target function.
+	g.AddNode(&graph.Node{ID: "repoB/lib/c.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoB/lib/c.go", Language: "go", RepoPrefix: "repoB"})
+
+	// Evidence: repoA's caller file imports repoB.
+	wireImport(g, "repoA/pkg/a.go", "repoB", "repoB/lib/c.go")
+
+	edge := &graph.Edge{From: "repoA/pkg/a.go::Caller", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a.go", Line: 5}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, 1, stats.CrossRepoEdges)
+	assert.Equal(t, "repoB/lib/c.go::Helper", edge.To)
+	assert.True(t, edge.CrossRepo)
+	assert.Equal(t, 1, stats.ByRepo["repoB"])
+}
+
+// Without an import edge, the SAME graph must NOT resolve the call
+// across the repo boundary — it stays unresolved. This is the
+// regression guard for the M3 false-positive class: a name-only match
+// in a repo the caller never imports is never selected.
+func TestCrossRepoResolveAll_RefusesUnreachableCrossRepo(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/pkg/a.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoB/lib/c.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoB/lib/c.go", Language: "go", RepoPrefix: "repoB"})
+
+	edge := &graph.Edge{From: "repoA/pkg/a.go::Caller", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a.go", Line: 5}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, 0, stats.CrossRepoEdges)
+	assert.Equal(t, "unresolved::Helper", edge.To, "no import edge → must stay unresolved")
+	assert.False(t, edge.CrossRepo)
+}
+
+func TestCrossRepoResolveAll_Unresolvable(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoA/a.go", Language: "go", RepoPrefix: "repoA"})
+
+	edge := &graph.Edge{From: "repoA/a.go::Foo", To: "unresolved::NonExistent", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, 1, stats.Unresolved)
+}
+
+func TestCrossRepoResolveAll_ImportCrossRepo(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "repoA/main.go", Kind: graph.KindFile, Name: "main.go", FilePath: "repoA/main.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoB/utils/utils.go", Kind: graph.KindPackage, Name: "utils", QualName: "utils", FilePath: "repoB/utils/utils.go", Language: "go", RepoPrefix: "repoB"})
+
+	edge := &graph.Edge{From: "repoA/main.go", To: "unresolved::import::utils", Kind: graph.EdgeImports, FilePath: "repoA/main.go", Line: 3}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, 1, stats.CrossRepoEdges)
+	assert.Equal(t, "repoB/utils/utils.go", edge.To)
+	assert.True(t, edge.CrossRepo)
+}
+
+func TestCrossRepoResolveAll_MethodCrossRepo(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/pkg/a.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoB/lib/b.go::Server.Start", Kind: graph.KindMethod, Name: "Start", FilePath: "repoB/lib/b.go", Language: "go", RepoPrefix: "repoB"})
+
+	// Evidence: repoA's caller file imports repoB.
+	wireImport(g, "repoA/pkg/a.go", "repoB", "repoB/lib/b.go")
+
+	edge := &graph.Edge{From: "repoA/pkg/a.go::Caller", To: "unresolved::*.Start", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a.go", Line: 10}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, 1, stats.CrossRepoEdges)
+	assert.Equal(t, "repoB/lib/b.go::Server.Start", edge.To)
+	assert.True(t, edge.CrossRepo)
+}
+
+// A method call into a repo the caller never imports must stay
+// unresolved — the receiver-type name alone is not evidence the call
+// crosses to that particular repo.
+func TestCrossRepoResolveAll_RefusesUnreachableMethodCall(t *testing.T) {
+	g := graph.New()
+
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repoA/pkg/a.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoB/lib/b.go::Server.Start", Kind: graph.KindMethod, Name: "Start", FilePath: "repoB/lib/b.go", Language: "go", RepoPrefix: "repoB"})
+
+	edge := &graph.Edge{From: "repoA/pkg/a.go::Caller", To: "unresolved::*.Start", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/a.go", Line: 10}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, "unresolved::*.Start", edge.To)
+	assert.False(t, edge.CrossRepo)
+}
+
+func TestCrossRepoResolveForRepo(t *testing.T) {
+	g := graph.New()
+
+	// Repo A: caller with unresolved edge.
+	g.AddNode(&graph.Node{ID: "repoA/a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoA/a.go", Language: "go", RepoPrefix: "repoA"})
+	// Repo B: caller with unresolved edge + target.
+	g.AddNode(&graph.Node{ID: "repoB/b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
+	g.AddNode(&graph.Node{ID: "repoB/b.go::Baz", Kind: graph.KindFunction, Name: "Baz", FilePath: "repoB/b.go", Language: "go", RepoPrefix: "repoB"})
+
+	// Evidence: repoA's file imports repoB.
+	wireImport(g, "repoA/a.go", "repoB", "repoB/b.go")
+
+	edgeA := &graph.Edge{From: "repoA/a.go::Foo", To: "unresolved::Baz", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5}
+	edgeB := &graph.Edge{From: "repoB/b.go::Bar", To: "unresolved::Foo", Kind: graph.EdgeCalls, FilePath: "repoB/b.go", Line: 5}
+	g.AddEdge(edgeA)
+	g.AddEdge(edgeB)
+
+	cr := NewCrossRepo(g)
+
+	// Resolve only repoA edges.
+	stats := cr.ResolveForRepo("repoA")
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, 1, stats.CrossRepoEdges)
+	assert.Equal(t, "repoB/b.go::Baz", edgeA.To)
+	assert.True(t, edgeA.CrossRepo)
+
+	// edgeB should still be unresolved.
+	assert.Equal(t, "unresolved::Foo", edgeB.To)
+}
+
+// --- Property test for Task 7.2 ---
+
+// Feature: multi-repo-support, Property 10: Cross-repo resolution with same-repo preference
+func TestPropertyCrossRepoResolutionSameRepoPreference(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		g := graph.New()
+
+		// Generate a function name.
+		funcName := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,8}`).Draw(rt, "funcName")
+
+		// Generate two repo prefixes.
+		repoA := "repo-" + rapid.StringMatching(`[a-z]{3,6}`).Draw(rt, "repoA")
+		repoB := "repo-" + rapid.StringMatching(`[a-z]{3,6}`).Draw(rt, "repoB")
+		// Ensure distinct repos.
+		if repoA == repoB {
+			repoB = repoB + "x"
+		}
+
+		// Decide whether the caller's repo has a same-repo match.
+		hasSameRepoMatch := rapid.Bool().Draw(rt, "hasSameRepoMatch")
+
+		// Always add the caller in repoA.
+		callerFile := repoA + "/src/caller.go"
+		callerID := callerFile + "::" + "Caller"
+		g.AddNode(&graph.Node{
+			ID: callerID, Kind: graph.KindFunction, Name: "Caller",
+			FilePath: callerFile, Language: "go", RepoPrefix: repoA,
+		})
+
+		// Always add the target in repoB (cross-repo candidate).
+		crossRepoTargetID := repoB + "/lib/target.go::" + funcName
+		g.AddNode(&graph.Node{
+			ID: crossRepoTargetID, Kind: graph.KindFunction, Name: funcName,
+			FilePath: repoB + "/lib/target.go", Language: "go", RepoPrefix: repoB,
+		})
+
+		// Evidence: the caller's file imports repoB — without this the
+		// cross-repo fallback is (correctly) refused.
+		wireImport(g, callerFile, repoB, repoB+"/lib/target.go")
+
+		// Optionally add a same-repo target in repoA.
+		sameRepoTargetID := repoA + "/src/target.go::" + funcName
+		if hasSameRepoMatch {
+			g.AddNode(&graph.Node{
+				ID: sameRepoTargetID, Kind: graph.KindFunction, Name: funcName,
+				FilePath: repoA + "/src/target.go", Language: "go", RepoPrefix: repoA,
+			})
+		}
+
+		// Add unresolved edge from caller.
+		edge := &graph.Edge{
+			From: callerID, To: "unresolved::" + funcName,
+			Kind: graph.EdgeCalls, FilePath: callerFile, Line: 10,
+		}
+		g.AddEdge(edge)
+
+		cr := NewCrossRepo(g)
+		stats := cr.ResolveAll()
+
+		require.Equal(rt, 1, stats.Resolved, "edge should be resolved")
+		require.Equal(rt, 0, stats.Unresolved, "no edges should remain unresolved")
+
+		if hasSameRepoMatch {
+			// Same-repo match preferred.
+			require.Equal(rt, sameRepoTargetID, edge.To,
+				"same-repo match should be preferred")
+			require.False(rt, edge.CrossRepo,
+				"same-repo edge should not be marked cross-repo")
+			require.Equal(rt, 0, stats.CrossRepoEdges,
+				"no cross-repo edges when same-repo match exists")
+		} else {
+			// Cross-repo fallback — eligible because the caller imports repoB.
+			require.Equal(rt, crossRepoTargetID, edge.To,
+				"cross-repo target should be used when no same-repo match")
+			require.True(rt, edge.CrossRepo,
+				"cross-repo edge must have CrossRepo == true")
+			require.Equal(rt, 1, stats.CrossRepoEdges,
+				"one cross-repo edge expected")
+			// Target ID should be a Qualified_Node_ID containing the target's RepoPrefix.
+			require.Contains(rt, edge.To, repoB+"/",
+				"cross-repo target should use Qualified_Node_ID with target RepoPrefix")
+		}
+	})
+}
+
+// TestCrossRepoResolveAll_RefusesCrossWorkspaceNameCollision is the
+// end-to-end regression guard for the M3 false-positive report: a
+// caller in one workspace must never resolve a bare-name call to a
+// same-named symbol in an unrelated workspace it does not import.
+func TestCrossRepoResolveAll_RefusesCrossWorkspaceNameCollision(t *testing.T) {
+	g := graph.New()
+
+	// Workspace "gortex": a type method named `string`.
+	g.AddNode(&graph.Node{ID: "gortex/edge.go::EdgeKind", Kind: graph.KindType, Name: "EdgeKind", FilePath: "gortex/edge.go", Language: "go", RepoPrefix: "gortex", WorkspaceID: "gortex"})
+	g.AddNode(&graph.Node{ID: "gortex/edge.go::caller", Kind: graph.KindFunction, Name: "caller", FilePath: "gortex/edge.go", Language: "go", RepoPrefix: "gortex", WorkspaceID: "gortex"})
+
+	// Unrelated workspace "rcd": a method literally named `string`.
+	g.AddNode(&graph.Node{ID: "rcd/models/bot.go::BotClass.string", Kind: graph.KindMethod, Name: "string", FilePath: "rcd/models/bot.go", Language: "go", RepoPrefix: "rcd", WorkspaceID: "rcd"})
+
+	// gortex calls something named `string` — no import into rcd.
+	edge := &graph.Edge{From: "gortex/edge.go::caller", To: "unresolved::string", Kind: graph.EdgeCalls, FilePath: "gortex/edge.go", Line: 3}
+	g.AddEdge(edge)
+
+	cr := NewCrossRepo(g)
+	stats := cr.ResolveAll()
+
+	assert.Equal(t, 0, stats.CrossRepoEdges, "must not cross into an unimported, unrelated workspace")
+	assert.Equal(t, "unresolved::string", edge.To)
+	assert.False(t, edge.CrossRepo)
+}

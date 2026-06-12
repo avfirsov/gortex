@@ -1,0 +1,15 @@
+tool: batch_symbols
+description: 6 symbols in one batch, 3 with source bodies
+input: |
+  {
+    "symbols": [
+      {"id":"a.go::Foo","kind":"function","name":"Foo","file_path":"a.go","start_line":10,"end_line":20,"signature":"func Foo() error","source":"func Foo() error {\n\treturn nil\n}","from_line":8},
+      {"id":"a.go::Bar","kind":"method","name":"Bar","file_path":"a.go","start_line":30,"end_line":52,"signature":"func (s *Svc) Bar(ctx context.Context) error"},
+      {"id":"b.go::Baz","kind":"function","name":"Baz","file_path":"b.go","start_line":44,"end_line":78,"signature":"func Baz(x int) (string, error)","source":"func Baz(x int) (string, error) {\n\tif x == 0 {\n\t\treturn \"\", errors.New(\"zero\")\n\t}\n\treturn strconv.Itoa(x), nil\n}","from_line":42},
+      {"id":"b.go::MissingSymbol","error":"symbol not found"},
+      {"id":"c.go::Qux","kind":"function","name":"Qux","file_path":"c.go","start_line":5,"end_line":7,"signature":"func Qux()","source":"func Qux() {\n\treturn\n}","from_line":3},
+      {"id":"d.go::Garply","kind":"type","name":"Garply","file_path":"d.go","start_line":12,"end_line":18,"signature":"type Garply struct { A int; B string }"}
+    ],
+    "total": 6,
+    "etag": "ffffeeee00001111"
+  }

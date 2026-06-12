@@ -1,0 +1,62 @@
+version: 2
+
+# Dependabot keeps GitHub Actions and Go modules current.
+#
+# Scorecard bumps the "Pinned-Dependencies" score when actions are pinned
+# to full commit SHAs; enabling updates here + allowing Dependabot to
+# rewrite `@v6` refs to `@<sha>` is the maintainable path to that score.
+# (Set `.github/.scorecard.yml` or per-action comment later if you want
+# Scorecard to accept shield-style tag refs.)
+
+updates:
+  # GitHub Actions across every workflow file (ci.yml, release.yml,
+  # scorecard.yml, bench-arm.yml).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+    # Group everything non-major into one PR per week to keep the
+    # notification rate sane. Majors get their own PRs so they can be
+    # reviewed carefully (Actions majors occasionally break).
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # Go module dependencies.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: deps
+      include: scope
+    labels:
+      - dependencies
+      - go
+    # Same strategy — minor/patch grouped, majors separate. The indirect
+    # tree under tree-sitter-* is large and would otherwise drown the
+    # inbox in individual PRs.
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+    # Open a manageable number of PRs at once — default 5 for gomod is
+    # fine; bumping to 10 covers our broader dep tree without flooding.
+    open-pull-requests-limit: 10

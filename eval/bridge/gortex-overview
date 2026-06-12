@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# gortex-overview — graph statistics and health via eval-server
+# Usage: gortex-overview
+set -euo pipefail
+
+GORTEX_EVAL_PORT="${GORTEX_EVAL_PORT:-4747}"
+GORTEX_EVAL_URL="http://127.0.0.1:${GORTEX_EVAL_PORT}"
+
+# Try eval-server (fast path)
+response=$(curl -sf -X POST "${GORTEX_EVAL_URL}/tool/graph_stats" \
+    -H "Content-Type: application/json" \
+    -d '{}' 2>/dev/null) && server_ok=true || server_ok=false
+
+if [ "$server_ok" = true ] && [ -n "$response" ]; then
+    if command -v jq &>/dev/null; then
+        echo "=== Codebase Overview ==="
+        echo ""
+        echo "$response" | jq -r '
+            if .content then
+                .content[] | select(.type == "text") | .text
+            elif type == "object" and .error then
+                "Error: \(.error)"
+            else
+                tostring
+            end
+        ' 2>/dev/null || echo "$response"
+    else
+        echo "=== Codebase Overview ==="
+        echo ""
+        echo "$response" | sed 's/[{}\[\]"]//g; s/,/\n/g' | grep -v '^\s*$'
+    fi
+else
+    # Fallback: gortex CLI
+    echo "Error: Gortex eval-server not running on port $GORTEX_EVAL_PORT. Start it with: gortex eval-server --index /testbed" >&2
+    if false; then
+        gortex stats 2>&1
+    else
+        echo "Error: Gortex tools temporarily unavailable (no eval-server, no CLI)." >&2
+        exit 1
+    fi
+fi
+
+echo ""
+echo "--- Next steps ---"
+echo "  gortex-search \"<query>\"        — search for symbols related to your task"
+echo "  gortex-context \"<task>\"         — get full context for a specific task"
+echo "  gortex-impact \"<symbol_id>\"     — analyze blast radius of a planned change"

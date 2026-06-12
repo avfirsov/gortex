@@ -1,0 +1,114 @@
+# Spring Boot DI-recall fixture
+#
+# Spring DI shapes in scope:
+#   - @Autowired field injection
+#   - @Autowired constructor injection (equivalent to @Inject)
+#   - @Qualifier for multi-implementation disambiguation
+#   - @Bean factory methods in a @Configuration class
+#
+# Tiering matches the NestJS/FastAPI fixtures:
+#   exact   — symbol-name queries
+#   concept — paraphrase queries
+#   di      — shapes Java's explicit-type system already handles
+#             (constructor param typed as the concrete class/interface
+#             — the resolver links method calls on `this.field` to
+#             the declared type)
+#   di_gap  — shapes a type-aware resolver can't handle alone
+#             (interface injection with multiple impls, @Bean factory
+#             return values, @Qualifier disambiguation)
+name: gortex-spring-di
+cases:
+
+  # ------------------------------------------------------------------
+  # Tier 1 — exact
+  # ------------------------------------------------------------------
+  - id: exact-UserService
+    tier: exact
+    query: UserService
+    expected: [src/main/java/com/example/users/UserService.java::UserService]
+  - id: exact-OrderService
+    tier: exact
+    query: OrderService
+    expected: [src/main/java/com/example/orders/OrderService.java::OrderService]
+  - id: exact-JpaUserRepository
+    tier: exact
+    query: JpaUserRepository
+    expected: [src/main/java/com/example/users/JpaUserRepository.java::JpaUserRepository]
+  - id: exact-systemClock
+    tier: exact
+    query: systemClock
+    expected: [src/main/java/com/example/config/Clocks.java::Clocks.systemClock]
+  - id: exact-lookup
+    tier: exact
+    query: lookup
+    expected: [src/main/java/com/example/users/UserService.java::UserService.lookup]
+
+  # ------------------------------------------------------------------
+  # Tier 2 — concept
+  # ------------------------------------------------------------------
+  - id: concept-find-user-cache-fallback
+    tier: concept
+    query: look up a user with cache fallback
+    expected: [src/main/java/com/example/users/UserService.java::UserService.lookup]
+  - id: concept-system-clock
+    tier: concept
+    query: provide the system clock
+    expected: [src/main/java/com/example/config/Clocks.java::Clocks.systemClock]
+
+  # ------------------------------------------------------------------
+  # Tier 3 — di: Java's explicit type system handles these
+  # ------------------------------------------------------------------
+  # UserService.lookup calls this.cache.findById(...) and this.primary.findById(...).
+  # `cache` is a constructor-injected InMemoryUserRepository (concrete class),
+  # `primary` is a field-injected UserRepository (interface). Expected: the
+  # concrete findById — Java's type-aware resolver gets the concrete call directly.
+  - id: di-call_chain-UserService-lookup
+    tier: di
+    query: "call_chain:src/main/java/com/example/users/UserService.java::UserService.lookup"
+    expected:
+      - src/main/java/com/example/users/InMemoryUserRepository.java::InMemoryUserRepository.findById
+
+  - id: di-call_chain-OrderService-describe
+    tier: di
+    query: "call_chain:src/main/java/com/example/orders/OrderService.java::OrderService.describe"
+    expected:
+      - src/main/java/com/example/users/UserService.java::UserService.lookup
+
+  # ------------------------------------------------------------------
+  # Tier 4 — di_gap: Spring-specific resolution beyond Java types
+  # ------------------------------------------------------------------
+  # Interface injection + multiple implementations: UserService.primary is
+  # typed as UserRepository. Two @Repository beans implement it
+  # (JpaUserRepository, InMemoryUserRepository). Without a @Primary or
+  # @Qualifier annotation Spring itself fails at runtime — the static
+  # resolver picks one arbitrarily. Either concrete implementation is
+  # a legitimate answer here; a future @Primary-aware extractor would
+  # narrow this to a specific impl.
+  - id: di_gap-call_chain-UserService-lookup-interface
+    tier: di_gap
+    query: "call_chain:src/main/java/com/example/users/UserService.java::UserService.lookup"
+    expected:
+      - src/main/java/com/example/users/JpaUserRepository.java::JpaUserRepository.findById
+      - src/main/java/com/example/users/InMemoryUserRepository.java::InMemoryUserRepository.findById
+
+  # @Bean factory method: OrderService receives a Clock via constructor,
+  # but Clock isn't a @Service or @Component — it's provided by
+  # Clocks.systemClock() which returns Clock. Without @Bean-aware
+  # extraction, callers(systemClock) is empty and users of Clock can't
+  # trace back to its factory.
+  - id: di_gap-callers-systemClock
+    tier: di_gap
+    query: "callers:src/main/java/com/example/config/Clocks.java::Clocks.systemClock"
+    expected:
+      - src/main/java/com/example/orders/OrderService.java::OrderService
+
+  # @Qualifier disambiguation: UserService constructor param is
+  # @Qualifier("inMemoryUsers") InMemoryUserRepository. The type is
+  # explicit (concrete class), so Java's resolver already handles it.
+  # This case should pass even WITHOUT Spring-aware extraction — tests
+  # that the qualified injection doesn't break the baseline.
+  - id: di-call_chain-UserService-cache-path
+    tier: di
+    query: "call_chain:src/main/java/com/example/users/UserService.java::UserService.lookup"
+    expected:
+      - src/main/java/com/example/users/InMemoryUserRepository.java::InMemoryUserRepository.findById

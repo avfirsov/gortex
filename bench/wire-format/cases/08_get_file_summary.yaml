@@ -1,0 +1,17 @@
+tool: get_file_summary
+description: file with 12 symbols
+input: |
+  [
+    {"id":"internal/mcp/gcx.go::isGCX","kind":"function","name":"isGCX","start_line":19,"signature":"func isGCX(req mcp.CallToolRequest) bool"},
+    {"id":"internal/mcp/gcx.go::requestedFormat","kind":"function","name":"requestedFormat","start_line":28,"signature":"func requestedFormat(req mcp.CallToolRequest) wire.Format"},
+    {"id":"internal/mcp/gcx.go::gcxResponse","kind":"function","name":"gcxResponse","start_line":44,"signature":"func gcxResponse(payload []byte, err error) (*mcp.CallToolResult, error)"},
+    {"id":"internal/mcp/gcx.go::newGCX","kind":"function","name":"newGCX","start_line":59,"signature":"func newGCX(w *bytes.Buffer, tool string, fields []string, metaKV ...string) *wire.Encoder"},
+    {"id":"internal/mcp/gcx.go::nodeShort","kind":"function","name":"nodeShort","start_line":72,"signature":"func nodeShort(n *graph.Node) string"},
+    {"id":"internal/mcp/gcx.go::nodeSig","kind":"function","name":"nodeSig","start_line":87,"signature":"func nodeSig(n *graph.Node) string"},
+    {"id":"internal/mcp/gcx.go::encodeSearchSymbols","kind":"function","name":"encodeSearchSymbols","start_line":107,"signature":"func encodeSearchSymbols(nodes []*graph.Node, total, limit int) ([]byte, error)"},
+    {"id":"internal/mcp/gcx.go::encodeGetSymbolSource","kind":"function","name":"encodeGetSymbolSource","start_line":141,"signature":"func encodeGetSymbolSource(node *graph.Node, source string, fromLine int, etag string) ([]byte, error)"},
+    {"id":"internal/mcp/gcx.go::encodeBatchSymbols","kind":"function","name":"encodeBatchSymbols","start_line":166,"signature":"func encodeBatchSymbols(rows []map[string]any, includeSource bool) ([]byte, error)"},
+    {"id":"internal/mcp/gcx.go::encodeFindUsages","kind":"function","name":"encodeFindUsages","start_line":200,"signature":"func encodeFindUsages(sg *query.SubGraph) ([]byte, error)"},
+    {"id":"internal/mcp/gcx.go::encodeSubGraph","kind":"function","name":"encodeSubGraph","start_line":229,"signature":"func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error)"},
+    {"id":"internal/mcp/gcx.go::encodeAnalyze","kind":"function","name":"encodeAnalyze","start_line":390,"signature":"func encodeAnalyze(kind string, payload any) ([]byte, error)"}
+  ]
