@@ -141,29 +141,17 @@ func goTemporalHandlerName(callNode *sitter.Node, src []byte) string {
 	return ""
 }
 
-// goTemporalDispatchName extracts the activity (or child-workflow)
-// name from a `workflow.ExecuteActivity(ctx, X, args...)` call. X is
-// the second positional argument and is either:
-//
-//   - a string literal:                    "MyActivity"
-//   - a bare identifier:                   MyActivity
-//   - a selector expression:               pkg.MyActivity, recv.Method
-//
-// In every case we return the trailing identifier — that's the name
-// the worker registers under (Temporal Go SDK convention: the bare
-// function name unless `RegisterActivityWithOptions` overrides it).
-// Returns "" when the second argument is missing, an expression we
-// can't reduce to a name (e.g. a function literal), or when the call
-// has fewer than two positional arguments.
-func goTemporalDispatchName(callNode *sitter.Node, src []byte) string {
-	return goTemporalNameFromExpr(goTemporalDispatchArg(callNode), src)
-}
-
 // goTemporalDispatchArg returns the second positional argument node of a
-// dispatch call (`workflow.ExecuteActivity(ctx, X, ...)` → X), or nil.
-// Exposed separately from goTemporalDispatchName so the env-default
-// refinement can inspect the argument's shape (a bare identifier is the
-// only case it tries to resolve to a literal default).
+// dispatch call (`workflow.ExecuteActivity(ctx, X, args...)` → X), or
+// nil. X is either a string literal ("MyActivity"), a bare identifier
+// (MyActivity), or a selector expression (pkg.MyActivity, recv.Method);
+// goTemporalNameFromExpr reduces it to the trailing identifier — the
+// name the worker registers under (the bare function name unless
+// `RegisterActivityWithOptions` overrides it). Returned as a node, not a
+// reduced name, so the env-default refinement can inspect the argument's
+// shape (a bare identifier is the only case it tries to resolve to a
+// literal default). Returns nil when the call has fewer than two
+// positional arguments.
 func goTemporalDispatchArg(callNode *sitter.Node) *sitter.Node {
 	if callNode == nil || callNode.Type() != "call_expression" {
 		return nil
@@ -189,7 +177,7 @@ func goTemporalDispatchArg(callNode *sitter.Node) *sitter.Node {
 // goTemporalRegisterName extracts the registered function name from a
 // `worker.RegisterActivity(F)` / `worker.RegisterWorkflow(F)` call —
 // the first positional argument, which is the function reference.
-// Same expression shapes as goTemporalDispatchName.
+// Same expression shapes as the dispatch-name argument.
 func goTemporalRegisterName(callNode *sitter.Node, src []byte) string {
 	if callNode == nil || callNode.Type() != "call_expression" {
 		return ""
