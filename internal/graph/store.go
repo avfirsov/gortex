@@ -1052,6 +1052,14 @@ type RefFactsWriter interface {
 // set of source files (all files when files is empty), as the audit/diff seed.
 type RefFactsReader interface {
 	LoadRefFactsByFiles(repoPrefix string, files []string) ([]RefFact, error)
+	// LoadRefFactsByTargets is the reverse lookup: the persisted facts that
+	// resolve TO any of the given node IDs, grouped by source file path. It
+	// answers "which files reference these symbols" durably — live in-edges
+	// are dropped when their target file is re-indexed, but the sidecar row
+	// keyed by to_id survives, so incremental re-resolution can find the
+	// referencing files after the eviction. Empty input yields an empty,
+	// non-nil map.
+	LoadRefFactsByTargets(repoPrefix string, targetIDs []string) (map[string][]RefFact, error)
 }
 
 // ChurnEnrichment is one node's git-churn enrichment, moved out of
