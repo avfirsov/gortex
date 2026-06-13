@@ -74,7 +74,8 @@ env-helper) он резолвится.
 | func-returning-constant dispatch (`GetName()` → `"X"`) | `TestFuncConstReturnDispatch_E2E` |
 | env-helper с дефолтом (`GetEnvOrDefault`/`…Value`/`EnvOr`/`GetenvDefault`/`GetEnvDefault`) | `TestEnvFallbackResolution`, `TestEnvFallbackViaHelper_*` |
 | env-default через `os.Getenv` / `cmp.Or` / `if name==""` | `TestTemporalE2E_GoEnvDefaultActivity` |
-| wrapper-following **глубины 1** (literal и const аргумент) | `TestTemporalE2E_GoWrapperFollowing` |
+| wrapper-following глубины 1 (literal и const аргумент) | `TestTemporalE2E_GoWrapperFollowing` |
+| wrapper-following **глубины >1** (итерация до фикспоинта, bound 3) | `TestTemporalE2E_GoWrapperDepth2` |
 | cross-package wrapper (`wfutil.ExecuteActivityMethod`) | `TestTemporalE2E_GoWfutilCrossPackage` |
 | step/executor struct-field dispatch (литеральное поле) | `TestTemporalE2E_GoStepExecutor` |
 | незарегистрированная активность по convention-имени | `TestTemporalE2E_GoUnregisteredActivityByConvention` |
@@ -84,9 +85,13 @@ env-helper) он резолвится.
 | child workflow | `TestTemporalE2E_GoChildWorkflow` |
 | **подавление кросс-репо `*_test.go` стаб-FP** (новое) | `TestResolveTemporalCalls_CrossRepoTestStubSuppressed` |
 
-> Уже починено в этом раунде (форк): добавлен `GetEnvOrDefaultValue` в allow-list env-хелперов;
-> добавлен фильтр, не дающий dispatch'у из репо A резолвиться в `*_test.go` стаб чужого репо B
-> (тот единственный подтверждённый FP из L1-аудита).
+> Уже починено в этом раунде (форк):
+> 1. добавлен `GetEnvOrDefaultValue` в allow-list env-хелперов;
+> 2. добавлен фильтр, не дающий dispatch'у из репо A резолвиться в `*_test.go` стаб чужого репо B
+>    (тот единственный подтверждённый FP из L1-аудита);
+> 3. **починен wrapper-following глубины >1** — `arg_names` теперь записываются и для
+>    forward'нутого lowercase-параметра, так что итеративный пасс проходит цепочку обёрток до
+>    фикспоинта (bound = 3 уровня). Зелёный e2e: `TestTemporalE2E_GoWrapperDepth2`.
 
 ---
 
@@ -96,7 +101,13 @@ env-helper) он резолвится.
 Главный источник — ваш собственный `analyze kind=temporal_orphans`: **всё, что висит как
 `broken_dispatch` и НЕ попадает в раздел 2, — это незакрытый шейп, который нужно сюда вынести.**
 
-### 3.1. Wrapper depth>1 (G2) — **МОК** (единственный реальный gap либы)
+### 3.1. Wrapper depth>1 (G2) — **ПОЧИНЕНО для глубины ≤3; подтвердить вашу реальную глубину**
+
+Был единственный реальный gap либы — теперь закрыт (см. п.3 «уже починено»). Итеративный пасс
+проходит цепочку обёрток до фикспоинта с bound = 3 уровня. **Что нужно от вас:** намокать вашу
+**самую глубокую реальную** цепочку обёрток (анонимизированно) и **зарепортить максимальную
+глубину**. Если в проде встречается глубина > 3 — это единственный оставшийся риск; по репорту
+поднимем bound.
 
 Что искать: цепочку обёрток, где имя активности forward'ится через ≥2 функции, прежде чем
 дойти до `workflow.ExecuteActivity`.
@@ -116,9 +127,9 @@ func execActivity(ctx workflow.Context, name string, in Input) error {
 // activity.go + worker.go: ProcessCancelActivity + RegisterActivity(ProcessCancelActivity)
 ```
 
-**Ожидаемое ребро (после фикса):** `CancelWorkflow → ProcessCancelActivity`, `via=temporal.stub`,
-`temporal_via_wrapper`. Сейчас зафейлится (резолвер делает один шаг). **Репорт:** максимальная
-реальная глубина обёрток в ваших репо (чтобы выбрать bound для итерации до фикспоинта).
+**Ожидаемое ребро:** `CancelWorkflow → ProcessCancelActivity`, `via=temporal.stub`,
+`temporal_via_wrapper`. На текущем форке такой кейс уже **зелёный** (глубина 2). **Репорт:**
+максимальная реальная глубина обёрток в ваших репо — если она > 3, нужно поднять bound.
 
 ### 3.2. Прочие env-helper имена — **РЕПОРТ** (+ мок только при иной сигнатуре)
 
