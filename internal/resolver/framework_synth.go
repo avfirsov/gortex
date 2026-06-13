@@ -146,18 +146,39 @@ type FrameworkSynthReport struct {
 	Per   []SynthCount `json:"per_synthesizer"`
 }
 
-// RunFrameworkSynthesizers runs every registered framework synthesizer
-// over g, in registration order, and returns the per-synthesizer and
-// total landed-edge counts. A nil graph is a no-op.
-func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
+// RunFrameworkSynthesizersExcept runs every registered framework synthesizer
+// over g, in registration order, skipping any whose Name() appears in skip.
+// A nil or empty skip map is identical to RunFrameworkSynthesizers — zero
+// behaviour change when no synthesizer is gated out. A nil graph is a no-op.
+//
+// PURPOSE — allow a caller to gate off one or more synthesizers at runtime
+// (e.g. SynthTemporalStub when GORTEX_TEMPORAL=off) without modifying the
+// global registry or the individual pass functions.
+// RATIONALE — the skip map is computed once per index settle by the caller
+// (e.g. Indexer.temporalSkip) and passed through; the engine enforces it here
+// so every call site gets the gate for free without per-site if-guards.
+// KEYWORDS — skip, gate, temporal, synthesizer, runtime
+func RunFrameworkSynthesizersExcept(g graph.Store, skip map[string]bool) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
 	for _, s := range defaultFrameworkSynthesizers() {
+		if skip[s.Name()] {
+			rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: 0})
+			continue
+		}
 		n := s.Synthesize(g)
 		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n})
 		rep.Total += n
 	}
 	return rep
+}
+
+// RunFrameworkSynthesizers runs every registered framework synthesizer
+// over g, in registration order, and returns the per-synthesizer and
+// total landed-edge counts. A nil graph is a no-op.
+// This is a thin wrapper around RunFrameworkSynthesizersExcept with no skip.
+func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
+	return RunFrameworkSynthesizersExcept(g, nil)
 }

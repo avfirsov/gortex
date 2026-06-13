@@ -110,6 +110,13 @@ const qGoAll = `
     (literal_element (identifier) @fieldval.key)
     (literal_element (identifier) @fieldval.value)) @fieldval.elem
 
+  ; Struct field set to a string literal, e.g. ActivityName: "Charge".
+  ; The Temporal step/executor resolver joins these to a struct whose
+  ; method dispatches via that field.
+  (keyed_element
+    (literal_element (identifier) @fieldstr.key)
+    (literal_element (interpreted_string_literal) @fieldstr.val)) @fieldstr.elem
+
   (keyed_element
     (literal_element (identifier) @fieldsel.key)
     (literal_element
@@ -178,6 +185,11 @@ type goDeferredCall struct {
 	line       int    // 1-based line of call_expression
 	isSelector bool
 	spawn      bool // call is launched via `go` — emit EdgeSpawns alongside EdgeCalls
+	// callNode is the call_expression AST node, retained so the call
+	// post-pass can extract positional argument names (arg_names) for
+	// the Temporal wrapper-following resolver. Valid only during Extract
+	// (the parse tree is live); never stored on the graph.
+	callNode *sitter.Node
 	// gRPC server registration. Set when this call is the generated
 	// `Register<Service>Server(registrar, impl)` helper: grpcRegService
 	// is the service name and grpcRegArgNode is the second-argument AST
@@ -201,6 +213,33 @@ type goDeferredCall struct {
 	tempKind  string
 	tempName  string
 	tempLocal bool
+	// tempNameFunc is set when the dispatch argument is a call_expression
+	// (`workflow.ExecuteActivity(ctx, pkg.GetFooName(), …)`); it carries
+	// the bare name of the CALLED function whose string return value
+	// supplies the activity / workflow name. The stub edge is tagged
+	// `temporal_name_func=<func>` so the resolver's ResolveTemporalCalls
+	// pass can join it to that func's const-return literal (G2). When set,
+	// tempName carries the same func name purely as a non-resolving
+	// placeholder so the edge keeps its `unresolved::temporal::…` shape.
+	tempNameFunc string
+	// tempHandlerKind is "query" / "signal" / "update" when this call
+	// is a `workflow.SetQueryHandler` / `GetSignalChannel` /
+	// `SetUpdateHandler` in-workflow handler declaration; tempName then
+	// carries the handler's string name. `via=temporal.handler` meta is
+	// stamped on the emitted edge in the call post-pass below.
+	tempHandlerKind string
+	// tempEnvDefault is set when tempName was resolved from a bare
+	// variable read from an env var with a literal default (e.g.
+	// `cmp.Or(os.Getenv("K"), "Default")`). The stub edge is then tagged
+	// `temporal_name_origin=env_default` so the resolver lands it at the
+	// speculative tier — the runtime env value may differ from the default.
+	tempEnvDefault bool
+	// tempOutKind is "signal" / "query" when this call is an outbound
+	// signal-send / query-call against a running workflow
+	// (SignalExternalWorkflow / SignalWorkflow / QueryWorkflow); tempName
+	// then carries the signal/query name. `via=temporal.signal-send` /
+	// `temporal.query-call` meta is stamped on the emitted edge below.
+	tempOutKind string
 }
 
 type goDeferredTypeRef struct {
@@ -220,6 +259,17 @@ type goDeferredValueSel struct {
 type goDeferredValueIdent struct {
 	name string
 	line int
+}
+
+// goExecutorField records a struct field set to a string literal in a
+// composite literal (`ActivityExecutor{ActivityName: "Charge"}`). The
+// Temporal step/executor resolver joins it to a struct whose method
+// dispatches an activity via that field.
+type goExecutorField struct {
+	typeName string
+	field    string
+	value    string
+	line     int
 }
 
 func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -269,6 +319,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	var valueIdents []goDeferredValueIdent
 	var fieldValSels []goDeferredValueSel
 	var fieldValIdents []goDeferredValueIdent
+	var executorFields []goExecutorField
 	var observabilityEvents []goObservabilityEvent
 	var pubsubCandidates []goPubsubCandidate
 	var stringEvents []goStringEvent
@@ -311,6 +362,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				callName: callName,
 				line:     expr.StartLine + 1,
 				spawn:    isGoroutineSpawn(expr.Node),
+				callNode: expr.Node,
 			}
 			if svc, argNode, ok := grpcRegisterArgNode(expr.Node, callName); ok {
 				dc.grpcRegService, dc.grpcRegArgNode = svc, argNode
@@ -327,6 +379,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				line:       expr.StartLine + 1,
 				isSelector: true,
 				spawn:      isGoroutineSpawn(expr.Node),
+				callNode:   expr.Node,
 			}
 			if svc, argNode, ok := grpcRegisterArgNode(expr.Node, method); ok {
 				dc.grpcRegService, dc.grpcRegArgNode = svc, argNode
@@ -334,16 +387,52 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			// Temporal workflow → activity dispatch:
 			// `workflow.ExecuteActivity(ctx, X, ...)` etc.
 			if kind, local, ok := goTemporalDispatchKind(receiver, method); ok {
-				if name := goTemporalDispatchName(expr.Node, src); name != "" {
+				argNode := goTemporalDispatchArg(expr.Node)
+				if name := goTemporalNameFromExpr(argNode, src); name != "" {
 					dc.tempKind = kind
 					dc.tempName = name
 					dc.tempLocal = local
+					// Env-default refinement: when the name is a bare local
+					// variable, try to resolve it to an env-var-with-literal
+					// -default so the dispatch lands on the default activity.
+					if argNode != nil && argNode.Type() == "identifier" {
+						if def, ok := goTemporalEnvDefaultName(expr.Node, name, src); ok {
+							dc.tempName = def
+							dc.tempEnvDefault = true
+						}
+					}
+				} else if argNode != nil && argNode.Type() == "call_expression" {
+					// Func-returning-literal dispatch (G2):
+					// `ExecuteActivity(ctx, pkg.GetFooName(), …)`. The name
+					// is whatever GetFooName() returns; record the callee so
+					// the resolver can join it to the func's const-return.
+					if fn := goTemporalFuncCallName(argNode, src); fn != "" {
+						dc.tempKind = kind
+						dc.tempName = fn // placeholder only; not register-matched
+						dc.tempLocal = local
+						dc.tempNameFunc = fn
+					}
 				}
 			} else if kind, _, ok := goTemporalRegisterKind(method); ok {
 				// Temporal worker registration:
 				// `w.RegisterActivity(F)` etc.
 				if name := goTemporalRegisterName(expr.Node, src); name != "" {
 					dc.tempKind = "register_" + kind
+					dc.tempName = name
+				}
+			} else if hkind, ok := goTemporalHandlerKind(receiver, method); ok {
+				// Temporal in-workflow handler declaration:
+				// `workflow.SetQueryHandler(ctx, "name", fn)` etc.
+				if name := goTemporalHandlerName(expr.Node, src); name != "" {
+					dc.tempHandlerKind = hkind
+					dc.tempName = name
+				}
+			} else if okind, namePos, ok := goTemporalSignalQueryOutKind(receiver, method); ok {
+				// Outbound signal-send / query-call against a running
+				// workflow: SignalExternalWorkflow / SignalWorkflow /
+				// QueryWorkflow. The name is the 4th positional literal.
+				if name := goTemporalNthStringLiteralArg(expr.Node, namePos, src); name != "" {
+					dc.tempOutKind = okind
 					dc.tempName = name
 				}
 			}
@@ -420,7 +509,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			e.emitVar(m, filePath, fileID, result, tenv)
 
 		case m.Captures["const.def"] != nil:
-			e.emitConst(m, filePath, fileID, result)
+			e.emitConst(m, filePath, fileID, src, result)
 
 		case m.Captures["svar.def"] != nil:
 			e.recordShortVarType(m, src, tenv)
@@ -515,6 +604,21 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				line: elem.StartLine + 1,
 			})
 
+		case m.Captures["fieldstr.elem"] != nil:
+			elem := m.Captures["fieldstr.elem"]
+			if typeName := goCompositeLiteralType(elem.Node, src); typeName != "" {
+				val := m.Captures["fieldstr.val"].Text
+				if len(val) >= 2 && (val[0] == '"' || val[0] == '`') {
+					val = val[1 : len(val)-1]
+				}
+				executorFields = append(executorFields, goExecutorField{
+					typeName: typeName,
+					field:    m.Captures["fieldstr.key"].Text,
+					value:    val,
+					line:     elem.StartLine + 1,
+				})
+			}
+
 		case m.Captures["assign.def"] != nil:
 			def := m.Captures["assign.def"]
 			writes = append(writes, goDeferredValueSel{
@@ -596,15 +700,38 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 	// (s.counter.Increment() / s.helper()) — the basis for indirect
 	// receiver-field-mutation attribution.
 	recvNameByID := map[string]string{}
+	recvTypeByID := map[string]string{}
 	for _, n := range result.Nodes {
 		if n.Kind == graph.KindMethod && n.Meta != nil {
 			if rn, _ := n.Meta["recv_name"].(string); rn != "" {
 				recvNameByID[n.ID] = rn
 			}
+			if rt, _ := n.Meta["receiver"].(string); rt != "" {
+				recvTypeByID[n.ID] = rt
+			}
 		}
 	}
 
 	// --- Calls ---
+	// paramNames maps a function ID → its parameter-name set, recovered
+	// from the KindParam nodes already emitted (id = `<owner>#param:<name>`).
+	// Used to flag a Temporal dispatch whose name argument is one of the
+	// enclosing function's own parameters — i.e. a dispatch wrapper, whose
+	// real name arrives at the wrapper's call sites (resolved later by the
+	// wrapper-following pass).
+	paramNames := map[string]map[string]bool{}
+	for _, n := range result.Nodes {
+		if n == nil || n.Kind != graph.KindParam {
+			continue
+		}
+		if idx := strings.Index(n.ID, "#param:"); idx >= 0 {
+			owner := n.ID[:idx]
+			if paramNames[owner] == nil {
+				paramNames[owner] = map[string]bool{}
+			}
+			paramNames[owner][n.Name] = true
+		}
+	}
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
@@ -650,6 +777,39 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				if c.tempLocal {
 					meta["temporal_local"] = true
 				}
+				if c.tempEnvDefault {
+					meta["temporal_name_origin"] = "env_default"
+				}
+				// Func-returning-literal dispatch (G2): the name is supplied
+				// by a const-returning func call. Tag the callee so the
+				// resolver can substitute the func's return literal.
+				if c.tempNameFunc != "" {
+					meta["temporal_name_func"] = c.tempNameFunc
+				}
+				// Dispatch wrapper: the name is one of the enclosing
+				// function's parameters, so this function forwards a
+				// caller-supplied activity/workflow name. The
+				// wrapper-following resolver reads the real name from this
+				// function's call sites.
+				if paramNames[callerID][c.tempName] {
+					meta["temporal_name_param"] = c.tempName
+				}
+				// Step/executor: the dispatch name is a field of the
+				// method's own receiver (`e.ActivityName`). Flag it so the
+				// resolver can read the value from the struct's
+				// construction sites.
+				if recvName := recvNameByID[callerID]; recvName != "" {
+					if arg := goTemporalDispatchArg(c.callNode); arg != nil && arg.Type() == "selector_expression" {
+						op := arg.ChildByFieldName("operand")
+						fld := arg.ChildByFieldName("field")
+						if op != nil && fld != nil && op.Content(src) == recvName {
+							meta["temporal_name_field"] = fld.Content(src)
+							if rt := recvTypeByID[callerID]; rt != "" {
+								meta["temporal_recv_type"] = rt
+							}
+						}
+					}
+				}
 				result.Edges = append(result.Edges, &graph.Edge{
 					From: callerID, To: target,
 					Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
@@ -668,6 +828,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
+			applyGoTemporalSignalQueryMeta(edge, c)
+			attachGoTemporalCallArgNames(edge, c, src)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -680,6 +843,9 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			}
 			applyGoGRPCRegisterMeta(edge, c, src, tenv)
 			applyGoTemporalRegisterMeta(edge, c)
+			applyGoTemporalHandlerMeta(edge, c)
+			applyGoTemporalSignalQueryMeta(edge, c)
+			attachGoTemporalCallArgNames(edge, c, src)
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -729,6 +895,8 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		}
 		applyGoGRPCRegisterMeta(edge, c, src, tenv)
 		applyGoTemporalRegisterMeta(edge, c)
+		applyGoTemporalSignalQueryMeta(edge, c)
+		attachGoTemporalCallArgNames(edge, c, src)
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
@@ -841,6 +1009,31 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		})
 	}
 
+	// Temporal step/executor field: `ActivityExecutor{ActivityName: "X"}`.
+	// Emitted as a marker EdgeCalls carrying the (type, field, value) so
+	// the resolver can join it to a struct whose method dispatches via
+	// that field. Targets a dedicated placeholder so the edge never
+	// pollutes ordinary call resolution.
+	for _, ef := range executorFields {
+		callerID := findEnclosingFunc(funcRanges, ef.line)
+		if callerID == "" {
+			callerID = filePath
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     callerID,
+			To:       "unresolved::temporal-executor::" + ef.typeName + "::" + ef.field,
+			Kind:     graph.EdgeCalls,
+			FilePath: filePath,
+			Line:     ef.line,
+			Meta: map[string]any{
+				"via":            "temporal.executor-field",
+				"executor_type":  ef.typeName,
+				"executor_field": ef.field,
+				"executor_value": ef.value,
+			},
+		})
+	}
+
 	// Selector as struct field value: {Handler: h.handleHealth}
 	for _, v := range fieldValSels {
 		callerID := findEnclosingFunc(funcRanges, v.line)
@@ -927,6 +1120,12 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	node.Meta["visibility"] = VisibilityByCase(name)
 	if body := goFuncBody(def.Node); body != nil {
 		StampFunctionMetrics(node, body, "go")
+	}
+	// Temporal func-returning-literal index (G2): a func whose body is a
+	// single `return "<literal>"` centralises an activity / workflow name;
+	// record the literal so the resolver can resolve a dispatch through it.
+	if lit, ok := goFuncConstReturnLiteral(def.Node, src); ok {
+		node.Meta["temporal_const_return"] = lit
 	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)
@@ -1023,6 +1222,10 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	node.Meta["visibility"] = VisibilityByCase(name)
 	if body := goFuncBody(def.Node); body != nil {
 		StampFunctionMetrics(node, body, "go")
+	}
+	// Temporal func-returning-literal index (G2): see emitFunction.
+	if lit, ok := goFuncConstReturnLiteral(def.Node, src); ok {
+		node.Meta["temporal_const_return"] = lit
 	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)
@@ -1607,7 +1810,7 @@ func (e *GoExtractor) emitVar(m parser.QueryResult, filePath, fileID string, res
 	}
 }
 
-func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
+func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
 	nameCap := m.Captures["const.name"]
 	def := m.Captures["const.def"]
 	if nameCap == nil || nameCap.Text == "" || nameCap.Text == "_" {
@@ -1627,15 +1830,98 @@ func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, r
 	if def != nil && def.Node != nil && containsGoIotaBlock(def.Text) {
 		kind = graph.KindEnumMember
 	}
+	meta := map[string]any{"visibility": VisibilityByCase(name)}
+	// Retain the literal string value of a string-typed const so the
+	// resolver can land a string-named dispatch (e.g.
+	// `workflow.ExecuteActivity(ctx, constants.ChargeActivity, …)` where
+	// `const ChargeActivity = "ChargeCard"`) on the real activity. Only
+	// string literals are captured — iota / numeric / computed consts
+	// carry no value.
+	if def != nil && def.Node != nil {
+		if v, ok := goConstStringValue(def.Node, name, m.Captures["const.def"].Text, src); ok {
+			meta["value"] = v
+		}
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: kind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "go",
-		Meta:     map[string]any{"visibility": VisibilityByCase(name)},
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+}
+
+// goConstStringValue returns the unquoted string-literal value assigned
+// to the const named `name` within a `const_declaration` node (handles
+// the single-spec and block forms), or ("", false) when that const's
+// value is not a plain string literal. `declText` is unused beyond
+// guarding empty input; the value is read structurally from the AST.
+func goConstStringValue(constDecl *sitter.Node, name, declText string, src []byte) (string, bool) {
+	if constDecl == nil || declText == "" {
+		return "", false
+	}
+	for i := 0; i < int(constDecl.NamedChildCount()); i++ {
+		spec := constDecl.NamedChild(i)
+		if spec == nil || spec.Type() != "const_spec" {
+			continue
+		}
+		nameNode := spec.ChildByFieldName("name")
+		if nameNode == nil || nameNode.Content(src) != name {
+			continue
+		}
+		val := spec.ChildByFieldName("value")
+		if val == nil {
+			return "", false
+		}
+		expr := val
+		if val.Type() == "expression_list" {
+			expr = val.NamedChild(0)
+		}
+		if expr == nil {
+			return "", false
+		}
+		switch expr.Type() {
+		case "interpreted_string_literal", "raw_string_literal":
+			t := expr.Content(src)
+			if len(t) >= 2 && (t[0] == '"' || t[0] == '`') {
+				return t[1 : len(t)-1], true
+			}
+			return t, true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// goCompositeLiteralType walks up from a keyed_element to its enclosing
+// composite_literal and returns the type name (the trailing identifier
+// for a qualified type), or "" when there isn't one.
+func goCompositeLiteralType(keyed *sitter.Node, src []byte) string {
+	for n := keyed; n != nil; n = n.Parent() {
+		if n.Type() != "composite_literal" {
+			continue
+		}
+		t := n.ChildByFieldName("type")
+		if t == nil {
+			return ""
+		}
+		switch t.Type() {
+		case "type_identifier":
+			return t.Content(src)
+		case "pointer_type":
+			if inner := t.NamedChild(0); inner != nil && inner.Type() == "type_identifier" {
+				return inner.Content(src)
+			}
+		case "qualified_type":
+			if f := t.ChildByFieldName("name"); f != nil {
+				return f.Content(src)
+			}
+		}
+		return ""
+	}
+	return ""
 }
 
 // containsGoIotaBlock reports whether a const_declaration's source

@@ -588,6 +588,16 @@ type IndexConfig struct {
 	// stdlib calls are filtered out regardless so the synthetic nodes
 	// only ever name genuine third-party packages.
 	SynthesizeExternalCalls *bool `mapstructure:"synthesize_external_calls" yaml:"synthesize_external_calls,omitempty"`
+	// SynthesizeTemporalDispatch enables the Temporal workflow/activity
+	// dispatch synthesiser, which mints `calls` edges from Workflow
+	// ExecuteActivity / ExecuteChildWorkflow call sites to the registered
+	// Activity / Workflow implementations — bridging the reflection-based
+	// registration gap that the static resolver cannot cross. DEFAULT ON
+	// (tri-state, nil = on) because the synthesiser is low-cost and the
+	// edges are load-bearing for any codebase built on Temporal. Opt out
+	// per-repo with `.gortex.yaml::index::synthesize_temporal_dispatch:
+	// false` or the GORTEX_TEMPORAL=off environment override.
+	SynthesizeTemporalDispatch *bool `mapstructure:"synthesize_temporal_dispatch" yaml:"synthesize_temporal_dispatch,omitempty"`
 	// SynthesizeSpeculativeDispatch mints opt-in, best-guess `calls` edges for
 	// dynamic-dispatch blind spots (computed-member calls obj["foo"](),
 	// getattr, decorator registries). Unlike external-call synthesis it
@@ -1363,6 +1373,25 @@ func (i IndexConfig) ExternalCallSynthesisEnabledOrDefault() bool {
 		return true
 	}
 	return *i.SynthesizeExternalCalls
+}
+
+// TemporalDispatchEnabledOrDefault resolves the tri-state
+// SynthesizeTemporalDispatch flag against a default-ON policy: an unset flag
+// (key absent from config) means Temporal workflow/activity dispatch
+// synthesis is enabled, so call edges from ExecuteActivity /
+// ExecuteChildWorkflow sites to registered implementations are materialised
+// by default. The GORTEX_TEMPORAL environment variable takes precedence over
+// the struct field when set (on/1/true → enabled; off/0/false → disabled,
+// case-insensitive). Opt out per-repo with the key set to false or
+// GORTEX_TEMPORAL=off.
+func (i IndexConfig) TemporalDispatchEnabledOrDefault() bool {
+	if v := os.Getenv("GORTEX_TEMPORAL"); v != "" {
+		return strings.EqualFold(v, "on") || v == "1" || strings.EqualFold(v, "true")
+	}
+	if i.SynthesizeTemporalDispatch == nil {
+		return true
+	}
+	return *i.SynthesizeTemporalDispatch
 }
 
 // SpeculativeDispatchEnabledOrDefault resolves the tri-state

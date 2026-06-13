@@ -282,3 +282,38 @@ func Log(_ string, args ...any) {}
 		t.Errorf("variadic flag missing on args param")
 	}
 }
+
+func TestGoConst_StringValueRetained(t *testing.T) {
+	fix := runGoExtract(t, `package c
+
+const ChargeActivity = "ChargeCard"
+
+const (
+	PkgName  = "browse-product-catalog-activities"
+	FuncName = "GetProductOfferingActivity"
+	Limit    = 42
+)
+`)
+	get := func(name string) *graph.Node {
+		for _, n := range fix.nodesByKind[graph.KindConstant] {
+			if n.Name == name {
+				return n
+			}
+		}
+		return nil
+	}
+	if n := get("ChargeActivity"); n == nil || n.Meta["value"] != "ChargeCard" {
+		t.Fatalf("ChargeActivity value = %v, want ChargeCard", n)
+	}
+	if n := get("PkgName"); n == nil || n.Meta["value"] != "browse-product-catalog-activities" {
+		t.Errorf("PkgName value = %v", n.Meta["value"])
+	}
+	if n := get("FuncName"); n == nil || n.Meta["value"] != "GetProductOfferingActivity" {
+		t.Errorf("FuncName value = %v", n.Meta["value"])
+	}
+	if n := get("Limit"); n != nil {
+		if _, ok := n.Meta["value"]; ok {
+			t.Errorf("numeric const Limit must not carry a string value, got %v", n.Meta["value"])
+		}
+	}
+}

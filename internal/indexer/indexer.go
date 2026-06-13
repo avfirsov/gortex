@@ -740,7 +740,7 @@ func (idx *Indexer) RunGlobalGraphPasses(ctx context.Context) {
 	// before DetectCrossRepoEdges so a cross-repo synthesized call gets
 	// its parallel cross_repo_calls edge.
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
-	if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+	if rep := resolver.RunFrameworkSynthesizersExcept(idx.graph, idx.temporalSkip()); rep.Total > 0 {
 		idx.logger.Info("framework dispatch calls synthesized (global)",
 			zap.Int("edges", rep.Total),
 			zap.Any("per_synthesizer", rep.Per),
@@ -2488,7 +2488,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			// deferGlobalPasses; the batch caller folds it into
 			// RunGlobalGraphPasses.
 			reporter.Report("framework dispatch synthesis", 0, 0)
-			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+			if rep := resolver.RunFrameworkSynthesizersExcept(idx.graph, idx.temporalSkip()); rep.Total > 0 {
 				idx.logger.Info("framework dispatch calls synthesized",
 					zap.Int("edges", rep.Total),
 					zap.Any("per_synthesizer", rep.Per),
@@ -2930,7 +2930,7 @@ func (idx *Indexer) ResolveAll() {
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
 	// channels / native bridges) depends on InferImplements (the
 	// interface-satisfaction signals) having run first.
-	resolver.RunFrameworkSynthesizers(idx.graph)
+	resolver.RunFrameworkSynthesizersExcept(idx.graph, idx.temporalSkip())
 	// External-call placeholder synthesis (opt-in) — runs after the
 	// resolver and stub passes so only genuinely un-indexed external
 	// targets remain to materialise.
@@ -3959,7 +3959,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		// accesses_field) fresh on incremental reindex — same idempotent
 		// re-derive RunGlobalGraphPasses runs at full index.
 		synthesizeCapabilityEdges(idx.graph)
-		resolver.RunFrameworkSynthesizers(idx.graph)
+		resolver.RunFrameworkSynthesizersExcept(idx.graph, idx.temporalSkip())
 		// Incremental: synthesize external calls only for the reindexed
 		// files (O(edited files)), not a full-graph recompute.
 		resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), idx.graphFilePaths(staleFiles))
@@ -4183,7 +4183,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		// may have dropped a handler, a registration edge, or an emit /
 		// listen edge, and each synthesizer's index must be rebuilt
 		// against the fresh graph. Every pass is a full recompute.
-		resolver.RunFrameworkSynthesizers(idx.graph)
+		resolver.RunFrameworkSynthesizersExcept(idx.graph, idx.temporalSkip())
 		// External-call synthesis (opt-in) — file-scoped to the reindexed
 		// files (O(edited files)), not a full-graph recompute. Eviction
 		// already dropped a removed file's synthetic edges; a re-indexed

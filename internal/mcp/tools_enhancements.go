@@ -805,6 +805,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeExternalCalls(ctx, req)
 	case "synthesizers":
 		return s.handleAnalyzeSynthesizers(ctx, req)
+	case "temporal_orphans":
+		return s.handleAnalyzeTemporalOrphans(ctx, req)
 	case "resolution_outcomes":
 		return s.handleAnalyzeResolutionOutcomes(ctx, req)
 	case "retrieval_log":

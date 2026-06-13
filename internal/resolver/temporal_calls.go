@@ -12,6 +12,14 @@ import (
 // (`unresolved::temporal::<kind>::<name>`).
 const temporalStubPrefix = unresolvedPrefix + "temporal::"
 
+// temporalEnvDefaultConfidence is stamped on a stub edge whose name was
+// resolved through an env-var-with-literal-default variable (the parser
+// tags it `temporal_name_origin=env_default`). It sits in the
+// speculative band (< 0.5) so the edge lands at the AMBIGUOUS label and,
+// together with MetaSpeculative, is hidden from default queries: the
+// runtime env override may name a different handler than the default.
+const temporalEnvDefaultConfidence = 0.4
+
 // Temporal annotation node IDs the Java extractor emits via
 // EmitAnnotationEdge. The resolver consumes these to discover
 // temporal-tagged interfaces and methods.
@@ -85,6 +93,23 @@ func ResolveTemporalCalls(g graph.Store) int {
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
+	// Wrapper-following: before resolving stubs, propagate dispatch names
+	// from wrapper call sites into fresh temporal.stub edges, so a
+	// workflow that dispatches via a user helper (`executeActivity(ctx,
+	// ao, "Charge", …)`) gets a real workflow→activity edge.
+	// Run iteratively (max 3 passes) to handle depth > 1: wrapper A calls
+	// wrapper B which calls ExecuteActivity. On iteration 1, B's stub is
+	// emitted; on iteration 2, A's caller gets its stub from B. The loop
+	// breaks early when a pass adds no new temporal.stub edges (fixed point).
+	const maxWrapperIterations = 3
+	for iter := 0; iter < maxWrapperIterations; iter++ {
+		before := countTemporalStubEdges(g)
+		resolveTemporalWrapperCalls(g)
+		if countTemporalStubEdges(g) == before {
+			break
+		}
+	}
+	resolveTemporalExecutorFields(g)
 	idx := buildTemporalIndex(g)
 	resolved := 0
 	var reindexBatch []graph.EdgeReindex
@@ -127,6 +152,88 @@ func ResolveTemporalCalls(g graph.Store) int {
 		}
 		handlerID, origin, conf := idx.lookup(s.kind, s.name, callerRepo)
 
+		// Const-named dispatch: when the name is a reference to a string
+		// const (e.g. `constants.ChargeActivity`), the parser recorded
+		// the const NAME; retry against the const's literal VALUE, which
+		// is what the activity is actually registered under.
+		if handlerID == "" {
+			if v, ok := idx.constVal[s.name]; ok && v != s.name {
+				if id, o, c := idx.lookup(s.kind, v, callerRepo); id != "" {
+					handlerID, origin, conf = id, o, c
+					e.Meta["temporal_const_value"] = v
+				}
+			}
+		}
+
+		// Func-returning-literal dispatch (G2): the stub carries
+		// `temporal_name_func=<func>` when the dispatch arg was a
+		// call_expression (`ExecuteActivity(ctx, pkg.GetFooName(), …)`).
+		// Resolve funcName → constVal literal → handler.
+		if handlerID == "" {
+			if fn, _ := e.Meta["temporal_name_func"].(string); fn != "" {
+				if v, ok := idx.constVal[fn]; ok {
+					if id, o, c := idx.lookup(s.kind, v, callerRepo); id != "" {
+						handlerID, origin, conf = id, o, c
+						e.Meta["temporal_const_value"] = v
+					}
+					// Even if lookup fails, record the resolved literal for diagnostics.
+					if handlerID == "" {
+						if id := idx.lookupConvention(s.kind, v, callerRepo); id != "" {
+							handlerID, origin, conf = id, graph.OriginASTInferred, 0.6
+							e.Meta["temporal_const_value"] = v
+							e.Meta["temporal_resolution_via"] = "convention"
+						}
+					}
+				}
+			}
+		}
+
+		// Convention fallback: dispatch to an activity/workflow FUNCTION
+		// by name when the worker registers it elsewhere (unregistered
+		// here) — Pattern 2 / Stage 1.2. Try the dispatch name, then its
+		// const value. Landed at the inferred tier (name convention, not
+		// a register-confirmed binding).
+		if handlerID == "" {
+			candNames := []string{s.name}
+			if v, ok := idx.constVal[s.name]; ok && v != s.name {
+				candNames = append(candNames, v)
+			}
+			for _, nm := range candNames {
+				if id := idx.lookupConvention(s.kind, nm, callerRepo); id != "" {
+					handlerID, origin, conf = id, graph.OriginASTInferred, 0.6
+					e.Meta["temporal_resolution_via"] = "convention"
+					if nm != s.name {
+						e.Meta["temporal_const_value"] = nm
+					}
+					break
+				}
+			}
+		}
+
+		// Fuzzy fallback: only when exact + const + convention all failed.
+		// A single kind-suffixed function whose name contains the dispatch
+		// name (or its core) is the best remaining guess; land it at the
+		// speculative tier so it is hidden from default queries.
+		if handlerID == "" {
+			if id := idx.lookupFuzzy(s.kind, s.name, callerRepo); id != "" {
+				handlerID, origin, conf = id, graph.OriginSpeculative, 0.5
+				e.Meta["temporal_resolution_via"] = "fuzzy"
+				e.Meta[graph.MetaSpeculative] = true
+			}
+		}
+
+		// When the name came from an env-var-with-literal-default
+		// variable, the value is a best-guess: land the resolved edge at
+		// the speculative tier instead of ast_resolved.
+		envDefault := false
+		if v, _ := e.Meta["temporal_name_origin"].(string); v == "env_default" {
+			envDefault = true
+		}
+		if handlerID != "" && envDefault {
+			origin = graph.OriginSpeculative
+			conf = temporalEnvDefaultConfidence
+		}
+
 		want := handlerID
 		if want == "" {
 			want = temporalStubPlaceholder(s.kind, s.name)
@@ -145,6 +252,9 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = conf
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, conf)
 			e.Meta["temporal_resolution"] = origin
+			if envDefault {
+				e.Meta[graph.MetaSpeculative] = true
+			}
 			StampSynthesized(e, SynthTemporalStub)
 			resolved++
 		} else {
@@ -152,6 +262,7 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = 0
 			e.ConfidenceLabel = ""
 			delete(e.Meta, "temporal_resolution")
+			delete(e.Meta, graph.MetaSpeculative)
 			UnstampSynthesized(e)
 		}
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
@@ -159,7 +270,102 @@ func ResolveTemporalCalls(g graph.Store) int {
 	if len(reindexBatch) > 0 {
 		g.ReindexEdges(reindexBatch)
 	}
+	// Link signal senders / query callers to the workflows that handle
+	// them, by shared name.
+	resolveTemporalSignalQueryLinks(g)
+	// Link Java consumers (workflow starts / signals / queries) to the Go
+	// workflows and handlers they target, by shared canonical name.
+	resolveTemporalCrossLanguage(g)
 	return resolved
+}
+
+// resolveTemporalSignalQueryLinks connects the consumer side of the
+// signal/query namespaces to the provider side, both within Go:
+//
+//   - provider: an in-workflow handler declaration
+//     (`workflow.GetSignalChannel(ctx, "cancel")` /
+//     `SetQueryHandler(ctx, "status", …)`), emitted by the parser as a
+//     via=temporal.handler edge from the workflow function, kind ∈
+//     {signal, query, update}, temporal_name = the handler name.
+//   - consumer: an outbound send/call
+//     (`SignalExternalWorkflow` / client `SignalWorkflow` / `QueryWorkflow`),
+//     emitted as via=temporal.signal-send / temporal.query-call,
+//     temporal_name = the same name.
+//
+// For each consumer it emits an EdgeCalls edge from the sender to every
+// workflow that handles that signal/query, tagged
+// via=temporal.signal-link / temporal.query-link. graph.AddEdge dedupes,
+// so the pass is idempotent. Cross-language (Java↔Go) linking is a
+// separate pass; this one stays within the Go graph.
+func resolveTemporalSignalQueryLinks(g graph.Store) {
+	// providers["<kind>::<name>"] → set of handler-owning workflow IDs.
+	providers := map[string][]string{}
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil || e.From == "" {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.handler" {
+			continue
+		}
+		kind, _ := e.Meta["temporal_kind"].(string)
+		name, _ := e.Meta["temporal_name"].(string)
+		if kind == "" || name == "" {
+			continue
+		}
+		providers[kind+"::"+name] = append(providers[kind+"::"+name], e.From)
+	}
+	if len(providers) == 0 {
+		return
+	}
+
+	type link struct {
+		from, to, via, kind, name, file string
+		line                            int
+	}
+	var out []link
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil || e.From == "" {
+			continue
+		}
+		via, _ := e.Meta["via"].(string)
+		var kind, linkVia string
+		switch via {
+		case "temporal.signal-send":
+			kind, linkVia = "signal", "temporal.signal-link"
+		case "temporal.query-call":
+			kind, linkVia = "query", "temporal.query-link"
+		default:
+			continue
+		}
+		name, _ := e.Meta["temporal_name"].(string)
+		if name == "" {
+			continue
+		}
+		for _, wid := range providers[kind+"::"+name] {
+			if wid == e.From {
+				continue
+			}
+			out = append(out, link{
+				from: e.From, to: wid, via: linkVia,
+				kind: kind, name: name, file: e.FilePath, line: e.Line,
+			})
+		}
+	}
+	for _, l := range out {
+		g.AddEdge(&graph.Edge{
+			From:     l.from,
+			To:       l.to,
+			Kind:     graph.EdgeCalls,
+			FilePath: l.file,
+			Line:     l.line,
+			Origin:   graph.OriginASTInferred,
+			Meta: map[string]any{
+				"via":           l.via,
+				"temporal_kind": l.kind,
+				"temporal_name": l.name,
+			},
+		})
+	}
 }
 
 // temporalStubPlaceholder is the canonical placeholder target for an
@@ -168,12 +374,497 @@ func temporalStubPlaceholder(kind, name string) string {
 	return temporalStubPrefix + kind + "::" + name
 }
 
+// countTemporalStubEdges returns the number of EdgeCalls edges carrying
+// Meta["via"]=="temporal.stub". Used by the iterative wrapper-following
+// driver to detect fixed-point convergence.
+//
+// PURPOSE: fixed-point sentinel for the iterative wrapper-following loop.
+// RATIONALE: graph.AddEdge dedupes by key, so a pass that adds nothing new
+// leaves the count unchanged — the loop can break early.
+// KEYWORDS: temporal, wrapper, convergence, fixed-point
+func countTemporalStubEdges(g graph.Store) int {
+	n := 0
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v == "temporal.stub" {
+			n++
+		}
+	}
+	return n
+}
+
+// parseJavaAnnotationName extracts the value of a `name = "..."` argument
+// from a Java annotation's raw argument text (e.g.
+// `@WorkflowMethod(name = "my-workflow")` → "my-workflow"). Returns ""
+// when there's no `name` argument. Handles single and double quotes and
+// optional whitespace around `=`; matches `name` only at a token boundary
+// so it doesn't trip on another argument that merely contains "name".
+func parseJavaAnnotationName(args string) string {
+	for i := 0; i+4 <= len(args); i++ {
+		if args[i:i+4] != "name" {
+			continue
+		}
+		if i > 0 {
+			p := args[i-1]
+			if p == '_' || (p >= 'a' && p <= 'z') || (p >= 'A' && p <= 'Z') || (p >= '0' && p <= '9') {
+				continue // part of a longer identifier
+			}
+		}
+		j := i + 4
+		for j < len(args) && (args[j] == ' ' || args[j] == '\t') {
+			j++
+		}
+		if j >= len(args) || args[j] != '=' {
+			continue
+		}
+		j++
+		for j < len(args) && (args[j] == ' ' || args[j] == '\t') {
+			j++
+		}
+		if j >= len(args) || (args[j] != '"' && args[j] != '\'') {
+			continue
+		}
+		q := args[j]
+		j++
+		start := j
+		for j < len(args) && args[j] != q {
+			j++
+		}
+		if j <= len(args) && j >= start {
+			return args[start:j]
+		}
+	}
+	return ""
+}
+
+// resolveTemporalCrossLanguage links Java consumers to the Go workflows /
+// handlers they target, by shared canonical name:
+//
+//   - a Java `@WorkflowInterface` method (role "workflow", canonical name
+//     from `@WorkflowMethod(name=…)`) → the Go workflow registered /
+//     named the same  → via=temporal.start-workflow.
+//   - a Java `@SignalMethod(name="cancel")` → a Go workflow that serves
+//     signal "cancel" (via=temporal.handler kind=signal) →
+//     via=temporal.signal-link.
+//   - a Java `@QueryMethod(name="status")` → a Go query handler →
+//     via=temporal.query-link.
+//
+// All edges carry cross_language=true and are emitted at the inferred
+// tier (the link is by string name across the type-system boundary).
+// graph.AddEdge dedupes → idempotent.
+func resolveTemporalCrossLanguage(g graph.Store) {
+	// Go provider indexes, by name.
+	goWorkflow := map[string][]string{}
+	goSignalWf := map[string][]string{}
+	goQueryWf := map[string][]string{}
+	addGoWorkflow := func(n *graph.Node) {
+		if n == nil || n.Language != "go" {
+			return
+		}
+		if r, _ := n.Meta["temporal_role"].(string); r != "workflow" {
+			return
+		}
+		name := n.Name
+		if tn, _ := n.Meta["temporal_name"].(string); tn != "" {
+			name = tn
+		}
+		goWorkflow[name] = append(goWorkflow[name], n.ID)
+		if n.Name != name {
+			goWorkflow[n.Name] = append(goWorkflow[n.Name], n.ID)
+		}
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		addGoWorkflow(n)
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		addGoWorkflow(n)
+	}
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil || e.From == "" {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.handler" {
+			continue
+		}
+		from := g.GetNode(e.From)
+		if from == nil || from.Language != "go" {
+			continue
+		}
+		kind, _ := e.Meta["temporal_kind"].(string)
+		name, _ := e.Meta["temporal_name"].(string)
+		if name == "" {
+			continue
+		}
+		switch kind {
+		case "signal":
+			goSignalWf[name] = append(goSignalWf[name], e.From)
+		case "query":
+			goQueryWf[name] = append(goQueryWf[name], e.From)
+		}
+	}
+	if len(goWorkflow) == 0 && len(goSignalWf) == 0 && len(goQueryWf) == 0 {
+		return
+	}
+
+	type link struct {
+		from, to, via string
+	}
+	var out []link
+	consume := func(n *graph.Node) {
+		if n == nil || n.Language != "java" {
+			return
+		}
+		role, _ := n.Meta["temporal_role"].(string)
+		name, _ := n.Meta["temporal_name"].(string)
+		if name == "" {
+			name = n.Name
+		}
+		var targets []string
+		var via string
+		switch role {
+		case "workflow":
+			targets, via = goWorkflow[name], "temporal.start-workflow"
+		case "signal":
+			targets, via = goSignalWf[name], "temporal.signal-link"
+		case "query":
+			targets, via = goQueryWf[name], "temporal.query-link"
+		default:
+			return
+		}
+		for _, to := range targets {
+			if to != n.ID {
+				out = append(out, link{from: n.ID, to: to, via: via})
+			}
+		}
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		consume(n)
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		consume(n)
+	}
+	for _, l := range out {
+		g.AddEdge(&graph.Edge{
+			From:   l.from,
+			To:     l.to,
+			Kind:   graph.EdgeCalls,
+			Origin: graph.OriginASTInferred,
+			Meta: map[string]any{
+				"via":            l.via,
+				"cross_language": true,
+			},
+		})
+	}
+}
+
+// resolveTemporalWrapperCalls implements one level of Temporal dispatch
+// wrapper-following. A "wrapper" is a function whose body dispatches with
+// one of its own parameters as the name (`func exec(ctx, name, …) {
+// workflow.ExecuteActivity(ctx, name, …) }`); the parser flags that
+// internal stub with Meta["temporal_name_param"]=<param>. This pass finds
+// each wrapper's call sites, reads the argument at the wrapper's
+// name-parameter position (recorded by the parser as Meta["arg_names"]),
+// and emits a fresh temporal.stub edge from the caller carrying that name
+// — a string-literal value, or a const NAME that the main pass then
+// resolves through the const-value index. graph.AddEdge dedupes, so the
+// pass is idempotent.
+func resolveTemporalWrapperCalls(g graph.Store) {
+	type wrapper struct {
+		id, kind, name string
+		pos            int
+	}
+	// Discover wrappers and resolve each one's name-parameter position.
+	byID := map[string]wrapper{}
+	byName := map[string][]wrapper{}
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil || e.From == "" {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
+			continue
+		}
+		param, _ := e.Meta["temporal_name_param"].(string)
+		kind, _ := e.Meta["temporal_kind"].(string)
+		if param == "" || kind == "" {
+			continue
+		}
+		if _, seen := byID[e.From]; seen {
+			continue
+		}
+		pn := g.GetNode(e.From + "#param:" + param)
+		if pn == nil {
+			continue
+		}
+		pos, ok := metaIntValue(pn.Meta["position"])
+		if !ok {
+			continue
+		}
+		wname := ""
+		if wnode := g.GetNode(e.From); wnode != nil {
+			wname = wnode.Name
+		}
+		w := wrapper{id: e.From, kind: kind, name: wname, pos: pos}
+		byID[e.From] = w
+		if wname != "" {
+			byName[wname] = append(byName[wname], w)
+		}
+	}
+	if len(byID) == 0 {
+		return
+	}
+
+	type pending struct {
+		from, file, kind, name, wrapperName string
+		line                                int
+		// fwdParam, when non-empty, marks this emitted stub as itself a
+		// name-forwarding wrapper: the caller passed its OWN parameter
+		// (named fwdParam) into the inner wrapper's name position, so the
+		// caller is a transitive wrapper the NEXT iteration must discover.
+		// The stub then carries temporal_name_param=fwdParam (the depth>1
+		// hook), enabling iterative resolution.
+		fwdParam string
+	}
+	var out []pending
+	emit := func(w wrapper, ce *graph.Edge) {
+		if ce.From == w.id {
+			return
+		}
+		name := argNameAt(ce, w.pos)
+		if name == "" {
+			return
+		}
+		// Depth>1 propagation: if the forwarded argument is itself a
+		// parameter of the caller (a `<caller>#param:<name>` node with a
+		// position exists), the caller merely passes a name THROUGH — it is
+		// a transitive wrapper. Emit a temporal_name_param stub so the next
+		// iteration discovers the caller as a wrapper and reaches its own
+		// callers. Otherwise the argument is a literal / const NAME the main
+		// resolver lands directly, and no further hop is needed.
+		fwd := ""
+		if pn := g.GetNode(ce.From + "#param:" + name); pn != nil && pn.Kind == graph.KindParam {
+			if _, ok := metaIntValue(pn.Meta["position"]); ok {
+				fwd = name
+			}
+		}
+		out = append(out, pending{
+			from: ce.From, file: ce.FilePath, line: ce.Line,
+			kind: w.kind, name: name, wrapperName: w.name, fwdParam: fwd,
+		})
+	}
+	// Match each call that carries arg_names to a wrapper, by resolved
+	// node (same-repo) or by callee name (when cross-package / cross-repo
+	// resolution couldn't land the edge on the wrapper's node).
+	for ce := range g.EdgesByKind(graph.EdgeCalls) {
+		if ce == nil || ce.From == "" || ce.Meta == nil {
+			continue
+		}
+		if _, ok := ce.Meta["arg_names"]; !ok {
+			continue
+		}
+		if w, ok := byID[ce.To]; ok {
+			emit(w, ce)
+			continue
+		}
+		callee, _ := ce.Meta["callee"].(string)
+		if callee == "" {
+			continue
+		}
+		for _, w := range byName[callee] {
+			emit(w, ce)
+		}
+	}
+
+	for _, p := range out {
+		// Idempotence guard: skip if an equivalent stub already exists on
+		// this caller. graph.AddEdge dedupes by key, but when fwdParam is
+		// set the stub may have been emitted by a prior iteration with
+		// temporal_name_param already set — avoid replacing the pointer.
+		if temporalWrapperStubExists(g, p.from, p.kind, p.name) {
+			continue
+		}
+		meta := map[string]any{
+			"via":                  "temporal.stub",
+			"temporal_kind":        p.kind,
+			"temporal_name":        p.name,
+			"temporal_via_wrapper": p.wrapperName,
+		}
+		// Transitive wrapper: stamp temporal_name_param so the next
+		// iteration discovers p.from as a wrapper and propagates through
+		// to its own callers (depth > 1).
+		if p.fwdParam != "" {
+			meta["temporal_name_param"] = p.fwdParam
+		}
+		g.AddEdge(&graph.Edge{
+			From:     p.from,
+			To:       temporalStubPlaceholder(p.kind, p.name),
+			Kind:     graph.EdgeCalls,
+			FilePath: p.file,
+			Line:     p.line,
+			Meta:     meta,
+		})
+	}
+}
+
+// temporalWrapperStubExists reports whether `from` already carries a
+// via=temporal.stub out-edge for (kind, name). Used by the idempotence
+// guard inside resolveTemporalWrapperCalls to prevent re-minting stubs
+// across iterative passes.
+//
+// PURPOSE: pointer-stability guard for the iterative wrapper-following loop.
+// RATIONALE: graph.AddEdge deduplicates by edge key; re-adding replaces the
+// stored *Edge pointer, which breaks any retargeted in-edge the main resolver
+// already resolved. Skipping re-emission keeps both out-edge and in-edge
+// buckets pointing at the same *Edge.
+// KEYWORDS: temporal, wrapper, idempotence, dedup
+func temporalWrapperStubExists(g graph.Store, from, kind, name string) bool {
+	for _, e := range g.GetOutEdges(from) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
+			continue
+		}
+		ek, _ := e.Meta["temporal_kind"].(string)
+		en, _ := e.Meta["temporal_name"].(string)
+		if ek == kind && en == name {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTemporalExecutorFields implements the Temporal step/executor
+// pattern: a struct whose method dispatches an activity via one of its
+// own fields (`func (e *ActivityExecutor) Execute(ctx) { ExecuteActivity(
+// ctx, e.ActivityName, …) }`), constructed with the field set to a string
+// (`ActivityExecutor{ActivityName: "Charge"}`). The parser flags the
+// dispatch stub with temporal_name_field + temporal_recv_type, and emits
+// a via=temporal.executor-field marker at each construction site carrying
+// (executor_type, executor_field, executor_value). This pass joins them
+// by (type, field) and emits a fresh temporal.stub from the constructor
+// to the named activity. graph.AddEdge dedupes → idempotent.
+func resolveTemporalExecutorFields(g graph.Store) {
+	// dispatchKind["<type>::<field>"] = activity/workflow kind.
+	dispatchKind := map[string]string{}
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
+			continue
+		}
+		field, _ := e.Meta["temporal_name_field"].(string)
+		rtype, _ := e.Meta["temporal_recv_type"].(string)
+		kind, _ := e.Meta["temporal_kind"].(string)
+		if field == "" || rtype == "" || kind == "" {
+			continue
+		}
+		dispatchKind[rtype+"::"+field] = kind
+	}
+	if len(dispatchKind) == 0 {
+		return
+	}
+
+	type pending struct {
+		from, file, kind, name string
+		line                   int
+	}
+	var out []pending
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil || e.From == "" {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.executor-field" {
+			continue
+		}
+		rtype, _ := e.Meta["executor_type"].(string)
+		field, _ := e.Meta["executor_field"].(string)
+		value, _ := e.Meta["executor_value"].(string)
+		if rtype == "" || field == "" || value == "" {
+			continue
+		}
+		kind, ok := dispatchKind[rtype+"::"+field]
+		if !ok {
+			continue
+		}
+		out = append(out, pending{from: e.From, file: e.FilePath, line: e.Line, kind: kind, name: value})
+	}
+	for _, p := range out {
+		g.AddEdge(&graph.Edge{
+			From:     p.from,
+			To:       temporalStubPlaceholder(p.kind, p.name),
+			Kind:     graph.EdgeCalls,
+			FilePath: p.file,
+			Line:     p.line,
+			Meta: map[string]any{
+				"via":                   "temporal.stub",
+				"temporal_kind":         p.kind,
+				"temporal_name":         p.name,
+				"temporal_via_executor": true,
+			},
+		})
+	}
+}
+
+// metaIntValue reads an int stored in Node.Meta, tolerating the float64 /
+// int64 forms a JSON-backed store may round-trip through.
+func metaIntValue(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// argNameAt reads the reduced positional argument name the parser
+// recorded on a call edge (Meta["arg_names"]), tolerating both []string
+// and the []any form a JSON-backed store round-trips through.
+func argNameAt(e *graph.Edge, pos int) string {
+	if e == nil || e.Meta == nil || pos < 0 {
+		return ""
+	}
+	switch a := e.Meta["arg_names"].(type) {
+	case []string:
+		if pos < len(a) {
+			return a[pos]
+		}
+	case []any:
+		if pos < len(a) {
+			if s, ok := a[pos].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // temporalIndex maps (kind, name) to candidate handler nodes plus the
 // origin / confidence tier the resolver should stamp on the rewritten
 // edge.
 type temporalIndex struct {
 	// byKindName maps "<kind>::<name>" → handler candidate nodes.
 	byKindName map[string][]*graph.Node
+	// constVal maps a string-const NAME → its literal VALUE, used to
+	// resolve a const-named dispatch (`ExecuteActivity(ctx,
+	// constants.ChargeActivity, …)`) to the activity registered under
+	// the const's value. A name that resolves to two different values
+	// across the workspace is ambiguous and omitted.
+	constVal map[string]string
+	// funcByName indexes Go functions / methods whose name follows the
+	// activity / workflow naming convention (suffix "Activity" /
+	// "Workflow"), keyed by bare name. Used as a last-resort, lower-
+	// confidence resolution for dispatch to an UNREGISTERED activity —
+	// the common case where activity repos hold the functions but the
+	// `worker.Register*` calls live in a separate worker-runner (so the
+	// register-based byKindName index never sees them). Pattern 2's
+	// two-part name resolves here once F1/F2 reduce it to the func name.
+	funcByName map[string][]*graph.Node
 }
 
 func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin string, confidence float64) {
@@ -197,6 +888,97 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin stri
 	return "", "", 0
 }
 
+// lookupConvention resolves a dispatch name to a convention-named Go
+// function (suffix "Activity" / "Workflow" matching the kind) when no
+// registered handler matched — the unregistered-activity case (Pattern 2
+// / Stage 1.2). Returns "" when there's no unambiguous candidate. The
+// caller stamps this at a lower (inferred) confidence than a
+// register-confirmed match.
+func (idx *temporalIndex) lookupConvention(kind, name, callerRepo string) string {
+	suffix := "Activity"
+	if kind == "workflow" {
+		suffix = "Workflow"
+	}
+	// core is the dispatch name with any redundant kind-suffix trimmed: a
+	// dispatch of bare "Charge" and a dispatch of the already-suffixed
+	// "ChargeActivity" both reduce to the core "Charge", which the matching
+	// activity FUNCTION ("ChargeActivity", "MyChargeActivity", …) contains.
+	// Trimming keeps the suffixed and bare forms backward-compatible: for
+	// name="ChargeActivity", core="Charge" and "ChargeActivity" both
+	// HasSuffix and Contains(core), so the original suffix-exact match is
+	// preserved while bare-name dispatch now resolves too.
+	core := strings.TrimSuffix(name, suffix)
+	if core == "" {
+		return ""
+	}
+	// Iterate the whole convention index (not an exact-name key): the bare
+	// dispatch name is, by construction, NOT the func name, so an exact-key
+	// lookup never matched the cross-repo / unregistered FUNCTION it names.
+	var filtered, sameRepo []*graph.Node
+	for fn, cands := range idx.funcByName {
+		if !strings.HasSuffix(fn, suffix) || !strings.Contains(fn, core) {
+			continue
+		}
+		for _, n := range cands {
+			filtered = append(filtered, n)
+			if callerRepo != "" && n.RepoPrefix == callerRepo {
+				sameRepo = append(sameRepo, n)
+			}
+		}
+	}
+	if len(sameRepo) == 1 {
+		return sameRepo[0].ID
+	}
+	if len(filtered) == 1 {
+		return filtered[0].ID
+	}
+	return ""
+}
+
+// lookupFuzzy is the conservative last-resort fallback, fired only when both
+// the exact (register-confirmed) lookup and the convention lookup have
+// failed. It re-scans the convention index for the single kind-suffixed
+// FUNCTION whose name contains the raw dispatch name (or its kind-trimmed
+// core) — a looser substring match than convention's suffix-core shape. To
+// keep precision high it resolves ONLY when EXACTLY ONE such candidate
+// exists across the workspace; any ambiguity abstains. The caller stamps the
+// result at the speculative tier (confidence ≤ 0.5, MetaSpeculative) so the
+// best-guess edge is hidden from default queries.
+func (idx *temporalIndex) lookupFuzzy(kind, name, callerRepo string) string {
+	suffix := "Activity"
+	if kind == "workflow" {
+		suffix = "Workflow"
+	}
+	core := strings.TrimSuffix(name, suffix)
+	if core == "" {
+		return ""
+	}
+	// Prefer the stricter raw-name containment; only widen to the trimmed
+	// core when the raw name matches nothing. This keeps the lone-candidate
+	// guarantee meaningful: a tighter needle is tried before a looser one.
+	collect := func(needle string) []*graph.Node {
+		var out []*graph.Node
+		for fn, cands := range idx.funcByName {
+			if !strings.HasSuffix(fn, suffix) {
+				continue
+			}
+			if !strings.Contains(fn, needle) {
+				continue
+			}
+			out = append(out, cands...)
+		}
+		return out
+	}
+	matched := collect(name)
+	if len(matched) == 0 && core != name {
+		matched = collect(core)
+	}
+	if len(matched) == 1 {
+		return matched[0].ID
+	}
+	return ""
+}
+
 // buildTemporalIndex walks the graph once and (a) stamps temporal_role
 // on every node identifiable as a Temporal workflow / activity via
 // either Go `worker.Register*` calls or Java `@ActivityInterface` /
@@ -204,7 +986,86 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin stri
 // implementors), and (b) returns a name index the stub-call resolver
 // consults.
 func buildTemporalIndex(g graph.Store) *temporalIndex {
-	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}}
+	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, constVal: map[string]string{}, funcByName: map[string][]*graph.Node{}}
+
+	// Convention index: Go functions / methods named like activities or
+	// workflows (suffix "Activity" / "Workflow"), for resolving dispatch
+	// to functions the worker-runner registers elsewhere (unregistered
+	// here). Bounded to the convention-named set to keep it small.
+	indexConventionFunc := func(n *graph.Node) {
+		if n == nil || n.Language != "go" {
+			return
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			return
+		}
+		if strings.HasSuffix(n.Name, "Activity") || strings.HasSuffix(n.Name, "Workflow") {
+			idx.funcByName[n.Name] = append(idx.funcByName[n.Name], n)
+		}
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		indexConventionFunc(n)
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		indexConventionFunc(n)
+	}
+
+	// String-const value index: name → value, dropping any name that
+	// maps to more than one distinct value (ambiguous). Lets the stub
+	// resolver below substitute `constants.X` → "the string X holds".
+	constAmbiguous := map[string]struct{}{}
+	for n := range g.NodesByKind(graph.KindConstant) {
+		if n == nil {
+			continue
+		}
+		v, ok := n.Meta["value"].(string)
+		if !ok || v == "" {
+			continue
+		}
+		if _, dropped := constAmbiguous[n.Name]; dropped {
+			continue
+		}
+		if prev, seen := idx.constVal[n.Name]; seen && prev != v {
+			delete(idx.constVal, n.Name)
+			constAmbiguous[n.Name] = struct{}{}
+			continue
+		}
+		idx.constVal[n.Name] = v
+	}
+
+	// Function-return-literal index (G2): a func whose body is a single
+	// `return "<literal>"` centralises an activity / workflow name.
+	// Index funcName → literal into the same constVal map (same ambiguity
+	// rule as string constants: a name with two distinct literals is
+	// dropped). This lets stub edges carrying `temporal_name_func=<func>`
+	// resolve via funcName → literal → registered handler.
+	indexFunctionReturnLiterals := func(n *graph.Node) {
+		if n == nil || n.Language != "go" {
+			return
+		}
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			return
+		}
+		lit, ok := n.Meta["temporal_const_return"].(string)
+		if !ok || lit == "" {
+			return
+		}
+		if _, dropped := constAmbiguous[n.Name]; dropped {
+			return
+		}
+		if prev, seen := idx.constVal[n.Name]; seen && prev != lit {
+			delete(idx.constVal, n.Name)
+			constAmbiguous[n.Name] = struct{}{}
+			return
+		}
+		idx.constVal[n.Name] = lit
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		indexFunctionReturnLiterals(n)
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		indexFunctionReturnLiterals(n)
+	}
 
 	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the
 	// registered function's node. The "via" tag lives on EdgeCalls
@@ -268,6 +1129,7 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	type javaAnno struct {
 		fromID                string
 		ifaceRole, methodRole string
+		annName               string // parsed @X(name="...") override
 	}
 	var javaAnnos []javaAnno
 	annoFromIDs := map[string]struct{}{}
@@ -279,7 +1141,11 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if role == "" && methodRole == "" {
 			continue
 		}
-		javaAnnos = append(javaAnnos, javaAnno{fromID: e.From, ifaceRole: role, methodRole: methodRole})
+		args, _ := e.Meta["args"].(string)
+		javaAnnos = append(javaAnnos, javaAnno{
+			fromID: e.From, ifaceRole: role, methodRole: methodRole,
+			annName: parseJavaAnnotationName(args),
+		})
 		if e.From != "" {
 			annoFromIDs[e.From] = struct{}{}
 		}
@@ -300,11 +1166,21 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		if from == nil {
 			continue
 		}
-		// Method-level annotation: stamp directly.
+		// Method-level annotation: stamp directly. The canonical Temporal
+		// name is the @X(name="…") override when present, else the bare
+		// method name; index under both so a Go side that registers under
+		// either matches.
 		if a.methodRole != "" && (from.Kind == graph.KindMethod || from.Kind == graph.KindFunction) {
-			stampTemporalRole(g, from, a.methodRole, from.Name)
-			idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name] = append(
-				idx.byKindName[normaliseTemporalKind(a.methodRole)+"::"+from.Name], from)
+			canonical := from.Name
+			if a.annName != "" {
+				canonical = a.annName
+			}
+			stampTemporalRole(g, from, a.methodRole, canonical)
+			nk := normaliseTemporalKind(a.methodRole)
+			idx.byKindName[nk+"::"+canonical] = append(idx.byKindName[nk+"::"+canonical], from)
+			if canonical != from.Name {
+				idx.byKindName[nk+"::"+from.Name] = append(idx.byKindName[nk+"::"+from.Name], from)
+			}
 			continue
 		}
 		// Interface-level annotation: queue for the propagation pass.
@@ -368,6 +1244,13 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		}
 		ifaceMethods := collectJavaInterfaceMethodsFromIndex(iface, javaMethodsByFile)
 		for _, m := range ifaceMethods {
+			// A method carrying its own @WorkflowMethod / @SignalMethod /
+			// @QueryMethod / @UpdateMethod annotation was already stamped
+			// (with its name= override) in Phase 2 — don't let the
+			// interface-level role clobber a more specific method role.
+			if r, _ := m.Meta["temporal_role"].(string); r != "" {
+				continue
+			}
 			stampTemporalRole(g, m, methodRole, m.Name)
 			idx.byKindName[methodRole+"::"+m.Name] = append(idx.byKindName[methodRole+"::"+m.Name], m)
 		}
