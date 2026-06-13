@@ -282,6 +282,67 @@ func setup(w Worker) { w.RegisterWorkflow(ProcessOrderWorkflow) }
 	assert.Equal(t, goWf.ID, heur.To, "env-default invoker dispatch resolves to the Go workflow")
 }
 
+// TestTemporalE2E_JavaInvokerValueField exercises Java invoker priority 3: the
+// dispatch name is a Spring `@Value("${key:Default}")`-injected field. The
+// detector resolves the field to its SpEL literal default and lands the edge on
+// the Go workflow at the heuristic tier.
+func TestTemporalE2E_JavaInvokerValueField(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "OrderManager.java"), `package com.example;
+
+import org.springframework.beans.factory.annotation.Value;
+
+public class OrderManager {
+    private final Invoker invoker;
+
+    @Value("${order.workflow.type:ProcessOrderWorkflow}")
+    private String workflowType;
+
+    public String startConfigured(Object input) {
+        return invoker.invokeAsync(workflowType, options, input).block();
+    }
+}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package main
+
+import "go.temporal.io/sdk/workflow"
+
+func ProcessOrderWorkflow(ctx workflow.Context, input string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func setup(w Worker) { w.RegisterWorkflow(ProcessOrderWorkflow) }
+`)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	reg.Register(languages.NewJavaExtractor())
+	languages.ConfigureTemporalJavaInvokers(reg, []string{"Invoker"}, nil)
+	cfg := config.Default().Index
+	cfg.Workers = 2
+	idx := New(g, reg, cfg, zap.NewNop())
+
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	goWf := g.FindNodesByName("ProcessOrderWorkflow")[0]
+	nodes := g.FindNodesByName("startConfigured")
+	require.NotEmpty(t, nodes)
+	var stub *graph.Edge
+	for _, e := range g.GetOutEdges(nodes[0].ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stub = e
+			break
+		}
+	}
+	require.NotNil(t, stub, "@Value-field invoker dispatch must emit a temporal.stub")
+	assert.Equal(t, "ProcessOrderWorkflow", stub.Meta["temporal_name"])
+	assert.Equal(t, "heuristic", stub.Meta["temporal_env_source"])
+	assert.Equal(t, goWf.ID, stub.To, "@Value default resolves to the Go workflow")
+}
+
 // TestTemporalE2E_JavaInvokerOffWhenUnconfigured asserts zero behavioural
 // change when java_temporal_invokers is not configured: the invoker call is
 // left to the generic path, emitting no temporal.stub.

@@ -320,6 +320,13 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+	// @Value("${key:Default}") fields → their literal defaults, for invoker
+	// dispatch through a Spring-injected field (built only when invoker
+	// detection is configured).
+	var valueFields map[string]string
+	if len(e.javaInvokers) > 0 {
+		valueFields = javaCollectValueFields(varBuf, src)
+	}
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
@@ -328,7 +335,7 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 		// Temporal invoker dispatch (`invoker.invokeAsync("Wf", …)`): emit a
 		// via=temporal.stub edge instead of the generic call edge. No-op unless
 		// java_temporal_invokers is configured.
-		if e.emitJavaTemporalInvoker(c, callerID, tenv, filePath, src, result) {
+		if e.emitJavaTemporalInvoker(c, callerID, tenv, valueFields, filePath, src, result) {
 			continue
 		}
 		edge := &graph.Edge{

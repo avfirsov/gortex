@@ -161,7 +161,7 @@ func (e *JavaExtractor) isInvokerMethod(name string) bool {
 // invoker and emits a via=temporal.stub EdgeCalls edge the resolver lands on the
 // Go workflow of that name. Returns true when a stub was emitted (the caller
 // then skips the generic call edge).
-func (e *JavaExtractor) emitJavaTemporalInvoker(c javaDeferredCall, callerID string, tenv typeEnv, filePath string, src []byte, result *parser.ExtractionResult) bool {
+func (e *JavaExtractor) emitJavaTemporalInvoker(c javaDeferredCall, callerID string, tenv typeEnv, valueFields map[string]string, filePath string, src []byte, result *parser.ExtractionResult) bool {
 	if len(e.javaInvokers) == 0 || !c.isSelector || c.callNode == nil {
 		return false
 	}
@@ -179,7 +179,7 @@ func (e *JavaExtractor) emitJavaTemporalInvoker(c javaDeferredCall, callerID str
 		kind, namePos, signalNamePos = "workflow", 0, -1
 	}
 	args := c.callNode.ChildByFieldName("arguments")
-	name, source, envKey, ok := javaInvokerDispatchName(javaArgAt(args, namePos), src)
+	name, source, envKey, ok := javaInvokerDispatchName(javaArgAt(args, namePos), valueFields, src)
 	if !ok || name == "" {
 		return false
 	}
@@ -205,7 +205,7 @@ func (e *JavaExtractor) emitJavaTemporalInvoker(c javaDeferredCall, callerID str
 	default: // "exact" — a string literal; resolves at the register tier.
 	}
 	if signalNamePos >= 0 {
-		if sn, _, _, okSig := javaInvokerDispatchName(javaArgAt(args, signalNamePos), src); okSig && sn != "" {
+		if sn, _, _, okSig := javaInvokerDispatchName(javaArgAt(args, signalNamePos), valueFields, src); okSig && sn != "" {
 			meta["temporal_signal_name"] = sn
 		}
 	}
@@ -233,7 +233,7 @@ func temporalJavaStubPlaceholder(kind, name string) string {
 // with a literal default (heuristic) → constant reference (const_ref) → bare
 // variable (heuristic, unresolvable). Returns the name, its source tier marker,
 // and (for env reads) the env key.
-func javaInvokerDispatchName(arg *sitter.Node, src []byte) (name, source, envKey string, ok bool) {
+func javaInvokerDispatchName(arg *sitter.Node, valueFields map[string]string, src []byte) (name, source, envKey string, ok bool) {
 	if arg == nil {
 		return "", "", "", false
 	}
@@ -249,6 +249,11 @@ func javaInvokerDispatchName(arg *sitter.Node, src []byte) (name, source, envKey
 		}
 	case "identifier":
 		n := arg.Content(src)
+		// A field injected by `@Value("${key:Default}")` resolves to its
+		// SpEL default (Spring property with a literal fallback) → heuristic.
+		if def, has := valueFields[n]; has && def != "" {
+			return def, "heuristic", "", true
+		}
 		if isJavaConstName(n) {
 			return n, "const_ref", "", true
 		}
@@ -257,6 +262,74 @@ func javaInvokerDispatchName(arg *sitter.Node, src []byte) (name, source, envKey
 		return javaEnvPropertyName(arg, src)
 	}
 	return "", "", "", false
+}
+
+// javaCollectValueFields scans buffered field declarations for
+// `@Value("${key:Default}")` annotations and returns a map fieldName → literal
+// default (only fields whose SpEL expression carries a default are included).
+// These are Spring-injected fields whose runtime value defaults to the literal
+// when the property is unset — the same env-or-default shape as Go's env-helper
+// defaults, so dispatch through such a field resolves to the default at the
+// heuristic tier.
+func javaCollectValueFields(varBuf []javaDeferredVar, src []byte) map[string]string {
+	out := map[string]string{}
+	for _, v := range varBuf {
+		if v.isLocal || v.defNode == nil {
+			continue
+		}
+		if def, ok := javaFieldValueDefault(v.defNode, src); ok {
+			out[v.name] = def
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// javaFieldValueDefault returns the literal default of a `@Value("${…:Default}")`
+// annotation on a field declaration, or ("", false).
+func javaFieldValueDefault(fieldDecl *sitter.Node, src []byte) (string, bool) {
+	var def string
+	var found bool
+	walkNodes(fieldDecl, func(n *sitter.Node) {
+		if found || n == nil {
+			return
+		}
+		if n.Type() != "annotation" && n.Type() != "marker_annotation" {
+			return
+		}
+		nameNode := n.ChildByFieldName("name")
+		if nameNode == nil || nameNode.Content(src) != "Value" {
+			return
+		}
+		walkNodes(n, func(c *sitter.Node) {
+			if found || c == nil || c.Type() != "string_literal" {
+				return
+			}
+			if d, ok := javaSpelDefault(javaStringLiteralText(c, src)); ok {
+				def, found = d, true
+			}
+		})
+	})
+	return def, found
+}
+
+// javaSpelDefault extracts the literal default from a Spring SpEL property
+// expression `${prop.name:Default}` — the substring after the first ':'. Returns
+// ("", false) for a non-`${…}` form or a property with no default.
+func javaSpelDefault(spel string) (string, bool) {
+	s := strings.TrimSpace(spel)
+	if !strings.HasPrefix(s, "${") || !strings.HasSuffix(s, "}") {
+		return "", false
+	}
+	inner := s[2 : len(s)-1]
+	if i := strings.IndexByte(inner, ':'); i >= 0 {
+		if d := strings.TrimSpace(inner[i+1:]); d != "" {
+			return d, true
+		}
+	}
+	return "", false
 }
 
 // javaEnvPropertyName recognises an env / config read with a literal default
