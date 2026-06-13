@@ -126,10 +126,10 @@ func runSynthesizers(cmd *cobra.Command, g graph.Store) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(result)
 	default:
-		fmt.Fprintf(cmd.OutOrStdout(), "synthesizers: groups=%d total_edges=%d\n",
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "synthesizers: groups=%d total_edges=%d\n",
 			len(result.Synthesizers), result.TotalEdges)
 		for _, row := range result.Synthesizers {
-			fmt.Fprintf(cmd.OutOrStdout(), "  %s: edges=%d\n", row.Name, row.Edges)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s: edges=%d\n", row.Name, row.Edges)
 		}
 		return nil
 	}
@@ -145,9 +145,9 @@ func runResolutionOutcomes(cmd *cobra.Command, g graph.Store) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(result)
 	default:
-		fmt.Fprintf(cmd.OutOrStdout(), "resolution_outcomes: total=%d\n", result.Total)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "resolution_outcomes: total=%d\n", result.Total)
 		for reason, count := range result.ByReason {
-			fmt.Fprintf(cmd.OutOrStdout(), "  %s: %d\n", reason, count)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s: %d\n", reason, count)
 		}
 		return nil
 	}
