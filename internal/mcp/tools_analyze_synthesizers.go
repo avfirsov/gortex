@@ -2,20 +2,12 @@ package mcp
 
 import (
 	"context"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
-)
 
-// Edge.Meta keys the framework dynamic-dispatch synthesizer engine
-// stamps (mirrors resolver.MetaSynthesizedBy / MetaProvenance — kept as
-// literals here so the MCP layer doesn't depend on the resolver package
-// just for two string constants).
-const (
-	metaSynthesizedByKey = "synthesized_by"
-	metaProvenanceKey    = "provenance"
+	"github.com/zzet/gortex/internal/analyzer"
 )
 
 // handleAnalyzeSynthesizers rolls up the framework dynamic-dispatch
@@ -27,72 +19,23 @@ const (
 // Temporal proxy → activity, event-channel emit → listener, native
 // bridge call → implementation) separately from compiler-verified ones.
 //
+// The aggregation itself lives in internal/analyzer.AnalyzeSynthesizers so
+// the same logic backs both this MCP tool and the `gortex analyze` CLI.
+//
 // Optional `name` filters to a single synthesizer.
 func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	nameFilter := strings.TrimSpace(stringArg(args, "name"))
 
-	type sample struct {
-		From string `json:"from"`
-		To   string `json:"to"`
-		Kind string `json:"kind"`
-		Via  string `json:"via,omitempty"`
+	var opts []analyzer.SynthesizersOption
+	if nameFilter != "" {
+		opts = append(opts, analyzer.WithSynthesizerNameFilter(nameFilter))
 	}
-	type synthRow struct {
-		Name       string         `json:"synthesizer"`
-		Provenance string         `json:"provenance"`
-		Edges      int            `json:"edges"`
-		ByKind     map[string]int `json:"by_kind"`
-		Samples    []sample       `json:"samples,omitempty"`
-	}
-	const maxSamples = 5
-	rows := map[string]*synthRow{}
-	for _, e := range s.graph.AllEdges() {
-		if e == nil || e.Meta == nil {
-			continue
-		}
-		by, _ := e.Meta[metaSynthesizedByKey].(string)
-		if by == "" {
-			continue
-		}
-		if nameFilter != "" && by != nameFilter {
-			continue
-		}
-		row, ok := rows[by]
-		if !ok {
-			prov, _ := e.Meta[metaProvenanceKey].(string)
-			row = &synthRow{Name: by, Provenance: prov, ByKind: map[string]int{}}
-			rows[by] = row
-		}
-		row.Edges++
-		row.ByKind[string(e.Kind)]++
-		if len(row.Samples) < maxSamples {
-			via, _ := e.Meta["via"].(string)
-			row.Samples = append(row.Samples, sample{
-				From: e.From,
-				To:   e.To,
-				Kind: string(e.Kind),
-				Via:  via,
-			})
-		}
-	}
-
-	out := make([]*synthRow, 0, len(rows))
-	total := 0
-	for _, r := range rows {
-		total += r.Edges
-		out = append(out, r)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Edges != out[j].Edges {
-			return out[i].Edges > out[j].Edges
-		}
-		return out[i].Name < out[j].Name
-	})
+	result := analyzer.AnalyzeSynthesizers(s.graph, opts...)
 
 	if isCompact(req) {
 		var b strings.Builder
-		for _, r := range out {
+		for _, r := range result.Synthesizers {
 			b.WriteString(r.Name)
 			b.WriteString(": ")
 			b.WriteString(strconv.Itoa(r.Edges))
@@ -100,14 +43,14 @@ func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallTool
 			b.WriteString(r.Provenance)
 			b.WriteString(")\n")
 		}
-		if len(out) == 0 {
+		if len(result.Synthesizers) == 0 {
 			b.WriteString("no synthesized edges\n")
 		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"synthesizers": out,
-		"total_edges":  total,
+		"synthesizers": result.Synthesizers,
+		"total_edges":  result.TotalEdges,
 	})
 }
