@@ -163,6 +163,31 @@ const qGoAll = `
 type GoExtractor struct {
 	lang *sitter.Language
 	qAll *parser.PreparedQuery
+	// envHelperExtra is the per-repo corporate env-helper allow-list (lower-
+	// cased names) loaded from the git-ignored `.gortex/temporal-allowlist.yaml`.
+	// Names here are merged with the built-in goEnvHelperNames when recognising
+	// a Temporal env-or-default dispatch helper, promoting the resolved edge to
+	// the inferred (visible) tier. Empty/nil when no local allow-list is loaded.
+	envHelperExtra map[string]bool
+}
+
+// SetEnvHelperNames installs the per-repo corporate env-helper allow-list on
+// the extractor. Names are stored lower-cased for case-insensitive matching.
+// Called once during extractor registration (config is not available at parse
+// time); a nil / empty slice clears it. Safe to call before indexing begins;
+// must not be called concurrently with Extract.
+func (e *GoExtractor) SetEnvHelperNames(names []string) {
+	if len(names) == 0 {
+		e.envHelperExtra = nil
+		return
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			m[strings.ToLower(n)] = true
+		}
+	}
+	e.envHelperExtra = m
 }
 
 func NewGoExtractor() *GoExtractor {
@@ -213,6 +238,15 @@ type goDeferredCall struct {
 	tempKind  string
 	tempName  string
 	tempLocal bool
+	// tempNameFunc is set when the dispatch argument is a call_expression
+	// (`workflow.ExecuteActivity(ctx, pkg.GetFooName(), …)`); it carries
+	// the bare name of the CALLED function whose string return value
+	// supplies the activity / workflow name. The stub edge is tagged
+	// `temporal_name_func=<func>` so the resolver's ResolveTemporalCalls
+	// pass can join it to that func's const-return literal (G2). When set,
+	// tempName carries the same func name purely as a non-resolving
+	// placeholder so the edge keeps its `unresolved::temporal::…` shape.
+	tempNameFunc string
 	// tempHandlerKind is "query" / "signal" / "update" when this call
 	// is a `workflow.SetQueryHandler` / `GetSignalChannel` /
 	// `SetUpdateHandler` in-workflow handler declaration; tempName then
@@ -225,12 +259,33 @@ type goDeferredCall struct {
 	// `temporal_name_origin=env_default` so the resolver lands it at the
 	// speculative tier — the runtime env value may differ from the default.
 	tempEnvDefault bool
+	// tempDefaultConst is set when the env-default's default argument was a
+	// constant REFERENCE (`config.ACTIVITY_NAME_DEFAULT` / a bare const name)
+	// rather than a string literal. temporal_name then stays the dispatch
+	// variable name; the resolver substitutes the constant's literal value
+	// from its constVal index. Emitted as `temporal_default_const`.
+	tempDefaultConst string
+	// tempEnvSource records HOW the env-default name was recognised:
+	// "os_getenv" (provable os.Getenv / os.LookupEnv read), "allowlist" (a
+	// helper name in the configured env-helper allow-list), or "heuristic"
+	// (a generic env-named helper matched structurally). Emitted as
+	// `temporal_env_source` so the resolver can tier the edge: allow-list /
+	// os.Getenv land at the inferred tier, the heuristic stays speculative.
+	tempEnvSource string
 	// tempOutKind is "signal" / "query" when this call is an outbound
 	// signal-send / query-call against a running workflow
 	// (SignalExternalWorkflow / SignalWorkflow / QueryWorkflow); tempName
 	// then carries the signal/query name. `via=temporal.signal-send` /
 	// `temporal.query-call` meta is stamped on the emitted edge below.
 	tempOutKind string
+	// tempStartWorkerRegs holds the activity/workflow registrations
+	// extracted from a StartWorker / StartWorkerWithOptions /
+	// StartWorkerWithInterceptors call. Unlike single-name register calls
+	// (tempKind="register_activity" + tempName), StartWorker registers
+	// multiple names at once via two []any{…} composite literal arguments.
+	// When non-nil, the post-pass emits one temporal.register edge per
+	// entry; tempKind and tempName stay at their zero values.
+	tempStartWorkerRegs []TemporalStartWorkerReg
 }
 
 type goDeferredTypeRef struct {
@@ -387,10 +442,29 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					// variable, try to resolve it to an env-var-with-literal
 					// -default so the dispatch lands on the default activity.
 					if argNode != nil && argNode.Type() == "identifier" {
-						if def, ok := goTemporalEnvDefaultName(expr.Node, name, src); ok {
-							dc.tempName = def
+						if litDef, constName, source, ok := goTemporalEnvDefaultName(expr.Node, name, src, e.envHelperExtra); ok {
 							dc.tempEnvDefault = true
+							dc.tempEnvSource = source
+							if constName != "" {
+								// Const-reference default: keep temporal_name as the
+								// dispatch variable; the resolver substitutes the
+								// constant's literal value via temporal_default_const.
+								dc.tempDefaultConst = constName
+							} else {
+								dc.tempName = litDef
+							}
 						}
+					}
+				} else if argNode != nil && argNode.Type() == "call_expression" {
+					// Func-returning-literal dispatch (G2):
+					// `ExecuteActivity(ctx, pkg.GetFooName(), …)`. The name
+					// is whatever GetFooName() returns; record the callee so
+					// the resolver can join it to the func's const-return.
+					if fn := goTemporalFuncCallName(argNode, src); fn != "" {
+						dc.tempKind = kind
+						dc.tempName = fn // placeholder only; not register-matched
+						dc.tempLocal = local
+						dc.tempNameFunc = fn
 					}
 				}
 			} else if kind, _, ok := goTemporalRegisterKind(method); ok {
@@ -399,6 +473,13 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				if name := goTemporalRegisterName(expr.Node, src); name != "" {
 					dc.tempKind = "register_" + kind
 					dc.tempName = name
+				}
+			} else if goTemporalStartWorkerKind(method) {
+				// OMS worker-runner registration:
+				// `wi.StartWorker([]any{workflow.XXX,…}, []any{activity.YYY,…})`
+				// Emits N temporal.register edges (one per element).
+				if regs := goTemporalStartWorkerNames(expr.Node, src); len(regs) > 0 {
+					dc.tempStartWorkerRegs = regs
 				}
 			} else if hkind, ok := goTemporalHandlerKind(receiver, method); ok {
 				// Temporal in-workflow handler declaration:
@@ -759,6 +840,18 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				}
 				if c.tempEnvDefault {
 					meta["temporal_name_origin"] = "env_default"
+					if c.tempEnvSource != "" {
+						meta["temporal_env_source"] = c.tempEnvSource
+					}
+					if c.tempDefaultConst != "" {
+						meta["temporal_default_const"] = c.tempDefaultConst
+					}
+				}
+				// Func-returning-literal dispatch (G2): the name is supplied
+				// by a const-returning func call. Tag the callee so the
+				// resolver can substitute the func's return literal.
+				if c.tempNameFunc != "" {
+					meta["temporal_name_func"] = c.tempNameFunc
 				}
 				// Dispatch wrapper: the name is one of the enclosing
 				// function's parameters, so this function forwards a
@@ -792,6 +885,23 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 				emitGoSpawnEdge(c, callerID, target, filePath, result)
 				continue
 			}
+			// StartWorker family: emit one temporal.register edge per
+			// activity/workflow name extracted from the []any{…} args.
+			if len(c.tempStartWorkerRegs) > 0 {
+				for _, reg := range c.tempStartWorkerRegs {
+					regTarget := "unresolved::temporal::register_" + reg.Kind + "::" + reg.Name
+					result.Edges = append(result.Edges, &graph.Edge{
+						From: callerID, To: regTarget,
+						Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
+						Meta: map[string]any{
+							"via":           "temporal.register",
+							"temporal_kind": reg.Kind,
+							"temporal_name": reg.Name,
+						},
+					})
+				}
+				continue
+			}
 		}
 		var target string
 		if !c.isSelector {
@@ -804,7 +914,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalRegisterMeta(edge, c)
 			applyGoTemporalHandlerMeta(edge, c)
 			applyGoTemporalSignalQueryMeta(edge, c)
-			attachGoTemporalCallArgNames(edge, c, src)
+			attachGoTemporalCallArgNames(edge, c, src, paramNames[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -819,7 +929,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 			applyGoTemporalRegisterMeta(edge, c)
 			applyGoTemporalHandlerMeta(edge, c)
 			applyGoTemporalSignalQueryMeta(edge, c)
-			attachGoTemporalCallArgNames(edge, c, src)
+			attachGoTemporalCallArgNames(edge, c, src, paramNames[callerID])
 			result.Edges = append(result.Edges, edge)
 			emitGoSpawnEdge(c, callerID, target, filePath, result)
 			continue
@@ -870,7 +980,7 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 		applyGoGRPCRegisterMeta(edge, c, src, tenv)
 		applyGoTemporalRegisterMeta(edge, c)
 		applyGoTemporalSignalQueryMeta(edge, c)
-		attachGoTemporalCallArgNames(edge, c, src)
+		attachGoTemporalCallArgNames(edge, c, src, paramNames[callerID])
 		result.Edges = append(result.Edges, edge)
 		emitGoSpawnEdge(c, callerID, target, filePath, result)
 	}
@@ -1095,6 +1205,12 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	if body := goFuncBody(def.Node); body != nil {
 		StampFunctionMetrics(node, body, "go")
 	}
+	// Temporal func-returning-literal index (G2): a func whose body is a
+	// single `return "<literal>"` centralises an activity / workflow name;
+	// record the literal so the resolver can resolve a dispatch through it.
+	if lit, ok := goFuncConstReturnLiteral(def.Node, src); ok {
+		node.Meta["temporal_const_return"] = lit
+	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
@@ -1190,6 +1306,10 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	node.Meta["visibility"] = VisibilityByCase(name)
 	if body := goFuncBody(def.Node); body != nil {
 		StampFunctionMetrics(node, body, "go")
+	}
+	// Temporal func-returning-literal index (G2): see emitFunction.
+	if lit, ok := goFuncConstReturnLiteral(def.Node, src); ok {
+		node.Meta["temporal_const_return"] = lit
 	}
 	scanGoPragmas(src, def.StartLine, node)
 	result.Nodes = append(result.Nodes, node)

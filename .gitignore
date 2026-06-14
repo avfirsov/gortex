@@ -4,6 +4,10 @@
 /gortex-linux
 /specs/
 
+# Repo-local, opt-in gortex config (corporate Temporal allow-list, local
+# providers). Never committed — see AGENTS.md / GORTEX_ALLOW_LOCAL_*.
+.gortex/
+
 # Go
 *.exe
 *.exe~
@@ -51,6 +55,10 @@ eval/scripts/
 eval/logs/
 
 internal_docs/
+
+# Anonymization tooling (git filter-branch helpers) — not part of the repo.
+anonymize.py
+msg_filter.py
 
 # Ad-hoc bench/probe tooling — kept locally, not part of the repo.
 bench/all-tools-bench/

@@ -408,6 +408,355 @@ func WF(ctx workflow.Context) {
 	assert.False(t, flagged)
 }
 
+// G1 (env-with-fallback via helper calls): the dispatch name is assigned
+// from a project-local env-or-default helper (e.g. wfutils.GetEnvOrDefault)
+// rather than os.Getenv directly. The helper body lives in another package
+// and is invisible at extract time, so the match is on the helper NAME
+// only; the string-literal 2nd argument is taken as the fallback default
+// and the stub is flagged env_default (speculative tier).
+
+func TestEnvFallbackViaHelper_GetEnvOrDefault(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/wfutils"
+)
+
+func WF(ctx workflow.Context) {
+	actName := wfutils.GetEnvOrDefault("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "unresolved::temporal::activity::ChargeActivity", e.To,
+		"helper env-default must resolve to the literal default, not the variable")
+	assert.Equal(t, "ChargeActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+}
+
+func TestEnvFallbackViaHelper_GetEnvOrDefaultValue(t *testing.T) {
+	// The `...Value`-suffixed sibling of GetEnvOrDefault is a real variant
+	// seen in production env-helper packages (L1 corpus audit); it must be
+	// recognised exactly like GetEnvOrDefault since the allow-list matches
+	// the full callee name, not a substring.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/envhelper"
+)
+
+func WF(ctx workflow.Context) {
+	actName := envhelper.GetEnvOrDefaultValue("PROCESS_CANCEL_ACTIVITY", "ProcessCancelActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "ProcessCancelActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+}
+
+func TestEnvFallbackViaHelper_BareIdentifierEnvOr(t *testing.T) {
+	// Bare (un-qualified) helper call: `EnvOr(KEY, "Default")`.
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func WF(ctx workflow.Context) {
+	actName := EnvOr("REFUND_ACTIVITY", "RefundActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "RefundActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+}
+
+func TestEnvFallbackHeuristic_EnvNamedHelperFlaggedSpeculative(t *testing.T) {
+	// Generic recall layer: a helper NOT in the allow-list but whose name
+	// contains "env" (case-insensitive) is recognised by the structural
+	// heuristic — its 2nd string-literal argument is taken as the default,
+	// tagged temporal_env_source=heuristic so the resolver can keep it at the
+	// hidden speculative tier (the LLM cleaning pass verifies it later).
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/cfg"
+)
+
+func WF(ctx workflow.Context) {
+	actName := cfg.ActivityFromEnv("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "ChargeActivity", e.Meta["temporal_name"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+	assert.Equal(t, "heuristic", e.Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_AllowlistTaggedSource(t *testing.T) {
+	// An allow-list helper is tagged temporal_env_source=allowlist so the
+	// resolver can promote it above the generic-heuristic tier.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/wfutils"
+)
+
+func WF(ctx workflow.Context) {
+	actName := wfutils.GetEnvOrDefault("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "allowlist", edges[0].Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_ConstSelectorDefault(t *testing.T) {
+	// The #1 corpus gap: env-helper default is a selector_expression constant
+	// reference, not a literal. temporal_name stays the dispatch variable; the
+	// const NAME is recorded in temporal_default_const at the const_ref tier.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/config"
+	"example.com/app/wfutils"
+)
+
+func WF(ctx workflow.Context) {
+	actName := wfutils.GetEnvOrDefault(config.ACTIVITY_NAME_ENV, config.ACTIVITY_NAME_DEFAULT)
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "actName", e.Meta["temporal_name"], "temporal_name stays the dispatch variable for a const default")
+	assert.Equal(t, "ACTIVITY_NAME_DEFAULT", e.Meta["temporal_default_const"])
+	assert.Equal(t, "env_default", e.Meta["temporal_name_origin"])
+	assert.Equal(t, "const_ref", e.Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_ConstBareDefault(t *testing.T) {
+	// Local (un-qualified) constant default — a bare identifier.
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+const VALIDATE_ACTIVITY_NAME_DEFAULT = "ValidateActivity"
+
+func WF(ctx workflow.Context) {
+	actName := EnvOr("VALIDATE_ACTIVITY_NAME_ENV", VALIDATE_ACTIVITY_NAME_DEFAULT)
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "VALIDATE_ACTIVITY_NAME_DEFAULT", e.Meta["temporal_default_const"])
+	assert.Equal(t, "const_ref", e.Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackHeuristic_ConstDefaultStaysHeuristic(t *testing.T) {
+	// An env-NAMED (heuristic, not allow-listed) helper with a const default:
+	// the const is recorded, but the source stays "heuristic" (the helper
+	// itself is the unproven link → hidden speculative tier).
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/cfg"
+)
+
+func WF(ctx workflow.Context) {
+	actName := cfg.ActivityFromEnv("CHARGE_ACTIVITY", cfg.CHARGE_ACTIVITY_DEFAULT)
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "CHARGE_ACTIVITY_DEFAULT", e.Meta["temporal_default_const"])
+	assert.Equal(t, "heuristic", e.Meta["temporal_env_source"],
+		"heuristic helper stays heuristic even with a const default")
+}
+
+func TestEnvFallbackAllowlist_ConfigPromotesHelper(t *testing.T) {
+	// A helper that is neither built-in NOR "env"-named is invisible to both
+	// layers by default — but installing it in the per-repo corporate
+	// allow-list promotes it to the allowlist tier (source=allowlist).
+	src := `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/cfg"
+)
+
+func WF(ctx workflow.Context) {
+	actName := cfg.FetchActivityName("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`
+	// Default: the unknown helper is not recognised (the dispatch keeps the
+	// bare variable name, no env_default flag).
+	def := temporalEdgesByVia(runGoExtract(t, src), "temporal.stub")
+	require.Len(t, def, 1)
+	assert.Equal(t, "actName", def[0].Meta["temporal_name"])
+	_, flagged := def[0].Meta["temporal_name_origin"]
+	assert.False(t, flagged, "unknown non-env helper must not be flagged by default")
+
+	// With the corporate allow-list, the same helper resolves to its literal
+	// default at the allowlist tier.
+	got := temporalEdgesByVia(runGoExtractWithEnvHelpers(t, src, []string{"FetchActivityName"}), "temporal.stub")
+	require.Len(t, got, 1)
+	assert.Equal(t, "ChargeActivity", got[0].Meta["temporal_name"])
+	assert.Equal(t, "env_default", got[0].Meta["temporal_name_origin"])
+	assert.Equal(t, "allowlist", got[0].Meta["temporal_env_source"])
+}
+
+func TestEnvFallbackViaHelper_UnknownHelperNotFlagged(t *testing.T) {
+	// A helper whose name is NOT in the tight allow-list must not be
+	// treated as an env-default — precision over recall.
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/wfutils"
+)
+
+func WF(ctx workflow.Context) {
+	actName := wfutils.PickActivity("CHARGE_ACTIVITY", "ChargeActivity")
+	workflow.ExecuteActivity(ctx, actName, 1)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "actName", edges[0].Meta["temporal_name"])
+	_, flagged := edges[0].Meta["temporal_name_origin"]
+	assert.False(t, flagged, "unknown helper must not be flagged env_default")
+}
+
+// --- G2: func-returning-literal dispatch ----------------------------
+//
+// When the activity-name argument is a call_expression (`pkg.GetName()`),
+// the extractor cannot resolve it at parse time. It emits a stub with
+// temporal_name_func=<callee> so the resolver can join it to the func's
+// const-return literal. A parallel pass stamps temporal_const_return on
+// single-return-literal functions.
+
+// TestGoTemporal_FuncCallArg_EmitsNameFunc asserts that when a dispatch
+// argument is a call_expression (`pkg.GetChargeName()`), the extractor
+// emits a stub edge with temporal_name_func=<callee> (NOT temporal_name)
+// so the resolver can join it to the func's const-return literal.
+func TestGoTemporal_FuncCallArg_EmitsNameFunc(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/names"
+)
+
+func WF(ctx workflow.Context) {
+	workflow.ExecuteActivity(ctx, names.GetChargeName())
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	e := edges[0]
+	assert.Equal(t, "GetChargeName", e.Meta["temporal_name_func"],
+		"call_expression arg must emit the callee func name under temporal_name_func")
+	assert.NotEmpty(t, e.To, "stub edge must have a placeholder To")
+}
+
+// TestGoTemporal_FuncCallArg_BareIdentifierCallee asserts that a bare func
+// call (not a selector) is also captured under temporal_name_func.
+func TestGoTemporal_FuncCallArg_BareIdentifierCallee(t *testing.T) {
+	fix := runGoExtract(t, `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func WF(ctx workflow.Context) {
+	workflow.ExecuteActivity(ctx, GetChargeName())
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.stub")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "GetChargeName", edges[0].Meta["temporal_name_func"])
+}
+
+// TestGoTemporal_ConstReturnFunc_StampsTemporalConstReturn asserts that a
+// function whose body is a single `return "<literal>"` gets
+// temporal_const_return=<literal> stamped on its node, and that a function
+// with branching returns does NOT receive that stamp.
+func TestGoTemporal_ConstReturnFunc_StampsTemporalConstReturn(t *testing.T) {
+	fix := runGoExtract(t, `package names
+
+func GetChargeName() string {
+	return "ChargeActivity"
+}
+
+func GetMultiName() string {
+	if true {
+		return "A"
+	}
+	return "B"
+}
+`)
+	var charge, notConst *graph.Node
+	for _, n := range fix.nodesByKind[graph.KindFunction] {
+		if n.Name == "GetChargeName" {
+			charge = n
+		}
+		if n.Name == "GetMultiName" {
+			notConst = n
+		}
+	}
+	require.NotNil(t, charge, "GetChargeName node must exist")
+	require.NotNil(t, notConst, "GetMultiName node must exist")
+	assert.Equal(t, "ChargeActivity", charge.Meta["temporal_const_return"],
+		"single-return-literal func must be stamped temporal_const_return")
+	_, flagged := notConst.Meta["temporal_const_return"]
+	assert.False(t, flagged,
+		"a function with branching returns must not be stamped temporal_const_return")
+}
+
+// TestGoTemporal_ConstReturnMethod_StampsTemporalConstReturn asserts that a
+// method (not a top-level function) whose body is a single `return "<literal>"`
+// also receives the temporal_const_return stamp.
+func TestGoTemporal_ConstReturnMethod_StampsTemporalConstReturn(t *testing.T) {
+	fix := runGoExtract(t, `package names
+
+type Names struct{}
+
+func (n Names) GetChargeName() string {
+	return "ChargeActivity"
+}
+`)
+	var method *graph.Node
+	for _, n := range fix.nodesByKind[graph.KindMethod] {
+		if n.Name == "GetChargeName" {
+			method = n
+		}
+	}
+	require.NotNil(t, method, "GetChargeName method node must exist")
+	assert.Equal(t, "ChargeActivity", method.Meta["temporal_const_return"],
+		"single-return-literal method must be stamped temporal_const_return")
+}
+
 // --- Outbound signal sends / query calls ----------------------------
 //
 // Consumer side of the signal/query namespaces: signalling or querying
@@ -516,4 +865,139 @@ func OrderWorkflow(ctx workflow.Context) error {
 	names, _ := wrapperCall.Meta["arg_names"].([]string)
 	require.GreaterOrEqual(t, len(names), 2)
 	assert.Equal(t, "ChargeCard", names[1], "arg_names must capture the literal at position 1")
+}
+
+// --- StartWorker family tests ---
+
+func TestGoTemporal_StartWorker_Basic(t *testing.T) {
+	// wi.StartWorker([]any{workflow.XXX, workflow.YYY}, []any{activity.AAA, activity.BBB})
+	// must emit 4 temporal.register edges (2 workflow + 2 activity).
+	fix := runGoExtract(t, `package main
+
+import "example.com/workflows"
+import "example.com/activities"
+
+func run(wi WorkflowInfo) {
+	wi.StartWorker(
+		[]any{workflows.OrderWorkflow, workflows.ShipWorkflow},
+		[]any{activities.ChargeCard, activities.ProcessPayment},
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 4)
+	byKind := map[string][]string{}
+	for _, e := range edges {
+		kind, _ := e.Meta["temporal_kind"].(string)
+		name, _ := e.Meta["temporal_name"].(string)
+		byKind[kind] = append(byKind[kind], name)
+	}
+	assert.ElementsMatch(t, []string{"OrderWorkflow", "ShipWorkflow"}, byKind["workflow"])
+	assert.ElementsMatch(t, []string{"ChargeCard", "ProcessPayment"}, byKind["activity"])
+}
+
+func TestGoTemporal_StartWorkerWithOptions(t *testing.T) {
+	fix := runGoExtract(t, `package main
+
+import "example.com/activities"
+
+func run(wi WorkflowInfo) {
+	wi.StartWorkerWithOptions(
+		[]any{},
+		[]any{activities.Validate},
+		WorkerOptions{MaxConcurrent: 10},
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "activity", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "Validate", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_StartWorkerWithInterceptors(t *testing.T) {
+	fix := runGoExtract(t, `package main
+
+import "example.com/workflows"
+
+func run(wi WorkflowInfo) {
+	wi.StartWorkerWithInterceptors(
+		[]any{workflows.MainWorkflow},
+		[]any{},
+		nil,
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "workflow", edges[0].Meta["temporal_kind"])
+	assert.Equal(t, "MainWorkflow", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_StartWorker_SkipsNonSymbolElements(t *testing.T) {
+	// Call expressions inside []any{…} (e.g. activities.New(provider))
+	// should be silently dropped — goTemporalNameFromExpr returns "" for them.
+	fix := runGoExtract(t, `package main
+
+import "example.com/activities"
+
+func run(wi WorkflowInfo) {
+	wi.StartWorker(
+		[]any{},
+		[]any{activities.Charge, activities.New(provider)},
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "Charge", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_StartWorker_EmptySlices_NoEdges(t *testing.T) {
+	fix := runGoExtract(t, `package main
+
+func run(wi WorkflowInfo) {
+	wi.StartWorker([]any{}, []any{})
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	assert.Empty(t, edges, "empty []any slices must emit no register edges")
+}
+
+func TestGoTemporal_StartWorker_ReceiverCall(t *testing.T) {
+	// (&wi).StartWorker(...) — selector on a parenthesised receiver.
+	fix := runGoExtract(t, `package main
+
+import "example.com/activities"
+
+func run(wi *WorkflowInfo) {
+	(&wi).StartWorker(
+		[]any{},
+		[]any{activities.Send},
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "Send", edges[0].Meta["temporal_name"])
+}
+
+func TestGoTemporal_StartWorker_NotOnOtherMethod(t *testing.T) {
+	// A method named StartWorker on a non-WorkflowInfo receiver should
+	// still be detected (we match on method name only, like RegisterActivity).
+	// This test documents the current design choice.
+	fix := runGoExtract(t, `package main
+
+import "example.com/workflows"
+
+func run(s Something) {
+	s.StartWorker(
+		[]any{workflows.XWorkflow},
+		[]any{},
+	)
+}
+`)
+	edges := temporalEdgesByVia(fix, "temporal.register")
+	require.Len(t, edges, 1)
+	assert.Equal(t, "XWorkflow", edges[0].Meta["temporal_name"])
 }

@@ -20,6 +20,14 @@ const temporalStubPrefix = unresolvedPrefix + "temporal::"
 // runtime env override may name a different handler than the default.
 const temporalEnvDefaultConfidence = 0.4
 
+// temporalEnvDefaultInferredConfidence is stamped instead when the env-default
+// was recognised with high confidence — a provable os.Getenv read or a helper
+// name in the configured allow-list (`temporal_env_source` = "os_getenv" /
+// "allowlist"). It sits in the inferred band (≥ 0.5, visible by default): we
+// trust that the dispatch DOES default to this name, leaving the residual
+// "runtime may override" risk to the optional LLM cleaning pass.
+const temporalEnvDefaultInferredConfidence = 0.6
+
 // Temporal annotation node IDs the Java extractor emits via
 // EmitAnnotationEdge. The resolver consumes these to discover
 // temporal-tagged interfaces and methods.
@@ -97,7 +105,18 @@ func ResolveTemporalCalls(g graph.Store) int {
 	// from wrapper call sites into fresh temporal.stub edges, so a
 	// workflow that dispatches via a user helper (`executeActivity(ctx,
 	// ao, "Charge", …)`) gets a real workflow→activity edge.
-	resolveTemporalWrapperCalls(g)
+	// Run iteratively (max 3 passes) to handle depth > 1: wrapper A calls
+	// wrapper B which calls ExecuteActivity. On iteration 1, B's stub is
+	// emitted; on iteration 2, A's caller gets its stub from B. The loop
+	// breaks early when a pass adds no new temporal.stub edges (fixed point).
+	const maxWrapperIterations = 3
+	for iter := 0; iter < maxWrapperIterations; iter++ {
+		before := countTemporalStubEdges(g)
+		resolveTemporalWrapperCalls(g)
+		if countTemporalStubEdges(g) == before {
+			break
+		}
+	}
 	resolveTemporalExecutorFields(g)
 	idx := buildTemporalIndex(g)
 	resolved := 0
@@ -146,10 +165,66 @@ func ResolveTemporalCalls(g graph.Store) int {
 		// the const NAME; retry against the const's literal VALUE, which
 		// is what the activity is actually registered under.
 		if handlerID == "" {
-			if v, ok := idx.constVal[s.name]; ok && v != s.name {
+			if v, ok := idx.lookupConstVal(s.name, callerRepo); ok && v != s.name {
 				if id, o, c := idx.lookup(s.kind, v, callerRepo); id != "" {
 					handlerID, origin, conf = id, o, c
 					e.Meta["temporal_const_value"] = v
+				}
+			}
+		}
+
+		// Env-default const reference: the env-helper's default argument was a
+		// constant reference (`GetEnvOrDefault(KEY, config.ACTIVITY_NAME_DEFAULT)`),
+		// recorded as `temporal_default_const`. Substitute the constant's literal
+		// VALUE through constVal, then resolve register-confirmed or by
+		// convention. The env-default tier override below keeps the edge at the
+		// const_ref tier (inferred, visible) regardless of how it resolved.
+		if handlerID == "" {
+			if cn, _ := e.Meta["temporal_default_const"].(string); cn != "" {
+				if v, ok := idx.lookupConstVal(cn, callerRepo); ok && v != "" {
+					if id, o, c := idx.lookup(s.kind, v, callerRepo); id != "" {
+						handlerID, origin, conf = id, o, c
+						e.Meta["temporal_const_value"] = v
+					} else if id, mismatch := idx.lookupConvention(s.kind, v, callerRepo); id != "" {
+						handlerID = id
+						if mismatch {
+							origin, conf = graph.OriginSpeculative, 0.45
+							e.Meta["temporal_resolution_via"] = "convention_mismatch"
+						} else {
+							origin, conf = graph.OriginASTInferred, 0.6
+							e.Meta["temporal_resolution_via"] = "convention"
+						}
+						e.Meta["temporal_const_value"] = v
+					}
+				}
+			}
+		}
+
+		// Func-returning-literal dispatch (G2): the stub carries
+		// `temporal_name_func=<func>` when the dispatch arg was a
+		// call_expression (`ExecuteActivity(ctx, pkg.GetFooName(), …)`).
+		// Resolve funcName → constVal literal → handler.
+		if handlerID == "" {
+			if fn, _ := e.Meta["temporal_name_func"].(string); fn != "" {
+				if v, ok := idx.lookupConstVal(fn, callerRepo); ok {
+					if id, o, c := idx.lookup(s.kind, v, callerRepo); id != "" {
+						handlerID, origin, conf = id, o, c
+						e.Meta["temporal_const_value"] = v
+					}
+					// Even if lookup fails, record the resolved literal for diagnostics.
+					if handlerID == "" {
+						if id, mismatch := idx.lookupConvention(s.kind, v, callerRepo); id != "" {
+							handlerID = id
+							if mismatch {
+								origin, conf = graph.OriginSpeculative, 0.45
+								e.Meta["temporal_resolution_via"] = "convention_mismatch"
+							} else {
+								origin, conf = graph.OriginASTInferred, 0.6
+								e.Meta["temporal_resolution_via"] = "convention"
+							}
+							e.Meta["temporal_const_value"] = v
+						}
+					}
 				}
 			}
 		}
@@ -161,13 +236,19 @@ func ResolveTemporalCalls(g graph.Store) int {
 		// a register-confirmed binding).
 		if handlerID == "" {
 			candNames := []string{s.name}
-			if v, ok := idx.constVal[s.name]; ok && v != s.name {
+			if v, ok := idx.lookupConstVal(s.name, callerRepo); ok && v != s.name {
 				candNames = append(candNames, v)
 			}
 			for _, nm := range candNames {
-				if id := idx.lookupConvention(s.kind, nm, callerRepo); id != "" {
-					handlerID, origin, conf = id, graph.OriginASTInferred, 0.6
-					e.Meta["temporal_resolution_via"] = "convention"
+				if id, mismatch := idx.lookupConvention(s.kind, nm, callerRepo); id != "" {
+					handlerID = id
+					if mismatch {
+						origin, conf = graph.OriginSpeculative, 0.45
+						e.Meta["temporal_resolution_via"] = "convention_mismatch"
+					} else {
+						origin, conf = graph.OriginASTInferred, 0.6
+						e.Meta["temporal_resolution_via"] = "convention"
+					}
 					if nm != s.name {
 						e.Meta["temporal_const_value"] = nm
 					}
@@ -176,16 +257,41 @@ func ResolveTemporalCalls(g graph.Store) int {
 			}
 		}
 
-		// When the name came from an env-var-with-literal-default
-		// variable, the value is a best-guess: land the resolved edge at
-		// the speculative tier instead of ast_resolved.
+		// Fuzzy fallback: only when exact + const + convention all failed.
+		// A single kind-suffixed function whose name contains the dispatch
+		// name (or its core) is the best remaining guess; land it at the
+		// speculative tier so it is hidden from default queries.
+		if handlerID == "" {
+			if id := idx.lookupFuzzy(s.kind, s.name, callerRepo); id != "" {
+				handlerID, origin, conf = id, graph.OriginSpeculative, 0.5
+				e.Meta["temporal_resolution_via"] = "fuzzy"
+				e.Meta[graph.MetaSpeculative] = true
+			}
+		}
+
+		// When the name came from an env-var-with-literal-default variable,
+		// the value is a best-guess (the runtime env may differ from the
+		// literal default). HOW it was recognised decides the tier:
+		//   - "allowlist" / "os_getenv" / "const_ref": we are confident this IS
+		//     an env-with-default — land at the inferred tier (0.6, visible).
+		//   - "heuristic" (or unknown/legacy): a generic env-named-helper
+		//     guess — land at the hidden speculative tier (0.4), where the
+		//     optional LLM cleaning pass can confirm or prune it.
 		envDefault := false
+		envSource := ""
 		if v, _ := e.Meta["temporal_name_origin"].(string); v == "env_default" {
 			envDefault = true
+			envSource, _ = e.Meta["temporal_env_source"].(string)
 		}
+		envSpeculative := envDefault && envSource != "allowlist" && envSource != "os_getenv" && envSource != "const_ref"
 		if handlerID != "" && envDefault {
-			origin = graph.OriginSpeculative
-			conf = temporalEnvDefaultConfidence
+			if envSpeculative {
+				origin = graph.OriginSpeculative
+				conf = temporalEnvDefaultConfidence
+			} else {
+				origin = graph.OriginASTInferred
+				conf = temporalEnvDefaultInferredConfidence
+			}
 		}
 
 		want := handlerID
@@ -206,7 +312,9 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = conf
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, conf)
 			e.Meta["temporal_resolution"] = origin
-			if envDefault {
+			if envSpeculative {
+				e.Meta[graph.MetaSpeculative] = true
+			} else if via, _ := e.Meta["temporal_resolution_via"].(string); via == "convention_mismatch" {
 				e.Meta[graph.MetaSpeculative] = true
 			}
 			StampSynthesized(e, SynthTemporalStub)
@@ -326,6 +434,27 @@ func resolveTemporalSignalQueryLinks(g graph.Store) {
 // unresolved Temporal stub call.
 func temporalStubPlaceholder(kind, name string) string {
 	return temporalStubPrefix + kind + "::" + name
+}
+
+// countTemporalStubEdges returns the number of EdgeCalls edges carrying
+// Meta["via"]=="temporal.stub". Used by the iterative wrapper-following
+// driver to detect fixed-point convergence.
+//
+// PURPOSE: fixed-point sentinel for the iterative wrapper-following loop.
+// RATIONALE: graph.AddEdge dedupes by key, so a pass that adds nothing new
+// leaves the count unchanged — the loop can break early.
+// KEYWORDS: temporal, wrapper, convergence, fixed-point
+func countTemporalStubEdges(g graph.Store) int {
+	n := 0
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v == "temporal.stub" {
+			n++
+		}
+	}
+	return n
 }
 
 // parseJavaAnnotationName extracts the value of a `name = "..."` argument
@@ -551,6 +680,13 @@ func resolveTemporalWrapperCalls(g graph.Store) {
 	type pending struct {
 		from, file, kind, name, wrapperName string
 		line                                int
+		// fwdParam, when non-empty, marks this emitted stub as itself a
+		// name-forwarding wrapper: the caller passed its OWN parameter
+		// (named fwdParam) into the inner wrapper's name position, so the
+		// caller is a transitive wrapper the NEXT iteration must discover.
+		// The stub then carries temporal_name_param=fwdParam (the depth>1
+		// hook), enabling iterative resolution.
+		fwdParam string
 	}
 	var out []pending
 	emit := func(w wrapper, ce *graph.Edge) {
@@ -561,9 +697,22 @@ func resolveTemporalWrapperCalls(g graph.Store) {
 		if name == "" {
 			return
 		}
+		// Depth>1 propagation: if the forwarded argument is itself a
+		// parameter of the caller (a `<caller>#param:<name>` node with a
+		// position exists), the caller merely passes a name THROUGH — it is
+		// a transitive wrapper. Emit a temporal_name_param stub so the next
+		// iteration discovers the caller as a wrapper and reaches its own
+		// callers. Otherwise the argument is a literal / const NAME the main
+		// resolver lands directly, and no further hop is needed.
+		fwd := ""
+		if pn := g.GetNode(ce.From + "#param:" + name); pn != nil && pn.Kind == graph.KindParam {
+			if _, ok := metaIntValue(pn.Meta["position"]); ok {
+				fwd = name
+			}
+		}
 		out = append(out, pending{
 			from: ce.From, file: ce.FilePath, line: ce.Line,
-			kind: w.kind, name: name, wrapperName: w.name,
+			kind: w.kind, name: name, wrapperName: w.name, fwdParam: fwd,
 		})
 	}
 	// Match each call that carries arg_names to a wrapper, by resolved
@@ -590,20 +739,62 @@ func resolveTemporalWrapperCalls(g graph.Store) {
 	}
 
 	for _, p := range out {
+		// Idempotence guard: skip if an equivalent stub already exists on
+		// this caller. graph.AddEdge dedupes by key, but when fwdParam is
+		// set the stub may have been emitted by a prior iteration with
+		// temporal_name_param already set — avoid replacing the pointer.
+		if temporalWrapperStubExists(g, p.from, p.kind, p.name) {
+			continue
+		}
+		meta := map[string]any{
+			"via":                  "temporal.stub",
+			"temporal_kind":        p.kind,
+			"temporal_name":        p.name,
+			"temporal_via_wrapper": p.wrapperName,
+		}
+		// Transitive wrapper: stamp temporal_name_param so the next
+		// iteration discovers p.from as a wrapper and propagates through
+		// to its own callers (depth > 1).
+		if p.fwdParam != "" {
+			meta["temporal_name_param"] = p.fwdParam
+		}
 		g.AddEdge(&graph.Edge{
 			From:     p.from,
 			To:       temporalStubPlaceholder(p.kind, p.name),
 			Kind:     graph.EdgeCalls,
 			FilePath: p.file,
 			Line:     p.line,
-			Meta: map[string]any{
-				"via":                  "temporal.stub",
-				"temporal_kind":        p.kind,
-				"temporal_name":        p.name,
-				"temporal_via_wrapper": p.wrapperName,
-			},
+			Meta:     meta,
 		})
 	}
+}
+
+// temporalWrapperStubExists reports whether `from` already carries a
+// via=temporal.stub out-edge for (kind, name). Used by the idempotence
+// guard inside resolveTemporalWrapperCalls to prevent re-minting stubs
+// across iterative passes.
+//
+// PURPOSE: pointer-stability guard for the iterative wrapper-following loop.
+// RATIONALE: graph.AddEdge deduplicates by edge key; re-adding replaces the
+// stored *Edge pointer, which breaks any retargeted in-edge the main resolver
+// already resolved. Skipping re-emission keeps both out-edge and in-edge
+// buckets pointing at the same *Edge.
+// KEYWORDS: temporal, wrapper, idempotence, dedup
+func temporalWrapperStubExists(g graph.Store, from, kind, name string) bool {
+	for _, e := range g.GetOutEdges(from) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "temporal.stub" {
+			continue
+		}
+		ek, _ := e.Meta["temporal_kind"].(string)
+		en, _ := e.Meta["temporal_name"].(string)
+		if ek == kind && en == name {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveTemporalExecutorFields implements the Temporal step/executor
@@ -727,6 +918,13 @@ type temporalIndex struct {
 	// the const's value. A name that resolves to two different values
 	// across the workspace is ambiguous and omitted.
 	constVal map[string]string
+	// constValByRepo maps "repoPrefix::constName" → literal value, the repo-scoped
+	// companion to constVal. Where constVal drops a name with ≥2 distinct values
+	// across the workspace (ambiguity abstention), constValByRepo preserves each
+	// repo's value under a repo-prefixed key. The lookup path tries repo-affinity
+	// first (dispatch from repo X → constValByRepo["X::name"]), then falls back
+	// to the global constVal.
+	constValByRepo map[string]string
 	// funcByName indexes Go functions / methods whose name follows the
 	// activity / workflow naming convention (suffix "Activity" /
 	// "Workflow"), keyed by bare name. Used as a last-resort, lower-
@@ -738,8 +936,62 @@ type temporalIndex struct {
 	funcByName map[string][]*graph.Node
 }
 
+// lookupConstVal resolves a const name to its literal value, preferring the
+// repo-scoped entry (when the caller's repo defines a different value than
+// the global ambiguous drop would suggest) and falling back to the global
+// entry. Returns ("", false) when neither scope has the name.
+func (idx *temporalIndex) lookupConstVal(name, callerRepo string) (string, bool) {
+	if callerRepo != "" {
+		if v, ok := idx.constValByRepo[callerRepo+"::"+name]; ok {
+			return v, true
+		}
+	}
+	v, ok := idx.constVal[name]
+	return v, ok
+}
+
+// isCrossRepoTestStub reports whether candidate n is a `*_test.go` node in a
+// DIFFERENT repo than the dispatching caller. Such a node is, in practice, a
+// test mock / fixture of the activity / workflow (a `workflow_test.go` stub),
+// not the real cross-repo implementation; matching a dispatch to it mints a
+// spurious edge — the one confirmed false positive in the L1 corpus audit (a
+// service repo's dispatch resolving to a `*_test.go` stub in an unrelated
+// workflow repo). Same-repo test files stay eligible: the overwhelmingly
+// common test-workflow → test-activity edge within one package is correct.
+// An empty callerRepo or candidate RepoPrefix can't establish the cross-repo
+// relation, so the node is left eligible (precision over recall in reverse —
+// we only suppress when we are sure both repos are known and differ).
+func isCrossRepoTestStub(n *graph.Node, callerRepo string) bool {
+	if n == nil || callerRepo == "" || n.RepoPrefix == "" || n.RepoPrefix == callerRepo {
+		return false
+	}
+	return strings.HasSuffix(n.FilePath, "_test.go")
+}
+
+// eligibleTemporalCandidates drops cross-repo `*_test.go` stub candidates (see
+// isCrossRepoTestStub) from a candidate list, returning the input unchanged
+// when nothing is suppressed.
+func eligibleTemporalCandidates(cands []*graph.Node, callerRepo string) []*graph.Node {
+	if callerRepo == "" {
+		return cands
+	}
+	var out []*graph.Node
+	suppressed := false
+	for _, n := range cands {
+		if isCrossRepoTestStub(n, callerRepo) {
+			suppressed = true
+			continue
+		}
+		out = append(out, n)
+	}
+	if !suppressed {
+		return cands
+	}
+	return out
+}
+
 func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin string, confidence float64) {
-	cands := idx.byKindName[kind+"::"+name]
+	cands := eligibleTemporalCandidates(idx.byKindName[kind+"::"+name], callerRepo)
 	if len(cands) == 0 {
 		return "", "", 0
 	}
@@ -762,33 +1014,174 @@ func (idx *temporalIndex) lookup(kind, name, callerRepo string) (id, origin stri
 // lookupConvention resolves a dispatch name to a convention-named Go
 // function (suffix "Activity" / "Workflow" matching the kind) when no
 // registered handler matched — the unregistered-activity case (Pattern 2
-// / Stage 1.2). Returns "" when there's no unambiguous candidate. The
-// caller stamps this at a lower (inferred) confidence than a
-// register-confirmed match.
-func (idx *temporalIndex) lookupConvention(kind, name, callerRepo string) string {
-	cands := idx.funcByName[name]
-	if len(cands) == 0 {
-		return ""
-	}
+// / Stage 1.2). Returns ("", false) when there's no candidate. The
+// second return value indicates whether the single candidate's signature
+// mismatches the dispatch kind (e.g., kind="activity" but candidate
+// takes workflow.Context — a workflow wrapper, not a real activity). The
+// caller uses the mismatch flag to lower the confidence tier.
+func (idx *temporalIndex) lookupConvention(kind, name, callerRepo string) (string, bool) {
 	suffix := "Activity"
 	if kind == "workflow" {
 		suffix = "Workflow"
 	}
+	// core is the dispatch name with any redundant kind-suffix trimmed: a
+	// dispatch of bare "Charge" and a dispatch of the already-suffixed
+	// "ChargeActivity" both reduce to the core "Charge", which the matching
+	// activity FUNCTION ("ChargeActivity", "MyChargeActivity", …) contains.
+	// Trimming keeps the suffixed and bare forms backward-compatible: for
+	// name="ChargeActivity", core="Charge" and "ChargeActivity" both
+	// HasSuffix and Contains(core), so the original suffix-exact match is
+	// preserved while bare-name dispatch now resolves too.
+	core := strings.TrimSuffix(name, suffix)
+	if core == "" {
+		return "", false
+	}
+	// Iterate the whole convention index (not an exact-name key): the bare
+	// dispatch name is, by construction, NOT the func name, so an exact-key
+	// lookup never matched the cross-repo / unregistered FUNCTION it names.
 	var filtered, sameRepo []*graph.Node
-	for _, n := range cands {
-		if !strings.HasSuffix(n.Name, suffix) {
+	for fn, cands := range idx.funcByName {
+		if !strings.HasSuffix(fn, suffix) || !strings.Contains(fn, core) {
 			continue
 		}
-		filtered = append(filtered, n)
-		if callerRepo != "" && n.RepoPrefix == callerRepo {
-			sameRepo = append(sameRepo, n)
+		for _, n := range cands {
+			if isCrossRepoTestStub(n, callerRepo) {
+				continue
+			}
+			filtered = append(filtered, n)
+			if callerRepo != "" && n.RepoPrefix == callerRepo {
+				sameRepo = append(sameRepo, n)
+			}
 		}
 	}
 	if len(sameRepo) == 1 {
-		return sameRepo[0].ID
+		mismatch := signatureMismatchesKind(sameRepo[0], kind)
+		return sameRepo[0].ID, mismatch
 	}
 	if len(filtered) == 1 {
-		return filtered[0].ID
+		mismatch := signatureMismatchesKind(filtered[0], kind)
+		return filtered[0].ID, mismatch
+	}
+	// Tiebreaker: when multiple convention candidates share the same
+	// name (e.g., a real activity `func FooActivity(context.Context, …)`
+	// and a workflow wrapper `func FooActivity(workflow.Context, …)`),
+	// prefer the one whose signature matches the dispatch kind:
+	//   kind="activity"  → prefer context.Context  (real activity)
+	//   kind="workflow"  → prefer workflow.Context  (real workflow)
+	// The signature meta is set by the Go extractor on every function /
+	// method node. This is a Temporal Go SDK convention: activities
+	// accept context.Context, workflows accept workflow.Context.
+	if len(filtered) > 1 {
+		if preferred := preferBySignatureKind(filtered, kind); preferred != "" {
+			return preferred, false
+		}
+	}
+	if len(sameRepo) > 1 {
+		if preferred := preferBySignatureKind(sameRepo, kind); preferred != "" {
+			return preferred, false
+		}
+	}
+	return "", false
+}
+
+// signatureMismatchesKind reports whether a convention candidate's function
+// signature contradicts the dispatch kind. In Temporal Go SDK:
+//   - Activities accept context.Context
+//   - Workflows accept workflow.Context
+//
+// A kind="activity" dispatch that lands on a function taking
+// workflow.Context is likely a workflow wrapper, not the real activity.
+// The mismatch flag lets the caller lower the confidence tier instead of
+// rejecting the match outright — the wrapper is still a meaningful signal.
+func signatureMismatchesKind(n *graph.Node, kind string) bool {
+	if n == nil {
+		return false
+	}
+	sig, _ := n.Meta["signature"].(string)
+	if sig == "" {
+		return false
+	}
+	want := "context.Context"
+	dontWant := "workflow.Context"
+	if kind == "workflow" {
+		want, dontWant = "workflow.Context", "context.Context"
+	}
+	return strings.Contains(sig, dontWant) && !strings.Contains(sig, want)
+}
+
+// preferBySignatureKind applies the context.Context / workflow.Context
+// tiebreaker to a list of convention candidates. Returns the single
+// candidate whose Meta["signature"] contains the preferred first-param
+// type for the given kind, or "" if zero or 2+ candidates match.
+func preferBySignatureKind(cands []*graph.Node, kind string) string {
+	want := "context.Context"
+	if kind == "workflow" {
+		want = "workflow.Context"
+	}
+	var matching []*graph.Node
+	for _, n := range cands {
+		sig, _ := n.Meta["signature"].(string)
+		if sig == "" {
+			continue
+		}
+		// Check if the signature's first parameter is the preferred type.
+		// Go signatures look like: "func FooActivity(ctx context.Context, …)"
+		// or "func FooActivity(ctx workflow.Context, …)".
+		if strings.Contains(sig, want) {
+			matching = append(matching, n)
+		}
+	}
+	if len(matching) == 1 {
+		return matching[0].ID
+	}
+	return ""
+}
+
+// lookupFuzzy is the conservative last-resort fallback, fired only when both
+// the exact (register-confirmed) lookup and the convention lookup have
+// failed. It re-scans the convention index for the single kind-suffixed
+// FUNCTION whose name contains the raw dispatch name (or its kind-trimmed
+// core) — a looser substring match than convention's suffix-core shape. To
+// keep precision high it resolves ONLY when EXACTLY ONE such candidate
+// exists across the workspace; any ambiguity abstains. The caller stamps the
+// result at the speculative tier (confidence ≤ 0.5, MetaSpeculative) so the
+// best-guess edge is hidden from default queries.
+func (idx *temporalIndex) lookupFuzzy(kind, name, callerRepo string) string {
+	suffix := "Activity"
+	if kind == "workflow" {
+		suffix = "Workflow"
+	}
+	core := strings.TrimSuffix(name, suffix)
+	if core == "" {
+		return ""
+	}
+	// Prefer the stricter raw-name containment; only widen to the trimmed
+	// core when the raw name matches nothing. This keeps the lone-candidate
+	// guarantee meaningful: a tighter needle is tried before a looser one.
+	collect := func(needle string) []*graph.Node {
+		var out []*graph.Node
+		for fn, cands := range idx.funcByName {
+			if !strings.HasSuffix(fn, suffix) {
+				continue
+			}
+			if !strings.Contains(fn, needle) {
+				continue
+			}
+			for _, n := range cands {
+				if isCrossRepoTestStub(n, callerRepo) {
+					continue
+				}
+				out = append(out, n)
+			}
+		}
+		return out
+	}
+	matched := collect(name)
+	if len(matched) == 0 && core != name {
+		matched = collect(core)
+	}
+	if len(matched) == 1 {
+		return matched[0].ID
 	}
 	return ""
 }
@@ -800,7 +1193,7 @@ func (idx *temporalIndex) lookupConvention(kind, name, callerRepo string) string
 // implementors), and (b) returns a name index the stub-call resolver
 // consults.
 func buildTemporalIndex(g graph.Store) *temporalIndex {
-	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, constVal: map[string]string{}, funcByName: map[string][]*graph.Node{}}
+	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, constVal: map[string]string{}, constValByRepo: map[string]string{}, funcByName: map[string][]*graph.Node{}}
 
 	// Convention index: Go functions / methods named like activities or
 	// workflows (suffix "Activity" / "Workflow"), for resolving dispatch
@@ -828,23 +1221,73 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 	// maps to more than one distinct value (ambiguous). Lets the stub
 	// resolver below substitute `constants.X` → "the string X holds".
 	constAmbiguous := map[string]struct{}{}
+	ingestConst := func(name, v, repo string) {
+		if name == "" || v == "" {
+			return
+		}
+		// Repo-scoped: always record (same const name may have different
+		// values in different repos; repo-scoped key is unique by construction).
+		if repo != "" {
+			idx.constValByRepo[repo+"::"+name] = v
+		}
+		// Global: drop on ambiguity (unchanged behavior).
+		if _, dropped := constAmbiguous[name]; dropped {
+			return
+		}
+		if prev, seen := idx.constVal[name]; seen && prev != v {
+			delete(idx.constVal, name)
+			constAmbiguous[name] = struct{}{}
+			return
+		}
+		idx.constVal[name] = v
+	}
 	for n := range g.NodesByKind(graph.KindConstant) {
 		if n == nil {
 			continue
 		}
-		v, ok := n.Meta["value"].(string)
-		if !ok || v == "" {
+		if v, ok := n.Meta["value"].(string); ok {
+			ingestConst(n.Name, v, n.RepoPrefix)
+		}
+	}
+	// Java string constants are emitted as KindField (`static final String`),
+	// not KindConstant; the Java extractor stamps Meta["value"] on them. Ingest
+	// those into the SAME constVal index so a Java invoker const-ref dispatch
+	// (`invoker.invokeAsync(Constants.X, …)`) resolves cross-language to the
+	// registered Go workflow/activity. Same ambiguity rule applies — a name with
+	// two distinct values across the workspace is dropped.
+	for n := range g.NodesByKind(graph.KindField) {
+		if n == nil || n.Language != "java" {
 			continue
 		}
-		if _, dropped := constAmbiguous[n.Name]; dropped {
-			continue
+		if v, ok := n.Meta["value"].(string); ok {
+			ingestConst(n.Name, v, n.RepoPrefix)
 		}
-		if prev, seen := idx.constVal[n.Name]; seen && prev != v {
-			delete(idx.constVal, n.Name)
-			constAmbiguous[n.Name] = struct{}{}
-			continue
+	}
+
+	// Function-return-literal index (G2): a func whose body is a single
+	// `return "<literal>"` centralises an activity / workflow name.
+	// Index funcName → literal into the same constVal map (same ambiguity
+	// rule as string constants: a name with two distinct literals is
+	// dropped). This lets stub edges carrying `temporal_name_func=<func>`
+	// resolve via funcName → literal → registered handler.
+	indexFunctionReturnLiterals := func(n *graph.Node) {
+		if n == nil || n.Language != "go" {
+			return
 		}
-		idx.constVal[n.Name] = v
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			return
+		}
+		lit, ok := n.Meta["temporal_const_return"].(string)
+		if !ok || lit == "" {
+			return
+		}
+		ingestConst(n.Name, lit, n.RepoPrefix)
+	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		indexFunctionReturnLiterals(n)
+	}
+	for n := range g.NodesByKind(graph.KindMethod) {
+		indexFunctionReturnLiterals(n)
 	}
 
 	// Phase 1 — Go side. Walk `temporal.register` edges and stamp the

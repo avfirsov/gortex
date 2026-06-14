@@ -206,10 +206,382 @@ func setupWorker(w Worker) {
 	assert.Equal(t, activity.ID, stubCall.To,
 		"env-default dispatch must land on the default activity")
 	assert.Equal(t, "env_default", stubCall.Meta["temporal_name_origin"])
+	assert.Equal(t, "os_getenv", stubCall.Meta["temporal_env_source"])
+	assert.Equal(t, graph.OriginASTInferred, stubCall.Origin,
+		"provable os.Getenv env-default lands at the inferred (visible) tier")
+	_, hidden := stubCall.Meta[graph.MetaSpeculative]
+	assert.False(t, hidden, "os.Getenv env-default is visible by default")
+}
+
+// TestEnvFallbackResolution (G1) exercises the env-with-fallback-via-helper
+// dispatch name: the workflow names its activity through a variable read
+// from a project-local helper (`wfutils.GetEnvOrDefault(KEY, "Default")`)
+// rather than os.Getenv directly. The helper body lives in another package
+// and is invisible at extract time, so the literal 2nd argument is taken as
+// the default and the call lands on the default activity at the speculative
+// tier.
+func TestEnvFallbackResolution(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+)
+
+func GetEnvOrDefault(key, def string) string { return def }
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	actName := GetEnvOrDefault("CHARGE_ACTIVITY", "ChargeCard")
+	return workflow.ExecuteActivity(ctx, actName, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error {
+	return nil
+}
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeCard)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")[0]
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"helper env-default dispatch must land on the default activity")
+	assert.Equal(t, "env_default", stubCall.Meta["temporal_name_origin"])
+	assert.Equal(t, "allowlist", stubCall.Meta["temporal_env_source"])
+	assert.Equal(t, graph.OriginASTInferred, stubCall.Origin,
+		"allow-list helper env-default lands at the inferred (visible) tier")
+	_, hidden := stubCall.Meta[graph.MetaSpeculative]
+	assert.False(t, hidden, "allow-list env-default is visible by default")
+}
+
+// TestTemporalE2E_GoEnvHeuristicSpeculative exercises the generic recall
+// layer end-to-end: a helper NOT in the allow-list but whose name contains
+// "env" is recognised by the heuristic, still resolves to the default
+// activity, but lands at the HIDDEN speculative tier (source=heuristic) — the
+// LLM cleaning pass is what later confirms or prunes it.
+func TestTemporalE2E_GoEnvHeuristicSpeculative(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func ActivityFromEnv(key, def string) string { return def }
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	actName := ActivityFromEnv("CHARGE_ACTIVITY", "ChargeCard")
+	return workflow.ExecuteActivity(ctx, actName, id).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeCard(ctx context.Context, id string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeCard)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeCard")[0]
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"heuristic env-default still resolves to the default activity")
+	assert.Equal(t, "heuristic", stubCall.Meta["temporal_env_source"])
 	assert.Equal(t, graph.OriginSpeculative, stubCall.Origin,
-		"env-default resolution must be speculative")
+		"heuristic env-default stays at the speculative tier")
 	assert.Equal(t, true, stubCall.Meta[graph.MetaSpeculative],
-		"env-default edge must be hidden-by-default")
+		"heuristic env-default is hidden by default")
+}
+
+// TestTemporalE2E_JavaInvokerToGoBridge exercises the Java invoker detector: a
+// Java class dispatches a Go workflow through a configured custom invoker
+// (`invoker.invokeAsync("ProcessOrderWorkflow", …)`), both as a string literal
+// (exact, register-tier) and through an env property with a literal default
+// (heuristic, hidden tier). Both must emit via=temporal.stub edges the resolver
+// lands on the registered Go workflow.
+func TestTemporalE2E_JavaInvokerToGoBridge(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "OrderManager.java"), `package com.example;
+
+import io.temporal.workflow.WorkflowOptions;
+
+public class OrderManager {
+    private final Invoker invoker;
+
+    public String startOrder(Object input) {
+        WorkflowOptions options = WorkflowOptions.newBuilder()
+            .setTaskQueue("order-wf").build();
+        return invoker.invokeAsync("ProcessOrderWorkflow", options, input).block();
+    }
+
+    public String startWithDefault(Object input) {
+        return invoker.invokeAsync(
+            env.getProperty("order.workflow.type", "ProcessOrderWorkflow"),
+            options, input).block();
+    }
+}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package main
+
+import "go.temporal.io/sdk/workflow"
+
+func ProcessOrderWorkflow(ctx workflow.Context, input string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func setup(w Worker) { w.RegisterWorkflow(ProcessOrderWorkflow) }
+`)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	reg.Register(languages.NewJavaExtractor())
+	languages.ConfigureTemporalJavaInvokers(reg, []string{"Invoker"}, nil)
+	cfg := config.Default().Index
+	cfg.Workers = 2
+	idx := New(g, reg, cfg, zap.NewNop())
+
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	goWf := g.FindNodesByName("ProcessOrderWorkflow")[0]
+
+	javaStub := func(method string) *graph.Edge {
+		nodes := g.FindNodesByName(method)
+		require.NotEmpty(t, nodes, "java method %s must be a node", method)
+		for _, e := range g.GetOutEdges(nodes[0].ID) {
+			if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+				return e
+			}
+		}
+		return nil
+	}
+
+	// Literal name → exact tier, resolves to the Go workflow, visible.
+	exact := javaStub("startOrder")
+	require.NotNil(t, exact, "startOrder must emit a temporal.stub")
+	assert.Equal(t, "ProcessOrderWorkflow", exact.Meta["temporal_name"])
+	assert.Equal(t, "workflow", exact.Meta["temporal_kind"])
+	assert.Equal(t, true, exact.Meta["cross_language"])
+	assert.Equal(t, goWf.ID, exact.To, "literal invoker dispatch resolves to the Go workflow")
+
+	// Env-property default → heuristic tier, carries the env key, also resolves.
+	heur := javaStub("startWithDefault")
+	require.NotNil(t, heur, "startWithDefault must emit a temporal.stub")
+	assert.Equal(t, "ProcessOrderWorkflow", heur.Meta["temporal_name"])
+	assert.Equal(t, "heuristic", heur.Meta["temporal_env_source"])
+	assert.Equal(t, "order.workflow.type", heur.Meta["temporal_env_key"])
+	assert.Equal(t, goWf.ID, heur.To, "env-default invoker dispatch resolves to the Go workflow")
+}
+
+// TestTemporalE2E_JavaInvokerValueField exercises Java invoker priority 3: the
+// dispatch name is a Spring `@Value("${key:Default}")`-injected field. The
+// detector resolves the field to its SpEL literal default and lands the edge on
+// the Go workflow at the heuristic tier.
+func TestTemporalE2E_JavaInvokerValueField(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "OrderManager.java"), `package com.example;
+
+import org.springframework.beans.factory.annotation.Value;
+
+public class OrderManager {
+    private final Invoker invoker;
+
+    @Value("${order.workflow.type:ProcessOrderWorkflow}")
+    private String workflowType;
+
+    public String startConfigured(Object input) {
+        return invoker.invokeAsync(workflowType, options, input).block();
+    }
+}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package main
+
+import "go.temporal.io/sdk/workflow"
+
+func ProcessOrderWorkflow(ctx workflow.Context, input string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func setup(w Worker) { w.RegisterWorkflow(ProcessOrderWorkflow) }
+`)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	reg.Register(languages.NewJavaExtractor())
+	languages.ConfigureTemporalJavaInvokers(reg, []string{"Invoker"}, nil)
+	cfg := config.Default().Index
+	cfg.Workers = 2
+	idx := New(g, reg, cfg, zap.NewNop())
+
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	goWf := g.FindNodesByName("ProcessOrderWorkflow")[0]
+	nodes := g.FindNodesByName("startConfigured")
+	require.NotEmpty(t, nodes)
+	var stub *graph.Edge
+	for _, e := range g.GetOutEdges(nodes[0].ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stub = e
+			break
+		}
+	}
+	require.NotNil(t, stub, "@Value-field invoker dispatch must emit a temporal.stub")
+	assert.Equal(t, "ProcessOrderWorkflow", stub.Meta["temporal_name"])
+	assert.Equal(t, "heuristic", stub.Meta["temporal_env_source"])
+	assert.Equal(t, goWf.ID, stub.To, "@Value default resolves to the Go workflow")
+}
+
+// TestTemporalE2E_JavaInvokerOffWhenUnconfigured asserts zero behavioural
+// change when java_temporal_invokers is not configured: the invoker call is
+// left to the generic path, emitting no temporal.stub.
+func TestTemporalE2E_JavaInvokerOffWhenUnconfigured(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "OrderManager.java"), `package com.example;
+
+public class OrderManager {
+    private final Invoker invoker;
+
+    public String startOrder(Object input) {
+        return invoker.invokeAsync("ProcessOrderWorkflow", input).block();
+    }
+}
+`)
+	g := graph.New()
+	idx := newTestIndexerGoJava(g) // NOT configured with any invoker
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	for _, n := range g.FindNodesByName("startOrder") {
+		for _, e := range g.GetOutEdges(n.ID) {
+			if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+				t.Fatal("invoker detection must be OFF when java_temporal_invokers is unconfigured")
+			}
+		}
+	}
+}
+
+// TestTemporalE2E_GoEnvConstDefault exercises the #1 corpus gap: an env-helper
+// whose DEFAULT argument is a constant reference, not a string literal
+// (`wfutil.GetEnvOrDefault(config.ACTIVITY_NAME_ENV, config.ACTIVITY_NAME_DEFAULT)`).
+// The parser records temporal_default_const=ACTIVITY_NAME_DEFAULT (keeping
+// temporal_name as the dispatch variable); the resolver substitutes the
+// constant's literal value (ChargeActivity) through constVal and lands the edge
+// on the registered activity at the const_ref tier (inferred, visible).
+func TestTemporalE2E_GoEnvConstDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/app\n\ngo 1.22\n")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "config"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "wfutil"), 0o755))
+
+	writeFile(t, filepath.Join(dir, "config", "env.go"), `package config
+
+const (
+	ACTIVITY_NAME_ENV     = "CHARGE_ACTIVITY_NAME"
+	ACTIVITY_NAME_DEFAULT = "ChargeActivity"
+)
+`)
+	writeFile(t, filepath.Join(dir, "wfutil", "wfutil.go"), `package wfutil
+
+func GetEnvOrDefault(key, def string) string { return def }
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package app
+
+import (
+	"go.temporal.io/sdk/workflow"
+	"example.com/app/config"
+	"example.com/app/wfutil"
+)
+
+func OrderWorkflow(ctx workflow.Context, input string) error {
+	name := wfutil.GetEnvOrDefault(config.ACTIVITY_NAME_ENV, config.ACTIVITY_NAME_DEFAULT)
+	return workflow.ExecuteActivity(ctx, name, input).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package app
+
+import "context"
+
+func ChargeActivity(ctx context.Context, input string) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package app
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeActivity)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeActivity")[0]
+
+	var stub *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stub = e
+			break
+		}
+	}
+	require.NotNil(t, stub, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stub.To, "const-default dispatch must resolve to the activity")
+	assert.Equal(t, "const_ref", stub.Meta["temporal_env_source"])
+	assert.Equal(t, "ACTIVITY_NAME_DEFAULT", stub.Meta["temporal_default_const"])
+	assert.Equal(t, "ChargeActivity", stub.Meta["temporal_const_value"])
+	assert.Equal(t, graph.OriginASTInferred, stub.Origin, "const_ref lands at the inferred (visible) tier")
+	_, hidden := stub.Meta[graph.MetaSpeculative]
+	assert.False(t, hidden, "const_ref env-default is visible by default")
 }
 
 // TestTemporalE2E_GoQueryHandler exercises in-workflow handler detection:
@@ -367,6 +739,66 @@ func setupWorker(w Worker) {
 	}
 	assert.True(t, targets[charge.ID], "literal-arg wrapper dispatch must reach ChargeCard")
 	assert.True(t, targets[refund.ID], "const-arg wrapper dispatch must reach RefundCard")
+}
+
+// TestTemporalE2E_GoWrapperDepth2 exercises depth>1 wrapper-following: a
+// workflow passes a literal activity name into runStep, which forwards it to
+// execActivity, which finally calls workflow.ExecuteActivity. The iterative
+// wrapper pass must propagate the literal up the two-hop chain and land the
+// top workflow on the registered activity.
+func TestTemporalE2E_GoWrapperDepth2(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "wrappers.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func runStep(ctx workflow.Context, name string, args ...any) error {
+	return execActivity(ctx, name, args)
+}
+
+func execActivity(ctx workflow.Context, name string, args ...any) error {
+	return workflow.ExecuteActivity(ctx, name, args).Get(ctx, nil)
+}
+`)
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import "go.temporal.io/sdk/workflow"
+
+func CancelWorkflow(ctx workflow.Context) error {
+	return runStep(ctx, "ProcessCancel", 1)
+}
+`)
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ProcessCancel(ctx context.Context, n int) error { return nil }
+`)
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(CancelWorkflow)
+	w.RegisterActivity(ProcessCancel)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("CancelWorkflow")[0]
+	activity := g.FindNodesByName("ProcessCancel")[0]
+
+	targets := map[string]bool{}
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" && e.Meta["temporal_via_wrapper"] != nil {
+			targets[e.To] = true
+		}
+	}
+	assert.True(t, targets[activity.ID],
+		"depth-2 wrapper dispatch must follow runStep->execActivity and reach ProcessCancel")
 }
 
 // TestTemporalE2E_GoSignalQueryLink links a Go signal sender / query
@@ -689,4 +1121,77 @@ public interface OrderWorkflowApi {
 		"Java @SignalMethod(cancel-order) must link to the Go workflow handling it")
 	assert.True(t, hasCrossLink(getStatus.ID, "temporal.query-link"),
 		"Java @QueryMethod(order-status) must link to the Go workflow handling it")
+}
+
+// TestFuncConstReturnDispatch_E2E exercises G2 (func-returning-literal
+// dispatch): a workflow calls `names.GetChargeName()` as the activity-name
+// argument. GetChargeName returns the string literal "ChargeActivity", and
+// the worker registers an activity named "ChargeActivity". After indexing
+// the full pipeline must resolve the stub edge to the registered activity.
+func TestFuncConstReturnDispatch_E2E(t *testing.T) {
+	dir := t.TempDir()
+
+	// names/names.go — a helper package that returns the activity name.
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "names"), 0o755))
+	writeFile(t, filepath.Join(dir, "names", "names.go"), `package names
+
+// GetChargeName returns the canonical activity name used by the workflow.
+func GetChargeName() string {
+	return "ChargeActivity"
+}
+`)
+
+	// workflow.go — dispatches via names.GetChargeName().
+	writeFile(t, filepath.Join(dir, "workflow.go"), `package wf
+
+import (
+	"go.temporal.io/sdk/workflow"
+)
+
+func names_GetChargeName() string { return "ChargeActivity" } // stub for same-package resolution
+
+func OrderWorkflow(ctx workflow.Context, id string) error {
+	return workflow.ExecuteActivity(ctx, names_GetChargeName()).Get(ctx, nil)
+}
+`)
+
+	// activity.go — the registered activity function.
+	writeFile(t, filepath.Join(dir, "activity.go"), `package wf
+
+import "context"
+
+func ChargeActivity(ctx context.Context, id string) error {
+	return nil
+}
+`)
+
+	// main.go — registers the workflow and the activity.
+	writeFile(t, filepath.Join(dir, "main.go"), `package wf
+
+func setupWorker(w Worker) {
+	w.RegisterWorkflow(OrderWorkflow)
+	w.RegisterActivity(ChargeActivity)
+}
+`)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wf := g.FindNodesByName("OrderWorkflow")[0]
+	activity := g.FindNodesByName("ChargeActivity")[0]
+	assert.Equal(t, "activity", activity.Meta["temporal_role"],
+		"registered activity must carry temporal_role meta")
+
+	var stubCall *graph.Edge
+	for _, e := range g.GetOutEdges(wf.ID) {
+		if e != nil && e.Meta != nil && e.Meta["via"] == "temporal.stub" {
+			stubCall = e
+			break
+		}
+	}
+	require.NotNil(t, stubCall, "workflow must have an outbound temporal.stub edge")
+	assert.Equal(t, activity.ID, stubCall.To,
+		"func-const-return dispatch must resolve stub to the registered activity")
 }

@@ -1,0 +1,695 @@
+{
+  "broken_dispatch": [
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::SendChangeServicesFailWorkflow",
+      "kind": "activity",
+      "name": "SendChangeServicesFail",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 23
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\ucp2-acts/workflow\\ucp2_get_billing_account_testworkflow.go::Ucp2GetBillingAccountTestWorkflow",
+      "kind": "activity",
+      "name": "Ucp2GetBillingAccountActivity",
+      "file": "C:\\dev\\corp\\activities\\ucp2-acts/workflow\\ucp2_get_billing_account_testworkflow.go",
+      "line": 25
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\release_╤Бtn.go::FreeCtnActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\release_╤Бtn.go",
+      "line": 33
+    },
+    {
+      "from": "C:\\dev\\corp\\client-order-svc/src\\main\\java\\com.example.corp.clientorder\\workflow\\SalesScenarioMbWorkflowManagerImpl.java::SalesScenarioMbWorkflowManagerImpl.invokeWorkflow",
+      "kind": "workflow",
+      "name": "type",
+      "file": "C:\\dev\\corp\\client-order-svc/src\\main\\java\\com.example.corp.clientorder\\workflow\\SalesScenarioMbWorkflowManagerImpl.java",
+      "line": 40
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_bind_test_workflow.go::PostThresholdRuleBindTestWorkflow",
+      "kind": "activity",
+      "name": "PostThresholdRuleBindActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_bind_test_workflow.go",
+      "line": 26
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendOrderPickupSms",
+      "kind": "activity",
+      "name": "SendOrderPickupSmsActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 51
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\basequickvalidation.go::addAllowedForItems",
+      "kind": "activity",
+      "name": "GetGetAllowedWithV2ActivityName",
+      "file": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\basequickvalidation.go",
+      "line": 399
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callsom.go::callSomPutServiceOrderActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callsom.go",
+      "line": 34
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go::PrepareActivityByMode",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go",
+      "line": 33
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\get_threshold_rules_test_workflow.go::GetThresholdRulesTestWorkflow",
+      "kind": "activity",
+      "name": "GetThresholdRuleActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\get_threshold_rules_test_workflow.go",
+      "line": 26
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunCalculateWorkflow",
+      "kind": "workflow",
+      "name": "CALCULATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 53
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\b2blk.go::SaveRolePermissionsActivity",
+      "kind": "activity",
+      "name": "SaveRolePermissionsActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\b2blk.go",
+      "line": 18
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_individual.go::GetIndividualActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_individual.go",
+      "line": 36
+    },
+    {
+      "from": "C:\\dev\\corp\\abufix-processor/src\\main\\java\\ru\\beeline\\oms\\abufixboprocessor\\utils\\AbuFixWorkflowStarter.java::AbuFixWorkflowStarter.startAbuFixWorkflow",
+      "kind": "workflow",
+      "name": "AbufixWorkflow",
+      "file": "C:\\dev\\corp\\abufix-processor/src\\main\\java\\ru\\beeline\\oms\\abufixboprocessor\\utils\\AbuFixWorkflowStarter.java",
+      "line": 27
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\get_threshold_rule_template_test_workflow.go::GetThresholdRuleTemplateTestWorkflow",
+      "kind": "activity",
+      "name": "GetThresholdRuleTemplateActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\get_threshold_rule_template_test_workflow.go",
+      "line": 25
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\activityexecutor.go::ExecuteActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\activityexecutor.go",
+      "line": 18
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go::callBpcPocmGetExternalIdActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go",
+      "line": 109
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\basequickvalidation.go::GetProductOfferingAndProcess",
+      "kind": "activity",
+      "name": "GetCatalogProductOfferingAndProcessActivity",
+      "file": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\basequickvalidation.go",
+      "line": 614
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\policy-engine/policy-workflow\\businesslogic\\activity_calls.go::ExecuteDynamicActivity",
+      "kind": "activity",
+      "name": "activityName",
+      "file": "C:\\dev\\corp\\workflows\\policy-engine/policy-workflow\\businesslogic\\activity_calls.go",
+      "line": 55
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\patch_client_order\\patch_client_order_test_workflow.go::PatchClientOrderTestWorkflow",
+      "kind": "activity",
+      "name": "PatchClientOrderActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\patch_client_order\\patch_client_order_test_workflow.go",
+      "line": 28
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmDeleteThresholdRuleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 193
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunValidateWorkflow",
+      "kind": "workflow",
+      "name": "VALIDATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 42
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_adjust_balance_test_workflow.go::PostAdjustBalanceTestWorkflow",
+      "kind": "activity",
+      "name": "PostAdjustBalanceActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_adjust_balance_test_workflow.go",
+      "line": 26
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go::callBpcPocmGetRuleSpecActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go",
+      "line": 79
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::SendPricePlanFailWorkflow",
+      "kind": "activity",
+      "name": "SendPricePlanFail",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 12
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunB2CUSSSValidateWorkflow",
+      "kind": "workflow",
+      "name": "B2CUSSS_VALIDATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 20
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\timer_sign_step.go::timerSign",
+      "kind": "activity",
+      "name": "ReceiveContractDocumentActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\timer_sign_step.go",
+      "line": 59
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmGetThresholdRuleTemplateActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 58
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::SendChangePricePlanWorkflow",
+      "kind": "activity",
+      "name": "SendChangePricePlan",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 30
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callucp2.go::callUcp2CreateServiceActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callucp2.go",
+      "line": 35
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\childworkflowexecutor.go::RunQuickValidateWorkflow",
+      "kind": "workflow",
+      "name": "QuickValidateWorkflow",
+      "file": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\childworkflowexecutor.go",
+      "line": 37
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\activityExecutor.go::GetProcessConfigurationActivity",
+      "kind": "activity",
+      "name": "GET_PROCESS_CONFIGURATION_ACTIVITY",
+      "file": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\activityExecutor.go",
+      "line": 17
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\patch_client_order.go::PatchClientOrderActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\patch_client_order.go",
+      "line": 34
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmGetBucketActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 41
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_test_workflow.go::PostThresholdRuleTestWorkflow",
+      "kind": "activity",
+      "name": "PostThresholdRuleActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_test_workflow.go",
+      "line": 25
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmGetThresholdRuleBindActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 33
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendOrderPickupEmail",
+      "kind": "activity",
+      "name": "SendOrderPickupEmailActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 57
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendSimLimitEmail",
+      "kind": "activity",
+      "name": "SendSimLimitEmailActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 45
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunCalculateWorkflow",
+      "kind": "workflow",
+      "name": "CALCULATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 53
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendOrderCancelSms",
+      "kind": "activity",
+      "name": "SendOrderCancelSmsActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 39
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\send_contract_document.go::SendContractDocument",
+      "kind": "activity",
+      "name": "activityName",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\send_contract_document.go",
+      "line": 39
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\create_acrm_cases.go::CreateAcrmCasesActivity",
+      "kind": "activity",
+      "name": "GetCreateAcrmCasesActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\create_acrm_cases.go",
+      "line": 21
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\rich_acrm.go::GetBanAcrmActivity",
+      "kind": "activity",
+      "name": "GetBanAcrmActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\rich_acrm.go",
+      "line": 18
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\system_y.go::GetUlProfileActivity",
+      "kind": "activity",
+      "name": "GetUlProfileActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\system_y.go",
+      "line": 21
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunValidateWorkflow",
+      "kind": "workflow",
+      "name": "VALIDATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 42
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\rich_acrm.go::GetAcrmCaseDetailsActivity",
+      "kind": "activity",
+      "name": "GetAcrmCaseDetailsActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\rich_acrm.go",
+      "line": 31
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go::ExecuteActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go",
+      "line": 23
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmPostBucketActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 74
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmPostThresholdRuleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 169
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go::callUcp2PatchServiceActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go",
+      "line": 66
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmPostThresholdRuleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 157
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\receive_contract_document.go::ReceiveContractDocument",
+      "kind": "activity",
+      "name": "activityName",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\receive_contract_document.go",
+      "line": 40
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunQuickValidateWorkflow",
+      "kind": "workflow",
+      "name": "QUICK_VALIDATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 31
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go::PrepareExternalActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\validate-wf/workflow\\executeActivity.go",
+      "line": 43
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmPostAdjustBalanceActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 217
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go::callBpcPocmGetProductSpecificationActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbpcpocm.go",
+      "line": 47
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::SendPricePlanSuccessWorkflow",
+      "kind": "activity",
+      "name": "SendPricePlanSuccess",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 16
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\childworkflowexecutor.go::RunB2CUSSSValidateWorkflow",
+      "kind": "workflow",
+      "name": "B2CUSSSValidateWorkflow",
+      "file": "C:\\dev\\corp\\workflows\\val-wf/businesslogic\\childworkflowexecutor.go",
+      "line": 24
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callSync901.go::callPatchIdProductOrder",
+      "kind": "activity",
+      "name": "PatchIdProductOrder",
+      "file": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callSync901.go",
+      "line": 48
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\activityExecutor.go::GetProcessConfigurationActivity",
+      "kind": "activity",
+      "name": "GET_PROCESS_CONFIGURATION_ACTIVITY",
+      "file": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\activityExecutor.go",
+      "line": 17
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\sync-acts/workflow\\patch_id_product_order_test_workflow.go::SyncProductOrderIdTestWorkflow",
+      "kind": "activity",
+      "name": "PatchIdProductOrder",
+      "file": "C:\\dev\\corp\\activities\\sync-acts/workflow\\patch_id_product_order_test_workflow.go",
+      "line": 28
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\executeactivity.go::executeActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\executeactivity.go",
+      "line": 27
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go::callUcp2CreateServiceActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go",
+      "line": 38
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\get_and_attach_files_to_acrm_case.go::GetAndAttachFilesToAcrmCaseActivity",
+      "kind": "activity",
+      "name": "GetAndAttachFilesToAcrmCaseActivityName",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/activity_executor\\get_and_attach_files_to_acrm_case.go",
+      "line": 20
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go::callUcp2GetServiceActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callucp2.go",
+      "line": 90
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\reserve_╤Бtn.go::ReserveCtnActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\reserve_╤Бtn.go",
+      "line": 32
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::TestActivityWithOutput",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 75
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_party_role.go::GetPartyRoleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_party_role.go",
+      "line": 36
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\b2cusssprocessor.go::GetAllowedWithV2Activity",
+      "kind": "activity",
+      "name": "GET_ALLOWED_WITH_V2_ACTIVITY",
+      "file": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\b2cusssprocessor.go",
+      "line": 116
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunB2CUSSSCalculateWorkflow",
+      "kind": "workflow",
+      "name": "B2CUSSS_CALCULATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\calc-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 20
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendUnsignedContractEmail",
+      "kind": "activity",
+      "name": "SendUnsignedContractEmailActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 63
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\policy-engine/policy-workflow\\workflow\\policy_engine_workflow.go::PolicyEngineWorkflow",
+      "kind": "activity",
+      "name": "activityName",
+      "file": "C:\\dev\\corp\\workflows\\policy-engine/policy-workflow\\workflow\\policy_engine_workflow.go",
+      "line": 67
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_bucket_test_workflow.go::PostBucketTestWorkflow",
+      "kind": "activity",
+      "name": "PostBucketActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_bucket_test_workflow.go",
+      "line": 25
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callSync901.go::callPatchSyncStatus",
+      "kind": "activity",
+      "name": "PatchSyncStatus",
+      "file": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callSync901.go",
+      "line": 28
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_template_test_workflow.go::PostThresholdRuleTemplateTestWorkflow",
+      "kind": "activity",
+      "name": "PostThresholdRuleTemplateActivity",
+      "file": "C:\\dev\\corp\\activities\\bm-acts/workflow\\post_threshold_rule_template_test_workflow.go",
+      "line": 27
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go::RunQuickValidateWorkflow",
+      "kind": "workflow",
+      "name": "QUICK_VALIDATE_WORKFLOW",
+      "file": "C:\\dev\\corp\\workflows\\val-ctrl-wf/businesslogic\\childWorkflowExecutor.go",
+      "line": 31
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callucp2.go::callUcp2GetBillingAccountActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sync-wf/workflow\\callucp2.go",
+      "line": 136
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\get_shopping_cart\\test_workflow.go::GetShoppingCartTestWorkflow",
+      "kind": "activity",
+      "name": "GetShoppingCartActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\get_shopping_cart\\test_workflow.go",
+      "line": 25
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::SendChangeServicesSuccessWorkflow",
+      "kind": "activity",
+      "name": "SendChangeServicesSuccess",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 20
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_shopping_cart.go::GetShoppingCartActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\get_shopping_cart.go",
+      "line": 35
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\case_╤Бtn.go::CaseCtnActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\case_╤Бtn.go",
+      "line": 32
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\check_limits.go::CheckLimitsActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\check_limits.go",
+      "line": 36
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\send_notification_scp.go::SendNotificationSCP",
+      "kind": "activity",
+      "name": "activityName",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\send_notification_scp.go",
+      "line": 40
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go::TestActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\activities\\scprod/workflow\\workflows.go",
+      "line": 55
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmPostThresholdRuleTemplateActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 107
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go::callBmGetThresholdRuleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\callbm.go",
+      "line": 123
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmGetThresholdRuleActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 132
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go::SendOrderActivatedEmail",
+      "kind": "activity",
+      "name": "SendOrderActivatedEmailActivity",
+      "file": "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\call_activity\\scp_sms_email.go",
+      "line": 69
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\executeactivity.go::prepareActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\b2c-validate-wf/businesslogic\\executeactivity.go",
+      "line": 44
+    },
+    {
+      "from": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go::callBmPostThresholdRuleBindActivity",
+      "kind": "activity",
+      "name": "activity",
+      "file": "C:\\dev\\corp\\workflows\\settings-rules-wf/workflow\\callbm.go",
+      "line": 82
+    },
+    {
+      "from": "C:\\dev\\corp\\activities\\sync-acts/workflow\\patch_sync_status_test_workflow.go::SyncStatusTestWorkflow",
+      "kind": "activity",
+      "name": "PatchSyncStatus",
+      "file": "C:\\dev\\corp\\activities\\sync-acts/workflow\\patch_sync_status_test_workflow.go",
+      "line": 28
+    }
+  ],
+  "orphan_activity": [
+    "C:\\dev\\corp\\workflows\\order-wf/test\\get_case_details_step_test.go::GetAcrmCaseDetailsActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubDeleteBucketActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubGetThresholdRuleActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubDeleteThresholdRuleActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubPostBucketActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubGetProductSpecificationActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubPatchThresholdRuleActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubUcp2PatchServiceActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubPostThresholdRuleActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubUcp2GetServiceActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubPutServiceOrderActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubUcp2CreateServiceActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubGetBucketActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubGetExternalIdActivity",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/test\\stub_activities.go::stubPostAdjustBalanceActivity"
+  ],
+  "orphan_workflow": [
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\post_billing_account\\test_workflow.go::PostBillingAccountTestWorkflow",
+    "C:\\dev\\corp\\workflows\\calc-ctrl-wf/calculateControllerWorkflow_test.go::B2CUSSSCalculateWorkflow",
+    "C:\\dev\\corp\\workflows\\val-ctrl-wf/validateControllerWorkflow_test.go::ValidateWorkflow",
+    "C:\\dev\\corp\\workflows\\calc-ctrl-wf/calculateControllerWorkflow_test.go::ValidateWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/workflow\\integration_test\\b2bonline_integration_test.go::scpTestWrapperWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\rich_conract_order\\post_contract_ord_pp_rich\\test_workflow.go::PostContractOrdPpRichTestWorkflow",
+    "C:\\dev\\corp\\workflows\\val-ctrl-wf/validateControllerWorkflow_test.go::CalculateWorkflow",
+    "C:\\dev\\corp\\workflows\\calc-ctrl-wf/calculateControllerWorkflow_test.go::CalculateWorkflow",
+    "C:\\dev\\corp\\workflows\\val-ctrl-wf/validateControllerWorkflow_test.go::B2CUSSSValidateWorkflow",
+    "C:\\dev\\corp\\workflows\\svc-order-wf/workflow\\workflow.go::CreateServiceOrderWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\rich_conract_order\\post_contract_order_update_rich\\test_workflow.go::PostContractOrderUpdateRichTestWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\rich_conract_order\\post_contract_finalize_rich\\test_workflow.go::PostContractFinalizeRichTestWorkflow",
+    "C:\\dev\\corp\\workflows\\sync-wf/workflow\\workflow.go::SyncProductOrderHandlingWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\patch_billing_account\\test_workflow.go::PatchBillingAccountBillingInvoiceTestWorkflow",
+    "C:\\dev\\corp\\workflows\\calc-ctrl-wf/calculateControllerWorkflow_test.go::QuickValidateWorkflow",
+    "C:\\dev\\corp\\workflows\\svc-order-wf-v2/workflow\\workflow.go::CreateServiceOrderWorkflow",
+    "C:\\dev\\corp\\workflows\\val-ctrl-wf/validateControllerWorkflow_test.go::QuickValidateWorkflow",
+    "C:\\dev\\corp\\workflows\\sales-scenario-wf/activity\\rich_conract_order\\post_contract_order_rich\\test_workflow.go::PostContractOrderRichTestWorkflow"
+  ],
+  "query_no_handler": null,
+  "signal_no_handler": [
+    {
+      "from": "C:\\dev\\corp\\workflows\\order-wf/steps\\api\\step.go::signalParentWorkflowToSaveOrder",
+      "kind": "signal",
+      "name": "save-order-signal",
+      "file": "C:\\dev\\corp\\workflows\\order-wf/steps\\api\\step.go",
+      "line": 112
+    }
+  ],
+  "totals": {
+    "broken_dispatch": 91,
+    "orphan_activity": 15,
+    "orphan_workflow": 18,
+    "query_no_handler": 0,
+    "signal_no_handler": 1
+  }
+}

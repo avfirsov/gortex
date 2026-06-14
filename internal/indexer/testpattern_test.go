@@ -29,6 +29,11 @@ func TestIsTestFile(t *testing.T) {
 		{"src/UserTests.cs", true},
 		{"src/UserTests.swift", true},
 		{"src/UserTest.php", true},
+		// _testworkflow.go — Temporal mock-workflow convention (not _test_workflow.go)
+		{"workflow/ucp2_get_billing_account_testworkflow.go", true},
+		{"workflow/delete_shopping_cart_testworkflow.go", true},
+		{"workflow/some_test_workflow.go", true},  // _test_ with trailing part
+		{"workflow/some_workflow.go", false},       // production workflow
 	}
 	for _, c := range cases {
 		if got := IsTestFile(c.path); got != c.want {

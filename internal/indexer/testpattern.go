@@ -47,7 +47,7 @@ func IsTestFile(path string) bool {
 
 	switch ext {
 	case ".go":
-		return strings.HasSuffix(stem, "_test")
+		return strings.HasSuffix(stem, "_test") || strings.Contains(stem, "_test_") || strings.Contains(stem, "_testworkflow")
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
 		return strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec")
 	case ".py":

@@ -66,6 +66,24 @@ func DetectTemporalOrphans(g graph.Store) TemporalOrphanReport {
 			}
 		case "temporal.stub":
 			if strings.HasPrefix(e.To, temporalStubPrefix) {
+				// P0: a dispatch whose call site is a test file is almost
+				// always a fixture/mock (handler is a stub or lives in
+				// another repo); counting it as a broken_dispatch is the
+				// dominant false positive. Skip it — keyed on the edge's
+				// own FilePath (the dispatcher), so it's robust under both
+				// full and incremental reindex (no Node.Meta dependency).
+				if isTestFilePath(e.FilePath) {
+					continue
+				}
+				// FP: short lowercase bare identifiers (< 3 chars) with no
+				// resolution metadata are local variables (activity options,
+				// IDs, etc.), not activity/workflow names. The parser emits
+				// a stub edge for every positional arg of ExecuteActivity,
+				// and short names like "ao", "id", "fn" that lack const/
+				// function/param/field metadata are false positives.
+				if isShortLowercaseFP(name, e.Meta) {
+					continue
+				}
 				rep.BrokenDispatch = append(rep.BrokenDispatch, TemporalOrphan{
 					From: e.From, Kind: kind, Name: name, File: e.FilePath, Line: e.Line,
 				})
@@ -124,4 +142,34 @@ func DetectTemporalOrphans(g graph.Store) TemporalOrphanReport {
 		checkOrphanRole(n)
 	}
 	return rep
+}
+
+// isShortLowercaseFP reports whether a dispatch name is a short (< 3 chars)
+// all-lowercase bare identifier with no resolution metadata — a false
+// positive from the parser treating a local variable (activity options,
+// IDs, etc.) as a dispatch-name carrier. Names that have const, function,
+// param, or field metadata are kept since those are proven dispatch-name
+// carriers even when short.
+func isShortLowercaseFP(name string, meta map[string]any) bool {
+	if len(name) >= 3 || name == "" {
+		return false
+	}
+	for _, ch := range name {
+		if ch < 'a' || ch > 'z' {
+			return false
+		}
+	}
+	if _, ok := meta["temporal_default_const"]; ok {
+		return false
+	}
+	if _, ok := meta["temporal_name_func"]; ok {
+		return false
+	}
+	if _, ok := meta["temporal_name_param"]; ok {
+		return false
+	}
+	if _, ok := meta["temporal_name_field"]; ok {
+		return false
+	}
+	return true
 }

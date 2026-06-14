@@ -33,6 +33,34 @@ func runGoExtract(t *testing.T, src string) *extractedFixture {
 	return fix
 }
 
+// runGoExtractWithEnvHelpers is runGoExtract with a per-repo corporate
+// env-helper allow-list installed on the extractor first — exercises the
+// config-driven promotion path.
+func runGoExtractWithEnvHelpers(t *testing.T, src string, envHelpers []string) *extractedFixture {
+	t.Helper()
+	ext := NewGoExtractor()
+	ext.SetEnvHelperNames(envHelpers)
+	result, err := ext.Extract("pkg/foo.go", []byte(src))
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	fix := &extractedFixture{
+		nodesByID:    map[string]*graph.Node{},
+		nodesByKind:  map[graph.NodeKind][]*graph.Node{},
+		edgesByKind:  map[graph.EdgeKind][]*graph.Edge{},
+		edgesByOwner: map[string][]*graph.Edge{},
+	}
+	for _, n := range result.Nodes {
+		fix.nodesByID[n.ID] = n
+		fix.nodesByKind[n.Kind] = append(fix.nodesByKind[n.Kind], n)
+	}
+	for _, e := range result.Edges {
+		fix.edgesByKind[e.Kind] = append(fix.edgesByKind[e.Kind], e)
+		fix.edgesByOwner[e.From] = append(fix.edgesByOwner[e.From], e)
+	}
+	return fix
+}
+
 type extractedFixture struct {
 	nodesByID    map[string]*graph.Node
 	nodesByKind  map[graph.NodeKind][]*graph.Node
