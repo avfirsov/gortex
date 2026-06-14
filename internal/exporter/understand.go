@@ -230,12 +230,16 @@ type UAGraph struct {
 // UAProject is the project-metadata block. Languages / Frameworks are non-nil
 // so they marshal as `[]`.
 type UAProject struct {
-	Name          string   `json:"name"`
-	Languages     []string `json:"languages"`
-	Frameworks    []string `json:"frameworks"`
-	Description   string   `json:"description"`
-	AnalyzedAt    string   `json:"analyzedAt"`
-	GitCommitHash string   `json:"gitCommitHash,omitempty"`
+	Name        string   `json:"name"`
+	Languages   []string `json:"languages"`
+	Frameworks  []string `json:"frameworks"`
+	Description string   `json:"description"`
+	AnalyzedAt  string   `json:"analyzedAt"`
+	// GitCommitHash carries NO omitempty: the UA ProjectMetaSchema requires
+	// gitCommitHash (z.string()) to be PRESENT. An empty string is valid, but
+	// an omitted field is a validation fatal — so a commit-less daemon /
+	// multi-repo export must still emit `"gitCommitHash":""`.
+	GitCommitHash string `json:"gitCommitHash"`
 }
 
 // UANode mirrors the UA GraphNode. summary / tags / complexity are REQUIRED by
