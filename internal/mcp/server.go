@@ -1282,6 +1282,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerGraphCompletionTool()
 	s.registerWikiTools()
 	s.registerExportTools()
+	s.registerUnderstandTools()
 	s.registerAuditTool()
 	s.registerWalkGraphTool()
 	s.registerContextClosureTool()
