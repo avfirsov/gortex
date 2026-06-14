@@ -63,6 +63,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("RepoMemoryEstimate", func(t *testing.T) { testRepoMemoryEstimate(t, factory) })
 	t.Run("AllRepoMemoryEstimates", func(t *testing.T) { testAllRepoMemoryEstimates(t, factory) })
 	t.Run("MetaPreserved", func(t *testing.T) { testMetaPreserved(t, factory) })
+	t.Run("MergeNodeMeta", func(t *testing.T) { testMergeNodeMeta(t, factory) })
 	t.Run("EmptyStore", func(t *testing.T) { testEmptyStore(t, factory) })
 	t.Run("EdgesByKind", func(t *testing.T) { testEdgesByKind(t, factory) })
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
@@ -103,6 +104,71 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("ReleaseEnrichmentSidecar", func(t *testing.T) { testReleaseEnrichmentSidecar(t, factory) })
 	t.Run("BlameEnrichmentSidecar", func(t *testing.T) { testBlameEnrichmentSidecar(t, factory) })
 	t.Run("ContractBridgeRoundTrip", func(t *testing.T) { testContractBridgeRoundTrip(t, factory) })
+}
+
+// testMergeNodeMeta verifies the Store.MergeNodeMeta contract across
+// every backend: additive merge, deep-equal idempotency, found
+// semantics for an unknown id, lazy init of a nil Meta, and that
+// structural fields stay untouched. The in-memory store has its own
+// finer-grained tests in internal/graph; running the same contract here
+// proves the SQLite backend honours it identically (read-modify-write
+// of the gob Meta blob under writeMu).
+func testMergeNodeMeta(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	s.AddNode(mkNode("a.go::Foo", "Foo", "a.go", graph.KindFunction))
+
+	// First merge: two new keys -> changed=true, found=true.
+	changed, found := s.MergeNodeMeta("a.go::Foo", map[string]any{
+		"ua_summary": "computes foo",
+		"ua_domain":  "core",
+	})
+	if !found || !changed {
+		t.Fatalf("first merge: changed=%v found=%v, want true/true", changed, found)
+	}
+	got := s.GetNode("a.go::Foo")
+	if got == nil || got.Meta["ua_summary"] != "computes foo" || got.Meta["ua_domain"] != "core" {
+		t.Fatalf("merged Meta not persisted: %+v", got)
+	}
+
+	// Idempotent re-apply: identical input -> changed=false.
+	changed, found = s.MergeNodeMeta("a.go::Foo", map[string]any{
+		"ua_summary": "computes foo",
+		"ua_domain":  "core",
+	})
+	if !found || changed {
+		t.Fatalf("idempotent merge: changed=%v found=%v, want false/true", changed, found)
+	}
+
+	// Overwrite one key -> changed=true.
+	changed, found = s.MergeNodeMeta("a.go::Foo", map[string]any{"ua_summary": "revised"})
+	if !found || !changed {
+		t.Fatalf("overwrite merge: changed=%v found=%v, want true/true", changed, found)
+	}
+	got = s.GetNode("a.go::Foo")
+	if got.Meta["ua_summary"] != "revised" || got.Meta["ua_domain"] != "core" {
+		t.Fatalf("overwrite Meta wrong: %+v", got.Meta)
+	}
+	// Structural fields untouched.
+	if got.Name != "Foo" || got.Kind != graph.KindFunction || got.FilePath != "a.go" {
+		t.Fatalf("structural fields mutated: %+v", got)
+	}
+
+	// Unknown id -> found=false, no panic.
+	changed, found = s.MergeNodeMeta("a.go::Ghost", map[string]any{"ua_summary": "x"})
+	if found || changed {
+		t.Fatalf("unknown id: changed=%v found=%v, want false/false", changed, found)
+	}
+
+	// Lazy-init: a node added with nil Meta gets one on first merge.
+	s.AddNode(mkNode("b.go::Bar", "Bar", "b.go", graph.KindFunction))
+	changed, found = s.MergeNodeMeta("b.go::Bar", map[string]any{"ua_summary": "lazy"})
+	if !found || !changed {
+		t.Fatalf("lazy-init merge: changed=%v found=%v, want true/true", changed, found)
+	}
+	if s.GetNode("b.go::Bar").Meta["ua_summary"] != "lazy" {
+		t.Fatalf("lazy-init Meta not persisted")
+	}
 }
 
 // -- fixture helpers ---------------------------------------------------
