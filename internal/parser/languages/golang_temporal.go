@@ -760,6 +760,234 @@ func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte) (s
 	return resolved, resolvedOK
 }
 
+// goTemporalVarTrace traces a bare-identifier dispatch name to its
+// intra-procedural assignment when that assignment is a plain literal /
+// constant reference / const-returning func call. The env-var-with-default
+// shape is handled by goTemporalEnvDefaultName and takes precedence; this is
+// the general fallback for `name := <value>; workflow.ExecuteActivity(ctx,
+// name, …)` — the "meta_vars" broken-dispatch category (activity /
+// activityName / type). It returns the LAST assignment to `name` lexically
+// before the dispatch, reduced to exactly one of:
+//
+//	litDef   : string-literal value       (`name := "ChargeActivity"`)
+//	constName: a constant NAME            (`name := pkg.ChargeName` / `name := CHARGE`)
+//	funcName : a const-returning func name (`name := GetChargeName()`)
+//
+// The resolver validates constName / funcName against its constVal index, so
+// an identifier that is not actually a string constant simply fails to
+// resolve and stays a broken_dispatch — no false-resolution risk. The
+// last-assignment-wins rule is a best-effort static guess (a later
+// conditional reassignment may not execute), so the resolver lands these at
+// the inferred / convention tier, not the register-confirmed 0.9. Returns
+// ok=false when there is no traceable assignment to `name`.
+func goTemporalVarTrace(callNode *sitter.Node, name string, src []byte) (litDef, constName string, ok bool) {
+	body := goEnclosingFuncBody(callNode)
+	if body == nil {
+		return "", "", false
+	}
+	limit := callNode.StartByte()
+	var rhs *sitter.Node
+	assigns := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if (n.Type() == "short_var_declaration" || n.Type() == "assignment_statement") &&
+			n.StartByte() < limit && goAssignHasTarget(n, name, src) {
+			if r := goAssignRHSExpr(n); r != nil {
+				rhs = r
+				assigns++
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	// Trace ONLY when the variable has exactly ONE assignment before the
+	// dispatch. Multiple assignments mean the live value is conditional /
+	// reassigned (e.g. an env-default write later overwritten by a plain
+	// call) — guessing the last one would be a false-resolution risk, so we
+	// leave the dispatch a broken_dispatch rather than guess.
+	if assigns != 1 || rhs == nil {
+		return "", "", false
+	}
+	switch rhs.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		if v, okk := goStringLiteralValue(rhs, src); okk && v != "" {
+			return v, "", true
+		}
+	case "identifier":
+		// Bare const reference (`name := CHARGE`). Admitted ONLY when the
+		// referenced identifier is a package-level CONST declared in this
+		// file — a function parameter or arbitrary local (`actName :=
+		// picked`) is exactly the "don't guess at arbitrary variables" case
+		// the plain-var path deliberately refuses. The const NAME is emitted
+		// as temporal_name so the resolver's const-deref map substitutes the
+		// literal. Guarded by length to skip throwaway names; skip
+		// self-reference.
+		if cn := rhs.Content(src); len(cn) > 2 && cn != name && goIdentIsFileConst(callNode, cn, src) {
+			return "", cn, true
+		}
+	case "selector_expression":
+		// Package / receiver const reference (`name := config.ChargeName`).
+		if field := rhs.ChildByFieldName("field"); field != nil {
+			if cn := field.Content(src); len(cn) > 2 {
+				return "", cn, true
+			}
+		}
+	case "call_expression":
+		// Const-returning name getter (`name := GetChargeName()`). os.Getenv
+		// is the env path's job, not this one. Require ZERO arguments: a call
+		// WITH args (`wfutils.PickActivity("KEY", "default")`) is an
+		// env/helper-style call whose default is the env path's responsibility
+		// (and which the env path deliberately declines for unknown helpers) —
+		// treating it as a const-return getter would mislabel it. The callee's
+		// returned value is resolved in-file to a literal / const name, since
+		// the resolver has no func-returning-name channel.
+		if goIsEnvRead(rhs, src) {
+			return "", "", false
+		}
+		if a := rhs.ChildByFieldName("arguments"); a != nil && a.NamedChildCount() > 0 {
+			return "", "", false
+		}
+		if lit, cn, okk := goTemporalFuncReturnName(rhs, callNode, src); okk {
+			return lit, cn, true
+		}
+	}
+	return "", "", false
+}
+
+// goIdentIsFileConst reports whether `ident` is the name of a constant
+// declared anywhere in the same source file as fromNode. Used to gate the
+// variable-trace bare-identifier case so it admits a `name := chargeName`
+// const reference but refuses a `actName := picked` parameter / local —
+// honouring the "don't guess at arbitrary variables" invariant. The scan
+// inspects every const_spec name under the file root.
+func goIdentIsFileConst(fromNode *sitter.Node, ident string, src []byte) bool {
+	root := fromNode
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	found := false
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || found {
+			return
+		}
+		if n.Type() == "const_spec" {
+			if nm := n.ChildByFieldName("name"); nm != nil && nm.Content(src) == ident {
+				found = true
+				return
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(root)
+	return found
+}
+
+// goTemporalFuncReturnName resolves a no-argument func/method call used to
+// supply a dispatch name (`name := GetChargeName()`) to the value the callee
+// unconditionally returns — either a string literal (emitted as the dispatch
+// name directly) or a bare const reference (emitted as a const name for the
+// resolver to dereference). It locates the callee declaration by simple name
+// within the SAME file as the call, then returns the single `return <expr>`
+// it finds when that expr is a string literal or a one-hop identifier
+// reference. Returns ok=false when the callee is not found in-file, is not a
+// plain identifier call, has multiple/none returns, or returns something
+// other than a literal / bare const — keeping resolution precision-safe.
+func goTemporalFuncReturnName(call, fromNode *sitter.Node, src []byte) (litDef, constName string, ok bool) {
+	fn := call.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "identifier" {
+		return "", "", false
+	}
+	callee := fn.Content(src)
+	if callee == "" {
+		return "", "", false
+	}
+	root := fromNode
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	var decl *sitter.Node
+	var find func(n *sitter.Node)
+	find = func(n *sitter.Node) {
+		if n == nil || decl != nil {
+			return
+		}
+		if n.Type() == "function_declaration" {
+			if nm := n.ChildByFieldName("name"); nm != nil && nm.Content(src) == callee {
+				decl = n
+				return
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			find(n.NamedChild(i))
+		}
+	}
+	find(root)
+	if decl == nil {
+		return "", "", false
+	}
+	body := decl.ChildByFieldName("body")
+	if body == nil {
+		return "", "", false
+	}
+	var ret *sitter.Node
+	count := 0
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "return_statement" {
+			count++
+			if n.NamedChildCount() == 1 {
+				ret = n.NamedChild(0)
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	if count != 1 || ret == nil {
+		return "", "", false
+	}
+	// A return_statement's value is wrapped in an expression_list; unwrap a
+	// single-expression list down to the lone expression.
+	if ret.Type() == "expression_list" {
+		if ret.NamedChildCount() != 1 {
+			return "", "", false
+		}
+		ret = ret.NamedChild(0)
+	}
+	if ret == nil {
+		return "", "", false
+	}
+	switch ret.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		if v, okk := goStringLiteralValue(ret, src); okk && v != "" {
+			return v, "", true
+		}
+	case "identifier":
+		if cn := ret.Content(src); len(cn) > 2 {
+			return "", cn, true
+		}
+	case "selector_expression":
+		if field := ret.ChildByFieldName("field"); field != nil {
+			if cn := field.Content(src); len(cn) > 2 {
+				return "", cn, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 // goEnclosingFuncBody walks up from n to the nearest function-like
 // ancestor and returns its body block, or nil.
 func goEnclosingFuncBody(n *sitter.Node) *sitter.Node {
