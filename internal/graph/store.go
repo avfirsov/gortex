@@ -60,6 +60,38 @@ type Store interface {
 	AddNode(n *Node)
 	AddBatch(nodes []*Node, edges []*Edge)
 	AddEdge(e *Edge)
+	// MergeNodeMeta merges the key/value pairs in kv into the Meta map
+	// of the node identified by id, under the node's shard write lock.
+	// It is the ONLY sanctioned way for a caller holding a Store (rather
+	// than a concrete *Graph) to mutate Node.Meta: the shard lock the
+	// in-memory backend takes internally is private, so a handler that
+	// reached into GetNode(id).Meta directly would race the sharded map
+	// and panic on a live daemon.
+	//
+	// Semantics:
+	//
+	//   - found is false (and changed is false) when no node carries id —
+	//     callers batching many ids treat a miss as a recorded skip, not
+	//     a failure.
+	//   - changed is false when every key in kv already maps to an equal
+	//     value (deep-equal compare via metaDelta) — the merge is a no-op
+	//     and the call is idempotent. Re-applying the same kv twice yields
+	//     changed=false on the second call.
+	//   - changed is true when at least one key was added or its value
+	//     differed; only the differing keys are written, and a nil Meta is
+	//     lazily initialised before the first write.
+	//
+	// The method is deliberately scoped to additive Meta merges — it
+	// never deletes keys and never touches structural fields (ID, Kind,
+	// Name, FilePath, line ranges). Callers writing UA-produced semantics
+	// namespace their keys (ua_summary, ua_tags, …) so a merge can never
+	// shadow an indexer-owned Meta key by accident.
+	//
+	// Durability: the merge mutates in-memory state for the daemon
+	// session and rides the gob+gzip shutdown snapshot; there is no
+	// per-call persist. Cross-restart durability of annotations is an
+	// out-of-scope follow-up for this v1.
+	MergeNodeMeta(id string, kv map[string]any) (changed bool, found bool)
 	SetEdgeProvenance(e *Edge, newOrigin string) bool
 	ReindexEdge(e *Edge, oldTo string)
 	// Batched siblings of the per-edge mutators. Same semantics, but

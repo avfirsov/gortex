@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -652,6 +653,68 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) error {
 		metaBlob,
 	)
 	return err
+}
+
+// MergeNodeMeta is the on-disk implementation of the
+// Store.MergeNodeMeta contract: an additive, idempotent merge of kv
+// into the target node's Meta. See the graph.Store interface doc for
+// the full (changed, found) semantics.
+//
+// The whole read-modify-write runs under writeMu: the node is read
+// back (decoding its gob Meta blob), the differing keys are computed,
+// and — only if at least one key changed — the node is re-persisted via
+// the INSERT OR REPLACE node statement. Holding writeMu across the read
+// is what makes the merge atomic against a concurrent MergeNodeMeta /
+// AddNode to the same id; a read outside the lock could lose an update.
+//
+// Equality uses reflect.DeepEqual for the same reason the in-memory
+// metaDelta does: Meta values are JSON/gob-decoded scalars, slices, and
+// nested maps where == is either a panic or an identity compare.
+func (s *Store) MergeNodeMeta(id string, kv map[string]any) (changed bool, found bool) {
+	if len(kv) == 0 {
+		// Nothing to merge — report found honestly without a write.
+		if n := s.GetNode(id); n == nil {
+			return false, false
+		}
+		return false, true
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	n := s.GetNode(id)
+	if n == nil {
+		return false, false
+	}
+
+	// Compute the differing keys against the freshly-read Meta.
+	delta := make(map[string]any, len(kv))
+	for k, v := range kv {
+		if n.Meta != nil {
+			if cur, ok := n.Meta[k]; ok && reflect.DeepEqual(cur, v) {
+				continue
+			}
+		}
+		delta[k] = v
+	}
+	if len(delta) == 0 {
+		// Found, but already up to date — idempotent no-op.
+		return false, true
+	}
+
+	if n.Meta == nil {
+		n.Meta = make(map[string]any, len(delta))
+	}
+	for k, v := range delta {
+		n.Meta[k] = v
+	}
+	if err := s.insertNodeLocked(s.stmtInsertNode, n); err != nil {
+		// graph.Store.MergeNodeMeta has no error channel; mirror AddNode
+		// and panic only on a clearly catastrophic failure.
+		panicOnFatal(err)
+		return false, true
+	}
+	return true, true
 }
 
 // AddEdge inserts an edge. Idempotent on the logical edge key (from,
