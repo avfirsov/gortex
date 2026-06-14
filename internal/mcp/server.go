@@ -1040,6 +1040,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerASTTools()
 	s.registerCloneTools()
 	s.registerSimulationTools()
+	s.registerChangeContractTools()
 	s.registerNotesTools()
 	s.registerMemoriesTools()
 	s.registerNotebookTools()
