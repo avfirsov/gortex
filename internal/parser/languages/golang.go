@@ -453,6 +453,20 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 							} else {
 								dc.tempName = litDef
 							}
+						} else if lit, cn, fn, ok := goTemporalVarTrace(expr.Node, name, src); ok {
+							// Variable tracing (Cat 2): the dispatch name is a bare
+							// local var assigned a literal / const / const-returning
+							// func. Feed the existing resolution channels — the
+							// resolver validates const/func names via constVal.
+							switch {
+							case lit != "":
+								dc.tempName = lit
+							case cn != "":
+								dc.tempDefaultConst = cn
+							case fn != "":
+								dc.tempName = fn
+								dc.tempNameFunc = fn
+							}
 						}
 					}
 				} else if argNode != nil && argNode.Type() == "call_expression" {
@@ -843,9 +857,12 @@ func (e *GoExtractor) Extract(filePath string, src []byte) (*parser.ExtractionRe
 					if c.tempEnvSource != "" {
 						meta["temporal_env_source"] = c.tempEnvSource
 					}
-					if c.tempDefaultConst != "" {
-						meta["temporal_default_const"] = c.tempDefaultConst
-					}
+				}
+				// A const-reference default — from an env-helper (env_default
+				// above) OR from a plain variable trace (Cat 2) — is resolved by
+				// the resolver via constVal regardless of env provenance.
+				if c.tempDefaultConst != "" {
+					meta["temporal_default_const"] = c.tempDefaultConst
 				}
 				// Func-returning-literal dispatch (G2): the name is supplied
 				// by a const-returning func call. Tag the callee so the
@@ -1924,6 +1941,10 @@ func (e *GoExtractor) emitConst(m parser.QueryResult, filePath, fileID string, s
 	if def != nil && def.Node != nil {
 		if v, ok := goConstStringValue(def.Node, name, m.Captures["const.def"].Text, src); ok {
 			meta["value"] = v
+		} else if ref, ok := goConstRefName(def.Node, name, src); ok {
+			// `const ALIAS = RealName` — record the referenced const so the
+			// resolver can alias its value through constVal.
+			meta["const_ref"] = ref
 		}
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -1975,6 +1996,45 @@ func goConstStringValue(constDecl *sitter.Node, name, declText string, src []byt
 			return t, true
 		}
 		return "", false
+	}
+	return "", false
+}
+
+// goConstRefName returns the NAME of the constant that `name`'s value is a
+// plain one-hop reference to (`const ALIAS = RealName`), or ("", false) when
+// the value is not a single bare-identifier reference. The resolver aliases
+// one constant's value to another via constVal (chains collapsed by a
+// bounded fixpoint), so an ALL_CAPS dispatch name that is itself a const
+// alias still resolves to the underlying literal.
+func goConstRefName(constDecl *sitter.Node, name string, src []byte) (string, bool) {
+	if constDecl == nil {
+		return "", false
+	}
+	for i := 0; i < int(constDecl.NamedChildCount()); i++ {
+		spec := constDecl.NamedChild(i)
+		if spec == nil || spec.Type() != "const_spec" {
+			continue
+		}
+		nameNode := spec.ChildByFieldName("name")
+		if nameNode == nil || nameNode.Content(src) != name {
+			continue
+		}
+		val := spec.ChildByFieldName("value")
+		if val == nil {
+			return "", false
+		}
+		expr := val
+		if val.Type() == "expression_list" {
+			expr = val.NamedChild(0)
+		}
+		if expr == nil || expr.Type() != "identifier" {
+			return "", false
+		}
+		ref := expr.Content(src)
+		if ref == "" || ref == name {
+			return "", false
+		}
+		return ref, true
 	}
 	return "", false
 }

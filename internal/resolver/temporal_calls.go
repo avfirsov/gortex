@@ -269,6 +269,18 @@ func ResolveTemporalCalls(g graph.Store) int {
 			}
 		}
 
+		// Exact-name signature-gated fallback (Cat 4): a PascalCase dispatch
+		// whose target is a same-named, unregistered, non-suffixed function.
+		// Gated on exact name + a kind-matching Temporal signature + a unique
+		// candidate; landed speculative + hidden.
+		if handlerID == "" {
+			if id := idx.lookupExactSig(s.kind, s.name, callerRepo); id != "" {
+				handlerID, origin, conf = id, graph.OriginSpeculative, 0.45
+				e.Meta["temporal_resolution_via"] = "exact_sig"
+				e.Meta[graph.MetaSpeculative] = true
+			}
+		}
+
 		// When the name came from an env-var-with-literal-default variable,
 		// the value is a best-guess (the runtime env may differ from the
 		// literal default). HOW it was recognised decides the tier:
@@ -934,6 +946,14 @@ type temporalIndex struct {
 	// register-based byKindName index never sees them). Pattern 2's
 	// two-part name resolves here once F1/F2 reduce it to the func name.
 	funcByName map[string][]*graph.Node
+	// funcExact indexes EXPORTED Go functions / methods by their exact
+	// (bare) name — including those WITHOUT the Activity/Workflow suffix.
+	// Used only by lookupExactSig, the precision-gated last resort for a
+	// PascalCase dispatch whose target is a same-named, unregistered,
+	// non-convention-suffixed function (the "PascalCase, target in another
+	// repo/package" category). Resolution there is gated on an exact name
+	// match, a Temporal-shaped signature for the kind, and uniqueness.
+	funcExact map[string][]*graph.Node
 }
 
 // lookupConstVal resolves a const name to its literal value, preferring the
@@ -1186,6 +1206,62 @@ func (idx *temporalIndex) lookupFuzzy(kind, name, callerRepo string) string {
 	return ""
 }
 
+// signatureMatchesKind reports whether a function's first-parameter type
+// POSITIVELY matches the dispatch kind in the Temporal Go SDK convention:
+// activities take context.Context, workflows take workflow.Context. Unlike
+// signatureMismatchesKind (which flags a contradiction) this requires the
+// expected type to be present AND the other absent, so it is a strong,
+// precision-positive gate for the exact-name fallback.
+func signatureMatchesKind(n *graph.Node, kind string) bool {
+	if n == nil {
+		return false
+	}
+	sig, _ := n.Meta["signature"].(string)
+	if sig == "" {
+		return false
+	}
+	want, other := "context.Context", "workflow.Context"
+	if kind == "workflow" {
+		want, other = "workflow.Context", "context.Context"
+	}
+	return strings.Contains(sig, want) && !strings.Contains(sig, other)
+}
+
+// lookupExactSig is the precision-gated last resort for a PascalCase dispatch
+// whose target is a same-named function that is neither register-confirmed
+// nor convention-suffixed (the "PascalCase, target in another repo/package"
+// category). It resolves ONLY when the dispatch name exactly equals an
+// exported Go func/method name, that candidate's signature matches the
+// dispatch kind (activity → context.Context / workflow → workflow.Context),
+// and the match is unique (same-repo preferred, else unique workspace-wide).
+// The caller lands it at the speculative, hidden tier. Returns "" otherwise.
+func (idx *temporalIndex) lookupExactSig(kind, name, callerRepo string) string {
+	cands := idx.funcExact[name]
+	if len(cands) == 0 {
+		return ""
+	}
+	var filtered, sameRepo []*graph.Node
+	for _, n := range cands {
+		if isCrossRepoTestStub(n, callerRepo) {
+			continue
+		}
+		if !signatureMatchesKind(n, kind) {
+			continue
+		}
+		filtered = append(filtered, n)
+		if callerRepo != "" && n.RepoPrefix == callerRepo {
+			sameRepo = append(sameRepo, n)
+		}
+	}
+	if len(sameRepo) == 1 {
+		return sameRepo[0].ID
+	}
+	if len(filtered) == 1 {
+		return filtered[0].ID
+	}
+	return ""
+}
+
 // buildTemporalIndex walks the graph once and (a) stamps temporal_role
 // on every node identifiable as a Temporal workflow / activity via
 // either Go `worker.Register*` calls or Java `@ActivityInterface` /
@@ -1193,12 +1269,14 @@ func (idx *temporalIndex) lookupFuzzy(kind, name, callerRepo string) string {
 // implementors), and (b) returns a name index the stub-call resolver
 // consults.
 func buildTemporalIndex(g graph.Store) *temporalIndex {
-	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, constVal: map[string]string{}, constValByRepo: map[string]string{}, funcByName: map[string][]*graph.Node{}}
+	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, constVal: map[string]string{}, constValByRepo: map[string]string{}, funcByName: map[string][]*graph.Node{}, funcExact: map[string][]*graph.Node{}}
 
 	// Convention index: Go functions / methods named like activities or
 	// workflows (suffix "Activity" / "Workflow"), for resolving dispatch
 	// to functions the worker-runner registers elsewhere (unregistered
 	// here). Bounded to the convention-named set to keep it small.
+	// Additionally index EXPORTED Go funcs/methods by exact name into
+	// funcExact (for the signature-gated exact-name last resort).
 	indexConventionFunc := func(n *graph.Node) {
 		if n == nil || n.Language != "go" {
 			return
@@ -1208,6 +1286,9 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		}
 		if strings.HasSuffix(n.Name, "Activity") || strings.HasSuffix(n.Name, "Workflow") {
 			idx.funcByName[n.Name] = append(idx.funcByName[n.Name], n)
+		}
+		if n.Name != "" && n.Name[0] >= 'A' && n.Name[0] <= 'Z' {
+			idx.funcExact[n.Name] = append(idx.funcExact[n.Name], n)
 		}
 	}
 	for n := range g.NodesByKind(graph.KindFunction) {
@@ -1247,6 +1328,40 @@ func buildTemporalIndex(g graph.Store) *temporalIndex {
 		}
 		if v, ok := n.Meta["value"].(string); ok {
 			ingestConst(n.Name, v, n.RepoPrefix)
+		}
+	}
+	// Const-to-const aliases (`const ALIAS = RealName`): the parser records the
+	// referenced const name as Meta["const_ref"] when the value itself is not a
+	// literal. Resolve them against the already-built constVal by bounded
+	// fixpoint so chains (A = B = "lit") collapse, then ingest each alias's
+	// resolved literal. Cycles never progress and are dropped after the cap.
+	type constAlias struct{ name, ref, repo string }
+	var aliases []constAlias
+	for n := range g.NodesByKind(graph.KindConstant) {
+		if n == nil {
+			continue
+		}
+		if _, has := n.Meta["value"]; has {
+			continue
+		}
+		if ref, ok := n.Meta["const_ref"].(string); ok && ref != "" {
+			aliases = append(aliases, constAlias{name: n.Name, ref: ref, repo: n.RepoPrefix})
+		}
+	}
+	for pass := 0; pass < 8 && len(aliases) > 0; pass++ {
+		progressed := false
+		var pending []constAlias
+		for _, a := range aliases {
+			if v, ok := idx.lookupConstVal(a.ref, a.repo); ok && v != "" {
+				ingestConst(a.name, v, a.repo)
+				progressed = true
+			} else {
+				pending = append(pending, a)
+			}
+		}
+		aliases = pending
+		if !progressed {
+			break
 		}
 	}
 	// Java string constants are emitted as KindField (`static final String`),

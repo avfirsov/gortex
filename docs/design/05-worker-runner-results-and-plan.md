@@ -399,3 +399,41 @@ literal_value → literal_element (обёртка) → selector_expression / ide
 | v5 | 48 | Convention mismatch fallback + test-workflow suppression |
 | v6 | 203 | StartWorker worker-runner (-13 vs baseline 216); baseline вырос |
 | **v7** | **147** | **testworkflow is_test фикс (-56); 75% снижение от v6** |
+
+---
+
+## 11. v8 (внешний Claude 1M): Категории 2/3/4 §9
+
+Реализованы три категории, назначенные мне в §9. Ветка `feat/temporal-variable-tracing`
+(от squash `2e879e5`). Все три — TDD; корпусный замер (147 → X) за корп-агентом (нет доступа к корпусу
+у внешнего агента; здесь — синтетические e2e-фикстуры + полный regression зелёный под `-race`).
+
+### Кат. 2 — Variable tracing (meta_vars, ~64)
+Дано `name := <значение>; workflow.ExecuteActivity(ctx, name, …)` — раньше `temporal_name` оставался
+именем переменной. Новый `goTemporalVarTrace` (`golang_temporal.go`) трассирует ПОСЛЕДНЕЕ присваивание
+переменной до диспатча и сводит к одному из: строковый литерал → `temporal_name`; конст-ссылка
+(bare/selector) → `temporal_default_const`; **no-arg** const-возвращающий вызов (`GetName()`) →
+`temporal_name_func`. Резолвер валидирует const/func через `constVal` → **precision-safe** (не-конст
+переменная просто не резолвится). Параметр-функции уже покрыты `temporal_name_param`
+(wrapper-following). Эмиссия `temporal_default_const` выведена из env-гейта. Прецизионный гард:
+no-arg-only для const-getter (env-helper-вызов с аргументами НЕ трассируется — сохраняет
+`TestEnvFallbackViaHelper_UnknownHelperNotFlagged`). Тесты: `temporal_vartrace_test.go` (literal/
+const/func + untraceable-stays-broken).
+
+### Кат. 3 — ALL_CAPS const (≈13)
+Прямые строковые консты (одиночные и блок-форма) уже резолвились через `constVal`. Закрыт остаточный
+gap **const-to-const** (`const ALIAS = RealName`): парсер пишет `Meta["const_ref"]` (`goConstRefName`,
+`golang.go`), резолвер (`buildTemporalIndex`) разрешает алиасы по `constVal` ограниченным фикспоинтом
+(8 проходов, циклы отбрасываются). Тесты: `temporal_allcaps_test.go` (direct/block/const-to-const).
+
+### Кат. 4 — PascalCase exact-name (≈70, низкий ROI)
+Большинство нерезолвимо в принципе (таргет в неиндексированных репо). Точечно и **безопасно**: новый
+`lookupExactSig` — резолвит PascalCase-диспатч на одноимённую НЕзарегистрированную функцию без суффикса
+Activity/Workflow ТОЛЬКО при совпадении сигнатуры с kind (activity→`context.Context`,
+workflow→`workflow.Context`) и уникальности кандидата. Тир — speculative/hidden (`temporal_resolution_via=exact_sig`).
+Намеренно НЕ ослаблял fuzzy (точность важнее recall — как и предупреждал §9). Тесты:
+`temporal_pascalcase_test.go` (resolve + signature-mismatch/kind-mismatch abstain).
+
+### Проверка
+`go build ./...`, `go vet`, и полные temporal-сьюты (`parser/languages`, `indexer`, `resolver`,
+`cmd/gortex`) — зелёные под `-race`. Регрессий нет.

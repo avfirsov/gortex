@@ -644,6 +644,95 @@ func goTemporalEnvDefaultName(callNode *sitter.Node, name string, src []byte, ex
 	return resLit, resConst, resSource, found
 }
 
+// goTemporalVarTrace traces a bare-identifier dispatch name to its
+// intra-procedural assignment when that assignment is a plain literal /
+// constant reference / const-returning func call. The env-var-with-default
+// shape is handled by goTemporalEnvDefaultName and takes precedence; this is
+// the general fallback for `name := <value>; workflow.ExecuteActivity(ctx,
+// name, …)` — the "meta_vars" broken-dispatch category (activity /
+// activityName / type). It returns the LAST assignment to `name` lexically
+// before the dispatch, reduced to exactly one of:
+//
+//	litDef   : string-literal value       (`name := "ChargeActivity"`)
+//	constName: a constant NAME            (`name := pkg.ChargeName` / `name := CHARGE`)
+//	funcName : a const-returning func name (`name := GetChargeName()`)
+//
+// The resolver validates constName / funcName against its constVal index, so
+// an identifier that is not actually a string constant simply fails to
+// resolve and stays a broken_dispatch — no false-resolution risk. The
+// last-assignment-wins rule is a best-effort static guess (a later
+// conditional reassignment may not execute), so the resolver lands these at
+// the inferred / convention tier, not the register-confirmed 0.9. Returns
+// ok=false when there is no traceable assignment to `name`.
+func goTemporalVarTrace(callNode *sitter.Node, name string, src []byte) (litDef, constName, funcName string, ok bool) {
+	body := goEnclosingFuncBody(callNode)
+	if body == nil {
+		return "", "", "", false
+	}
+	limit := callNode.StartByte()
+	var rhs *sitter.Node
+	var rhsStart uint32
+	have := false
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if (n.Type() == "short_var_declaration" || n.Type() == "assignment_statement") &&
+			n.StartByte() < limit && goAssignHasTarget(n, name, src) {
+			if r := goAssignRHSExpr(n); r != nil {
+				if !have || n.StartByte() > rhsStart {
+					rhs, rhsStart, have = r, n.StartByte(), true
+				}
+			}
+		}
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(body)
+	if !have {
+		return "", "", "", false
+	}
+	switch rhs.Type() {
+	case "interpreted_string_literal", "raw_string_literal":
+		if v, okk := goStringLiteralValue(rhs, src); okk && v != "" {
+			return v, "", "", true
+		}
+	case "identifier":
+		// Bare const reference (`name := CHARGE`). Admitted optimistically —
+		// validated by the resolver against constVal. Guarded by length to
+		// skip throwaway locals; skip self-reference.
+		if cn := rhs.Content(src); len(cn) > 2 && cn != name {
+			return "", cn, "", true
+		}
+	case "selector_expression":
+		// Package / receiver const reference (`name := config.ChargeName`).
+		if field := rhs.ChildByFieldName("field"); field != nil {
+			if cn := field.Content(src); len(cn) > 2 {
+				return "", cn, "", true
+			}
+		}
+	case "call_expression":
+		// Const-returning name getter (`name := GetChargeName()`). os.Getenv
+		// is the env path's job, not this one. Require ZERO arguments: a call
+		// WITH args (`wfutils.PickActivity("KEY", "default")`) is an
+		// env/helper-style call whose default is the env path's responsibility
+		// (and which the env path deliberately declines for unknown helpers) —
+		// treating it as a const-return getter would mislabel it.
+		if goIsEnvRead(rhs, src) {
+			return "", "", "", false
+		}
+		if a := rhs.ChildByFieldName("arguments"); a != nil && a.NamedChildCount() > 0 {
+			return "", "", "", false
+		}
+		if fn := goTemporalFuncCallName(rhs, src); fn != "" {
+			return "", "", fn, true
+		}
+	}
+	return "", "", "", false
+}
+
 // goEnclosingFuncBody walks up from n to the nearest function-like
 // ancestor and returns its body block, or nil.
 func goEnclosingFuncBody(n *sitter.Node) *sitter.Node {
