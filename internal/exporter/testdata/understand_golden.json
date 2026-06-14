@@ -1,0 +1,145 @@
+{
+  "version": "1.0.0",
+  "kind": "codebase",
+  "project": {
+    "name": "fixt",
+    "languages": [
+      "go"
+    ],
+    "frameworks": [],
+    "description": "Exported from gortex code graph",
+    "analyzedAt": "2026-01-01T00:00:00Z",
+    "gitCommitHash": "deadbeef"
+  },
+  "nodes": [
+    {
+      "id": "fixt::file",
+      "type": "file",
+      "name": "main.go",
+      "filePath": "main.go",
+      "summary": "main.go",
+      "tags": [
+        "go",
+        "file"
+      ],
+      "complexity": "simple",
+      "repo": "fixt",
+      "workspace_id": "ws"
+    },
+    {
+      "id": "fixt::main.go::F",
+      "type": "function",
+      "name": "F",
+      "filePath": "main.go",
+      "lineRange": [
+        3,
+        12
+      ],
+      "summary": "example.com/m.F",
+      "tags": [
+        "go",
+        "function"
+      ],
+      "complexity": "simple",
+      "repo": "fixt",
+      "workspace_id": "ws"
+    },
+    {
+      "id": "fixt::main.go::Logger",
+      "type": "class",
+      "name": "Logger",
+      "filePath": "main.go",
+      "lineRange": [
+        1,
+        20
+      ],
+      "summary": "Logger",
+      "tags": [
+        "go",
+        "type"
+      ],
+      "complexity": "simple",
+      "repo": "fixt",
+      "workspace_id": "ws"
+    },
+    {
+      "id": "fixt::main.go::Logger.Print",
+      "type": "function",
+      "name": "Print",
+      "filePath": "main.go",
+      "lineRange": [
+        14,
+        18
+      ],
+      "summary": "Print",
+      "tags": [
+        "go",
+        "method"
+      ],
+      "complexity": "simple",
+      "repo": "fixt",
+      "workspace_id": "ws"
+    },
+    {
+      "id": "fixt::todo::1",
+      "type": "concept",
+      "name": "FIXME refactor",
+      "filePath": "main.go",
+      "lineRange": [
+        5,
+        5
+      ],
+      "summary": "FIXME refactor",
+      "tags": [
+        "go",
+        "todo"
+      ],
+      "complexity": "simple",
+      "gortex_kind": "todo",
+      "repo": "fixt",
+      "workspace_id": "ws"
+    }
+  ],
+  "edges": [
+    {
+      "source": "fixt::file",
+      "target": "fixt::main.go::F",
+      "type": "contains",
+      "direction": "forward",
+      "description": "ast_resolved",
+      "weight": 1,
+      "confidence_label": "EXTRACTED"
+    },
+    {
+      "source": "fixt::main.go::F",
+      "target": "fixt::main.go::Logger",
+      "type": "cross_domain",
+      "direction": "forward",
+      "description": "ast_inferred",
+      "weight": 0.7,
+      "gortex_kind": "cross_repo_calls",
+      "confidence_label": "INFERRED",
+      "cross_repo": true
+    },
+    {
+      "source": "fixt::main.go::F",
+      "target": "fixt::main.go::Logger.Print",
+      "type": "calls",
+      "direction": "forward",
+      "description": "ast_resolved",
+      "weight": 0.5,
+      "confidence_label": "INFERRED"
+    },
+    {
+      "source": "fixt::main.go::Logger",
+      "target": "fixt::main.go::Logger.Print",
+      "type": "contains",
+      "direction": "forward",
+      "description": "ast_resolved",
+      "weight": 1,
+      "confidence_label": "EXTRACTED"
+    }
+  ],
+  "layers": [],
+  "tour": []
+}
