@@ -40,7 +40,7 @@ func (idx *Indexer) merkleStaleFiles(rootAbs string, diskFiles map[string]bool) 
 	}
 	treePath := merkleTreeFile(rootAbs)
 	prior, _ := merkle.Load(treePath)
-	tree := merkle.Build(rootAbs, rels, prior)
+	tree := merkle.Build(rootAbs, rels, prior, merkleSaltFor)
 	changed, _ := tree.Diff(prior)
 	if err := tree.Save(treePath); err != nil {
 		idx.logger.Warn("indexer: merkle tree save failed", zap.Error(err))
@@ -62,7 +62,7 @@ func (idx *Indexer) saveMerkleBaseline(rootAbs string, absFiles []string) {
 			rels = append(rels, filepath.ToSlash(rel))
 		}
 	}
-	tree := merkle.Build(rootAbs, rels, nil)
+	tree := merkle.Build(rootAbs, rels, nil, merkleSaltFor)
 	if err := tree.Save(merkleTreeFile(rootAbs)); err != nil {
 		idx.logger.Warn("indexer: merkle baseline save failed", zap.Error(err))
 	}
