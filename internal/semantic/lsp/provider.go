@@ -335,31 +335,40 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 		return newC, nil
 	}
 
-	// Open-document reference counting: several nodes can live in one
-	// file, but the server must still see exactly one didOpen / didClose
-	// per file (TestLSP_Provider_OpensEachFileOnce). The first node into a
-	// file opens it; the last one out closes it. Peak open files therefore
-	// stays bounded by the number of distinct files in flight, itself
-	// bounded by the semaphore at maxParallel.
-	openRefs := map[string]int{}
+	// Open-document reference counting, keyed by (client, file): several
+	// nodes can live in one file, but each client must see exactly one
+	// didOpen / didClose per file (TestLSP_Provider_OpensEachFileOnce).
+	// Keying by client is what makes reconnection strict — a reconnect's
+	// fresh client starts with an empty open-set, so the first node to
+	// touch a file after recovery re-opens it on the new session instead
+	// of hovering against a document the dead session held. Peak open
+	// files stays bounded by the distinct files in flight, itself bounded
+	// by the semaphore at maxParallel.
+	type enrichDocKey struct {
+		c    *Client
+		path string
+	}
+	openRefs := map[enrichDocKey]int{}
 	var openMu sync.Mutex
 	acquireDoc := func(c *Client, absPath string, content []byte) error {
+		key := enrichDocKey{c: c, path: absPath}
 		openMu.Lock()
 		defer openMu.Unlock()
-		if openRefs[absPath] == 0 {
+		if openRefs[key] == 0 {
 			if err := p.enrichOpenDoc(c, absPath, content); err != nil {
 				return err
 			}
 		}
-		openRefs[absPath]++
+		openRefs[key]++
 		return nil
 	}
 	releaseDoc := func(c *Client, absPath string) {
+		key := enrichDocKey{c: c, path: absPath}
 		openMu.Lock()
-		openRefs[absPath]--
-		last := openRefs[absPath] <= 0
+		openRefs[key]--
+		last := openRefs[key] <= 0
 		if last {
-			delete(openRefs, absPath)
+			delete(openRefs, key)
 		}
 		openMu.Unlock()
 		if last {
@@ -415,20 +424,29 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 				return
 			}
 			// Release (and close on the last node out) always, even on
-			// hover error (acceptance criterion 2). Use the current client
-			// so a post-reconnect close lands on the live session.
-			defer releaseDoc(activeClient.Load(), absPath)
+			// hover error (acceptance criterion 2). Bound to the client we
+			// opened on — args are captured here, so a later reconnect that
+			// reassigns c does not redirect this close to the wrong session.
+			defer releaseDoc(c, absPath)
 
 			col := identifierColumn(content, n.StartLine, n.Name)
 			hoverResult, err := p.hoverWith(c, absRoot, n.FilePath, n.StartLine-1, col)
 			if err != nil && isServerExitError(err) {
 				// Server died mid-flight — recover once and retry this
-				// node's hover against the fresh session.
+				// node's hover against the fresh session. The new client
+				// has no record of our document, so re-open it there (and
+				// close it on the way out) before retrying.
 				newC, rerr := reconnect(c)
 				if rerr != nil {
 					return // aborted; wg.Wait + abort check below handles it
 				}
 				c = newC
+				if err := acquireDoc(c, absPath, content); err != nil {
+					p.logger.Debug("LSP enrich: reopen after reconnect failed",
+						zap.String("file", n.FilePath), zap.Error(err))
+					return
+				}
+				defer releaseDoc(c, absPath)
 				hoverResult, err = p.hoverWith(c, absRoot, n.FilePath, n.StartLine-1, col)
 			}
 			if err != nil {

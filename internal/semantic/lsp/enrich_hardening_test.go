@@ -496,6 +496,57 @@ func TestLSP_Enrich_AbortsWhenReconnectFails(t *testing.T) {
 	assert.GreaterOrEqual(t, int(attempts.Load()), 3, "must retry reconnect at least 3 times before giving up")
 }
 
+// TestLSP_Enrich_ReopensDocsOnNewServerAfterReconnect verifies the strict
+// post-reconnect contract: after the server dies mid-flight while a file is
+// held open, documents are re-opened on the FRESH server (which has no record
+// of the dead session's opens) rather than hovered against an assumed-open
+// doc. The new server must therefore receive a paired didOpen/didClose.
+func TestLSP_Enrich_ReopensDocsOnNewServerAfterReconnect(t *testing.T) {
+	repoRoot, g := seedRepo(t, 8) // 8 nodes, all in main.go
+
+	server1 := newInstrumentedServer()
+	p, cleanup := providerWithInstrumentedServer(t, server1, []string{"go"}, 8)
+	defer cleanup()
+	deadClient := p.client
+
+	var killOnce sync.Once
+	server1.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		// Kill on the first hover so the whole burst observes the exit
+		// while main.go is still held open on server1.
+		killOnce.Do(func() {
+			deadClient.mu.Lock()
+			if !deadClient.closed {
+				deadClient.closed = true
+				close(deadClient.done)
+			}
+			deadClient.mu.Unlock()
+		})
+		return nil, &jsonRPCError{Code: -32603, Message: "dying"}
+	})
+
+	server2 := newInstrumentedServer()
+	server2.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		return map[string]any{"contents": map[string]any{"kind": "plaintext", "value": "func F()"}}, nil
+	})
+	p.connectOnce = func(absRoot string) error {
+		c2, in2, out2, cl2 := newPipedClient(t)
+		go server2.run(in2, out2)
+		t.Cleanup(cl2)
+		p.client = c2
+		return nil
+	}
+	p.dialBackoffStart = 1 * time.Millisecond
+	p.maxDialBackoff = 5 * time.Millisecond
+
+	require.NoError(t, runEnrich(t, p, g, repoRoot, 15*time.Second))
+
+	_, opens2, closes2 := server2.stats()
+	assert.GreaterOrEqual(t, opens2, 1,
+		"main.go must be re-opened on the fresh server after reconnect, not assumed open")
+	assert.Equal(t, opens2, closes2,
+		"every didOpen on the new server must be paired with a didClose (opens=%d closes=%d)", opens2, closes2)
+}
+
 // ---------------------------------------------------------------------------
 // isServerExitError detection.
 // ---------------------------------------------------------------------------
