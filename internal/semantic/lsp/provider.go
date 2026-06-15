@@ -662,6 +662,11 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 			},
 		},
 	}
+	// Pass server-specific InitializationOptions (e.g. Maven/Gradle import
+	// settings for jdtls) when the provider was built from a ServerSpec.
+	if p.spec != nil && len(p.spec.InitializationOptions) > 0 {
+		initParams.InitializationOptions = p.spec.InitializationOptions
+	}
 
 	var initResult InitializeResult
 	if err := client.Call("initialize", initParams, &initResult); err != nil {
@@ -1537,6 +1542,7 @@ func identifierColumn(src []byte, oneBasedLine int, name string) int {
 func extractTypeFromHover(hover string) string {
 	// Remove markdown code fences.
 	hover = strings.TrimPrefix(hover, "```go\n")
+	hover = strings.TrimPrefix(hover, "```java\n")
 	hover = strings.TrimPrefix(hover, "```\n")
 	hover = strings.TrimSuffix(hover, "\n```")
 	hover = strings.TrimSpace(hover)
@@ -1544,6 +1550,7 @@ func extractTypeFromHover(hover string) string {
 	lines := strings.SplitN(hover, "\n", 2)
 	if len(lines) > 0 {
 		line := strings.TrimSpace(lines[0])
+		// Go keywords
 		if strings.HasPrefix(line, "func ") ||
 			strings.HasPrefix(line, "type ") ||
 			strings.HasPrefix(line, "var ") ||
@@ -1552,7 +1559,24 @@ func extractTypeFromHover(hover string) string {
 			strings.HasPrefix(line, "package ") {
 			return line
 		}
-		// Short type like "string", "*Foo", "[]byte".
+		// Java keywords / modifiers — jdtls hover format:
+		//   "public class Foo", "void bar()", "private String baz",
+		//   "abstract class X", "interface Y", "@Deprecated",
+		//   "static final int N", "enum Color", "protected Object"
+		if strings.HasPrefix(line, "public ") ||
+			strings.HasPrefix(line, "private ") ||
+			strings.HasPrefix(line, "protected ") ||
+			strings.HasPrefix(line, "abstract ") ||
+			strings.HasPrefix(line, "static ") ||
+			strings.HasPrefix(line, "final ") ||
+			strings.HasPrefix(line, "class ") ||
+			strings.HasPrefix(line, "interface ") ||
+			strings.HasPrefix(line, "enum ") ||
+			strings.HasPrefix(line, "void ") ||
+			strings.HasPrefix(line, "@") {
+			return line
+		}
+		// Short type like "string", "*Foo", "[]byte", "int", "boolean".
 		if !strings.Contains(line, " ") && len(line) > 0 && len(line) < 100 {
 			return line
 		}

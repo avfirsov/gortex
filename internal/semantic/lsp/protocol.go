@@ -14,6 +14,10 @@ type InitializeParams struct {
 	// servers that only understand rootUri keep working.
 	WorkspaceFolders []WorkspaceFolder  `json:"workspaceFolders,omitempty"`
 	Capabilities     ClientCapabilities `json:"capabilities"`
+	// InitializationOptions carries server-specific initialization
+	// parameters. For jdtls this includes Maven/Gradle import settings;
+	// for other servers it is nil/omitted.
+	InitializationOptions json.RawMessage `json:"initializationOptions,omitempty"`
 }
 
 // WorkspaceFolder is one root in a multi-folder LSP workspace.

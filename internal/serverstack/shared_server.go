@@ -246,6 +246,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// spec whose binary resolves on PATH (per-spec / GORTEX_LSP_DISABLE
 	// opt-out). All lifecycles get this (reconciles the prior mcp-only
 	// drift where the embedded path skipped auto-registration).
+	var semMgr *semantic.Manager
 	if conf.Semantic.Enabled {
 		semCfg := semantic.Config{
 			Enabled:           conf.Semantic.Enabled,
@@ -275,7 +276,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			}
 			semCfg.Providers = append(semCfg.Providers, out)
 		}
-		semMgr := semantic.NewManager(semCfg, logger)
+		semMgr = semantic.NewManager(semCfg, logger)
 
 		goMode := goanalysis.ModeTypeCheck
 		if cfg.SemanticMode == "callgraph" {
@@ -402,6 +403,13 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			mi.SetEmbeddingChunkOptions(EmbeddingChunkOptions(conf))
 			mi.SetEmbeddingMaxSymbols(conf.Embedding.MaxSymbols)
 			mi.SetEmbeddingAPIConcurrency(conf.Embedding.APIConcurrency)
+		}
+		// Propagate the semantic manager so per-repo Indexers
+		// created by the MultiIndexer can run LSP enrichment.
+		// Without this, daemon-mode enrichment produces zero
+		// results (enrich:0 in DEFERRED-TIMING).
+		if semMgr != nil {
+			mi.SetSemanticManager(semMgr)
 		}
 		if s.ResolverLSPRegistry != nil {
 			mi.SetResolverLSPHelper(s.ResolverLSPRegistry)

@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/trigram"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // RepoMetadata holds per-repo indexing state.
@@ -144,6 +145,13 @@ type MultiIndexer struct {
 	// API-backed embedder, propagated to every per-repo Indexer. Zero
 	// keeps the built-in default.
 	embedAPIConcurrency int
+
+	// semanticMgr is the semantic enrichment manager propagated to
+	// every per-repo Indexer. When nil (the default), per-repo
+	// deferred passes skip semantic enrichment — this is the root
+	// cause of "enrich:0" in daemon mode. Set by the daemon via
+	// SetSemanticManager before IndexAll / TrackRepo.
+	semanticMgr *semantic.Manager
 }
 
 // SetEmbedder installs the embedding provider every per-repo indexer
@@ -216,6 +224,9 @@ func (mi *MultiIndexer) newPerRepoIndexer(cfg config.IndexConfig) *Indexer {
 	if mi.resolverLSPHelper != nil {
 		idx.SetResolverLSPHelper(mi.resolverLSPHelper)
 	}
+	if mi.semanticMgr != nil {
+		idx.SetSemanticManager(mi.semanticMgr)
+	}
 	return idx
 }
 
@@ -268,6 +279,24 @@ func (mi *MultiIndexer) SetEmbeddingAPIConcurrency(n int) {
 	mi.mu.Unlock()
 	for _, idx := range live {
 		idx.SetEmbeddingAPIConcurrency(n)
+	}
+}
+
+// SetSemanticManager installs the semantic enrichment manager every
+// per-repo Indexer this MultiIndexer constructs should use, and
+// re-applies it to every per-repo Indexer already built. Without
+// this call, daemon-mode enrichment produces zero results because
+// the per-repo Indexers never receive the semantic manager.
+func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
+	mi.mu.Lock()
+	mi.semanticMgr = m
+	live := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		live = append(live, idx)
+	}
+	mi.mu.Unlock()
+	for _, idx := range live {
+		idx.SetSemanticManager(m)
 	}
 }
 
