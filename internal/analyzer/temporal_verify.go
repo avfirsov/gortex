@@ -152,6 +152,20 @@ func NewLLMTemporalVerifier(cfg llm.Config) (resolver.TemporalVerifier, func() e
 	return &llmTemporalVerifier{p: p}, p.Close, nil
 }
 
+// NewLLMTemporalVerifierFromProvider wraps an already-constructed provider.
+//
+// PURPOSE — let a host that already owns a live llm.Provider (e.g. the MCP
+// server's shared LLM service) reuse it for temporal verification instead of
+// spinning up a second provider from raw config via NewLLMTemporalVerifier.
+// RATIONALE — the verifier is a thin Verify(req)→verdict adapter over
+// Provider.Complete; binding it to an existing provider avoids duplicate model
+// loads / API clients and respects the caller's provider lifecycle (no Close
+// returned — the caller still owns p).
+// KEYWORDS — temporal, verify, llm, provider, reuse
+func NewLLMTemporalVerifierFromProvider(p llm.Provider) resolver.TemporalVerifier {
+	return &llmTemporalVerifier{p: p}
+}
+
 func (v *llmTemporalVerifier) Verify(ctx context.Context, req resolver.TemporalVerifyRequest) (resolver.TemporalVerifyResult, error) {
 	resp, err := v.p.Complete(ctx, llm.CompletionRequest{
 		Messages: []llm.Message{
