@@ -30,6 +30,14 @@ const temporalEnvDefaultConfidence = 0.4
 // default queries, consistent with the env-default tier.
 const temporalCrossLangConfidence = 0.4
 
+// temporalExactSigConfidence is stamped on an exact-name signature-gated
+// resolution (Cat 4): a PascalCase dispatch landed on a same-named,
+// unregistered, non-suffixed function whose signature matches the dispatch
+// kind. The name match is exact and the signature is a strong positive
+// gate, but the target is not register-confirmed — so it sits in the
+// speculative band (hidden, AMBIGUOUS) like the other best-guess tiers.
+const temporalExactSigConfidence = 0.45
+
 // temporalEnvDefaultInferredConfidence is stamped instead when the env-default
 // was recognised with high confidence — a provable os.Getenv read or a helper
 // name in the configured allow-list (`temporal_env_source` = "os_getenv" /
@@ -510,17 +518,37 @@ func ResolveTemporalCalls(g graph.Store) int {
 			}
 		}
 
-		// When the name came from an env-var-with-literal-default variable,
-		// the value is a best-guess (the runtime env may differ from the
-		// literal default). HOW it was recognised decides the tier:
-		//   - "allowlist" / "os_getenv" / "const_ref": we are confident this IS
-		//     an env-with-default — land at the inferred tier (0.6, visible).
-		//   - "heuristic" (or unknown/legacy): a generic env-named-helper
-		//     guess — land at the hidden speculative tier (0.4), where the
-		//     optional LLM cleaning pass can confirm or prune it.
+		// Exact-name signature-gated fallback (Cat 4): a PascalCase dispatch
+		// whose target is a same-named, unregistered, non-suffixed function.
+		// Gated on exact name + a kind-matching Temporal signature + a unique
+		// candidate; landed speculative + hidden. Last resort, so it runs
+		// only after register / const-deref / cross-language all abstained.
+		exactSig := false
+		if handlerID == "" {
+			matchName := s.name
+			if constDeref != "" {
+				matchName = constDeref
+			}
+			if id := idx.lookupExactSig(s.kind, matchName, callerRepo); id != "" {
+				handlerID = id
+				origin = graph.OriginSpeculative
+				conf = temporalExactSigConfidence
+				exactSig = true
+			}
+		}
+
+		// When the dispatch name came from an env-var-with-literal-default
+		// variable (env_default) or from tracing a bare local dispatch
+		// variable to its last assignment (var_trace), the value is a
+		// best-guess. HOW it was recognised decides the tier:
+		//   - "allowlist" / "os_getenv" / "const_ref": confident it IS an
+		//     env-with-default — inferred tier (0.6, visible).
+		//   - "heuristic" / var_trace / unknown: a guess — hidden speculative
+		//     tier (0.4), where the optional LLM cleaning pass can prune it.
 		envDefault := false
 		envSource := ""
-		if v, _ := e.Meta["temporal_name_origin"].(string); v == "env_default" {
+		switch v, _ := e.Meta["temporal_name_origin"].(string); v {
+		case "env_default", "var_trace":
 			envDefault = true
 			envSource, _ = e.Meta["temporal_env_source"].(string)
 		}
@@ -553,7 +581,7 @@ func ResolveTemporalCalls(g graph.Store) int {
 			e.Confidence = conf
 			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, conf)
 			e.Meta["temporal_resolution"] = origin
-			if envSpeculative || crossLang {
+			if envSpeculative || crossLang || exactSig {
 				e.Meta[graph.MetaSpeculative] = true
 			}
 			if crossLang {
@@ -561,15 +589,17 @@ func ResolveTemporalCalls(g graph.Store) int {
 			} else {
 				delete(e.Meta, "temporal_cross_lang")
 			}
+			if exactSig {
+				e.Meta["temporal_resolution_via"] = "exact_sig"
+			} else if convention {
+				e.Meta["temporal_resolution_via"] = "convention"
+			} else {
+				delete(e.Meta, "temporal_resolution_via")
+			}
 			if constDeref != "" {
 				e.Meta["temporal_const_deref"] = constDeref
 			} else {
 				delete(e.Meta, "temporal_const_deref")
-			}
-			if convention {
-				e.Meta["temporal_resolution_via"] = "convention"
-			} else {
-				delete(e.Meta, "temporal_resolution_via")
 			}
 			StampSynthesized(e, SynthTemporalStub)
 			resolved++
@@ -604,6 +634,14 @@ func temporalStubPlaceholder(kind, name string) string {
 type temporalIndex struct {
 	// byKindName maps "<kind>::<name>" → handler candidate nodes.
 	byKindName map[string][]*graph.Node
+	// funcExact indexes EXPORTED Go functions / methods by their exact
+	// (bare) name — including those WITHOUT the Activity/Workflow suffix and
+	// those never passed to worker.Register*. Used only by lookupExactSig,
+	// the precision-gated last resort for a PascalCase dispatch whose target
+	// is a same-named, unregistered function (the "PascalCase, target in
+	// another package/repo" category). Resolution there is gated on an exact
+	// name match, a Temporal-shaped signature for the kind, and uniqueness.
+	funcExact map[string][]*graph.Node
 	// funcByName indexes Go functions / methods whose name follows the
 	// activity / workflow naming convention (suffix "Activity" /
 	// "Workflow"), keyed by bare name. Used as a last-resort, lower-
@@ -766,6 +804,70 @@ func (idx *temporalIndex) lookupCrossLang(kind, name, callerLang string) (id str
 	return "", false
 }
 
+// signatureMatchesKind reports whether a function's first-parameter type
+// POSITIVELY matches the dispatch kind in the Temporal Go SDK convention:
+// activities take context.Context, workflows take workflow.Context. It
+// requires the expected type to be PRESENT in the signature AND the other
+// absent, so it is a strong, precision-positive gate for the exact-name
+// fallback (a kind mismatch — an activity dispatch onto a workflow.Context
+// function — abstains).
+func signatureMatchesKind(n *graph.Node, kind string) bool {
+	if n == nil {
+		return false
+	}
+	sig, _ := n.Meta["signature"].(string)
+	if sig == "" {
+		return false
+	}
+	want, other := "context.Context", "workflow.Context"
+	if kind == "workflow" {
+		want, other = "workflow.Context", "context.Context"
+	}
+	return strings.Contains(sig, want) && !strings.Contains(sig, other)
+}
+
+// lookupExactSig is the precision-gated last resort for a PascalCase dispatch
+// whose target is a same-named function that is neither register-confirmed
+// nor convention-suffixed (the "PascalCase, target in another package/repo"
+// category). It resolves ONLY when the dispatch name exactly equals an
+// exported Go func/method name, that candidate's signature matches the
+// dispatch kind (activity → context.Context / workflow → workflow.Context),
+// and the match is unique (same-repo preferred, else unique workspace-wide).
+// Cross-repo `*_test.go` candidates are dropped. The caller lands the result
+// at the speculative, hidden tier. Returns "" otherwise.
+func (idx *temporalIndex) lookupExactSig(kind, name, callerRepo string) string {
+	cands := idx.funcExact[name]
+	if len(cands) == 0 {
+		return ""
+	}
+	var filtered, sameRepo []*graph.Node
+	for _, n := range cands {
+		if n == nil {
+			continue
+		}
+		// Drop a cross-repo test stub: a different-repo candidate living in a
+		// _test.go file is almost never the production handler.
+		if callerRepo != "" && n.RepoPrefix != "" && n.RepoPrefix != callerRepo &&
+			strings.HasSuffix(n.FilePath, "_test.go") {
+			continue
+		}
+		if !signatureMatchesKind(n, kind) {
+			continue
+		}
+		filtered = append(filtered, n)
+		if callerRepo != "" && n.RepoPrefix == callerRepo {
+			sameRepo = append(sameRepo, n)
+		}
+	}
+	if len(sameRepo) == 1 {
+		return sameRepo[0].ID
+	}
+	if len(filtered) == 1 {
+		return filtered[0].ID
+	}
+	return ""
+}
+
 // buildTemporalIndex (a) stamps temporal_role on every node identifiable
 // as a Temporal workflow / activity via either Go `worker.Register*`
 // calls or Java `@ActivityInterface` / `@WorkflowInterface` annotations
@@ -778,7 +880,28 @@ func (idx *temporalIndex) lookupCrossLang(kind, name, callerLang string) (id str
 // avoids re-scanning the (largest) EdgeCalls class and the EdgeAnnotated
 // class a second time.
 func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Edge) *temporalIndex {
-	idx := &temporalIndex{byKindName: map[string][]*graph.Node{}, funcByName: map[string][]*graph.Node{}}
+	idx := &temporalIndex{
+		byKindName: map[string][]*graph.Node{},
+		funcExact:  map[string][]*graph.Node{},
+		funcByName: map[string][]*graph.Node{},
+	}
+
+	// funcExact index (Cat 4): every EXPORTED Go function / method by exact
+	// bare name, for the signature-gated exact-name last resort. Bounded to
+	// exported names carrying a signature so the map stays small; consulted
+	// only when register / const-deref / cross-language all abstain.
+	indexExactFunc := func(n *graph.Node) {
+		if n == nil || n.Language != "go" || n.Name == "" {
+			return
+		}
+		if c := n.Name[0]; c < 'A' || c > 'Z' {
+			return
+		}
+		if sig, _ := n.Meta["signature"].(string); sig == "" {
+			return
+		}
+		idx.funcExact[n.Name] = append(idx.funcExact[n.Name], n)
+	}
 
 	// Convention index: Go functions / methods named like activities or
 	// workflows (suffix "Activity" / "Workflow"), for resolving dispatch
@@ -797,11 +920,17 @@ func buildTemporalIndex(g graph.Store, registerEdges, annotatedEdges []*graph.Ed
 			idx.funcByName[n.Name] = append(idx.funcByName[n.Name], n)
 		}
 	}
-	for n := range g.NodesByKind(graph.KindFunction) {
+
+	// Single sweep over functions + methods populates both indexes.
+	indexFuncNode := func(n *graph.Node) {
+		indexExactFunc(n)
 		indexConventionFunc(n)
 	}
+	for n := range g.NodesByKind(graph.KindFunction) {
+		indexFuncNode(n)
+	}
 	for n := range g.NodesByKind(graph.KindMethod) {
-		indexConventionFunc(n)
+		indexFuncNode(n)
 	}
 
 	// Phase 1 — Go side. Walk the pre-collected `temporal.register` edges
@@ -1322,6 +1451,12 @@ func isExportedGoName(name string) bool {
 // same const name defined twice with different literals) is dropped so a
 // dereference is never a wrong guess. Returns nil when the backend does
 // not implement ConstantValueReader.
+//
+// Const-to-const aliases (Cat 3, `const ALIAS = RealName`) are followed: a
+// requested name whose const node carries no literal but a Meta["const_ref"]
+// is chased to the referenced const's literal value by a bounded fixpoint,
+// so an ALL_CAPS dispatch name that is itself an alias (ALIAS = REAL =
+// "lit") still dereferences. Cycles never progress and are dropped at the cap.
 func buildConstDerefMap(g graph.Store, names []string) map[string]string {
 	reader, ok := g.(graph.ConstantValueReader)
 	if !ok || len(names) == 0 {
@@ -1331,27 +1466,53 @@ func buildConstDerefMap(g graph.Store, names []string) map[string]string {
 	for _, n := range names {
 		nameSet[n] = struct{}{}
 	}
-	uniq := make([]string, 0, len(nameSet))
-	for n := range nameSet {
-		uniq = append(uniq, n)
-	}
-	candByName := g.FindNodesByNames(uniq)
+	// Expand the lookup set with every const_ref hop reachable from the
+	// requested names so an alias chain's terminal literal is fetched too.
+	// Bounded passes keep a malicious / cyclic graph from looping.
 	idToName := map[string]string{}
-	var constIDs []string
-	for name, cands := range candByName {
-		for _, n := range cands {
-			if n == nil || (n.Kind != graph.KindConstant && n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
-				continue
-			}
-			constIDs = append(constIDs, n.ID)
-			idToName[n.ID] = name
+	aliasRef := map[string]string{} // name → referenced const name
+	resolveNames := func(want map[string]struct{}) {
+		uniq := make([]string, 0, len(want))
+		for n := range want {
+			uniq = append(uniq, n)
 		}
+		for name, cands := range g.FindNodesByNames(uniq) {
+			for _, n := range cands {
+				if n == nil || (n.Kind != graph.KindConstant && n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+					continue
+				}
+				idToName[n.ID] = name
+				if ref, ok := n.Meta["const_ref"].(string); ok && ref != "" {
+					aliasRef[name] = ref
+				}
+			}
+		}
+	}
+	resolveNames(nameSet)
+	for pass := 0; pass < 8; pass++ {
+		pending := map[string]struct{}{}
+		for _, ref := range aliasRef {
+			if _, known := nameSet[ref]; !known {
+				pending[ref] = struct{}{}
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
+		for n := range pending {
+			nameSet[n] = struct{}{}
+		}
+		resolveNames(pending)
+	}
+	var constIDs []string
+	for id := range idToName {
+		constIDs = append(constIDs, id)
 	}
 	if len(constIDs) == 0 {
 		return nil
 	}
 	vals, err := reader.ConstantValuesByNodeIDs(constIDs)
-	if err != nil || len(vals) == 0 {
+	if err != nil {
 		return nil
 	}
 	out := make(map[string]string, len(vals))
@@ -1369,6 +1530,27 @@ func buildConstDerefMap(g graph.Store, names []string) map[string]string {
 	}
 	for name := range ambiguous {
 		delete(out, name)
+	}
+	// Collapse alias chains against the literal map by a bounded fixpoint:
+	// an alias name with no literal of its own inherits its referent's
+	// resolved literal. Cycles never progress and are dropped at the cap.
+	for pass := 0; pass < 8; pass++ {
+		progressed := false
+		for name, ref := range aliasRef {
+			if _, has := out[name]; has {
+				continue
+			}
+			if v, ok := out[ref]; ok && v != "" {
+				out[name] = v
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
