@@ -60,6 +60,7 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	gortexmcp.Version = version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules)
 	srv.SetArchitecture(cfg.Architecture)
+	srv.SetEventRules(cfg.Events.Rules)
 	srv.SetArtifacts(cfg.Artifacts)
 	srv.SetNamedQueries(cfg.Queries)
 

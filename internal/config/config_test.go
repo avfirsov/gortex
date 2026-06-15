@@ -48,11 +48,13 @@ type yamlGuardsConfig struct {
 }
 
 type yamlGuardRule struct {
-	Name    string `yaml:"name"`
-	Kind    string `yaml:"kind"`
-	Source  string `yaml:"source"`
-	Target  string `yaml:"target"`
-	Message string `yaml:"message"`
+	Name     string   `yaml:"name"`
+	Kind     string   `yaml:"kind"`
+	Source   string   `yaml:"source"`
+	Target   string   `yaml:"target"`
+	Message  string   `yaml:"message"`
+	Severity string   `yaml:"severity"`
+	Except   []string `yaml:"except"`
 }
 
 func toYAMLConfig(gc GuardsConfig) yamlConfig {

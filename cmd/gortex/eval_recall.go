@@ -16,9 +16,9 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/eval/recall"
+	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -233,6 +233,7 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 		eng.SetSearch(textBackend)
 		srv := gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), cfg.Guards.Rules)
 		srv.SetArchitecture(cfg.Architecture)
+		srv.SetEventRules(cfg.Events.Rules)
 		srv.SetArtifacts(cfg.Artifacts)
 		srv.SetNamedQueries(cfg.Queries)
 		srv.RunAnalysis()

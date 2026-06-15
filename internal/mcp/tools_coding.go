@@ -49,6 +49,9 @@ func (s *Server) registerCodingTools() {
 		mcp.NewTool("explain_change_impact",
 			mcp.WithDescription("Given a list of symbols you plan to modify, returns risk-tiered blast radius: d=1 will break, d=2 likely affected, d=3 needs testing. Includes affected processes and communities."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs to modify")),
+			mcp.WithBoolean("summary_only", mcp.Description("Return only by_depth_counts (e.g. {1:3, 2:12}) and drop the per-depth row lists — the cheapest blast-radius shape when you only need the headline counts.")),
+			mcp.WithNumber("offset", mcp.Description("Skip this many affected rows (in depth order) before returning by_depth — pairs with limit to page a large blast radius.")),
+			mcp.WithNumber("limit", mcp.Description("Max affected rows to return in by_depth (default 100, depth order). by_depth_counts always reports the full per-depth totals regardless.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
 		),
@@ -143,8 +146,10 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("old_string", mcp.Required(), mcp.Description("Exact text to replace (must be unique unless replace_all=true). CRLF/LF line-ending differences against the file are tolerated.")),
 			mcp.WithString("new_string", mcp.Required(), mcp.Description("Replacement text")),
 			mcp.WithBoolean("replace_all", mcp.Description("Replace every occurrence instead of requiring uniqueness (default: false)")),
+			mcp.WithNumber("expected_occurrences", mcp.Description("Guard: refuse the edit unless old_string matches exactly this many locations. Pairs with replace_all to assert the cardinality of a sweep (e.g. expected_occurrences:7 replace_all:true). Omit or 0 to disable the check.")),
 			mcp.WithBoolean("dry_run", mcp.Description("Validate the replacement and report what would change without writing (default: false)")),
 			mcp.WithString("base_sha", mcp.Description("Optional git blob SHA-1 the caller observed at read time. When set, the call refuses to write if the on-disk file's current SHA differs (drift guard against silent clobbers).")),
+			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default an edit that would introduce new tree-sitter parse errors (leaving the file more syntactically broken than before) is refused before the atomic write; set true to write anyway.")),
 		),
 		s.handleEditFile,
 	)
@@ -156,6 +161,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("content", mcp.Required(), mcp.Description("Full file content")),
 			mcp.WithBoolean("dry_run", mcp.Description("Report would_create / would_overwrite without writing (default: false)")),
 			mcp.WithString("base_sha", mcp.Description("Optional git blob SHA-1 the caller observed at read time. When set, write_file refuses to overwrite a divergent on-disk file (or write to a path the caller expected to exist but no longer does). Drift guard against silent clobbers on existing files; leave empty when creating a new file.")),
+			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default a write that would introduce new tree-sitter parse errors (relative to the prior content, or any error in a brand-new file) is refused before the atomic write; set true to write anyway.")),
 		),
 		s.handleWriteFile,
 	)

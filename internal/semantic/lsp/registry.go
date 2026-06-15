@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,13 @@ type ServerSpec struct {
 	// every built-in spec; populated only when a user overrides a
 	// server via .gortex.yaml (e.g. pinning JAVA_HOME for jdtls).
 	Env []string
+	// InitializationOptions carries server-specific initialization
+	// parameters sent in the "initialize" request. For jdtls this
+	// includes Maven/Gradle import settings so the server can resolve
+	// project dependencies instead of falling back to an "invisible
+	// project" with only JRE on the classpath. Nil/empty for servers
+	// that don't need it (gopls, rust-analyzer, etc.).
+	InitializationOptions json.RawMessage `json:"initializationOptions,omitempty"`
 	// Connect, when non-nil, switches this spec from spawn mode to
 	// passive-attach: instead of starting a subprocess via Command +
 	// Args, Gortex dials the configured network endpoint and uses
@@ -280,6 +288,23 @@ var Servers = []ServerSpec{
 		Priority:    6, // jdtls is heavyweight; lower priority than scip-java.
 		Daemon:      true,
 		MaxParallel: 6,
+		// InitializationOptions for jdtls: enable Maven/Gradle import
+		// so jdtls resolves project dependencies instead of falling
+		// back to an "invisible project" with only JRE on classpath.
+		// Without this, hover/codeSelect returns empty for all symbols.
+		InitializationOptions: json.RawMessage(`{
+			"settings": {
+				"java": {
+					"import": {
+						"maven": {"enabled": true},
+						"gradle": {"enabled": true}
+					},
+					"autobuild": {"enabled": true}
+				}
+			},
+			"bundles": [],
+			"workspaceFolders": "auto"
+		}`),
 	},
 	{
 		Name:       "kotlin-language-server",

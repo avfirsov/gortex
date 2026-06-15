@@ -21,10 +21,39 @@ type GuardRule struct {
 	Source  string `mapstructure:"source"  yaml:"source"`            // package/path prefix
 	Target  string `mapstructure:"target"  yaml:"target"`            // package/path prefix
 	Message string `mapstructure:"message" yaml:"message,omitempty"` // human-readable explanation
+	// Severity tiers the violation: "error" → a change_contract refuse,
+	// "warn" → warn, "info" → annotate. Empty defaults to "warn" so a rule
+	// advises until it explicitly opts into blocking.
+	Severity string `mapstructure:"severity" yaml:"severity,omitempty"`
+	// Except lists path globs exempt from this rule — a source symbol whose
+	// file matches one is never flagged.
+	Except []string `mapstructure:"except" yaml:"except,omitempty"`
 }
 
 type GuardsConfig struct {
 	Rules []GuardRule `mapstructure:"rules" yaml:"rules,omitempty"`
+}
+
+// EventRule is one declarative event-boundary / dispatch-guard constraint over
+// the pub/sub graph: which paths may produce or consume a topic, whether a
+// produced topic must have a consumer, and which paths are forbidden from it.
+type EventRule struct {
+	Name            string   `mapstructure:"name"             yaml:"name,omitempty"`
+	Topic           string   `mapstructure:"topic"            yaml:"topic,omitempty"`            // glob on event/topic name; empty = any
+	Producer        string   `mapstructure:"producer"         yaml:"producer,omitempty"`         // path glob allowed to produce
+	Consumer        string   `mapstructure:"consumer"         yaml:"consumer,omitempty"`         // path glob allowed to consume
+	RequireConsumer bool     `mapstructure:"require_consumer" yaml:"require_consumer,omitempty"` // a produced topic must have a consumer
+	Forbid          []string `mapstructure:"forbid"           yaml:"forbid,omitempty"`           // path globs forbidden to produce / consume
+	Severity        string   `mapstructure:"severity"         yaml:"severity,omitempty"`
+	Message         string   `mapstructure:"message"          yaml:"message,omitempty"`
+}
+
+// EventsConfig is the `events:` block of .gortex.yaml — declarative
+// event-boundary rules over the pub/sub graph (EdgeEmits / EdgeProducesTopic /
+// EdgeListensOn / EdgeConsumesTopic), evaluated as a change_contract rule
+// family.
+type EventsConfig struct {
+	Rules []EventRule `mapstructure:"rules" yaml:"rules,omitempty"`
 }
 
 // ArchitectureConfig is the declarative architecture-rules block of
@@ -41,6 +70,10 @@ type ArchitectureConfig struct {
 	// fan-out caps and caller-boundary restrictions — evaluated on
 	// top of the layer allow/deny graph.
 	Rules []ArchRule `mapstructure:"rules" yaml:"rules,omitempty"`
+	// Severity tiers the layer allow/deny violations: "error" → a
+	// change_contract refuse, "warn" → warn, "info" → annotate. Empty
+	// defaults to "warn".
+	Severity string `mapstructure:"severity" yaml:"severity,omitempty"`
 }
 
 // ArchRule is one architecture constraint scoped to a layer or a file
@@ -63,6 +96,11 @@ type ArchRule struct {
 	DenyCallersOutside []string `mapstructure:"deny_callers_outside" yaml:"deny_callers_outside,omitempty"`
 	// Message is an optional human-readable explanation.
 	Message string `mapstructure:"message" yaml:"message,omitempty"`
+	// Severity tiers the violation: "error" → a change_contract refuse,
+	// "warn" → warn, "info" → annotate. Empty defaults to "warn".
+	Severity string `mapstructure:"severity" yaml:"severity,omitempty"`
+	// Except lists path globs exempt from this rule.
+	Except []string `mapstructure:"except" yaml:"except,omitempty"`
 }
 
 // ArtifactEntry is one row of the `artifacts:` manifest — a non-code
@@ -421,6 +459,9 @@ type Config struct {
 	// by default; the flat Guards list above keeps working when it is
 	// unset.
 	Architecture ArchitectureConfig `mapstructure:"architecture" yaml:"architecture,omitempty"`
+	// Events is the declarative event-boundary rule family — pub/sub
+	// producer/consumer path constraints, evaluated by change_contract.
+	Events EventsConfig `mapstructure:"events" yaml:"events,omitempty"`
 	// Artifacts is the non-code knowledge manifest — schemas, API
 	// specs, infra configs, and ADRs surfaced as KindArtifact nodes.
 	Artifacts []ArtifactEntry `mapstructure:"artifacts" yaml:"artifacts,omitempty"`
