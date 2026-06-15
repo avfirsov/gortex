@@ -1,6 +1,9 @@
 package lsp
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // LSP protocol types — minimal subset needed for semantic enrichment.
 // Based on LSP 3.17.
@@ -257,8 +260,70 @@ type HoverParams struct {
 
 // HoverResult is the response for textDocument/hover.
 type HoverResult struct {
-	Contents MarkupContent `json:"contents"`
+	Contents HoverContents `json:"contents"`
 	Range    *Range        `json:"range,omitempty"`
+}
+
+// HoverContents handles the three LSP hover content formats:
+//   - MarkupContent (object with kind + value)
+//   - MarkedString (plain string or {language, value} object)
+//   - MarkedString[] (array of the above)
+//
+// jdtls returns an array, which caused "cannot unmarshal array into Go struct"
+// when Contents was typed as MarkupContent directly.
+type HoverContents struct {
+	Value string // the concatenated hover text
+}
+
+func (hc *HoverContents) UnmarshalJSON(data []byte) error {
+	// Try MarkupContent first (object with kind + value).
+	var mc MarkupContent
+	if err := json.Unmarshal(data, &mc); err == nil && mc.Value != "" {
+		hc.Value = mc.Value
+		return nil
+	}
+
+	// Try MarkedString[] (array).
+	var arr []json.RawMessage
+	if err := json.Unmarshal(data, &arr); err == nil {
+		var parts []string
+		for _, raw := range arr {
+			// Each element can be a string or a MarkedString object.
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				parts = append(parts, s)
+				continue
+			}
+			var ms MarkedString
+			if json.Unmarshal(raw, &ms) == nil {
+				parts = append(parts, ms.Value)
+			}
+		}
+		hc.Value = strings.Join(parts, "\n")
+		return nil
+	}
+
+	// Try plain string (MarkedString without array).
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		hc.Value = s
+		return nil
+	}
+
+	// Fallback: single MarkedString object.
+	var ms MarkedString
+	if err := json.Unmarshal(data, &ms); err == nil {
+		hc.Value = ms.Value
+		return nil
+	}
+
+	return nil // empty/unrecognised — leave Value empty
+}
+
+// MarkedString represents a {language, value} object in hover content.
+type MarkedString struct {
+	Language string `json:"language"`
+	Value    string `json:"value"`
 }
 
 // MarkupContent represents hover content.

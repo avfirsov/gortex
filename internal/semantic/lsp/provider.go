@@ -273,6 +273,14 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 	// round-trip them through the store at the end or the semantic_type
 	// stamp is discarded on the disk backend. See semantic.EnrichNodeMeta.
 	var stampedNodes []*graph.Node
+
+	// DIAGNOSTIC counters for debugging enrichment=0
+	var diagTotalNodes, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched int
+	var diagFirstHoverValue string
+	var diagFirstHoverError string
+	var diagFirstNodeName string
+	var diagFirstNodeFile string
+
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
@@ -288,8 +296,16 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 			continue
 		}
 
+		diagTotalNodes++
+
 		if !openedFiles[n.FilePath] {
 			if err := p.openDocument(absRoot, n.FilePath); err != nil {
+				if diagTotalNodes <= 5 {
+					p.logger.Debug("ENRICH-DBG: openDocument failed",
+						zap.String("file", n.FilePath),
+						zap.Error(err),
+					)
+				}
 				continue
 			}
 			openedFiles[n.FilePath] = true
@@ -298,11 +314,27 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 
 		col := identifierColumn(p.getSource(absRoot, n.FilePath), n.StartLine, n.Name)
 		hoverResult, err := p.hover(absRoot, n.FilePath, n.StartLine-1, col)
-		if err != nil || hoverResult == nil {
+		if err != nil {
+			diagHoverErr++
+			if diagFirstHoverError == "" {
+				diagFirstHoverError = err.Error()
+				diagFirstNodeName = n.Name
+				diagFirstNodeFile = n.FilePath
+			}
+			continue
+		}
+		if hoverResult == nil {
+			diagHoverNil++
 			continue
 		}
 
 		typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
+		if diagFirstHoverValue == "" {
+			diagFirstHoverValue = hoverResult.Contents.Value
+			if len(diagFirstHoverValue) > 200 {
+				diagFirstHoverValue = diagFirstHoverValue[:200]
+			}
+		}
 		if typeInfo != "" {
 			semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
 			stampedNodes = append(stampedNodes, n)
@@ -311,8 +343,23 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 				result.SymbolsCovered++
 				enrichedNodes[n.ID] = true
 			}
+			diagEnriched++
+		} else {
+			diagTypeEmpty++
 		}
 	}
+	// DIAGNOSTIC: log enrichment counters
+	p.logger.Info("ENRICH-DBG: hover loop complete",
+		zap.Int("total_nodes", diagTotalNodes),
+		zap.Int("hover_err", diagHoverErr),
+		zap.Int("hover_nil", diagHoverNil),
+		zap.Int("type_empty", diagTypeEmpty),
+		zap.Int("enriched", diagEnriched),
+		zap.String("first_hover_value", diagFirstHoverValue),
+		zap.String("first_hover_error", diagFirstHoverError),
+		zap.String("first_node_name", diagFirstNodeName),
+		zap.String("first_node_file", diagFirstNodeFile),
+	)
 	if len(stampedNodes) > 0 {
 		g.AddBatch(stampedNodes, nil)
 	}
