@@ -55,11 +55,14 @@ func TestEditFileSurfacesSyntaxHealthOnBreak(t *testing.T) {
 	srv, dir := setupTestServer(t)
 	mainGo := filepath.Join(dir, "main.go")
 
-	// Drop helper's closing brace — the file no longer parses.
+	// Drop helper's closing brace — the file no longer parses. Bypass the
+	// pre-write parse gate so the edit lands and the post-write syntax_health
+	// warning is the signal under test.
 	resp := callEditHandlerJSON(t, srv.handleEditFile, map[string]any{
-		"path":       mainGo,
-		"old_string": "func helper() {}",
-		"new_string": "func helper() {",
+		"path":               mainGo,
+		"old_string":         "func helper() {}",
+		"new_string":         "func helper() {",
+		"allow_parse_errors": true,
 	})
 	require.Equal(t, "applied", resp["status"])
 	health, ok := resp["syntax_health"].(map[string]any)

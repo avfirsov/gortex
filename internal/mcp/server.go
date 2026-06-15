@@ -208,6 +208,9 @@ type Server struct {
 
 	guardRules   []config.GuardRule
 	architecture config.ArchitectureConfig
+	// eventRules is the declarative event-boundary rule family, installed via
+	// SetEventRules alongside SetArchitecture and evaluated by change_contract.
+	eventRules []config.EventRule
 	// searchCfg carries the `.gortex.yaml::search` block — rerank
 	// weights plus the search-behaviour knobs (keyword-soup rewrite,
 	// equivalence-class expansion, prose indexing). Installed via
@@ -1040,6 +1043,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerASTTools()
 	s.registerCloneTools()
 	s.registerSimulationTools()
+	s.registerChangeContractTools()
 	s.registerNotesTools()
 	s.registerMemoriesTools()
 	s.registerNotebookTools()
@@ -1874,6 +1878,14 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 // NewServer; a no-op effect when the config carries no layers.
 func (s *Server) SetArchitecture(arch config.ArchitectureConfig) {
 	s.architecture = arch
+}
+
+// SetEventRules installs the declarative event-boundary rule family so
+// change_contract evaluates pub/sub producer/consumer constraints. Called by
+// the server / daemon entrypoint right after NewServer; a no-op when the
+// config carries no event rules.
+func (s *Server) SetEventRules(rules []config.EventRule) {
+	s.eventRules = rules
 }
 
 // WatchForReanalysis subscribes to hub events and re-runs analysis after

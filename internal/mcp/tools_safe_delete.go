@@ -40,6 +40,7 @@ func (s *Server) registerSafeDeleteSymbolTool() {
 			mcp.WithBoolean("force", mcp.Description("Bypass the referencing-edge check. Use when you've already removed every caller in the same change set. Default false.")),
 			mcp.WithString("cascade", mcp.Description("Orphan propagation mode: \"off\" (default — single-symbol delete only), \"preview\" (compute the transitive orphan closure and return it without deleting), or \"apply\" (compute the closure and delete every symbol in it together with the target).")),
 			mcp.WithBoolean("cascade_into_tests", mcp.Description("When true, symbols referenced only from test files are eligible for the cascade closure. Default false — test-only references disqualify a candidate so the cascade never deletes a symbol just because production stopped using it but tests still do.")),
+			mcp.WithBoolean("propagate", mcp.Description("Instead of rejecting on referencing edges, build a per-caller delete-and-patch plan: standalone statement calls are removed outright (parse-gate validated), embedded references are flagged for manual patching. dry_run returns the plan; dry_run=false applies the removable patches then deletes the symbol (force=true to delete even with manual / parse-blocked sites remaining).")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx, or toon")),
 		),
 		s.handleSafeDeleteSymbol,
@@ -105,6 +106,67 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// EdgeDefines / EdgeMemberOf are skipped (they don't represent
 	// "someone calls this").
 	refs := collectReferencingEdges(s.graph, id)
+
+	// SRN-7: propagate-delete — patch the surviving call sites instead of
+	// refusing. Builds a per-caller plan, applies the removable standalone
+	// calls (parse-gate validated), and flags embedded references as manual.
+	var appliedPatches, failedPatches []callerPatch
+	if req.GetBool("propagate", false) && len(refs) > 0 {
+		plan := s.buildPropagationPlan(node)
+		manual := countManual(plan)
+		if dryRun {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"status":          "propagation_plan",
+				"symbol":          id,
+				"file":            node.FilePath,
+				"caller_patches":  plan,
+				"removable":       len(plan) - manual,
+				"manual":          manual,
+				"reference_count": len(refs),
+				"dry_run":         true,
+				"hint":            "re-run with dry_run=false to apply the remove_line patches and delete the symbol; resolve manual patches first or pass force=true",
+			})
+		}
+		if manual > 0 && !force {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"status":         "propagation_blocked_manual",
+				"symbol":         id,
+				"caller_patches": plan,
+				"manual":         manual,
+				"hint":           fmt.Sprintf("%d call site(s) need manual patching; resolve them or pass force=true to delete anyway", manual),
+			})
+		}
+		applied, failed, perr := s.applyRemoveLinePatches(plan)
+		if perr != nil {
+			return mcp.NewToolResultError(perr.Error()), nil
+		}
+		appliedPatches, failedPatches = applied, failed
+		if len(failed) > 0 && !force {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"status":          "propagation_partial",
+				"symbol":          id,
+				"patches_applied": applied,
+				"patches_failed":  failed,
+				"hint":            "some removals would break their file's syntax and were skipped; patch them by hand or pass force=true to delete the symbol anyway",
+			})
+		}
+		// Callers patched — proceed with the deletion. Re-fetch the node in
+		// case a same-file removal shifted its line range.
+		force = true
+		node = s.graph.GetNode(id)
+		if node == nil {
+			return s.respondJSONOrTOON(ctx, req, map[string]any{
+				"status":          "deleted_by_propagation",
+				"symbol":          id,
+				"patches_applied": appliedPatches,
+				"note":            "the symbol's definition was removed as a side effect of patching (it no longer resolves in the graph)",
+			})
+		}
+		if node.StartLine == 0 || node.EndLine == 0 {
+			return mcp.NewToolResultError("symbol has no line range after propagation: " + id), nil
+		}
+	}
+
 	if len(refs) > 0 && !force {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"status":             "rejected_has_references",
@@ -232,6 +294,12 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	result["status"] = "deleted"
 	if cascadeMode == cascadeModeApply {
 		result["cascade_deleted"] = deletedIDs
+	}
+	if len(appliedPatches) > 0 {
+		result["patches_applied"] = appliedPatches
+	}
+	if len(failedPatches) > 0 {
+		result["patches_failed"] = failedPatches
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }

@@ -735,7 +735,7 @@ func (s *Server) handlePrefetchContext(ctx context.Context, req mcp.CallToolRequ
 func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	kind, err := req.RequireString("kind")
 	if err != nil {
-		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, def_use, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, health_score, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, synthesizers, resolution_outcomes, retrieval_log, routes, models, components, k8s_resources, images, kustomize, cross_repo, impact, named, tests_as_edges, connectivity_health, pagerank, louvain, wcc, scc, kcore)"), nil
+		return mcp.NewToolResultError("kind is required (one of: dead_code, hotspots, cycles, would_create_cycle, todos, blame, coverage, stale_code, ownership, coverage_gaps, stale_flags, releases, cgo_users, wasm_users, orphan_tables, unreferenced_tables, coverage_summary, channel_ops, def_use, goroutine_spawns, field_writers, race_writes, unclosed_channels, unsafe_patterns, health_score, annotation_users, config_readers, event_emitters, pubsub, string_emitters, error_surface, log_events, sql_rebuild, external_calls, synthesizers, resolution_outcomes, retrieval_log, routes, models, components, k8s_resources, images, kustomize, cross_repo, impact, named, tests_as_edges, connectivity_health, pagerank, louvain, wcc, scc, kcore, suggest_boundaries)"), nil
 	}
 	switch kind {
 	case "dead_code":
@@ -854,6 +854,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 		return s.handleAnalyzeConstructorsMissingFields(ctx, req)
 	case "clusters":
 		return s.handleAnalyzeClusters(ctx, req)
+	case "suggest_boundaries":
+		return s.handleSuggestBoundaries(ctx, req)
 	case "concepts":
 		return s.handleAnalyzeConcepts(ctx, req)
 	case "impact":

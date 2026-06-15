@@ -36,6 +36,9 @@ func (s *Server) registerAnalysisTools() {
 			mcp.WithString("scope", mcp.Description("unstaged (default), staged, all, or compare")),
 			mcp.WithString("base_ref", mcp.Description("Branch/commit for compare scope (default: main)")),
 			mcp.WithString("repo", mcp.Description("Repository prefix or path (multi-repo mode); defaults to the lone tracked repo or the session's cwd-bound repo")),
+			mcp.WithBoolean("summary_only", mcp.Description("Return only by_depth_counts and drop the per-depth row lists — the cheapest blast-radius shape.")),
+			mcp.WithNumber("offset", mcp.Description("Skip this many affected rows (depth order) before returning by_depth — pairs with limit to page a large blast radius.")),
+			mcp.WithNumber("limit", mcp.Description("Max affected rows to return in by_depth (default 100). by_depth_counts always reports the full per-depth totals.")),
 		),
 		s.handleDetectChanges,
 	)
@@ -265,7 +268,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 
 	impact := analysis.AnalyzeImpact(s.graph, symbolIDs, s.getCommunities(), s.getProcesses())
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	detectResult := map[string]any{
 		"changed_symbols":      diff.ChangedSymbols,
 		"changed_files":        diff.ChangedFiles,
 		"risk":                 impact.Risk,
@@ -275,7 +278,12 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		"affected_communities": impact.AffectedCommunities,
 		"test_files":           impact.TestFiles,
 		"total_affected":       impact.TotalAffected,
-	})
+	}
+	applyImpactDepthPaging(detectResult, impact.ByDepth,
+		req.GetBool("summary_only", false),
+		req.GetInt("offset", 0),
+		req.GetInt("limit", 100))
+	return s.respondJSONOrTOON(ctx, req, detectResult)
 }
 
 // handleEnhancedChangeImpact replaces the original explain_change_impact with risk tiering
@@ -303,6 +311,14 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		"total_affected":       impact.TotalAffected,
 		"cross_repo_impact":    impact.CrossRepoImpact,
 	}
+
+	// GNX-3: by_depth_counts is the headline; the heavy by_depth rows are
+	// paged (offset / limit) or dropped (summary_only) so the agent gets the
+	// "47 affected, 3 at depth-1" summary by default and the rows on demand.
+	applyImpactDepthPaging(result, impact.ByDepth,
+		req.GetBool("summary_only", false),
+		req.GetInt("offset", 0),
+		req.GetInt("limit", 100))
 
 	// Include per-repo grouping when cross-repo impact is detected.
 	if impact.CrossRepoImpact {

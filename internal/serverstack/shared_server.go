@@ -444,6 +444,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	gortexmcp.Version = cfg.Version
 	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, conf.Guards.Rules, multiOpts...)
 	srv.SetArchitecture(conf.Architecture)
+	srv.SetEventRules(conf.Events.Rules)
 	srv.SetArtifacts(conf.Artifacts)
 	srv.SetNamedQueries(conf.Queries)
 	srv.SetSearchConfig(conf.Search)
