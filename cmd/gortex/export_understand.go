@@ -187,8 +187,6 @@ func indexRepoInProcess(root string, logger *zap.Logger) (graph.Store, error) {
 	languages.RegisterCustomGrammars(reg, cfg.Index.Grammars, logger)
 	languages.RegisterExtractorPlugins(reg, cfg.Index.ExtractorPlugins, logger)
 	languages.RegisterFallbackChunkers(reg, cfg.Index.FallbackChunkers, logger)
-	languages.ConfigureTemporalEnvHelpers(reg, config.LoadLocalTemporalEnvHelpers(root))
-	languages.ConfigureTemporalJavaInvokers(reg, config.LoadLocalTemporalJavaInvokers(root), config.LoadLocalTemporalJavaInvokerMethods(root))
 	idx := indexer.New(g, reg, cfg.Index, logger)
 	if _, err := idx.IndexCtx(context.Background(), root); err != nil {
 		return nil, fmt.Errorf("indexing %s: %w", root, err)
