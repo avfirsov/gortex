@@ -75,12 +75,13 @@ func (i *fileSymbolIndex) finalise() {
 	})
 }
 
-// find returns (symbol_id, name) for the smallest enclosing symbol
-// whose [StartLine, EndLine] range covers `line`. Lines are 1-based;
-// graph nodes store the same convention.
-func (i *fileSymbolIndex) find(line int) (string, string) {
+// smallestEnclosing returns the narrowest symbol whose [StartLine,
+// EndLine] range covers `line`, or nil when no symbol does. Lines are
+// 1-based; graph nodes store the same convention. syms is sorted by
+// StartLine ascending, so the scan can stop once StartLine passes line.
+func (i *fileSymbolIndex) smallestEnclosing(line int) *graph.Node {
 	if i == nil {
-		return "", ""
+		return nil
 	}
 	var best *graph.Node
 	bestSpan := int(^uint(0) >> 1)
@@ -97,10 +98,47 @@ func (i *fileSymbolIndex) find(line int) (string, string) {
 			bestSpan = span
 		}
 	}
+	return best
+}
+
+// find returns (symbol_id, name) for the smallest enclosing symbol
+// whose [StartLine, EndLine] range covers `line`.
+func (i *fileSymbolIndex) find(line int) (string, string) {
+	best := i.smallestEnclosing(line)
 	if best == nil {
 		return "", ""
 	}
 	return best.ID, best.Name
+}
+
+// enclosingForRange returns the symbols that enclose any line in the
+// inclusive [start, end] range, choosing the smallest enclosing symbol
+// at each covered line — so a range inside one function yields that
+// function, while a range spanning two functions yields both. Results
+// are deduplicated by node ID and returned in first-seen (top-down)
+// order. A degenerate range (end < start) collapses to the single
+// start line.
+func (i *fileSymbolIndex) enclosingForRange(start, end int) []*graph.Node {
+	if i == nil {
+		return nil
+	}
+	if end < start {
+		end = start
+	}
+	seen := make(map[string]struct{})
+	var out []*graph.Node
+	for line := start; line <= end; line++ {
+		best := i.smallestEnclosing(line)
+		if best == nil {
+			continue
+		}
+		if _, ok := seen[best.ID]; ok {
+			continue
+		}
+		seen[best.ID] = struct{}{}
+		out = append(out, best)
+	}
+	return out
 }
 
 // enclosingName derives the enclosing owner of a node -- the symbol
