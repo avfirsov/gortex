@@ -94,6 +94,23 @@ func DefaultConfig() Config {
 				Priority:  1,
 				Enabled:   true,
 			},
+			{
+				// scip-java (Sourcegraph) builds the whole Maven/Gradle
+				// reactor once with the SemanticDB compiler plugin and
+				// emits a precise, project-wide SCIP index — the scalable
+				// path for large multi-module Java where the jdtls LSP's
+				// per-symbol hover doesn't finish (importing a 100-module
+				// reactor OOMs/hangs). Higher priority than the jdtls spec
+				// (priority 6) so it wins for Java when both are available;
+				// gated on the `scip-java` binary being on PATH, so this is
+				// a no-op when it isn't installed (like scip-go/ts/python).
+				Name:      "scip-java",
+				Command:   "scip-java",
+				Args:      []string{"index"},
+				Languages: []string{"java"},
+				Priority:  2,
+				Enabled:   true,
+			},
 		},
 	}
 	cfg.Providers = append(cfg.Providers, defaultLSPProviders()...)
