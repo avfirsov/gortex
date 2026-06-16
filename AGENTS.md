@@ -30,35 +30,6 @@
 **не обязательно** перечислять все хелперы — список нужен лишь чтобы **сделать конкретный хелпер
 видимым по умолчанию**.
 
-### jdtls does NOT scale to a whole multi-module reactor — use scip-java
-
-Measured on Drools: jdtls **completes per-module** (e.g. `drools-io`, 16 files:
-~8 min, RSS ~2 GB, `nodes_enriched=37 confirmed=78 added=29`) but **hangs on the
-full reactor** — one jdtls instance trying to import all ~100 Maven modules
-crashes and the reconnect re-attempts the same impossible import, idling forever
-(seen: 78 min, 4 min CPU, 18 MB RSS, 0 edges). Per-module × 100 ≈ 13 h at ~10%
-coverage — impractical.
-
-The scalable path is **scip-java** (Sourcegraph), now a first-class default
-provider (`internal/semantic/config.go`, priority 2 — wins over the jdtls spec).
-It builds the whole reactor **once** with the SemanticDB compiler plugin (Maven
-handles multi-module natively — no hang) and emits a precise, project-wide
-`index.scip`, which gortex's generic SCIP provider ingests (no per-symbol
-hover). Gated on the `scip-java` binary, so it's a no-op until installed. Recipe:
-
-```sh
-cs install scip-java                          # needs a JVM + coursier
-cd /mnt/d/code/drools && scip-java index      # one real Maven reactor build → ./index.scip
-gortex enrich semantic /mnt/d/code/drools     # scip-java (not jdtls) resolves Java;
-                                              # the SCIP provider also auto-ingests a
-                                              # pre-built ./index.scip / ./dump.scip
-```
-
-scip-java requires the project to **compile** (deps resolvable). For deep Java
-edges on a few key modules without a full build, the per-module jdtls route above
-is the fallback; the graph already carries full-coverage tree-sitter `java-types`
-edges regardless.
-
 ---
 
 ## 2. Как вести allow-list
