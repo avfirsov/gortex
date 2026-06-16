@@ -128,6 +128,15 @@ const (
 	// ControlEnrichCochange dispatches to Controller.EnrichCochange —
 	// co-change edge mining against the daemon's in-process graph.
 	ControlEnrichCochange = "enrich_cochange"
+	// ControlEnrichSemantic dispatches to Controller.EnrichSemantic —
+	// re-runs the language semantic providers (tree-sitter type
+	// resolvers and LSP servers such as jdtls) over the daemon's
+	// already-loaded graph, in place, without re-parsing or
+	// re-embedding. The change-gated warmup pass skips enrichment when
+	// nothing changed on disk, so a heavy LSP that can't share memory
+	// with a cold embedding pass never resolves edges on a warm
+	// restart; this drives it on demand against the live graph.
+	ControlEnrichSemantic = "enrich_semantic"
 )
 
 // TrackParams is the payload for ControlTrack.
@@ -347,6 +356,25 @@ type EnrichBlameParams struct {
 type EnrichBlameResult struct {
 	Nodes      int   `json:"nodes"`
 	DurationMS int64 `json:"duration_ms"`
+}
+
+// EnrichSemanticParams is the payload for ControlEnrichSemantic. Path
+// scopes the enrichment to a single tracked repo (matched by prefix,
+// abs path, or "" for "every tracked repo").
+type EnrichSemanticParams struct {
+	Path string `json:"path,omitempty"`
+}
+
+// EnrichSemanticResult aggregates the per-language semantic enrichment
+// outcome (one EnrichResult per provider) across every repo that
+// participated. Providers is the number of provider passes that ran.
+type EnrichSemanticResult struct {
+	Providers      int   `json:"providers"`
+	NodesEnriched  int   `json:"nodes_enriched"`
+	EdgesAdded     int   `json:"edges_added"`
+	EdgesConfirmed int   `json:"edges_confirmed"`
+	EdgesRefuted   int   `json:"edges_refuted"`
+	DurationMS     int64 `json:"duration_ms"`
 }
 
 // EnrichCoverageSegment mirrors coverage.Segment on the wire so the

@@ -317,6 +317,64 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 	return combined, nil
 }
 
+// EnrichSemantic re-runs the language semantic providers (LSP servers
+// such as jdtls and the in-process tree-sitter type resolvers) over the
+// daemon's already-loaded graph, in place, without re-parsing or
+// re-embedding.
+//
+// PURPOSE: the warmup pass only runs semantic enrichment when files
+// changed on disk (global_passes == changed_repos>0). A heavy LSP that
+// can't share a 10 GB box with a cold embedding pass therefore never
+// resolves edges on a warm restart, where nothing changed. This drives
+// Manager.EnrichAll directly on the live graph so the LSP runs on its
+// own memory budget after the embed pass has already flushed.
+//
+// RATIONALE: mirrors EnrichBlame — c.mu is held, targets resolve via the
+// multi-indexer, and the enricher mutates c.graph in place (new edges
+// persist through the same backend write path), so results are queryable
+// immediately and survive the next warm restart.
+//
+// KEYWORDS: enrich, semantic, lsp, jdtls, warm-restart, EnrichAll
+func (c *realController) EnrichSemantic(_ context.Context, p daemon.EnrichSemanticParams) (daemon.EnrichSemanticResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targets, err := c.resolveEnrichTargets(p.Path)
+	if err != nil {
+		return daemon.EnrichSemanticResult{}, err
+	}
+
+	started := time.Now()
+	var combined daemon.EnrichSemanticResult
+	for _, t := range targets {
+		idx := c.multiIndexer.GetIndexer(t.prefix)
+		if idx == nil {
+			continue
+		}
+		mgr := idx.SemanticManager()
+		if mgr == nil || !mgr.Enabled() || !mgr.HasProviders() {
+			continue
+		}
+		roots := map[string]string{t.prefix: t.root}
+		results, err := mgr.EnrichAll(c.graph, roots)
+		if err != nil {
+			return daemon.EnrichSemanticResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		for _, r := range results {
+			if r == nil {
+				continue
+			}
+			combined.Providers++
+			combined.NodesEnriched += r.NodesEnriched
+			combined.EdgesAdded += r.EdgesAdded
+			combined.EdgesConfirmed += r.EdgesConfirmed
+			combined.EdgesRefuted += r.EdgesRefuted
+		}
+	}
+	combined.DurationMS = time.Since(started).Milliseconds()
+	return combined, nil
+}
+
 // EnrichCoverage projects the caller-parsed cover-profile segments onto
 // the daemon's graph. The CLI parses the profile (the path is relative
 // to the caller's cwd, not the daemon's), so the daemon only needs the

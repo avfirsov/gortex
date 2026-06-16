@@ -124,6 +124,11 @@ type Controller interface {
 	// EnrichBlame runs the git-blame authorship enricher against the
 	// daemon's in-process graph. Same routing rationale as EnrichChurn.
 	EnrichBlame(ctx context.Context, params EnrichBlameParams) (EnrichBlameResult, error)
+	// EnrichSemantic re-runs the language semantic providers (LSP/jdtls
+	// + tree-sitter type resolvers) over the daemon's warm graph in
+	// place — used to pick up LSP-resolved edges on a warm restart,
+	// which the change-gated warmup pass otherwise skips.
+	EnrichSemantic(ctx context.Context, params EnrichSemanticParams) (EnrichSemanticResult, error)
 	// EnrichCoverage projects pre-parsed Go cover-profile segments onto
 	// the daemon's in-process graph. The CLI parses the profile so the
 	// daemon never reads the caller's filesystem.
@@ -668,6 +673,21 @@ func (s *Server) handleControl(_ *Session, req ControlRequest) ControlResponse {
 		buf, err := json.Marshal(result)
 		if err != nil {
 			return controlErr(ErrInternal, "marshal enrich_releases result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
+	case ControlEnrichSemantic:
+		var p EnrichSemanticParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := s.Controller.EnrichSemantic(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal enrich_semantic result: "+err.Error())
 		}
 		return ControlResponse{OK: true, Result: buf}
 
