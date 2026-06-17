@@ -1,7 +1,6 @@
 package languages
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -129,46 +128,8 @@ func htmlScriptIsJS(scriptType string) bool {
 // file node, and every line number is shifted by the body's offset within
 // the page so navigation lands on the real source line.
 func (e *HTMLExtractor) delegateInlineScript(body *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
-	content := []byte(body.Content(src))
-	if strings.TrimSpace(string(content)) == "" {
-		return
-	}
 	lineOffset := int(body.StartPoint().Row)
-	virtual := filePath + "#script:" + strconv.Itoa(lineOffset+1)
-	sub, err := e.js.Extract(virtual, content)
-	if err != nil || sub == nil {
-		return
-	}
-	for _, n := range sub.Nodes {
-		if n == nil || n.ID == virtual { // drop the synthetic file node
-			continue
-		}
-		n.FilePath = filePath
-		if n.StartLine > 0 {
-			n.StartLine += lineOffset
-		}
-		if n.EndLine > 0 {
-			n.EndLine += lineOffset
-		}
-		if n.Meta == nil {
-			n.Meta = map[string]any{}
-		}
-		n.Meta["inline_script"] = true
-		result.Nodes = append(result.Nodes, n)
-	}
-	for _, ed := range sub.Edges {
-		if ed == nil {
-			continue
-		}
-		if ed.From == virtual { // "file defines symbol" → the HTML file is the owner
-			ed.From = fileID
-		}
-		ed.FilePath = filePath
-		if ed.Line > 0 {
-			ed.Line += lineOffset
-		}
-		result.Edges = append(result.Edges, ed)
-	}
+	delegateInlineScriptSlice(e.js, []byte(body.Content(src)), lineOffset, filePath, fileID, "", result)
 }
 
 // extractElement checks elements for link tags (stylesheet imports) and id attributes.
