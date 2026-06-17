@@ -15,6 +15,10 @@ func RegisterAll(reg *parser.Registry) {
 	reg.Register(NewCExtractor())
 	reg.Register(NewCppExtractor())
 	reg.Register(NewHTMLExtractor())
+	// Vue single-file components — hand-written depth (carves <script>/<script
+	// setup> and delegates to TS/JS). Registered before registerForestLanguages
+	// so it claims .vue over the generic forest vue grammar.
+	reg.Register(NewVueExtractor())
 	reg.Register(NewCSSExtractor())
 	reg.Register(NewSQLExtractor())
 	reg.Register(NewKotlinExtractor())
