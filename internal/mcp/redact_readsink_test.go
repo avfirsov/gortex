@@ -33,3 +33,23 @@ func TestHandleReadFile_Redact(t *testing.T) {
 		t.Errorf("source code should not be redacted: did=%v", did)
 	}
 }
+
+func TestHandleGetSymbolSource_Redact(t *testing.T) {
+	s := &Server{} // nil configManager → redaction enabled by default
+
+	// A config-leaf value served as a symbol's source (a populated .env key)
+	// has its secret-shaped value withheld by default.
+	const src = "stripe_key: sk-0123456789abcdefghij0123456789\n"
+	out, did := s.maybeRedactConfigLeaf("dotenv", ".env", false, src)
+	if !did {
+		t.Fatalf("expected redaction of a config-leaf symbol value, got none: %q", out)
+	}
+	if strings.Contains(out, "sk-0123456789abcdefghij0123456789") {
+		t.Errorf("secret value survived redaction: %q", out)
+	}
+
+	// allow_secrets serves the value verbatim.
+	if raw, did := s.maybeRedactConfigLeaf("dotenv", ".env", true, src); did || raw != src {
+		t.Errorf("allow_secrets should serve verbatim: did=%v out=%q", did, raw)
+	}
+}
