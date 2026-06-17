@@ -21,9 +21,7 @@
 package store_sqlite
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"iter"
@@ -404,29 +402,8 @@ func (s *Store) prepare() error {
 	return err
 }
 
-// -- meta encode/decode ----------------------------------------------------
-
-func encodeMeta(m map[string]any) ([]byte, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(m); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func decodeMeta(b []byte) (map[string]any, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
-	var m map[string]any
-	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
+// encodeMeta / decodeMeta live in meta_json.go (JSON codec + the
+// metaWire typed DTO + the legacy-gob dual-read fallback).
 
 // -- row scanners ---------------------------------------------------------
 
