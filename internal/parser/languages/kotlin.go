@@ -331,6 +331,9 @@ func (e *KotlinExtractor) emitClassOrInterface(m parser.QueryResult, filePath, f
 
 	kind := graph.KindType
 	meta := map[string]any{"visibility": kotlinVisibility(def.Node, src)}
+	if _, kmpRole := kotlinModifierFlags(def.Node, src); kmpRole != "" {
+		meta["kmp_role"] = kmpRole
+	}
 	switch {
 	case isInterface:
 		kind = graph.KindInterface
@@ -430,6 +433,7 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 
 	doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar)
 	visibility := kotlinVisibility(def.Node, src)
+	isAsync, kmpRole := kotlinModifierFlags(def.Node, src)
 
 	ownerInfo := kotlinResolveMemberOwner(def.Node, src)
 	owner, ownerKind := ownerInfo.name, ownerInfo.kind
@@ -446,6 +450,7 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 			"receiver":   owner,
 			"visibility": visibility,
 		}
+		kotlinStampModMeta(meta, isAsync, kmpRole)
 		// Companion-object members dispatch on the TYPE (`Foo.create()`),
 		// so the method is attributed to the enclosing class and flagged
 		// static. Without this an agent can't see that the companion's
@@ -528,6 +533,7 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 	}
 	seen[id] = true
 	meta := map[string]any{"visibility": visibility}
+	kotlinStampModMeta(meta, isAsync, kmpRole)
 	if doc != "" {
 		meta["doc"] = doc
 	}
@@ -648,6 +654,46 @@ func kotlinVisibility(decl *sitter.Node, src []byte) string {
 		}
 	}
 	return VisibilityPublic
+}
+
+// kotlinModifierFlags scans a declaration's modifiers for the suspend
+// (coroutine) and expect/actual (Kotlin Multiplatform) keywords.
+func kotlinModifierFlags(decl *sitter.Node, src []byte) (isAsync bool, kmpRole string) {
+	if decl == nil {
+		return false, ""
+	}
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		c := decl.Child(i)
+		if c == nil || c.Type() != "modifiers" {
+			continue
+		}
+		for j := 0; j < int(c.ChildCount()); j++ {
+			tok := c.Child(j)
+			if tok == nil {
+				continue
+			}
+			switch strings.TrimSpace(tok.Content(src)) {
+			case "suspend":
+				isAsync = true
+			case "expect":
+				kmpRole = "expect"
+			case "actual":
+				kmpRole = "actual"
+			}
+		}
+	}
+	return isAsync, kmpRole
+}
+
+// kotlinStampModMeta records the async and Kotlin-Multiplatform role flags on a
+// declaration node's Meta.
+func kotlinStampModMeta(meta map[string]any, isAsync bool, kmpRole string) {
+	if isAsync {
+		meta["is_async"] = true
+	}
+	if kmpRole != "" {
+		meta["kmp_role"] = kmpRole
+	}
 }
 
 func (e *KotlinExtractor) emitImport(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
