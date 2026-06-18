@@ -40,7 +40,6 @@ type fakeController struct {
 	enrichBlameCalls    []EnrichBlameParams
 	enrichCoverageCalls []EnrichCoverageParams
 	enrichCochangeCalls []EnrichCochangeParams
-	enrichSemanticCalls []EnrichSemanticParams
 }
 
 func (f *fakeController) Track(_ context.Context, p TrackParams) (json.RawMessage, error) {
@@ -118,13 +117,6 @@ func (f *fakeController) EnrichBlame(_ context.Context, p EnrichBlameParams) (En
 	defer f.mu.Unlock()
 	f.enrichBlameCalls = append(f.enrichBlameCalls, p)
 	return EnrichBlameResult{Nodes: 5}, nil
-}
-
-func (f *fakeController) EnrichSemantic(_ context.Context, p EnrichSemanticParams) (EnrichSemanticResult, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.enrichSemanticCalls = append(f.enrichSemanticCalls, p)
-	return EnrichSemanticResult{Providers: 1, NodesEnriched: 3, EdgesAdded: 7}, nil
 }
 
 func (f *fakeController) EnrichCoverage(_ context.Context, p EnrichCoverageParams) (EnrichCoverageResult, error) {
@@ -281,16 +273,6 @@ func TestDaemon_ControlEnrichDispatch(t *testing.T) {
 	require.NoError(t, json.Unmarshal(coResp.Result, &coOut))
 	assert.Equal(t, 11, coOut.Edges)
 
-	// semantic (LSP/jdtls re-enrich on the warm graph)
-	semResp, err := c.Control(ControlEnrichSemantic, EnrichSemanticParams{Path: "/r"})
-	require.NoError(t, err)
-	require.True(t, semResp.OK, "semantic: %+v", semResp)
-	var semOut EnrichSemanticResult
-	require.NoError(t, json.Unmarshal(semResp.Result, &semOut))
-	assert.Equal(t, 1, semOut.Providers)
-	assert.Equal(t, 3, semOut.NodesEnriched)
-	assert.Equal(t, 7, semOut.EdgesAdded)
-
 	ctrl.mu.Lock()
 	defer ctrl.mu.Unlock()
 	require.Len(t, ctrl.enrichChurnCalls, 1)
@@ -301,8 +283,6 @@ func TestDaemon_ControlEnrichDispatch(t *testing.T) {
 	require.Len(t, ctrl.enrichCoverageCalls, 1)
 	assert.Len(t, ctrl.enrichCoverageCalls[0].Segments, 2)
 	require.Len(t, ctrl.enrichCochangeCalls, 1)
-	require.Len(t, ctrl.enrichSemanticCalls, 1)
-	assert.Equal(t, "/r", ctrl.enrichSemanticCalls[0].Path)
 }
 
 func TestDaemon_ProtocolMismatchRejected(t *testing.T) {

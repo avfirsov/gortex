@@ -68,24 +68,6 @@ var enrichCochangeCmd = &cobra.Command{
 	RunE:  runEnrichCochange,
 }
 
-var enrichSemanticCmd = &cobra.Command{
-	Use:   "semantic [path]",
-	Short: "Re-run language semantic providers (LSP/jdtls + type resolvers) over the daemon's warm graph",
-	Long: `Re-runs the configured semantic enrichment providers — the
-in-process tree-sitter type resolvers and LSP servers such as jdtls —
-over the daemon's already-loaded graph, in place, without re-parsing or
-re-embedding.
-
-The daemon's warmup only runs semantic enrichment when files changed on
-disk, so a heavy LSP (e.g. jdtls importing a large Maven project) that
-can't share memory with a cold embedding pass never runs on a warm
-restart. This command drives that enrichment on demand against the live
-graph, so the LSP runs on its own memory budget and its resolved edges
-land in the warm store.`,
-	Args: cobra.MaximumNArgs(1),
-	RunE: runEnrichSemantic,
-}
-
 var (
 	enrichAllBlame    bool
 	enrichAllReleases bool
@@ -127,7 +109,6 @@ func init() {
 	enrichCmd.AddCommand(enrichCoverageCmd)
 	enrichCmd.AddCommand(enrichReleasesCmd)
 	enrichCmd.AddCommand(enrichCochangeCmd)
-	enrichCmd.AddCommand(enrichSemanticCmd)
 	enrichCmd.AddCommand(enrichAllCmd)
 	rootCmd.AddCommand(enrichCmd)
 }
@@ -209,39 +190,6 @@ func runEnrichBlame(cmd *cobra.Command, args []string) error {
 		"duration_ms": out.DurationMS,
 		"path":        abs,
 		"mode":        "daemon",
-	})
-}
-
-func runEnrichSemantic(cmd *cobra.Command, args []string) error {
-	abs, err := enrichAbsPath(args)
-	if err != nil {
-		return err
-	}
-	if !daemon.IsRunning() {
-		return errNoDaemon
-	}
-	c, err := dialEnrichDaemon("cli-enrich-semantic")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close() }()
-
-	var out daemon.EnrichSemanticResult
-	if err := controlEnrich(c, daemon.ControlEnrichSemantic, daemon.EnrichSemanticParams{Path: abs}, &out); err != nil {
-		return err
-	}
-	sp := newCLISpinner(cmd, "Semantic enrichment via daemon")
-	sp.Set("", fmt.Sprintf("%d providers, %d nodes, +%d edges", out.Providers, out.NodesEnriched, out.EdgesAdded))
-	sp.Done()
-	return printEnrichResult(map[string]any{
-		"providers":       out.Providers,
-		"nodes_enriched":  out.NodesEnriched,
-		"edges_added":     out.EdgesAdded,
-		"edges_confirmed": out.EdgesConfirmed,
-		"edges_refuted":   out.EdgesRefuted,
-		"duration_ms":     out.DurationMS,
-		"path":            abs,
-		"mode":            "daemon",
 	})
 }
 

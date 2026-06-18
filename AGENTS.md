@@ -96,3 +96,43 @@ gortex analyze --kind temporal_verify --path . --format json
 Для dispatch-шейпов, остающихся `broken_dispatch` и не закрытых ничем выше, —
 `docs/temporal-compare/temporal-gap-synthetic-fixtures.md`: какие минимальные анонимизированные
 фикстуры отдать OSS-стороне, чтобы дорезолвить либу.
+
+---
+
+## DECISION (2026-06-16): Java resolution stays source-only — jdtls / scip-java consciously declined
+
+For this fork's workflow we **deliberately do NOT use a compiler-backed Java
+resolver** (neither the jdtls LSP nor scip-java). gortex's source-only pipeline
+(tree-sitter + the in-process `java-types` resolver) is the chosen level of
+fidelity. The whole point here is to **browse a project without compiling it**,
+and the source graph already delivers that.
+
+**Why (measured on Drools, 219k nodes / 1,013,593 edges, zero compilation):**
+the graph already carries the full Java edge shape from source —
+`calls: 379,638`, `typed_as: 51,794`, `implements: 22,635`, `extends: 3,213`,
+`overrides: 2,249`, plus returns / throws / annotated / member_of. That is
+plenty for navigation, usages, call chains, architecture, semantic search.
+
+**What a compiler resolver would have added, and why we skip it:**
+- jdtls / scip-java only sharpen the *ambiguous* subset (overload resolution,
+  generic/inferred types, inherited & dependency-classpath members, exact scope
+  binding). On `drools-io` jdtls scored `confirmed=78 added=29 refuted=0`
+  (~10 % coverage) — i.e. it confirmed the heuristic (refuted=0 ⇒ source edges
+  weren't *wrong*, just incomplete on hard cases). Marginal for browsing.
+- **scip-java requires compiling the whole project** (SemanticDB build) — a hard
+  no for the "view without compilation" goal.
+- **jdtls does not scale**: one LSP instance importing a ~100-module Maven
+  reactor crashes and the reconnect re-imports forever (observed: 78 min, 0
+  edges). It only completes per-module (~8 min each → ~13 h for the reactor).
+
+**What this means operationally:** run the daemon with `GORTEX_LSP_DISABLE=all`
+(no jdtls auto-register). The source-only `java-types` resolver runs during
+normal indexing and gives 100 % coverage in milliseconds — that is the Java
+enrichment the graph actually relies on. Re-verified 2026-06-18 on the
+post-merge binary: jdtls scores ~8 % coverage (`drools-util`: 109/1308 nodes,
+`refuted=0` / `hover_err=0` — it never contradicts source edges), ~3 min per
+small module, and **hung in post-hover processing** — marginal benefit at an
+impractical, unreliable cost. The fork's `gortex enrich semantic` command and
+the jdtls two-pass recipe (whose only purpose was driving jdtls on a warm graph)
+were therefore **removed (2026-06-18)**. The scip-java default provider was
+added (`afcfc65`) and then **reverted (`d498dfb`)** per this same decision.
