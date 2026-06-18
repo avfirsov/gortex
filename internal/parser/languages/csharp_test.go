@@ -173,11 +173,21 @@ public struct Point {
 	fields := nodesOfKind(result.Nodes, graph.KindField)
 	assert.Len(t, fields, 2)
 
-	memberEdges := edgesOfKind(result.Edges, graph.EdgeMemberOf)
-	assert.Len(t, memberEdges, 2)
-	for _, e := range memberEdges {
-		assert.Equal(t, "Types.cs::Point", e.To)
+	// Enum members are navigable nodes with their own MemberOf edges.
+	members := nodesOfKind(result.Nodes, graph.KindEnumMember)
+	assert.Len(t, members, 2, "Active + Inactive")
+
+	pointMembers, statusMembers := 0, 0
+	for _, e := range edgesOfKind(result.Edges, graph.EdgeMemberOf) {
+		switch e.To {
+		case "Types.cs::Point":
+			pointMembers++
+		case "Types.cs::Status":
+			statusMembers++
+		}
 	}
+	assert.Equal(t, 2, pointMembers, "struct fields belong to Point")
+	assert.Equal(t, 2, statusMembers, "enum members belong to Status")
 }
 
 func TestCSharpExtractor_Constructor(t *testing.T) {
@@ -597,4 +607,47 @@ class Panel : Widget {}`)
 		assert.Equal(t, []string{"IFoo"},
 			edgeTargetNames(result.Edges, "RS.cs::RS", graph.EdgeImplements))
 	})
+}
+
+// TestCSharpEnumMembersConstsAndFlags is the C8 test: enum members extract as
+// navigable nodes (with values), `const` fields classify as constants,
+// async/static/readonly/value-type flags are stamped, and types/methods carry
+// their namespace scope.
+func TestCSharpEnumMembersConstsAndFlags(t *testing.T) {
+	src := []byte("namespace App.Core {\n" +
+		"  public enum Color { Red, Green = 5, Blue }\n" +
+		"  public struct Point { public int X; }\n" +
+		"  public class C {\n" +
+		"    public const int MAX = 10;\n" +
+		"    private static readonly int Y = 1;\n" +
+		"    public async Task<int> FetchAsync() { return 1; }\n" +
+		"    public static void Helper() {}\n" +
+		"  }\n}\n")
+	res, err := NewCSharpExtractor().Extract("a.cs", src)
+	require.NoError(t, err)
+
+	byName := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		byName[n.Name] = n
+	}
+
+	// Enum members.
+	for _, m := range []string{"Red", "Green", "Blue"} {
+		require.NotNil(t, byName[m], "enum member %s should be a node", m)
+		assert.Equal(t, graph.KindEnumMember, byName[m].Kind)
+	}
+	assert.Equal(t, "5", byName["Green"].Meta["value"], "explicit enum value")
+
+	// const → constant; flags.
+	require.NotNil(t, byName["MAX"])
+	assert.Equal(t, graph.KindConstant, byName["MAX"].Kind, "const field classifies as a constant")
+	assert.Equal(t, true, byName["Y"].Meta["static"])
+	assert.Equal(t, true, byName["Y"].Meta["readonly"])
+	assert.Equal(t, true, byName["FetchAsync"].Meta["async"])
+	assert.Equal(t, true, byName["Helper"].Meta["static"])
+
+	// value type + namespace scope.
+	assert.Equal(t, true, byName["Point"].Meta["value_type"], "struct is a value type")
+	assert.Equal(t, "App.Core", byName["C"].Meta["scope_ns"])
+	assert.Equal(t, "App.Core", byName["FetchAsync"].Meta["scope_ns"])
 }

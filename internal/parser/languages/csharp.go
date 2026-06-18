@@ -396,6 +396,16 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	}
 	seen[id] = true
 	meta := map[string]any{"visibility": csharpVisibility(def.Node, src, VisibilityInternal)}
+	// A struct is a value type; record struct too. Surfacing it lets a
+	// consumer reason about copy-vs-reference semantics.
+	if kind == "struct" {
+		meta["value_type"] = true
+	}
+	// Namespace scope so a type in `namespace App.Core` is attributable
+	// without re-deriving its enclosing namespace from source.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
@@ -417,7 +427,98 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	switch kind {
 	case "class", "struct", "record":
 		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, result)
+	case "enum":
+		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
+}
+
+// emitCSharpEnumMembers emits one KindEnumMember per `enum_member_declaration`
+// in an enum body, with its explicit value (when given) and a MemberOf edge to
+// the enum — so an enum's members are navigable symbols, not lost in the type.
+func (e *CSharpExtractor) emitCSharpEnumMembers(enumNode *sitter.Node, src []byte, filePath, enumID, enumName string, result *parser.ExtractionResult, seen map[string]bool) {
+	var list *sitter.Node
+	for i := 0; i < int(enumNode.ChildCount()); i++ {
+		if c := enumNode.Child(i); c != nil && c.Type() == "enum_member_declaration_list" {
+			list = c
+			break
+		}
+	}
+	if list == nil {
+		return
+	}
+	for i := 0; i < int(list.NamedChildCount()); i++ {
+		mem := list.NamedChild(i)
+		if mem.Type() != "enum_member_declaration" {
+			continue
+		}
+		var nameNode, valNode *sitter.Node
+		if nn := mem.ChildByFieldName("name"); nn != nil {
+			nameNode = nn
+		}
+		for j := 0; j < int(mem.NamedChildCount()); j++ {
+			c := mem.NamedChild(j)
+			if c.Type() == "identifier" && nameNode == nil {
+				nameNode = c
+			} else if c != mem.ChildByFieldName("name") && c.Type() != "identifier" {
+				valNode = c
+			}
+		}
+		if nameNode == nil {
+			continue
+		}
+		mname := nameNode.Content(src)
+		line := int(mem.StartPoint().Row) + 1
+		id, ok := disambiguateID(seen, filePath+"::"+enumName+"."+mname, line)
+		if !ok {
+			continue
+		}
+		emeta := map[string]any{"enum": enumID, "receiver": enumName}
+		if valNode != nil {
+			emeta["value"] = strings.TrimSpace(valNode.Content(src))
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindEnumMember, Name: mname,
+			FilePath: filePath, StartLine: line, EndLine: line, Language: "csharp", Meta: emeta,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: enumID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: line,
+		})
+	}
+}
+
+// csharpHasModifier reports whether a declaration carries the given modifier
+// keyword (const / static / async / readonly / …).
+func csharpHasModifier(decl *sitter.Node, src []byte, mod string) bool {
+	if decl == nil {
+		return false
+	}
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		c := decl.Child(i)
+		if c != nil && c.Type() == "modifier" && strings.TrimSpace(c.Content(src)) == mod {
+			return true
+		}
+	}
+	return false
+}
+
+// csharpEnclosingNamespace returns the dotted name of the nearest enclosing
+// namespace declaration (block or file-scoped), or "".
+func csharpEnclosingNamespace(node *sitter.Node, src []byte) string {
+	for n := node; n != nil; n = n.Parent() {
+		t := n.Type()
+		if t == "namespace_declaration" || t == "file_scoped_namespace_declaration" {
+			if nm := n.ChildByFieldName("name"); nm != nil {
+				return strings.TrimSpace(nm.Content(src))
+			}
+			for i := 0; i < int(n.NamedChildCount()); i++ {
+				c := n.NamedChild(i)
+				if c.Type() == "identifier" || c.Type() == "qualified_name" {
+					return strings.TrimSpace(c.Content(src))
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // emitAnonymousType indexes a C# anonymous type — `new { Name = ..., Age = ... }`
@@ -575,6 +676,15 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if rt := extractCSharpMethodReturnType(def.Node, src, name); rt != "" {
 		meta["return_type"] = rt
 	}
+	if csharpHasModifier(def.Node, src, "async") {
+		meta["async"] = true
+	}
+	if csharpHasModifier(def.Node, src, "static") {
+		meta["static"] = true
+	}
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
@@ -653,11 +763,24 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	if t := def.Node.ChildByFieldName("type"); t != nil {
 		meta["field_type"] = strings.TrimSpace(t.Content(src))
 	}
+	// A `const` field is a compile-time constant, not a mutable field —
+	// classify it as KindConstant so it joins the value-reference impact
+	// surface. `static` / `readonly` are stamped for completeness.
+	fieldKind := graph.KindField
+	if csharpHasModifier(def.Node, src, "const") {
+		fieldKind = graph.KindConstant
+	}
+	if csharpHasModifier(def.Node, src, "static") {
+		meta["static"] = true
+	}
+	if csharpHasModifier(def.Node, src, "readonly") {
+		meta["readonly"] = true
+	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
-		ID: id, Kind: graph.KindField, Name: name,
+		ID: id, Kind: fieldKind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "csharp",
 		Meta:     meta,
