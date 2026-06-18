@@ -80,22 +80,33 @@ func NewRollup(t time.Time) *Rollup {
 	return &Rollup{Day: DayKey(t), Counts: map[string]int{}}
 }
 
+// metricName resolves an allow-listed (key, dim) pair to its counter name. ok
+// is false when key is not on the allow-list. A dimension that is not a bounded
+// token is dropped, so the bare key is returned — the path/name guard. This is
+// the single place the allow-list and dimension sanitiser are applied, shared
+// by Rollup.Add and the Recorder so they cannot diverge.
+func metricName(key, dim string) (name string, ok bool) {
+	if !allowedMetrics[key] {
+		return "", false
+	}
+	if d := safeDim(dim); d != "" {
+		return key + ":" + d, true
+	}
+	return key, true
+}
+
 // Add increments the counter for an allow-listed metric, optionally qualified
 // by a dimension (a bucket label or a fixed enum like a tool name). It returns
 // whether the event counted: a key not on the allow-list is silently dropped,
 // and a dimension that is not a bounded token is discarded (the bare key still
-// counts). This is the single mutation point, so the allow-list and dimension
-// guard are unavoidable.
+// counts).
 func (r *Rollup) Add(key, dim string) bool {
-	if !allowedMetrics[key] {
+	name, ok := metricName(key, dim)
+	if !ok {
 		return false
 	}
 	if r.Counts == nil {
 		r.Counts = map[string]int{}
-	}
-	name := key
-	if d := safeDim(dim); d != "" {
-		name = key + ":" + d
 	}
 	r.Counts[name]++
 	return true

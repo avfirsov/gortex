@@ -32,6 +32,7 @@ import (
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/server/hub"
+	"github.com/zzet/gortex/internal/telemetry"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -106,9 +107,13 @@ type Server struct {
 	scopeWorkspace string
 	scopeProject   string
 	logger         *zap.Logger
-	communities    *analysis.CommunityResult
-	processes      *analysis.ProcessResult
-	pageRank       *analysis.PageRankResult
+	// recorder counts allow-listed, consent-gated usage telemetry. nil or
+	// disabled when telemetry is off; Record is nil-safe and fail-silent so
+	// the dispatch hot path never branches on it.
+	recorder    *telemetry.Recorder
+	communities *analysis.CommunityResult
+	processes   *analysis.ProcessResult
+	pageRank    *analysis.PageRankResult
 	// hits holds the HITS authority/hub scores over the call graph.
 	// Authority measures "depended on by load-bearing code"; the
 	// search rerank consumes it as a complement to raw fan-in.
@@ -2097,6 +2102,19 @@ func (s *Server) effectiveContractRegistry() *contracts.Registry {
 // SetSemanticManager sets the semantic enrichment manager for the MCP server.
 func (s *Server) SetSemanticManager(m *semantic.Manager) {
 	s.semanticMgr = m
+}
+
+// SetTelemetryRecorder installs the consent-gated usage recorder. Passing a
+// disabled or nil recorder leaves telemetry off; the dispatch path is unchanged
+// either way because Record is nil-safe and fail-silent.
+func (s *Server) SetTelemetryRecorder(r *telemetry.Recorder) {
+	s.recorder = r
+}
+
+// FlushTelemetry persists any buffered usage counts. Called on daemon
+// shutdown; a no-op when telemetry is off.
+func (s *Server) FlushTelemetry() {
+	s.recorder.Flush()
 }
 
 // SemanticManager returns the semantic enrichment manager.

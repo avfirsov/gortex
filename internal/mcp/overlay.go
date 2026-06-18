@@ -139,6 +139,10 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 			qStart = time.Now()
 		}
 		res, hErr := h(ctx, req)
+		// Opt-in usage telemetry: count this tool invocation by name only —
+		// never arguments or results. nil-safe, consent-gated, and fail-silent,
+		// so a disabled or absent recorder adds nothing to the dispatch path.
+		s.recorder.Record("mcp_tool_call", req.Params.Name)
 		if logQuery {
 			s.queryLog.record(s, ctx, req, res, hErr, qStart)
 		}
