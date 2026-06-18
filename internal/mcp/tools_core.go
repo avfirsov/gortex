@@ -2007,9 +2007,13 @@ func (s *Server) handleGetCallChain(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	id, err := s.symbolIDArg(ctx, req)
+	target, err := req.RequireString("id")
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
+	}
+	id, candidates := s.resolveSymbolTarget(ctx, target)
+	if len(candidates) > 0 {
+		return s.symbolDisambiguationResult(ctx, req, "get_callers", target, candidates)
 	}
 	minTier := req.GetString("min_tier", "")
 	scopeWS, scopeProj := s.scopeFromRequest(ctx, &req)
