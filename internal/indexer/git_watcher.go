@@ -167,10 +167,46 @@ func (gw *GitWatcher) scheduleReconcile(trigger string) {
 	})
 }
 
+// gitWatcherScopedResolveMaxFiles caps how many changed files a ref
+// reconcile resolves through the scoped incremental path before it
+// falls back to a single whole-graph ResolveAll. Below the cap a
+// commit-sized change resolves only its own files (and their incoming
+// refs) -- the same path edit_file uses; above it (branch switches,
+// large merges) one amortised whole-graph pass beats many per-file
+// resolves. A package var so tests can lower it to exercise the
+// fallback.
+var gitWatcherScopedResolveMaxFiles = 100
+
+// changedAbsPaths collects the absolute on-disk paths a diff touched --
+// the new path for every status plus the old path of a rename --
+// deduplicated. Disk existence is resolved later by
+// IncrementalReindexPaths: a path present on disk is reindexed, one
+// absent is evicted, so a delete needs no special-casing here.
+func (gw *GitWatcher) changedAbsPaths(changes []gitChange) []string {
+	seen := make(map[string]struct{}, len(changes)+4)
+	out := make([]string, 0, len(changes)+4)
+	add := func(rel string) {
+		if rel == "" {
+			return
+		}
+		abs := filepath.Join(gw.repoPath, rel)
+		if _, ok := seen[abs]; ok {
+			return
+		}
+		seen[abs] = struct{}{}
+		out = append(out, abs)
+	}
+	for _, c := range changes {
+		add(c.Path)
+		add(c.OldPath)
+	}
+	return out
+}
+
 // reconcile reads the current HEAD SHA, diffs against the previously
 // seen SHA via `git diff --name-status`, and dispatches
-// EvictFile / IndexFileNoResolve per path. Runs ResolveAll once at
-// the end. Silently no-ops when HEAD hasn't moved — branches can
+// the changed paths to a scoped reindex + resolve (whole-graph only
+// above gitWatcherScopedResolveMaxFiles). Silently no-ops when HEAD hasn't moved — branches can
 // touch packed-refs without the resolved commit actually changing.
 func (gw *GitWatcher) reconcile(trigger string) {
 	// Single-flight: one reconcile at a time. A ref change observed
@@ -239,12 +275,30 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		return
 	}
 
-	patched := gw.applyChanges(changes)
-
-	// Re-run the global resolver once after the batch. Skipping the
-	// per-file resolver during applyChanges is what makes this fast
-	// on 500-file branch switches.
-	gw.indexer.ResolveAll()
+	// Resolve the batch. A commit-sized change set resolves only the
+	// files it touched (and their incoming refs) through the scoped
+	// incremental path -- the same one edit_file / fsnotify saves use --
+	// instead of a whole-graph ResolveAll that costs O(graph) no matter
+	// how few files moved. A large change set (branch switch, big merge)
+	// still takes one amortised whole-graph pass, where skipping the
+	// per-file resolver in applyChanges is the better trade.
+	changedPaths := gw.changedAbsPaths(changes)
+	var patched int
+	switch {
+	case len(changedPaths) > gitWatcherScopedResolveMaxFiles:
+		patched = gw.applyChanges(changes)
+		gw.indexer.ResolveAll()
+	default:
+		res, rerr := gw.indexer.IncrementalReindexPaths(gw.repoPath, changedPaths)
+		if rerr != nil {
+			gw.logger.Warn("git-watcher: scoped reindex failed, falling back to whole-graph resolve",
+				zap.String("trigger", trigger), zap.Error(rerr))
+			patched = gw.applyChanges(changes)
+			gw.indexer.ResolveAll()
+		} else {
+			patched = res.StaleFileCount + res.DeletedFileCount
+		}
+	}
 
 	gw.mu.Lock()
 	gw.lastSHA = newSHA
