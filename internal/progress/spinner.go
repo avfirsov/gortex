@@ -202,10 +202,11 @@ func (m meshModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m meshModel) View() string {
+	g := activeGlyphs()
 	switch m.state {
 	case meshDone:
 		return fmt.Sprintf("  %s  %s   %s\n",
-			styleOK.Render("✓"),
+			styleOK.Render(g.OK),
 			styleLabel.Render(m.label),
 			styleSub.Render(m.sub),
 		)
@@ -215,7 +216,7 @@ func (m meshModel) View() string {
 			sub = m.err.Error()
 		}
 		return fmt.Sprintf("  %s  %s   %s\n",
-			styleX.Render("✗"),
+			styleX.Render(g.Fail),
 			styleLabel.Render(m.label),
 			styleSub.Render(sub),
 		)
@@ -360,14 +361,15 @@ func (s *Spinner) finish(state meshState, err error) {
 		s.mu.Lock()
 		label := s.label
 		s.mu.Unlock()
+		g := activeGlyphs()
 		if state == meshFailed {
 			msg := label
 			if err != nil {
 				msg = fmt.Sprintf("%s: %v", label, err)
 			}
-			_, _ = fmt.Fprintf(s.w, "  ✗ %s\n", msg)
+			_, _ = fmt.Fprintf(s.w, "  %s %s\n", g.Fail, msg)
 		} else {
-			_, _ = fmt.Fprintf(s.w, "  ✓ %s\n", label)
+			_, _ = fmt.Fprintf(s.w, "  %s %s\n", g.OK, label)
 		}
 		return
 	}

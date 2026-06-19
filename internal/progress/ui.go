@@ -25,8 +25,10 @@ var (
 	styleHint    = lipgloss.NewStyle().Foreground(colMuted).Italic(true)
 	styleStep    = lipgloss.NewStyle().Foreground(colInfoSoft)
 	styleStrong  = lipgloss.NewStyle().Foreground(colFg).Bold(true)
-	styleBox     = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+	// styleBox carries everything but the border charset; Card applies the
+	// active (rounded or ASCII) border at render time so an OEM-codepage
+	// terminal gets a box it can actually draw.
+	styleBox = lipgloss.NewStyle().
 			BorderForeground(colBorder).
 			Padding(0, 1)
 )
@@ -36,7 +38,7 @@ var (
 func Heading(title string, count ...string) string {
 	t := styleHeading.Render(strings.ToLower(title))
 	if len(count) > 0 && count[0] != "" {
-		t += "   " + styleCount.Render("· "+count[0])
+		t += "   " + styleCount.Render(activeGlyphs().Sep+" "+count[0])
 	}
 	return t
 }
@@ -63,8 +65,9 @@ func Chips(items []string, width int) string {
 	if len(items) == 0 {
 		return ""
 	}
+	sep := " " + activeGlyphs().Sep + " "
 	if width <= 0 {
-		return styleVal.Render(strings.Join(items, " · "))
+		return styleVal.Render(strings.Join(items, sep))
 	}
 	// Width-aware multi-line wrap.
 	var lines []string
@@ -72,7 +75,7 @@ func Chips(items []string, width int) string {
 	for i, it := range items {
 		piece := it
 		if i > 0 {
-			piece = " · " + piece
+			piece = sep + piece
 		}
 		if cur.Len()+lipgloss.Width(piece) > width && cur.Len() > 0 {
 			lines = append(lines, cur.String())
@@ -119,9 +122,9 @@ func Stat(value, unit string, sev StatSeverity) string {
 	return v + " " + styleVal.Render(unit)
 }
 
-// StatStrip renders multiple Stats joined with " · ".
+// StatStrip renders multiple Stats joined with a mid-dot separator.
 func StatStrip(stats ...string) string {
-	return strings.Join(stats, styleVal.Render("  ·  "))
+	return strings.Join(stats, styleVal.Render("  "+activeGlyphs().Sep+"  "))
 }
 
 // Card wraps body in a dim rounded box with an optional title row above. Pad
@@ -130,7 +133,7 @@ func Card(title, body string) string {
 	if title != "" {
 		body = styleStrong.Render(title) + "\n" + body
 	}
-	return styleBox.Render(body) + "\n"
+	return styleBox.Border(activeGlyphs().Border).Render(body) + "\n"
 }
 
 // Indent prefixes every line of s with the given number of spaces.
