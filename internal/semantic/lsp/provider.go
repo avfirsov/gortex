@@ -260,44 +260,35 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		Language: p.languages[0],
 	}
 
-	// Gather this repo's symbols of the provider's language via the indexed
-	// repo-scoped scan, NOT a whole-graph AllNodes / AllEdges walk: on a disk
-	// backend the latter is O(graph) per provider per repo (a whole-graph
-	// AllEdges plus a point GetNode per edge), which dominated fresh-index
-	// warmup. langNodes drives the spawn gate, the symbol count, the per-file
-	// fan-out, and the interface-implementation pass below.
-	langNodes := p.repoLangNodes(g, repoPrefix)
-
-	// Lazy server spawn: the hover / implements / call- and type-hierarchy
-	// passes all operate on this language's symbols, so what makes the pass
-	// worth a server spin-up is at least one in-repo node of the provider's
-	// language. When the repo has none (a Swift or TS server scoped to a Go
-	// repo, or a language whose nodes all live in a different repo) return
-	// without starting the server. This is what stops a per-language LSP
-	// spin-up — process launch, initialize handshake, and a whole-repo
-	// sweep — for zero enrichment.
-	if len(langNodes) == 0 {
-		if p.logger != nil {
-			p.logger.Debug("LSP enrich: skipped, repo has no nodes for language",
-				zap.String("provider", p.Name()),
-				zap.String("repo_prefix", repoPrefix),
-			)
+	// Gather this repo's nodes via the indexed repo-scoped scan, NOT a
+	// whole-graph AllNodes / AllEdges walk: on a disk backend the latter is
+	// O(graph) per provider per repo (a whole-graph AllEdges plus a point
+	// GetNode per edge), which dominated fresh-index warmup. Split into two
+	// views from one scan:
+	//   - langNodes: SYMBOL nodes (file/import excluded) — drives the symbol
+	//     count, the per-file fan-out, and the interface-implementation pass.
+	//   - langAllByID: every repo+language node id INCLUDING file/import — the
+	//     original ambiguous-edge target scan matched any repo+language source
+	//     node (file/import edges like EdgeImports included), so the
+	//     references-confirm pass must keep matching those too.
+	repoNodes := p.repoScopedNodes(g, repoPrefix)
+	langAllByID := make(map[string]*graph.Node, len(repoNodes))
+	langNodes := make([]*graph.Node, 0, len(repoNodes))
+	for _, n := range repoNodes {
+		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
+			continue
 		}
-		result.DurationMs = time.Since(start).Milliseconds()
-		return result, nil
-	}
-
-	// Index repo+language nodes by ID so the ambiguous-edge scan can filter
-	// the repo-scoped edge set without a per-edge GetNode round-trip.
-	langByID := make(map[string]*graph.Node, len(langNodes))
-	for _, n := range langNodes {
-		langByID[n.ID] = n
+		langAllByID[n.ID] = n
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		langNodes = append(langNodes, n)
 	}
 
 	// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
 	// repo's language nodes — the references pass below confirms / refutes
-	// them. The indexed GetRepoEdges scan + the langByID set replaces the
-	// AllEdges walk with a per-edge GetNode.
+	// them. The indexed GetRepoEdges scan + the id-set replaces the AllEdges
+	// walk with a per-edge GetNode.
 	type enrichTarget struct {
 		node *graph.Node
 		edge *graph.Edge
@@ -307,9 +298,26 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		if e.Confidence >= 1.0 {
 			continue
 		}
-		if from, ok := langByID[e.From]; ok {
+		if from, ok := langAllByID[e.From]; ok {
 			targets = append(targets, enrichTarget{node: from, edge: e})
 		}
+	}
+
+	// Lazy server spawn: spin up only when there is something to do — at least
+	// one symbol node of the language, OR an ambiguous edge to confirm (the
+	// same condition the original whole-graph gate applied). When the repo has
+	// neither (a Swift / TS server scoped to a Go repo, or a language whose
+	// nodes all live in another repo) return without starting the server — this
+	// stops a per-language LSP spin-up for zero enrichment.
+	if len(langNodes) == 0 && len(targets) == 0 {
+		if p.logger != nil {
+			p.logger.Debug("LSP enrich: skipped, repo has no nodes for language",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+			)
+		}
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
 	}
 
 	// Start or reuse the client now that there is work to do.
@@ -1797,34 +1805,17 @@ func (p *Provider) languageMatches(lang string) bool {
 	return false
 }
 
-// repoLangNodes returns the repo's symbol nodes (excluding file / import
-// nodes) whose language this provider serves, using the indexed
-// GetRepoNodes scan rather than a whole-graph AllNodes walk — the latter
-// is O(graph) per provider per repo on a disk backend. For the embedded
-// single-repo path (repoPrefix == "") where GetRepoNodes can return empty
-// on some backends, it falls back to a language-filtered AllNodes pass so
-// the standalone server still enriches.
-func (p *Provider) repoLangNodes(g graph.Store, repoPrefix string) []*graph.Node {
-	filter := func(nodes []*graph.Node) []*graph.Node {
-		out := make([]*graph.Node, 0, len(nodes))
-		for _, n := range nodes {
-			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-				continue
-			}
-			if n.RepoPrefix != repoPrefix {
-				continue
-			}
-			if p.languageMatches(n.Language) {
-				out = append(out, n)
-			}
-		}
-		return out
+// repoScopedNodes returns the repo's nodes via the indexed GetRepoNodes scan
+// rather than a whole-graph AllNodes walk — the latter is O(graph) per
+// provider per repo on a disk backend. For the embedded single-repo path
+// (repoPrefix == "") where GetRepoNodes can return empty on some backends,
+// it falls back to AllNodes so the standalone server still enriches.
+func (p *Provider) repoScopedNodes(g graph.Store, repoPrefix string) []*graph.Node {
+	nodes := g.GetRepoNodes(repoPrefix)
+	if len(nodes) == 0 && repoPrefix == "" {
+		return g.AllNodes()
 	}
-	out := filter(g.GetRepoNodes(repoPrefix))
-	if len(out) == 0 && repoPrefix == "" {
-		return filter(g.AllNodes())
-	}
-	return out
+	return nodes
 }
 
 // repoScopedEdges returns the edges whose source node belongs to
