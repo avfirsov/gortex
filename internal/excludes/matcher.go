@@ -91,3 +91,84 @@ func (m *Matcher) MatchAbsDir(absPath, root string, isDir bool) bool {
 	}
 	return m.MatchRel(rel)
 }
+
+// HasNegatedDescendant reports whether any re-include ("!") pattern in
+// the matcher could match a path strictly beneath relDir.
+//
+// The index walk prunes an excluded directory with filepath.SkipDir so
+// it never descends a subtree it would only throw away. But go-gitignore
+// treats "*" as matching across "/", so a blanket like "a/b/*" reports
+// the directory "a/b" itself as excluded — pruning it would skip a later
+// "!a/b/keep/" re-include before the walk ever reaches the child. This
+// lets the walk ask "could a negation resurrect something under here?"
+// and keep descending when the answer is yes, mirroring git, which never
+// prunes a directory a negation could re-include a child from.
+//
+// relDir is a repo-root-relative, forward-slash directory path (a
+// trailing slash and a leading "./" are tolerated). The check is
+// deliberately conservative: an unanchored or wildcard-leading negation
+// can match at varying depths, so it is treated as "could be under
+// anything" and the directory is kept rather than pruned.
+func (m *Matcher) HasNegatedDescendant(relDir string) bool {
+	if m == nil {
+		return false
+	}
+	relDir = pathkey.Normalize(filepath.ToSlash(relDir))
+	relDir = strings.TrimPrefix(relDir, "./")
+	relDir = strings.TrimSuffix(relDir, "/")
+	if relDir == "." {
+		relDir = ""
+	}
+	for _, p := range m.patterns {
+		if !strings.HasPrefix(p, "!") {
+			continue
+		}
+		np := strings.TrimSpace(p[1:])
+		np = strings.TrimPrefix(np, "/")
+		np = strings.TrimSuffix(np, "/")
+		if np == "" {
+			continue
+		}
+		// A negation with no internal slash is unanchored: gitignore
+		// matches it at any depth, so it can re-include something under
+		// any directory. Keep descending.
+		if !strings.Contains(np, "/") {
+			return true
+		}
+		anchor := literalAnchor(np)
+		if anchor == "" {
+			// First segment is itself a wildcard ("*/...", "**/..."): it
+			// can match at varying depths, so stay conservative.
+			return true
+		}
+		// At the root, every anchored negation lives somewhere beneath us.
+		if relDir == "" {
+			return true
+		}
+		// The negation's match-set intersects relDir's subtree when its
+		// literal anchor sits at or under relDir, or relDir sits under the
+		// anchor (a wildcard tail can then still reach into relDir).
+		if anchor == relDir ||
+			strings.HasPrefix(anchor, relDir+"/") ||
+			strings.HasPrefix(relDir, anchor+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// literalAnchor returns the leading path segments of a slash-bearing
+// gitignore pattern up to (but excluding) the first segment that holds a
+// wildcard meta-character. It returns "" when the first segment is
+// itself a wildcard ("*", "**", "?foo", ...).
+func literalAnchor(pattern string) string {
+	segs := strings.Split(pattern, "/")
+	lit := make([]string, 0, len(segs))
+	for _, s := range segs {
+		if strings.ContainsAny(s, "*?[") {
+			break
+		}
+		lit = append(lit, s)
+	}
+	return strings.Join(lit, "/")
+}

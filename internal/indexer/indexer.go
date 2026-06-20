@@ -1857,7 +1857,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			return nil
 		}
 		if d.IsDir() {
-			if idx.shouldExclude(path, absRoot, true) {
+			if idx.shouldPruneDir(path, absRoot) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -3757,6 +3757,30 @@ func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
 	return idx.dirIgnoreMatcher(root).Match(path, isDir)
 }
 
+// shouldPruneDir reports whether the index walk may skip a directory
+// subtree wholesale (filepath.SkipDir) instead of descending it. A
+// directory is prunable only when it is excluded AND no re-include ("!")
+// pattern targets anything beneath it. go-gitignore's "*" matches across
+// "/", so a blanket like "wp-content/plugins/*" reports the parent
+// directory "wp-content/plugins" itself as excluded; pruning it would
+// skip a later "!wp-content/plugins/foo/" re-include before the walk ever
+// reaches the child. Mirroring git, we keep descending such a directory
+// and let the per-file shouldExclude check filter its contents.
+func (idx *Indexer) shouldPruneDir(path, root string) bool {
+	if !idx.shouldExclude(path, root, true) {
+		return false
+	}
+	if m := idx.excludeMatcher(); m != nil {
+		if rel, err := filepath.Rel(root, path); err == nil && m.HasNegatedDescendant(filepath.ToSlash(rel)) {
+			return false
+		}
+	}
+	if idx.dirIgnoreMatcher(root).HasNegatedDescendant(path) {
+		return false
+	}
+	return true
+}
+
 // dirIgnoreMatcher returns the per-directory ignore matcher, built lazily
 // against the repo root the index walk is anchored at.
 func (idx *Indexer) dirIgnoreMatcher(root string) *excludes.Hierarchical {
@@ -3933,7 +3957,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 					return nil
 				}
 				if d.IsDir() {
-					if idx.shouldExclude(path, absRoot, true) {
+					if idx.shouldPruneDir(path, absRoot) {
 						return filepath.SkipDir
 					}
 					return nil
@@ -4162,7 +4186,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			return nil
 		}
 		if d.IsDir() {
-			if idx.shouldExclude(path, absRoot, true) {
+			if idx.shouldPruneDir(path, absRoot) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -6287,7 +6311,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 			return nil
 		}
 		if d.IsDir() {
-			if idx.shouldExclude(path, absRoot, true) {
+			if idx.shouldPruneDir(path, absRoot) {
 				return filepath.SkipDir
 			}
 			return nil

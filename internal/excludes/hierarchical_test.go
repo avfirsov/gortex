@@ -89,6 +89,52 @@ func TestHierarchical_Negation(t *testing.T) {
 	}
 }
 
+func TestHierarchical_HasNegatedDescendant(t *testing.T) {
+	root := t.TempDir()
+	// A blanket "dir/*" plus a re-include of one child, expressed in a
+	// per-directory ignore file. The walk must keep descending pkg/ so
+	// the re-included pkg/keep/ subtree is reached.
+	mkIgnore(t, filepath.Join(root, ".gortexignore"), "pkg/*\n!pkg/keep/\n")
+	h := NewHierarchical(root, ".gortexignore")
+
+	if !h.HasNegatedDescendant(filepath.Join(root, "pkg")) {
+		t.Error("pkg/ has a re-included child and must not be pruned")
+	}
+	if h.HasNegatedDescendant(filepath.Join(root, "pkg", "other")) {
+		t.Error("pkg/other has no re-included descendant and is prunable")
+	}
+	if h.HasNegatedDescendant(filepath.Join(root, "unrelated")) {
+		t.Error("an unrelated directory has no re-included descendant")
+	}
+}
+
+func TestHierarchical_HasNegatedDescendant_Anchored(t *testing.T) {
+	root := t.TempDir()
+	// The negation lives in a nested ignore file, anchored at internal/.
+	mkIgnore(t, filepath.Join(root, "internal", ".gortexignore"), "build/*\n!build/keep/\n")
+	h := NewHierarchical(root, ".gortexignore")
+
+	if !h.HasNegatedDescendant(filepath.Join(root, "internal", "build")) {
+		t.Error("internal/build has a re-included child via the nested ignore file")
+	}
+	if h.HasNegatedDescendant(filepath.Join(root, "build")) {
+		t.Error("a root-level build/ is unaffected by internal/.gortexignore")
+	}
+}
+
+func TestHierarchical_HasNegatedDescendant_NilAndEmpty(t *testing.T) {
+	var h *Hierarchical
+	if h.HasNegatedDescendant("/anything") {
+		t.Error("nil Hierarchical should report no negated descendants")
+	}
+	root := t.TempDir()
+	mkIgnore(t, filepath.Join(root, ".gortexignore"), "pkg/*\n!pkg/keep/\n")
+	empty := NewHierarchical(root) // no filenames configured
+	if empty.HasNegatedDescendant(filepath.Join(root, "pkg")) {
+		t.Error("an empty filename list should report no negated descendants")
+	}
+}
+
 func TestHierarchical_NoFiles(t *testing.T) {
 	root := t.TempDir()
 	mkIgnore(t, filepath.Join(root, "foo.go"), "package x\n")
