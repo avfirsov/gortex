@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/zzet/gortex/internal/semantic"
 )
+
+// fileExists reports whether path names an existing regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
 
 // Router is a daemon-managed pool of LSP providers keyed by ServerSpec.
 // It routes requests to the right provider by file extension, spawns
@@ -417,6 +424,14 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	p := NewProviderFromSpec(spec, r.logger)
 	p.workspaceFolders = r.additionalWorkspaceFolders
 	p.excludeGlobs = r.enrichExcludeGlobs
+	// ruby-lsp (and any spec opting in) runs a `bundle install` for a composed
+	// bundle on spawn unless BUNDLE_GEMFILE is set; point it at the workspace's
+	// own Gemfile when present so enrichment skips that install.
+	if spec.UseWorkspaceBundleGemfile {
+		if gemfile := filepath.Join(workspace, "Gemfile"); fileExists(gemfile) {
+			p.env = append(append([]string(nil), p.env...), "BUNDLE_GEMFILE="+gemfile)
+		}
+	}
 	if err := p.EnsureClient(workspace); err != nil {
 		// A binary that resolves on PATH but cannot launch (e.g. a rustup
 		// `rust-analyzer` shim whose toolchain lacks the component) would
