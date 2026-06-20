@@ -44,7 +44,7 @@ func TestModelClientTotals_Sidecar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 
 	s.AddObservation(Observation{Tool: "read_file", Model: "claude-sonnet-4-6", Client: "claude-code", Returned: 20, Saved: 180})
 	s.AddObservation(Observation{Tool: "read_file", Model: "claude-sonnet-4-6", Client: "claude-code", Returned: 30, Saved: 270})

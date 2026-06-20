@@ -31,7 +31,7 @@ func cosine(a, b []float32) float64 {
 func TestStaticProvider_LoadsBakedTable(t *testing.T) {
 	p, err := NewStaticProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	// The baked table is GloVe 6B 50d. Dimensions() must reflect the
 	// loaded table, not the 50 hardcoded in the constructor before
@@ -51,7 +51,7 @@ func TestStaticProvider_LoadsBakedTable(t *testing.T) {
 func TestStaticProvider_SemanticRanking(t *testing.T) {
 	p, err := NewStaticProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	ctx := context.Background()
 
 	embed := func(s string) []float32 {
@@ -95,7 +95,7 @@ func TestStaticProvider_SemanticRanking(t *testing.T) {
 func TestStaticProvider_EmbedBatchRoundTrip(t *testing.T) {
 	p, err := NewStaticProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	ctx := context.Background()
 
 	inputs := []string{"validate token", "delete user", "parse json"}
@@ -116,7 +116,7 @@ func TestStaticProvider_EmbedBatchRoundTrip(t *testing.T) {
 func TestStaticProvider_EmbedBatchEmpty(t *testing.T) {
 	p, err := NewStaticProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	out, err := p.EmbedBatch(context.Background(), nil)
 	require.NoError(t, err)
@@ -154,7 +154,7 @@ func TestTokenizeForEmbedding_Splitters(t *testing.T) {
 func TestStaticProvider_SetVectorsInjection(t *testing.T) {
 	p, err := NewStaticProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	p.SetVectors(map[string][]float32{
 		"alpha": {1, 0, 0, 0},

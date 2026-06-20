@@ -482,7 +482,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if err := srv.Listen(); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())
 
@@ -763,9 +763,9 @@ func emitDaemonStartBanner(w io.Writer) {
 		Title:    "gortex daemon start",
 		Subtitle: "Spawning daemon in the background.",
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w)
 }
 
 // emitDaemonStartSummary prints the post-spawn card showing pid, socket, log
@@ -778,17 +778,17 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 		progress.Stat(fmt.Sprintf("%d", pid), "pid", progress.StatGood),
 		progress.Stat(elapsed.String(), "boot", progress.StatGood),
 	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("daemon ready"))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
-	_, _ = fmt.Fprintln(w, "     "+progress.Row("socket", daemon.SocketPath(), 8))
-	_, _ = fmt.Fprintln(w, "     "+progress.Row("log", daemon.LogFilePath(), 8))
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "     "+progress.Heading("next"))
-	_, _ = fmt.Fprintln(w, "     "+progress.Step(1, "track a repo:    gortex track <path>"))
-	_, _ = fmt.Fprintln(w, "     "+progress.Step(2, "watch status:    gortex daemon status --watch"))
-	_, _ = fmt.Fprintln(w, "     "+progress.Step(3, "shut down:       gortex daemon stop"))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("daemon ready"))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "     "+progress.Row("socket", daemon.SocketPath(), 8))
+	fmt.Fprintln(w, "     "+progress.Row("log", daemon.LogFilePath(), 8))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "     "+progress.Heading("next"))
+	fmt.Fprintln(w, "     "+progress.Step(1, "track a repo:    gortex track <path>"))
+	fmt.Fprintln(w, "     "+progress.Step(2, "watch status:    gortex daemon status --watch"))
+	fmt.Fprintln(w, "     "+progress.Step(3, "shut down:       gortex daemon stop"))
+	fmt.Fprintln(w)
 }
 
 func runDaemonStop(cmd *cobra.Command, _ []string) error {
@@ -799,7 +799,7 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	// following start, so only a standalone stop is sticky.
 	if !daemonRestartActive {
 		if err := daemon.MarkStopIntent(); err != nil {
-			_, _ = fmt.Fprintf(w, "[gortex daemon] warning: could not record stop intent (%v); daemon may auto-respawn\n", err)
+			fmt.Fprintf(w, "[gortex daemon] warning: could not record stop intent (%v); daemon may auto-respawn\n", err)
 		}
 		// If an OS supervisor (systemd --user / launchd) owns the daemon, stop
 		// it THROUGH the supervisor — a socket-level stop just kills the worker
@@ -889,7 +889,7 @@ func daemonUptimeBeforeStop() time.Duration {
 	if err != nil {
 		return 0
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil || !resp.OK {
 		return 0
@@ -905,13 +905,13 @@ func daemonUptimeBeforeStop() time.Duration {
 // non-TTY for script compat, a styled hint card on TTY.
 func emitDaemonStopAlreadyDown(w io.Writer) {
 	if !progress.IsTTY(w) || noProgress {
-		_, _ = fmt.Fprintln(w, "[gortex daemon] not running")
+		fmt.Fprintln(w, "[gortex daemon] not running")
 		return
 	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleHint.Render("◌  daemon was not running — nothing to stop"))
-	_, _ = fmt.Fprintln(w, "     "+progress.Caption("start with `gortex daemon start --detach`"))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  "+progress.StyleHint.Render("◌  daemon was not running — nothing to stop"))
+	fmt.Fprintln(w, "     "+progress.Caption("start with `gortex daemon start --detach`"))
+	fmt.Fprintln(w)
 }
 
 // emitDaemonStopSummary prints the post-shutdown banner + result card mirroring
@@ -919,7 +919,7 @@ func emitDaemonStopAlreadyDown(w io.Writer) {
 // right daemon went down.
 func emitDaemonStopSummary(w io.Writer, socket string, uptime time.Duration) {
 	if !progress.IsTTY(w) || noProgress {
-		_, _ = fmt.Fprintln(w, "[gortex daemon] stopped")
+		fmt.Fprintln(w, "[gortex daemon] stopped")
 		return
 	}
 	if !daemonRestartActive {
@@ -927,19 +927,19 @@ func emitDaemonStopSummary(w io.Writer, socket string, uptime time.Duration) {
 			Title:    "gortex daemon stop",
 			Subtitle: "Daemon shut down cleanly.",
 		}.Render()
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, banner)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, banner)
 	}
 	stats := []string{progress.Stat("clean shutdown", "", progress.StatGood)}
 	if uptime > 0 {
 		stats = append(stats, progress.Stat(uptime.Truncate(time.Second).String(), "uptime", progress.StatNeutral))
 	}
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("stopped"))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("stopped"))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 	if socket != "" {
-		_, _ = fmt.Fprintln(w, "     "+progress.Row("socket", socket+" (removed)", 8))
+		fmt.Fprintln(w, "     "+progress.Row("socket", socket+" (removed)", 8))
 	}
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 }
 
 // daemonRestartActive flips on for the duration of runDaemonRestart so the
@@ -986,9 +986,9 @@ func emitDaemonRestartBanner(w io.Writer) {
 		Title:    "gortex daemon restart",
 		Subtitle: "Cycling daemon: stop then start.",
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w)
 }
 
 func runDaemonReload(_ *cobra.Command, _ []string) error {
@@ -996,7 +996,7 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlReload, nil)
 	if err != nil {
 		return err
@@ -1004,7 +1004,7 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 	if !resp.OK {
 		return fmt.Errorf("reload rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
-	_, _ = fmt.Fprintln(os.Stderr, "[gortex daemon] reloaded")
+	fmt.Fprintln(os.Stderr, "[gortex daemon] reloaded")
 	return nil
 }
 
@@ -1033,7 +1033,7 @@ func fetchDaemonStatusForCLI() (daemon.StatusResponse, error) {
 	if err != nil {
 		return st, err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil {
 		return st, err
@@ -1118,7 +1118,7 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 // embedder model weights, runtime heap headroom, semantic caches, etc.
 func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	if len(st.TrackedRepos) == 0 {
-		_, _ = fmt.Fprintln(w, "\ntracked repos: (none)")
+		fmt.Fprintln(w, "\ntracked repos: (none)")
 		return
 	}
 
@@ -1140,7 +1140,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		}
 	}
 
-	_, _ = fmt.Fprintln(w, "\ntracked repos:")
+	fmt.Fprintln(w, "\ntracked repos:")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1246,17 +1246,17 @@ func renderDaemonWorkspaces(w io.Writer, st daemon.StatusResponse) {
 		// default mode and how to opt repos into a shared workspace.
 		// Avoids
 		// printing a 33-row table where every row says "1 repo".
-		_, _ = fmt.Fprintf(w,
+		fmt.Fprintf(w,
 			"\nworkspaces: %d (one per repo, default — every repo is its own workspace)\n",
 			len(st.Workspaces))
-		_, _ = fmt.Fprintln(w,
+		fmt.Fprintln(w,
 			"  Group repos into a shared workspace with `gortex workspace set <repo> <slug> --global`")
-		_, _ = fmt.Fprintln(w,
+		fmt.Fprintln(w,
 			"  or `gortex workspace set-all <slug> --root <path> --global`. See `gortex workspace --help`.")
 		return
 	}
 
-	_, _ = fmt.Fprintln(w, "\nworkspaces:")
+	fmt.Fprintln(w, "\nworkspaces:")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1287,7 +1287,7 @@ func renderDaemonSessions(w io.Writer, st daemon.StatusResponse) {
 	if len(st.MCPSessions) == 0 {
 		return
 	}
-	_, _ = fmt.Fprintln(w, "\nMCP sessions:")
+	fmt.Fprintln(w, "\nMCP sessions:")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1326,7 +1326,7 @@ func renderDaemonServers(w io.Writer, st daemon.StatusResponse) {
 	if len(st.ConfiguredServers) == 0 {
 		return
 	}
-	_, _ = fmt.Fprintln(w, "\nconfigured servers (~/.gortex/servers.toml):")
+	fmt.Fprintln(w, "\nconfigured servers (~/.gortex/servers.toml):")
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1365,13 +1365,13 @@ func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("open log %s: %w", path, err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	lines, err := tailLines(f, daemonTail)
 	if err != nil {
 		return err
 	}
 	for _, l := range lines {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), l)
+		fmt.Fprintln(cmd.OutOrStdout(), l)
 	}
 	return nil
 }

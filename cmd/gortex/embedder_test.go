@@ -31,7 +31,7 @@ func TestResolveEmbedder_DefaultOnStatic(t *testing.T) {
 	emb, desc, err := resolveEmbedder(embedderRequest{}, cfg)
 	require.NoError(t, err)
 	require.NotNil(t, emb, "default-on must produce an embedder")
-	defer func() { _ = emb.Close() }()
+	defer emb.Close()
 
 	_, isStatic := emb.(*embedding.StaticProvider)
 	assert.True(t, isStatic, "the default-on embedder must be the static GloVe provider, got %T", emb)
@@ -99,7 +99,7 @@ func TestResolveEmbedder_ExplicitURLForcesAPI(t *testing.T) {
 	}, cfg)
 	require.NoError(t, err)
 	require.NotNil(t, emb, "an explicit URL must produce an embedder even when config disables embeddings")
-	defer func() { _ = emb.Close() }()
+	defer emb.Close()
 
 	_, isAPI := emb.(*embedding.APIProvider)
 	assert.True(t, isAPI, "an explicit URL must select the API provider, got %T", emb)
@@ -120,7 +120,7 @@ func TestResolveEmbedder_ConfigProviderHonored(t *testing.T) {
 	emb, _, err := resolveEmbedder(embedderRequest{}, cfg)
 	require.NoError(t, err)
 	require.NotNil(t, emb)
-	defer func() { _ = emb.Close() }()
+	defer emb.Close()
 
 	_, isAPI := emb.(*embedding.APIProvider)
 	assert.True(t, isAPI, "config provider:api must build an APIProvider, got %T", emb)

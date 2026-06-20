@@ -259,7 +259,7 @@ func printReview(cmd *cobra.Command, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	if p.Error != "" {
-		_, _ = fmt.Fprintf(out, "review failed: %s\n", p.Error)
+		fmt.Fprintf(out, "review failed: %s\n", p.Error)
 		return nil
 	}
 

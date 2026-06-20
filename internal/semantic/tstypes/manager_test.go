@@ -74,7 +74,7 @@ pub fn main() {
 func TestManager_SupplementalProvidersEnrichWithoutLSP(t *testing.T) {
 	g, dir := buildFixture(t, mixedFixture())
 	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
-	defer func() { _ = mgr.Close() }()
+	defer mgr.Close()
 	for _, p := range DefaultProviders(zap.NewNop()) {
 		mgr.RegisterProvider(p)
 	}
@@ -154,7 +154,7 @@ func TestManager_ConfigDisablesOneProvider(t *testing.T) {
 		},
 	}
 	mgr := semantic.NewManager(cfg, zap.NewNop())
-	defer func() { _ = mgr.Close() }()
+	defer mgr.Close()
 	for _, p := range DefaultProviders(zap.NewNop()) {
 		mgr.RegisterProvider(p)
 	}
@@ -178,7 +178,7 @@ func TestManager_ConfigDisablesOneProvider(t *testing.T) {
 func TestManager_EnrichFileRunsSupplemental(t *testing.T) {
 	g, dir := buildFixture(t, mixedFixture())
 	mgr := semantic.NewManager(semantic.Config{Enabled: true, EnrichOnWatch: true}, zap.NewNop())
-	defer func() { _ = mgr.Close() }()
+	defer mgr.Close()
 	for _, p := range DefaultProviders(zap.NewNop()) {
 		mgr.RegisterProvider(p)
 	}

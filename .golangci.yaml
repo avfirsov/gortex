@@ -1,0 +1,34 @@
+# golangci-lint configuration (schema v2).
+# CI pins golangci-lint to v2.11.4 (.github/workflows/ci.yml).
+version: "2"
+
+linters:
+  # Keep the same set CI already enforced before this file existed:
+  # errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+
+  settings:
+    errcheck:
+      # Unchecked errors on the fmt print family are noise, not bugs: these
+      # return (n int, err error) whose error is virtually never actionable.
+      # Listed explicitly so the intent is obvious at the call site review;
+      # the std-error-handling preset below also covers them via regex.
+      exclude-functions:
+        - fmt.Print
+        - fmt.Printf
+        - fmt.Println
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*bufio.Writer).Flush
+        - (io.Closer).Close
+
+  exclusions:
+    # `lax` skips obviously generated files; we keep it explicit.
+    generated: lax
+    presets:
+      # Drops the well-known stdlib error-handling false positives that
+      # errcheck flags: the fmt print family, (*T).Close / .Flush,
+      # os.Remove(All), os.Setenv / os.Unsetenv, and writes to
+      # os.Stdout / os.Stderr.
+      - std-error-handling

@@ -116,8 +116,8 @@ func runCloudLogin(_ *cobra.Command, _ []string) error {
 	if err := cfg.Save(path); err != nil {
 		return fmt.Errorf("save servers config: %w", err)
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "logged in: workspace=%s endpoint=%s slug=%s\n", cloudWorkspace, cloudEndpoint, slug)
-	_, _ = fmt.Fprintf(os.Stdout, "next: gortex daemon start (or already running)\n")
+	fmt.Fprintf(os.Stdout, "logged in: workspace=%s endpoint=%s slug=%s\n", cloudWorkspace, cloudEndpoint, slug)
+	fmt.Fprintf(os.Stdout, "next: gortex daemon start (or already running)\n")
 	return nil
 }
 
@@ -127,12 +127,12 @@ func runCloudList(_ *cobra.Command, _ []string) error {
 		return err
 	}
 	if len(cfg.Server) == 0 {
-		_, _ = fmt.Fprintln(os.Stdout, "no [[server]] entries — run `gortex cloud login` to add one")
+		fmt.Fprintln(os.Stdout, "no [[server]] entries — run `gortex cloud login` to add one")
 		return nil
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "%-24s %-46s %s\n", "SLUG", "ENDPOINT", "WORKSPACES")
+	fmt.Fprintf(os.Stdout, "%-24s %-46s %s\n", "SLUG", "ENDPOINT", "WORKSPACES")
 	for _, s := range cfg.Server {
-		_, _ = fmt.Fprintf(os.Stdout, "%-24s %-46s %s\n", s.Slug, s.URL, strings.Join(s.Workspaces, ","))
+		fmt.Fprintf(os.Stdout, "%-24s %-46s %s\n", s.Slug, s.URL, strings.Join(s.Workspaces, ","))
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func runCloudLogout(_ *cobra.Command, _ []string) error {
 	if err := cfg.Save(path); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "logged out: %s\n", slug)
+	fmt.Fprintf(os.Stdout, "logged out: %s\n", slug)
 	return nil
 }
 
@@ -179,7 +179,7 @@ func pingCloudEndpoint(endpoint, token string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK {
 		return nil

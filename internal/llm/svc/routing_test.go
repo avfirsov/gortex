@@ -26,7 +26,7 @@ func TestProviderForModel_BaseAndRouted(t *testing.T) {
 	if !s.Enabled() {
 		t.Fatal("service should be enabled with an API key set")
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 
 	// Empty model id, or the active model, returns the base provider.
 	if p, err := s.providerForModel(""); err != nil || p != s.provider {

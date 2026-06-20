@@ -57,7 +57,7 @@ func TestComplete_AddressesDeploymentWithApiKeyHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -102,7 +102,7 @@ func TestComplete_EndpointFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -138,7 +138,7 @@ func TestComplete_StructuredUsesJSONSchema(t *testing.T) {
 
 	t.Setenv("AZURE_OPENAI_API_KEY", "k")
 	p, _ := New(llm.AzureConfig{Deployment: "d", Endpoint: srv.URL, APIKeyEnv: "AZURE_OPENAI_API_KEY"})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "auth"}},

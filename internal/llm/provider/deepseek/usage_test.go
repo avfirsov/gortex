@@ -28,7 +28,7 @@ func TestComplete_UsageStaysZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

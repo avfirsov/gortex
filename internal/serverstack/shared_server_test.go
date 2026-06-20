@@ -38,7 +38,7 @@ func TestNewSharedServer_OneshotMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSharedServer: %v", err)
 	}
-	defer func() { _ = ss.Close() }()
+	defer ss.Close()
 
 	if ss.Graph == nil || ss.Indexer == nil || ss.Engine == nil || ss.MCP == nil {
 		t.Fatalf("incomplete stack: graph=%v idx=%v eng=%v mcp=%v", ss.Graph != nil, ss.Indexer != nil, ss.Engine != nil, ss.MCP != nil)

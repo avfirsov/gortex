@@ -127,7 +127,7 @@ func (s *SidecarStore) SavingsTotals() (map[string]SavingsTotalsRow, time.Time, 
 	if err != nil {
 		return nil, time.Time{}, time.Time{}, fmt.Errorf("persistence: savings totals: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	out := make(map[string]SavingsTotalsRow)
 	for rows.Next() {
@@ -168,7 +168,7 @@ func (s *SidecarStore) SavingsEventsSince(since time.Time) ([]SavingsEvent, erro
 	if err != nil {
 		return nil, fmt.Errorf("persistence: savings events: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []SavingsEvent
 	for rows.Next() {
@@ -283,7 +283,7 @@ func (s *SidecarStore) SavingsToolTotals(since time.Time) ([]SavingsToolRow, err
 	if err != nil {
 		return nil, fmt.Errorf("persistence: savings tool totals: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []SavingsToolRow
 	for rows.Next() {
@@ -342,7 +342,7 @@ func (s *SidecarStore) savingsDimTotals(column string, since time.Time) ([]Savin
 	if err != nil {
 		return nil, fmt.Errorf("persistence: savings %s totals: %w", column, err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []SavingsDimRow
 	for rows.Next() {

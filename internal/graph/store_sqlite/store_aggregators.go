@@ -83,7 +83,7 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 	q := `SELECT to_id, COUNT(*) FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) GROUP BY to_id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {
 		var id string
@@ -105,7 +105,7 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) ORDER BY id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []string
 	for rows.Next() {
 		var id string
@@ -121,7 +121,7 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 func (s *Store) EdgeKindCounts() map[graph.EdgeKind]int {
 	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM edges GROUP BY kind`)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	out := make(map[graph.EdgeKind]int)
 	for rows.Next() {
 		var kind string
@@ -154,7 +154,7 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	q += ` ORDER BY n.id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []graph.NodeDegreeRow
 	for rows.Next() {
 		var r graph.NodeDegreeRow
@@ -227,7 +227,7 @@ func (s *Store) FileImportCounts(scope []string) []graph.FileImportCountRow {
 func aggScanImportCounts(s *Store, q string, args []any, acc map[string]int) {
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	for rows.Next() {
 		var path string
 		var cnt int
@@ -277,7 +277,7 @@ func (s *Store) CrossRepoEdgeCounts() []graph.CrossRepoEdgeRow {
 		GROUP BY e.kind, nf.repo_prefix, nt.repo_prefix`
 	rows, err := s.db.Query(q)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	// Aggregate keyed by the edge's OWN kind (cross_repo_*), NOT the base.
 	// BaseKindForCrossRepo is used only as the recogniser that decides
 	// whether an edge participates — parity with the in-memory store.
@@ -322,7 +322,7 @@ func (s *Store) FileImporters(filePath string) []graph.FileImporterRow {
 		ORDER BY nf.file_path`
 	rows, err := s.db.Query(q, string(graph.EdgeImports), filePath, filePath)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []graph.FileImporterRow
 	for rows.Next() {
 		var r graph.FileImporterRow
@@ -444,7 +444,7 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
-		defer func() { _ = rows.Close() }()
+		defer rows.Close()
 		for rows.Next() {
 			var from, to string
 			panicOnFatal(rows.Scan(&from, &to))
@@ -562,7 +562,7 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `)`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {
 		var from, to string

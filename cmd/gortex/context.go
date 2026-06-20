@@ -56,6 +56,6 @@ func runContext(cmd *cobra.Command, args []string) error {
 	}
 	// export_context returns the rendered briefing (markdown or JSON) as
 	// the tool's text content; print it verbatim.
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	fmt.Fprintln(cmd.OutOrStdout(), string(out))
 	return nil
 }

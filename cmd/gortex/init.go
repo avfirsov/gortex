@@ -162,7 +162,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 			return err
 		}
 		if cancelled {
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  cancelled — no changes made.")
+			fmt.Fprintln(cmd.ErrOrStderr(), "  cancelled — no changes made.")
 			return nil
 		}
 	} else if !initYes && !initHooksOnly && isInteractive() {
@@ -186,7 +186,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	// nothing else needs to live inside it.
 	if !initDryRun && !initHooksOnly {
 		if err := ensureProjectMarker(absRoot, cmd.ErrOrStderr()); err != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: could not create %s: %v\n", workspace.IndexDir, err)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: could not create %s: %v\n", workspace.IndexDir, err)
 		}
 	}
 
@@ -201,7 +201,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		if err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init --hooks-only] %s %s\n", action.Action, action.Path)
+		fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init --hooks-only] %s %s\n", action.Action, action.Path)
 		return nil
 	}
 
@@ -266,7 +266,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		}
 		g, idxErr := indexRepoForInit(ctx, absRoot, idxLogger)
 		if idxErr != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] indexing failed: %v — proceeding without analysis/skills\n", idxErr)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] indexing failed: %v — proceeding without analysis/skills\n", idxErr)
 		} else {
 			prog.StageDone(stageIndex, "")
 			if initAnalyze {
@@ -308,7 +308,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 			if a.Name() == claudecode.Name {
 				return fmt.Errorf("%s: %w", a.Name(), applyErr)
 			}
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: %s setup failed: %v\n", a.Name(), applyErr)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: %s setup failed: %v\n", a.Name(), applyErr)
 		}
 		if r != nil {
 			results = append(results, r)
@@ -320,7 +320,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	// up this repo next time it starts (harmless when no daemon).
 	if !initDryRun {
 		if err := ensureGlobalConfig(absRoot); err != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: could not update global config: %v\n", err)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] warning: could not update global config: %v\n", err)
 		}
 	}
 
@@ -432,7 +432,7 @@ func ensureProjectMarker(root string, w io.Writer) error {
 		return err
 	}
 	if !existed {
-		_, _ = fmt.Fprintf(w, "[gortex init] created %s/ to hold this project's Gortex config\n", workspace.IndexDir)
+		fmt.Fprintf(w, "[gortex init] created %s/ to hold this project's Gortex config\n", workspace.IndexDir)
 	}
 	return nil
 }
@@ -450,6 +450,6 @@ func ensureGlobalConfig(root string) error {
 	if err := gc.Save(); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "[gortex init] updated global config at %s\n", gc.ConfigPath())
+	fmt.Fprintf(os.Stderr, "[gortex init] updated global config at %s\n", gc.ConfigPath())
 	return nil
 }

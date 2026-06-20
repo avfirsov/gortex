@@ -137,7 +137,7 @@ func (s *Store) ChurnRows(repoPrefix string) []graph.ChurnEnrichment {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.ChurnEnrichment
 	for rows.Next() {

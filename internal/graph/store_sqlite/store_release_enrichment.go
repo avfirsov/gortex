@@ -123,7 +123,7 @@ func (s *Store) ReleaseRows(repoPrefix string) []graph.ReleaseEnrichment {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.ReleaseEnrichment
 	for rows.Next() {

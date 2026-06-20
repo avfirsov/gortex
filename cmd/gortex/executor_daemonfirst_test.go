@@ -78,7 +78,7 @@ func (s *stubDaemonServer) serve() {
 }
 
 func (s *stubDaemonServer) handleConn(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
 	hsLine, err := reader.ReadBytes('\n')
@@ -197,7 +197,7 @@ func TestResolveExecutor_DaemonFirst(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveExecutor on a warm daemon that owns the repo: %v", err)
 		}
-		defer func() { _ = exec.Close() }()
+		defer exec.Close()
 
 		if _, ok := exec.(*daemonExecutor); !ok {
 			t.Fatalf("daemon-first path must return a *daemonExecutor, got %T", exec)
@@ -261,7 +261,7 @@ func TestDaemonExecutor_ErrDistinct(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveExecutor: %v", err)
 		}
-		defer func() { _ = exec.Close() }()
+		defer exec.Close()
 
 		_, callErr := exec.CallTool(context.Background(), "search_symbols", nil)
 		if !errors.Is(callErr, ErrRepoNotTracked) {
@@ -281,7 +281,7 @@ func TestDaemonExecutor_ErrDistinct(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveExecutor: %v", err)
 		}
-		defer func() { _ = exec.Close() }()
+		defer exec.Close()
 
 		_, callErr := exec.CallTool(context.Background(), "get_symbol", nil)
 		if callErr == nil {

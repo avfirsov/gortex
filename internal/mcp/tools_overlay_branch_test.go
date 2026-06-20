@@ -719,7 +719,7 @@ func branchRead(srv *Server, sessID, branchName, path string) (string, error) {
 // depend on whether the production helper is exported.
 func gitBlobSHAForTest(data []byte) string {
 	h := sha1.New()
-	_, _ = fmt.Fprintf(h, "blob %d\x00", len(data))
+	fmt.Fprintf(h, "blob %d\x00", len(data))
 	_, _ = h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -46,19 +46,19 @@ func runVersion(cmd *cobra.Command, _ []string) {
 	}
 
 	if versionShort {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), canonical(v))
+		fmt.Fprintln(cmd.OutOrStdout(), canonical(v))
 		return
 	}
 
 	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(w, "gortex %s\n", canonical(v))
+	fmt.Fprintf(w, "gortex %s\n", canonical(v))
 	if v.IsZero() && v.Build == "" {
-		_, _ = fmt.Fprintln(w, "  (dev build — no ldflags injected; build via `make build` or `goreleaser` for a versioned binary)")
+		fmt.Fprintln(w, "  (dev build — no ldflags injected; build via `make build` or `goreleaser` for a versioned binary)")
 	}
-	_, _ = fmt.Fprintf(w, "  commit:  %s\n", printable(commitFromMain(), "(none)"))
-	_, _ = fmt.Fprintf(w, "  built:   %s\n", printable(dateFromMain(), "(unknown)"))
-	_, _ = fmt.Fprintf(w, "  go:      %s\n", runtime.Version())
-	_, _ = fmt.Fprintf(w, "  os/arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(w, "  commit:  %s\n", printable(commitFromMain(), "(none)"))
+	fmt.Fprintf(w, "  built:   %s\n", printable(dateFromMain(), "(unknown)"))
+	fmt.Fprintf(w, "  go:      %s\n", runtime.Version())
+	fmt.Fprintf(w, "  os/arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 }
 
 // canonical renders a Version with a graceful fallback for dev builds.
@@ -190,13 +190,13 @@ func runVersionBump(cmd *cobra.Command, args []string) error {
 	}
 
 	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(w, "Bumped %s: %s → %s\n", kind, current, next.String()[1:])
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Next steps:")
-	_, _ = fmt.Fprintf(w, "  git add %s\n", path)
-	_, _ = fmt.Fprintf(w, "  git commit -m \"Bump version to %s\"\n", next.String())
-	_, _ = fmt.Fprintf(w, "  git tag %s\n", next.String())
-	_, _ = fmt.Fprintf(w, "  git push && git push origin %s\n", next.String())
+	fmt.Fprintf(w, "Bumped %s: %s → %s\n", kind, current, next.String()[1:])
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Next steps:")
+	fmt.Fprintf(w, "  git add %s\n", path)
+	fmt.Fprintf(w, "  git commit -m \"Bump version to %s\"\n", next.String())
+	fmt.Fprintf(w, "  git tag %s\n", next.String())
+	fmt.Fprintf(w, "  git push && git push origin %s\n", next.String())
 	return nil
 }
 

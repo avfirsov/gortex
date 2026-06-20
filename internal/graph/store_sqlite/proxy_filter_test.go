@@ -41,7 +41,7 @@ func TestProxyNodes_NeverReachDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 
 	if s2.GetNode(proxy.ID) != nil {
 		t.Error("proxy node must not be persisted")

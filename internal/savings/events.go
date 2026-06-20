@@ -103,7 +103,7 @@ func LoadEvents(path string, since time.Time) ([]Event, error) {
 		}
 		return nil, fmt.Errorf("open events log: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	out := make([]Event, 0, 64)
 	r := bufio.NewReaderSize(f, 64*1024)

@@ -196,7 +196,7 @@ func callServerTool(port int, name string, args map[string]any) string {
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return ""
 	}

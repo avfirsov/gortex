@@ -35,7 +35,7 @@ func seedSession(t *testing.T, dir, session string, recs []conversationlog.Recor
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	enc := json.NewEncoder(f)
 	for _, rec := range recs {
 		if err := enc.Encode(&rec); err != nil {
@@ -60,7 +60,7 @@ func TestConversations_ListAndLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list status = %d", resp.StatusCode)
 	}
@@ -82,7 +82,7 @@ func TestConversations_ListAndLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp2.Body.Close() }()
+	defer resp2.Body.Close()
 	var got struct {
 		Session  string                   `json:"session"`
 		Records  []conversationlog.Record `json:"records"`
@@ -104,7 +104,7 @@ func TestConversations_ListAndLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp3.Body.Close() }()
+	defer resp3.Body.Close()
 	var gotF struct {
 		Records  []conversationlog.Record `json:"records"`
 		Total    int                      `json:"total"`

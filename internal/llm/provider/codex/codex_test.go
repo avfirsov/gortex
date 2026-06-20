@@ -100,7 +100,7 @@ func TestNew_DefaultsBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "codex" {
 		t.Errorf("Name()=%q want codex", p.Name())
 	}
@@ -113,7 +113,7 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -149,7 +149,7 @@ func TestComplete_StdoutFallback(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{stdout: "fallback answer"})
 
 	p, _ := New(llm.CodexConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -166,7 +166,7 @@ func TestComplete_PassesModel(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{lastMessage: "ok"})
 
 	p, _ := New(llm.CodexConfig{Binary: script, Model: "gpt-5-codex"})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -184,7 +184,7 @@ func TestComplete_StructuredExtractsJSON(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{lastMessage: wrapped})
 
 	p, _ := New(llm.CodexConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "expand 'password hashing'"}},
@@ -206,7 +206,7 @@ func TestComplete_StructuredNoJSONErrors(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{lastMessage: "I cannot help with that."})
 
 	p, _ := New(llm.CodexConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "x"}},
@@ -220,7 +220,7 @@ func TestComplete_NonZeroExit(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{exitCode: 2, stderr: "not signed in"})
 
 	p, _ := New(llm.CodexConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -237,7 +237,7 @@ func TestComplete_EmptyResponseErrors(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{})
 
 	p, _ := New(llm.CodexConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -250,7 +250,7 @@ func TestComplete_ContextCancellation(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{lastMessage: "late", sleep: 2 * time.Second})
 
 	p, _ := New(llm.CodexConfig{Binary: script, TimeoutSeconds: 1})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -263,7 +263,7 @@ func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	script := fakeCodex(t, "", fakeOpts{lastMessage: "ok"})
 
 	p, _ := New(llm.CodexConfig{Binary: script, Args: []string{"--sandbox", "workspace-write"}})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

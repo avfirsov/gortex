@@ -119,12 +119,12 @@ var evalEmbeddersListCmd = &cobra.Command{
 	Short: "List registered embedder model specs (next-gen + MiniLM variants) with availability",
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		w := cmd.OutOrStdout()
-		_, _ = fmt.Fprintln(w, "# Embedder model registry")
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "## Next-gen specs (Python-backed)")
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "| name | provider | dim | available | install hint |")
-		_, _ = fmt.Fprintln(w, "|------|----------|----:|:---------:|--------------|")
+		fmt.Fprintln(w, "# Embedder model registry")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "## Next-gen specs (Python-backed)")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "| name | provider | dim | available | install hint |")
+		fmt.Fprintln(w, "|------|----------|----:|:---------:|--------------|")
 		specs := nextGenModelSpecs()
 		// Stable display order: by provider then name.
 		sort.Slice(specs, func(i, j int) bool {
@@ -140,16 +140,16 @@ var evalEmbeddersListCmd = &cobra.Command{
 					avail = "✗"
 				}
 			}
-			_, _ = fmt.Fprintf(w, "| %s | %s | %d | %s | %s |\n",
+			fmt.Fprintf(w, "| %s | %s | %d | %s | %s |\n",
 				s.Name, s.Provider, s.Dim, avail, s.InstallHint)
 		}
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "## MiniLM-L6-v2 ONNX variants (in-process via Hugot)")
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "All variants ship in-process — no external install required. Pass to `gortex eval embedders --variants <name>`.")
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "## MiniLM-L6-v2 ONNX variants (in-process via Hugot)")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "All variants ship in-process — no external install required. Pass to `gortex eval embedders --variants <name>`.")
+		fmt.Fprintln(w)
 		for _, name := range []string{"fp32", "o2", "o3", "o4", "qint8_arm64", "qint8_avx512", "quint8_avx2"} {
-			_, _ = fmt.Fprintf(w, "- %s\n", name)
+			fmt.Fprintf(w, "- %s\n", name)
 		}
 		return nil
 	},

@@ -126,7 +126,7 @@ func (s *Store) CoverageRows(repoPrefix string) []graph.CoverageEnrichment {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.CoverageEnrichment
 	for rows.Next() {

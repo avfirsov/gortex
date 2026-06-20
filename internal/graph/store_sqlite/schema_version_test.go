@@ -19,7 +19,7 @@ func withRawDB(t *testing.T, path string, fn func(db *sql.DB)) {
 	if err != nil {
 		t.Fatalf("open raw db: %v", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 	fn(db)
 }
 
@@ -40,7 +40,7 @@ func TestOpenStampsFreshDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open fresh: %v", err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
 		t.Fatalf("fresh user_version = %d (err %v), want %d", v, err, currentSchemaVersion)
 	}
@@ -73,7 +73,7 @@ func TestOpenBaselineStampsOldDBWithoutWipe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen old DB: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
 		t.Fatalf("user_version after baseline = %d, want %d", v, currentSchemaVersion)
 	}
@@ -109,7 +109,7 @@ func TestOpenRebuildsNewerDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen newer DB: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
 		t.Fatalf("user_version after rebuild = %d, want %d", v, currentSchemaVersion)
 	}
@@ -271,7 +271,7 @@ func TestOpenAtCurrentVersionIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen at current version: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
 		t.Fatalf("user_version = %d, want %d", v, currentSchemaVersion)
 	}
@@ -316,7 +316,7 @@ func TestOpenWithInPlaceMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWith v2 in-place: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 	if !ran {
 		t.Fatal("the in-place migration step did not run")
 	}
@@ -377,7 +377,7 @@ func TestOpenWithMemoryUnderWipePlanStampsWithoutError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWith :memory: under wipe plan: %v", err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 	if v, _ := readUserVersion(s.db); v != 2 {
 		t.Fatalf("user_version = %d, want 2", v)
 	}
@@ -406,7 +406,7 @@ func TestNeedsRebuildSignalAfterWipe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen newer DB: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 	if !s2.NeedsRebuild() {
 		t.Fatal("a wiped store must report NeedsRebuild so the daemon re-indexes")
 	}

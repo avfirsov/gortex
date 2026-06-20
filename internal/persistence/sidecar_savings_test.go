@@ -42,7 +42,7 @@ func TestSavings_DurableAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = sc2.Close() }()
+	defer sc2.Close()
 
 	buckets, firstSeen, lastUpdated, err := sc2.SavingsTotals()
 	if err != nil {
@@ -73,7 +73,7 @@ func TestSavings_DurableAcrossReopen(t *testing.T) {
 
 func TestSavings_MetaStampsMinMax(t *testing.T) {
 	sc, _ := openTestSidecar(t)
-	defer func() { _ = sc.Close() }()
+	defer sc.Close()
 
 	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
 	t2 := t1.Add(time.Hour)
@@ -98,7 +98,7 @@ func TestSavings_MetaStampsMinMax(t *testing.T) {
 
 func TestSavings_ResetClearsButKeepsImportMark(t *testing.T) {
 	sc, _ := openTestSidecar(t)
-	defer func() { _ = sc.Close() }()
+	defer sc.Close()
 
 	if err := sc.ImportLegacySavings(
 		map[string]SavingsTotalsRow{"": {Saved: 100, Returned: 10, Calls: 1}},
@@ -126,7 +126,7 @@ func TestSavings_ResetClearsButKeepsImportMark(t *testing.T) {
 
 func TestSavings_ImportIsIdempotent(t *testing.T) {
 	sc, _ := openTestSidecar(t)
-	defer func() { _ = sc.Close() }()
+	defer sc.Close()
 
 	rows := map[string]SavingsTotalsRow{"": {Saved: 100, Returned: 10, Calls: 1}}
 	if err := sc.ImportLegacySavings(rows, time.Time{}, time.Time{}, nil); err != nil {

@@ -662,7 +662,7 @@ func queryGortex(port int, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", resp.StatusCode)

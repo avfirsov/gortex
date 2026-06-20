@@ -297,13 +297,13 @@ func migrateSnapshotFile(path string, fromVersion int) (io.Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reopen snapshot for migration: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("gzip reader for migration: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	// Buffer the raw uncompressed stream once, then fold each migration
 	// step over it. Each step reads its input and writes the next
@@ -487,13 +487,13 @@ func readSnapshotHeader(path string) (hdr snapshotHeader, ok bool) {
 	if err != nil {
 		return snapshotHeader{}, false
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return snapshotHeader{}, false
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var header snapshotHeader
 	if err := gob.NewDecoder(gz).Decode(&header); err != nil {
@@ -624,13 +624,13 @@ func loadSnapshotFrom(g graph.Store, path string, logger *zap.Logger) (snapshotL
 		}
 		return result, fmt.Errorf("open snapshot: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return result, fmt.Errorf("gzip reader: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	dec := gob.NewDecoder(gz)
 	var header snapshotHeader

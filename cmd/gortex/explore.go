@@ -59,6 +59,6 @@ func runExplore(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	fmt.Fprintln(cmd.OutOrStdout(), string(out))
 	return nil
 }

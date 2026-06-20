@@ -52,7 +52,7 @@ func captureBody(t *testing.T, cfg llm.RemoteConfig) map[string]any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
 	}); err != nil {

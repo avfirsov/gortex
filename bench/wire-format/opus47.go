@@ -258,7 +258,7 @@ func (a *apiCounter) callAPI(payload string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("opus47 API %d: %s", resp.StatusCode, string(raw))

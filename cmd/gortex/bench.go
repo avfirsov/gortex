@@ -226,8 +226,8 @@ var benchTokensCmd = &cobra.Command{
 
 		switch benchFormat {
 		case "markdown", "md":
-			_, _ = fmt.Fprintln(cmd.OutOrStdout())
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), card)
+			fmt.Fprintln(cmd.OutOrStdout())
+			fmt.Fprintln(cmd.OutOrStdout(), card)
 		case "json":
 			out, err := json.MarshalIndent(map[string]any{
 				"metrics":   metrics,
@@ -238,7 +238,7 @@ var benchTokensCmd = &cobra.Command{
 				return err
 			}
 			_, _ = cmd.OutOrStdout().Write(out)
-			_, _ = fmt.Fprintln(cmd.OutOrStdout())
+			fmt.Fprintln(cmd.OutOrStdout())
 		default:
 			return fmt.Errorf("unknown --format %q (want markdown or json)", benchFormat)
 		}
@@ -460,7 +460,7 @@ var benchSWECmd = &cobra.Command{
 		// and we don't want CI / casual users to wait on a missing
 		// dataset.
 		if !swebenchAvailable() {
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+			fmt.Fprintln(cmd.ErrOrStderr(),
 				"[gortex bench swebench] SWE-bench harness not available locally;",
 				"see eval/README.md for setup. Skipping.")
 			return nil
@@ -497,15 +497,15 @@ var benchAllCmd = &cobra.Command{
 
 		results := map[string]string{}
 		for _, sub := range []struct {
-			name    string
-			runFn   func() error
+			name  string
+			runFn func() error
 		}{
 			{"tokens", func() error { return benchTokensCmd.RunE(cmd, nil) }},
 			{"recall", func() error { return benchRecallCmd.RunE(cmd, nil) }},
 			{"embedders", func() error { return benchEmbeddersCmd.RunE(cmd, nil) }},
 		} {
 			if err := sub.runFn(); err != nil {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				fmt.Fprintf(cmd.ErrOrStderr(),
 					"[gortex bench all] %s failed: %v (continuing)\n", sub.name, err)
 				results[sub.name] = "failed: " + err.Error()
 				continue
@@ -514,16 +514,16 @@ var benchAllCmd = &cobra.Command{
 		}
 
 		summary := map[string]any{
-			"generated":          time.Now().UTC().Format(time.RFC3339),
-			"run_dir":            runDir,
-			"results":            results,
-			"responses_per_day":  benchAllResponsesDay,
+			"generated":         time.Now().UTC().Format(time.RFC3339),
+			"run_dir":           runDir,
+			"results":           results,
+			"responses_per_day": benchAllResponsesDay,
 		}
 		summaryBytes, _ := json.MarshalIndent(summary, "", "  ")
 		if err := os.WriteFile(filepath.Join(runDir, "summary.json"), summaryBytes, 0o644); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\n[gortex bench all] artifacts: %s\n", runDir)
+		fmt.Fprintf(cmd.OutOrStdout(), "\n[gortex bench all] artifacts: %s\n", runDir)
 		return nil
 	},
 }
@@ -597,7 +597,7 @@ func loadTokensMetrics(path string) ([]tokensMetric, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	raw, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err

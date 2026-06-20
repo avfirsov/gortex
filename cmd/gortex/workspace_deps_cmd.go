@@ -100,7 +100,7 @@ func init() {
 // printDaemonReloadNote emits the standard reminder that an already-running
 // daemon caches config and needs an explicit reload to see the edit.
 func printDaemonReloadNote(cmd *cobra.Command) {
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+	fmt.Fprintln(cmd.OutOrStdout(),
 		"\nNote: a running daemon needs `gortex daemon reload` (or restart) to pick up the change.")
 }
 
@@ -300,7 +300,7 @@ func runWorkspaceDepsList(cmd *cobra.Command, args []string) error {
 		repos = repos[idx : idx+1]
 	}
 	if len(repos) == 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos)")
+		fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos)")
 		return nil
 	}
 
@@ -338,9 +338,9 @@ func runWorkspaceDepsList(cmd *cobra.Command, args []string) error {
 	}
 	if rows == 0 {
 		if scoped {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no cross-workspace dependencies declared)")
+			fmt.Fprintln(cmd.OutOrStdout(), "(no cross-workspace dependencies declared)")
 		} else {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repo declares cross-workspace dependencies)")
+			fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repo declares cross-workspace dependencies)")
 		}
 		return nil
 	}
@@ -393,7 +393,7 @@ func runWorkspaceDepsAdd(cmd *cobra.Command, args []string) error {
 	if extended {
 		verb = "extended"
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+	fmt.Fprintf(cmd.OutOrStdout(),
 		"%s cross-workspace dependency in %s/.gortex.yaml: %s → %s [%s]\n  modules: %s\n",
 		verb, r.Path, from, targetWS, result.Mode, strings.Join(result.Modules, ", "))
 	printDaemonReloadNote(cmd)
@@ -426,7 +426,7 @@ func runWorkspaceDepsMode(cmd *cobra.Command, args []string) error {
 	if err := writeCrossWorkspaceDeps(r.Path, deps); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+	fmt.Fprintf(cmd.OutOrStdout(),
 		"updated %s/.gortex.yaml: cross-workspace dependency → %s mode=%s\n",
 		r.Path, targetWS, mode)
 	printDaemonReloadNote(cmd)
@@ -457,10 +457,10 @@ func runWorkspaceDepsRemove(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if len(modules) == 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		fmt.Fprintf(cmd.OutOrStdout(),
 			"removed cross-workspace dependency from %s/.gortex.yaml: → %s\n", r.Path, targetWS)
 	} else {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		fmt.Fprintf(cmd.OutOrStdout(),
 			"removed module(s) from %s/.gortex.yaml cross-workspace dependency → %s: %s\n",
 			r.Path, targetWS, strings.Join(modules, ", "))
 	}

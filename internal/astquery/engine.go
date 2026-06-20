@@ -434,7 +434,7 @@ func readBoundedFile(path string, maxBytes int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
 		return nil, err

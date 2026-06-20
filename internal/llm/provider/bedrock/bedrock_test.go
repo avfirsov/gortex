@@ -53,7 +53,7 @@ func TestComplete_StructuredUsesForcedTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	// Pin time for reproducibility.
 	p.(*Provider).now = func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) }
 
@@ -109,7 +109,7 @@ func TestComplete_FreeformNoToolConfig(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
 	t.Setenv("AWS_SESSION_TOKEN", "")
 	p, _ := New(llm.BedrockConfig{ModelID: "amazon.nova-pro-v1:0", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -136,7 +136,7 @@ func TestComplete_APIError(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "k")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
 	p, _ := New(llm.BedrockConfig{ModelID: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -162,7 +162,7 @@ func TestComplete_SessionTokenIncludedInSignedHeaders(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
 	t.Setenv("AWS_SESSION_TOKEN", "FwoGZ...session...")
 	p, _ := New(llm.BedrockConfig{ModelID: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

@@ -38,13 +38,13 @@ func runInteractiveInit(in io.Reader, out io.Writer, hooksPreset bool) (interact
 		return choice, true
 	}
 
-	_, _ = fmt.Fprint(out, "Install Claude Code hooks (PreToolUse + PreCompact + Stop)? [Y/n]: ")
+	fmt.Fprint(out, "Install Claude Code hooks (PreToolUse + PreCompact + Stop)? [Y/n]: ")
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return interactiveChoice{}, false
 	}
 	choice.Hooks = !isNo(line)
-	_, _ = fmt.Fprintln(out)
+	fmt.Fprintln(out)
 	return choice, true
 }
 

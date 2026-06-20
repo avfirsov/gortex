@@ -154,11 +154,11 @@ func appendAiderIgnoreBlock(w interface {
 	if err != nil {
 		return agents.FileAction{}, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	if _, err := f.WriteString(block); err != nil {
 		return agents.FileAction{}, err
 	}
-	_, _ = fmt.Fprintf(w, "[gortex init] appended Gortex ignore block to %s\n", path)
+	fmt.Fprintf(w, "[gortex init] appended Gortex ignore block to %s\n", path)
 	action := agents.ActionMerge
 	if !existed {
 		action = agents.ActionCreate

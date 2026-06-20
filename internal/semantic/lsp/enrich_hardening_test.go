@@ -173,7 +173,7 @@ func (s *instrumentedServer) run(in *bufio.Reader, out io.Writer) {
 				return
 			}
 			s.outMu.Lock()
-			_, _ = fmt.Fprintf(out, "Content-Length: %d\r\n\r\n", len(data))
+			fmt.Fprintf(out, "Content-Length: %d\r\n\r\n", len(data))
 			_, _ = out.Write(data)
 			s.outMu.Unlock()
 		}(req)

@@ -518,7 +518,7 @@ func hashOverlayFiles(files []daemon.OverlayFile) string {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
 	h := sha256.New()
 	for _, f := range sorted {
-		_, _ = fmt.Fprintf(h, "%s\x00%t\x00%s\x00", f.Path, f.Deleted, f.BaseSHA)
+		fmt.Fprintf(h, "%s\x00%t\x00%s\x00", f.Path, f.Deleted, f.BaseSHA)
 		_, _ = h.Write([]byte(f.Content))
 		_, _ = h.Write([]byte{0})
 	}

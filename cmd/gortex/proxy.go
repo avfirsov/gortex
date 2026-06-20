@@ -114,7 +114,7 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		}
 		return false, fmt.Errorf("dial daemon: %w", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer client.Close()
 
 	fmt.Fprintf(os.Stderr,
 		"[gortex mcp] proxying to daemon (session %s, default_repo=%q)\n",

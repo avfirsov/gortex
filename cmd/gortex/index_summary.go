@@ -26,7 +26,7 @@ func writeIndexTextSummary(w io.Writer, path string, r *indexer.IndexResult) {
 		stats = append(stats, progress.Stat(humanizeInt(len(r.Errors)), "errors", progress.StatBad))
 	}
 
-	_, _ = fmt.Fprintf(w, "  %s   %s\n", progress.Row(path, "", 4), progress.StatStrip(stats...))
+	fmt.Fprintf(w, "  %s   %s\n", progress.Row(path, "", 4), progress.StatStrip(stats...))
 	writeIndexErrorBreakdown(w, r)
 }
 
@@ -51,7 +51,7 @@ func writeIndexErrorBreakdown(w io.Writer, r *indexer.IndexResult) {
 		caps = append(caps, fmt.Sprintf("%s failed after retry", humanizeInt(n)))
 	}
 	if len(caps) > 0 {
-		_, _ = fmt.Fprintf(w, "      %s\n", progress.Caption("breakdown: "+strings.Join(caps, " · ")))
+		fmt.Fprintf(w, "      %s\n", progress.Caption("breakdown: "+strings.Join(caps, " · ")))
 	}
 
 	if len(r.Errors) == 0 {
@@ -77,10 +77,10 @@ func writeIndexErrorBreakdown(w io.Writer, r *indexer.IndexResult) {
 		shown = shown[:indexBreakdownErrorCap]
 	}
 	for _, reason := range shown {
-		_, _ = fmt.Fprintf(w, "      %s\n", progress.Caption(fmt.Sprintf("%s × %s", humanizeInt(counts[reason]), reason)))
+		fmt.Fprintf(w, "      %s\n", progress.Caption(fmt.Sprintf("%s × %s", humanizeInt(counts[reason]), reason)))
 	}
 	if extra := len(reasons) - len(shown); extra > 0 {
-		_, _ = fmt.Fprintf(w, "      %s\n", progress.Caption(fmt.Sprintf("+%d more error reasons", extra)))
+		fmt.Fprintf(w, "      %s\n", progress.Caption(fmt.Sprintf("+%d more error reasons", extra)))
 	}
 }
 

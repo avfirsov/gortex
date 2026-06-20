@@ -148,7 +148,7 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 			return werr
 		}
 		if cancelled {
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  cancelled — no changes made.")
+			fmt.Fprintln(cmd.ErrOrStderr(), "  cancelled — no changes made.")
 			return nil
 		}
 	}
@@ -159,7 +159,7 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 	// default (off) and the first-run notice untouched.
 	if (telemetryFlagSet || wantWizard) && !installDryRun {
 		if serr := telemetry.SaveConsent(platform.TelemetryDir(), installTelemetry, "installer", time.Now); serr != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex install] warning: could not save telemetry choice: %v\n", serr)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex install] warning: could not save telemetry choice: %v\n", serr)
 		}
 	}
 
@@ -232,7 +232,7 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 			if a.Name() == claudecode.Name {
 				return fmt.Errorf("%s: %w", a.Name(), applyErr)
 			}
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex install] warning: %s setup failed: %v\n", a.Name(), applyErr)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex install] warning: %s setup failed: %v\n", a.Name(), applyErr)
 		}
 		if r != nil {
 			results = append(results, r)
@@ -293,33 +293,33 @@ func runInstallFollowUps(cmd *cobra.Command) error {
 
 	if installStartDaemon {
 		if daemon.IsRunning() {
-			_, _ = fmt.Fprintln(w, "[gortex install] daemon already running (skipped --start)")
+			fmt.Fprintln(w, "[gortex install] daemon already running (skipped --start)")
 		} else {
 			if err := spawnDetachedDaemon(); err != nil {
 				return fmt.Errorf("start daemon: %w", err)
 			}
-			_, _ = fmt.Fprintln(w, "[gortex install] daemon started (detached)")
+			fmt.Fprintln(w, "[gortex install] daemon started (detached)")
 		}
 	}
 
 	if installTrackRepo {
 		abs := mustAbs(installTrackPath)
 		if !daemon.IsRunning() {
-			_, _ = fmt.Fprintln(w, "[gortex install] ⚠ skipping --track: daemon is not running (try `gortex daemon start`)")
+			fmt.Fprintln(w, "[gortex install] ⚠ skipping --track: daemon is not running (try `gortex daemon start`)")
 		} else {
 			resp, err := trackViaDaemon(abs)
 			if err != nil {
 				return fmt.Errorf("track %s: %w", abs, err)
 			}
-			_, _ = fmt.Fprintf(w, "[gortex install] tracked %s (%s)\n", abs, resp)
+			fmt.Fprintf(w, "[gortex install] tracked %s (%s)\n", abs, resp)
 		}
 	}
 
 	if !installStartDaemon {
-		_, _ = fmt.Fprintln(w, "\nNext: start the daemon → `gortex daemon start --detach`")
+		fmt.Fprintln(w, "\nNext: start the daemon → `gortex daemon start --detach`")
 	}
 	if !installTrackRepo && installStartDaemon {
-		_, _ = fmt.Fprintln(w, "Then: track a repo → `cd <repo> && gortex init` (or `gortex track <path>`)")
+		fmt.Fprintln(w, "Then: track a repo → `cd <repo> && gortex init` (or `gortex track <path>`)")
 	}
 	return nil
 }

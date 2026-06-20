@@ -48,13 +48,13 @@ func LoadFrecency(dir string) (*FrecencyStore, error) {
 		}
 		return nil, fmt.Errorf("persistence: open frecency: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader frecency: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var store FrecencyStore
 	if err := gob.NewDecoder(gz).Decode(&store); err != nil {

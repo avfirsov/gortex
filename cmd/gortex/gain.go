@@ -113,7 +113,7 @@ func runGain(cmd *cobra.Command, _ []string) error {
 	if !gainNoHistory {
 		h, herr := loadHistory(gainCacheDir, gainSince)
 		if herr != nil {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex gain] history unavailable: %v\n", herr)
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex gain] history unavailable: %v\n", herr)
 		} else {
 			history = h
 		}
@@ -134,7 +134,7 @@ func runGain(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		_, _ = cmd.OutOrStdout().Write(raw)
-		_, _ = fmt.Fprintln(cmd.OutOrStdout())
+		fmt.Fprintln(cmd.OutOrStdout())
 		return nil
 	}
 
@@ -142,28 +142,28 @@ func runGain(cmd *cobra.Command, _ []string) error {
 	// convention); errors on print to stdout are not actionable so
 	// we explicitly discard the return values.
 	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintln(w, "Gortex Token Gain")
-	_, _ = fmt.Fprintln(w, "=================")
-	_, _ = fmt.Fprintf(w, "Bench source:   %s\n", benchPath)
+	fmt.Fprintln(w, "Gortex Token Gain")
+	fmt.Fprintln(w, "=================")
+	fmt.Fprintf(w, "Bench source:   %s\n", benchPath)
 	if benchAge != "" {
-		_, _ = fmt.Fprintf(w, "Bench age:      %s\n", benchAge)
+		fmt.Fprintf(w, "Bench age:      %s\n", benchAge)
 	}
 	if gainModel != "" {
-		_, _ = fmt.Fprintf(w, "Headline model: %s\n", gainModel)
+		fmt.Fprintf(w, "Headline model: %s\n", gainModel)
 	}
 	medianCL := medianSavedTokens(metrics, false)
 	medianOpus := medianSavedTokens(metrics, true)
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintf(w, "Median tokens saved / response: **%d** (cl100k_base)", medianCL)
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Median tokens saved / response: **%d** (cl100k_base)", medianCL)
 	if medianOpus > 0 {
-		_, _ = fmt.Fprintf(w, ", **%d** (Opus 4.7)", medianOpus)
+		fmt.Fprintf(w, ", **%d** (Opus 4.7)", medianOpus)
 	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintf(w, "Projected at %d responses/day:\n\n", gainResponsesPerDay)
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Projected at %d responses/day:\n\n", gainResponsesPerDay)
 	renderGainProjection(w, metrics, gainResponsesPerDay, gainModel)
 
 	if history != nil && history.Calls > 0 {
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 		renderGainHistory(w, history, gainModel)
 	}
 	return nil
@@ -274,8 +274,8 @@ func benchSourceAge(path string, autoFound bool) string {
 func renderGainProjection(w interface{ Write([]byte) (int, error) }, rows []tokensMetric, responsesPerDay int, headline string) {
 	medianCL := medianSavedTokens(rows, false)
 	medianOpus := medianSavedTokens(rows, true)
-	_, _ = fmt.Fprintln(w, "| Model            | $/M input | $/day  | $/month |")
-	_, _ = fmt.Fprintln(w, "|------------------|----------:|-------:|--------:|")
+	fmt.Fprintln(w, "| Model            | $/M input | $/day  | $/month |")
+	fmt.Fprintln(w, "|------------------|----------:|-------:|--------:|")
 	for _, p := range savings.Pricing() {
 		median := medianCL
 		if medianOpus > 0 && strings.Contains(strings.ToLower(p.Model), "opus") {
@@ -288,12 +288,12 @@ func renderGainProjection(w interface{ Write([]byte) (int, error) }, rows []toke
 		if headline != "" && strings.EqualFold(p.Model, headline) {
 			marker = "*"
 		}
-		_, _ = fmt.Fprintf(w, "|%s%-16s | $%-8.2f | $%-5.2f | $%-7.2f |\n",
+		fmt.Fprintf(w, "|%s%-16s | $%-8.2f | $%-5.2f | $%-7.2f |\n",
 			marker, p.Model, p.USDPerMInput, perDay, perMonth)
 	}
 	if headline != "" {
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintf(w, "*headlined: %s\n", headline)
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "*headlined: %s\n", headline)
 	}
 }
 
@@ -377,29 +377,29 @@ func loadHistory(cacheDir string, since time.Duration) (*gainHistory, error) {
 // renderGainHistory prints the "your history" section: how many calls
 // in the window, tokens saved, cost avoided at each priced model.
 func renderGainHistory(w interface{ Write([]byte) (int, error) }, h *gainHistory, headline string) {
-	_, _ = fmt.Fprintf(w, "Your history (last %s):\n", humanDuration(h.Since))
-	_, _ = fmt.Fprintf(w, "  Calls counted:  %d\n", h.Calls)
-	_, _ = fmt.Fprintf(w, "  Tokens saved:   %s\n", humanInt(h.Saved))
+	fmt.Fprintf(w, "Your history (last %s):\n", humanDuration(h.Since))
+	fmt.Fprintf(w, "  Calls counted:  %d\n", h.Calls)
+	fmt.Fprintf(w, "  Tokens saved:   %s\n", humanInt(h.Saved))
 	if h.Returned > 0 {
 		ratio := float64(h.Saved+h.Returned) / float64(h.Returned)
-		_, _ = fmt.Fprintf(w, "  Efficiency:     %.1fx vs naive full-file reads\n", ratio)
+		fmt.Fprintf(w, "  Efficiency:     %.1fx vs naive full-file reads\n", ratio)
 	}
 	if len(h.Costs) > 0 {
 		featured, model := pickHeadlineCost(h.Costs, headline)
-		_, _ = fmt.Fprintf(w, "  Cost avoided:   %s (%s)\n", formatUSD(featured), model)
+		fmt.Fprintf(w, "  Cost avoided:   %s (%s)\n", formatUSD(featured), model)
 		// Show all rows under the headline so the reader can compare.
 		names := make([]string, 0, len(h.Costs))
 		for n := range h.Costs {
 			names = append(names, n)
 		}
 		sort.Strings(names)
-		_, _ = fmt.Fprintln(w, "  Per model:")
+		fmt.Fprintln(w, "  Per model:")
 		for _, n := range names {
 			marker := " "
 			if strings.EqualFold(n, model) {
 				marker = "*"
 			}
-			_, _ = fmt.Fprintf(w, "    %s%-20s %s\n", marker, n, formatUSD(h.Costs[n]))
+			fmt.Fprintf(w, "    %s%-20s %s\n", marker, n, formatUSD(h.Costs[n]))
 		}
 	}
 }

@@ -119,7 +119,7 @@ func (s *Store) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.
 		if err != nil {
 			return err
 		}
-		defer func() { _ = rows.Close() }()
+		defer rows.Close()
 		for rows.Next() {
 			var f graph.RefFact
 			var cand string

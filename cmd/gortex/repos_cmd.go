@@ -117,7 +117,7 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("open persistence store: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer store.Close()
 
 	entries := make([]repoStatus, 0, len(repos))
 	for _, r := range repos {
@@ -236,10 +236,10 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 	if len(entries) == 0 {
 		if tty {
 			emitReposBanner(stderr)
-			_, _ = fmt.Fprintln(stderr, "  "+progress.StyleHint.Render("◌  no tracked repos — run `gortex track <path>` to add one"))
-			_, _ = fmt.Fprintln(stderr)
+			fmt.Fprintln(stderr, "  "+progress.StyleHint.Render("◌  no tracked repos — run `gortex track <path>` to add one"))
+			fmt.Fprintln(stderr)
 		} else {
-			_, _ = fmt.Fprintln(out, "(no tracked repos)")
+			fmt.Fprintln(out, "(no tracked repos)")
 		}
 		return nil
 	}
@@ -288,9 +288,9 @@ func emitReposBanner(w interface{ Write([]byte) (int, error) }) {
 		Title:    "gortex repos",
 		Subtitle: "Every tracked repository with its git head and index freshness.",
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w)
 }
 
 // emitReposSummary appends a stat strip below the table: total / fresh /
@@ -317,9 +317,9 @@ func emitReposSummary(w interface{ Write([]byte) (int, error) }, entries []repoS
 	if never > 0 {
 		stats = append(stats, progress.Stat(strconv.Itoa(never), "never indexed", progress.StatBad))
 	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "  "+progress.StatStrip(stats...))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  "+progress.StatStrip(stats...))
+	fmt.Fprintln(w)
 }
 
 // shortSHA abbreviates a 40-char git SHA to its 12-char prefix for the

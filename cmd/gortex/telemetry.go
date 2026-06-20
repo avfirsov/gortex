@@ -33,7 +33,7 @@ var telemetryOnCmd = &cobra.Command{
 		if err := telemetry.SaveConsent(platform.TelemetryDir(), true, "cli", time.Now); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Telemetry enabled — anonymous tool/command counts only (no code, paths, or names).")
+		fmt.Fprintln(cmd.OutOrStdout(), "Telemetry enabled — anonymous tool/command counts only (no code, paths, or names).")
 		return nil
 	},
 }
@@ -45,7 +45,7 @@ var telemetryOffCmd = &cobra.Command{
 		if err := telemetry.SaveConsent(platform.TelemetryDir(), false, "cli", time.Now); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Telemetry disabled — buffered data cleared.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Telemetry disabled — buffered data cleared.")
 		return nil
 	},
 }
@@ -61,15 +61,15 @@ var telemetryStatusCmd = &cobra.Command{
 		if consent.Enabled {
 			state = "enabled"
 		}
-		_, _ = fmt.Fprintf(out, "Telemetry: %s (decided by: %s)\n", state, consent.Source)
+		fmt.Fprintf(out, "Telemetry: %s (decided by: %s)\n", state, consent.Source)
 		endpoint := "not configured — nothing is transmitted"
 		if v := os.Getenv(telemetry.EnvEndpoint); v != "" {
 			endpoint = v
 		}
-		_, _ = fmt.Fprintf(out, "Ingest endpoint: %s\n", endpoint)
-		_, _ = fmt.Fprintf(out, "Install id: %s\n", telemetry.InstallID(dir))
-		_, _ = fmt.Fprintln(out, "Collected: coarse counts of which tools/commands run, bucketed (no code, paths, names, or exact counts).")
-		_, _ = fmt.Fprintln(out, "Change with: gortex telemetry on | off")
+		fmt.Fprintf(out, "Ingest endpoint: %s\n", endpoint)
+		fmt.Fprintf(out, "Install id: %s\n", telemetry.InstallID(dir))
+		fmt.Fprintln(out, "Collected: coarse counts of which tools/commands run, bucketed (no code, paths, names, or exact counts).")
+		fmt.Fprintln(out, "Change with: gortex telemetry on | off")
 		return nil
 	},
 }

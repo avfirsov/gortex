@@ -137,5 +137,5 @@ func logf(w io.Writer, format string, args ...any) {
 	if w == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(w, format+"\n", args...)
+	fmt.Fprintf(w, format+"\n", args...)
 }

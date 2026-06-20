@@ -114,7 +114,7 @@ func (s *Store) BlameRows(repoPrefix string) []graph.BlameEnrichment {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []graph.BlameEnrichment
 	for rows.Next() {
 		var e graph.BlameEnrichment

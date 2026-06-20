@@ -112,8 +112,8 @@ func runWiki(cmd *cobra.Command, args []string) error {
 	}
 	w := cmd.OutOrStdout()
 	if json.Unmarshal(out, &res) == nil && res.OutputDir != "" {
-		_, _ = fmt.Fprintf(w, "wiki generated: %d files under %s\n", res.FileCount, res.OutputDir)
-		_, _ = fmt.Fprintf(w, "open: %s/%s/index.md\n", res.OutputDir, repoSlug)
+		fmt.Fprintf(w, "wiki generated: %d files under %s\n", res.FileCount, res.OutputDir)
+		fmt.Fprintf(w, "open: %s/%s/index.md\n", res.OutputDir, repoSlug)
 		return nil
 	}
 	_, _ = w.Write(out)

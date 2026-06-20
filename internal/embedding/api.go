@@ -174,7 +174,7 @@ func (p *APIProvider) embedOllama(ctx context.Context, texts []string) ([][]floa
 	if err != nil {
 		return nil, fmt.Errorf("API call: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -231,7 +231,7 @@ func (p *APIProvider) embedOpenAI(ctx context.Context, texts []string) ([][]floa
 	if err != nil {
 		return nil, fmt.Errorf("API call: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

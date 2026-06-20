@@ -82,7 +82,7 @@ func defaultServiceStop(w io.Writer) error {
 	default:
 		return fmt.Errorf("supervised stop not supported on %s", runtime.GOOS)
 	}
-	_, _ = fmt.Fprintln(w, "[gortex daemon] stopped via service supervisor")
+	fmt.Fprintln(w, "[gortex daemon] stopped via service supervisor")
 	return nil
 }
 
@@ -102,6 +102,6 @@ func defaultServiceRestart(w io.Writer) error {
 	default:
 		return fmt.Errorf("supervised restart not supported on %s", runtime.GOOS)
 	}
-	_, _ = fmt.Fprintln(w, "[gortex daemon] restarted via service supervisor")
+	fmt.Fprintln(w, "[gortex daemon] restarted via service supervisor")
 	return nil
 }

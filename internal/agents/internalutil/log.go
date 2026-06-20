@@ -16,7 +16,7 @@ func Logf(w io.Writer, format string, args ...any) {
 	if w == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(w, format+"\n", args...)
+	fmt.Fprintf(w, format+"\n", args...)
 }
 
 // Warnf writes a "[gortex init] warning: …" prefixed line.
@@ -24,5 +24,5 @@ func Warnf(w io.Writer, format string, args ...any) {
 	if w == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(w, "[gortex init] warning: "+format+"\n", args...)
+	fmt.Fprintf(w, "[gortex init] warning: "+format+"\n", args...)
 }

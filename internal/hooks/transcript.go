@@ -28,7 +28,7 @@ func modelFromTranscript(path string) string {
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {

@@ -40,7 +40,7 @@ func (c *EnhanceCache) Key(section EnhanceSection, providerName string) string {
 	h := sha256.New()
 	// sha256.Hash.Write never returns an error; ignore Fprintf's int+err.
 	write := func(format string, args ...any) {
-		_, _ = fmt.Fprintf(h, format, args...)
+		fmt.Fprintf(h, format, args...)
 	}
 	write("v=%d\n", promptVersion)
 	write("provider=%s\n", providerName)

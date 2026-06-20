@@ -54,7 +54,7 @@ func requireDaemonTool(repoPath, tool string, args map[string]any) (json.RawMess
 		}
 		return nil, err
 	}
-	defer func() { _ = exec.Close() }()
+	defer exec.Close()
 	out, err := exec.CallTool(context.Background(), tool, args)
 	if err != nil {
 		if errors.Is(err, ErrRepoNotTracked) {
@@ -83,7 +83,7 @@ func daemonRequiredErr(repoPath string) error {
 func emitDaemonJSON(cmd *cobra.Command, raw json.RawMessage) error {
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(raw))
+		fmt.Fprintln(cmd.OutOrStdout(), string(raw))
 		return nil
 	}
 	enc := json.NewEncoder(cmd.OutOrStdout())
@@ -107,7 +107,7 @@ func printDaemonSearchSymbols(cmd *cobra.Command, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	for _, r := range payload.Results {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%-12s %-40s %s:%d\n", r.Kind, r.ID, r.FilePath, r.Line)
+		fmt.Fprintf(cmd.OutOrStdout(), "%-12s %-40s %s:%d\n", r.Kind, r.ID, r.FilePath, r.Line)
 	}
 	return nil
 }
@@ -139,10 +139,10 @@ func printDaemonSubgraph(cmd *cobra.Command, raw json.RawMessage) error {
 		if line == 0 {
 			line = n.StartLine
 		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%-12s %-40s %s:%d\n", n.Kind, n.ID, n.FilePath, line)
+		fmt.Fprintf(cmd.OutOrStdout(), "%-12s %-40s %s:%d\n", n.Kind, n.ID, n.FilePath, line)
 	}
 	if payload.Truncated {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "... truncated (%d total)\n", payload.TotalNodes)
+		fmt.Fprintf(cmd.OutOrStdout(), "... truncated (%d total)\n", payload.TotalNodes)
 	}
 	return nil
 }
@@ -161,7 +161,7 @@ func emitSubgraph(cmd *cobra.Command, repoPath, tool string, args map[string]any
 		return err
 	}
 	if diagram {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(out))
+		fmt.Fprintln(cmd.OutOrStdout(), string(out))
 		return nil
 	}
 	return printDaemonSubgraph(cmd, out)
@@ -181,17 +181,17 @@ func printDaemonStats(cmd *cobra.Command, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	out := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(out, "Nodes: %d  Edges: %d\n", payload.TotalNodes, payload.TotalEdges)
+	fmt.Fprintf(out, "Nodes: %d  Edges: %d\n", payload.TotalNodes, payload.TotalEdges)
 	if len(payload.ByKind) > 0 {
-		_, _ = fmt.Fprintln(out, "By kind:")
+		fmt.Fprintln(out, "By kind:")
 		for k, v := range payload.ByKind {
-			_, _ = fmt.Fprintf(out, "  %-12s %d\n", k, v)
+			fmt.Fprintf(out, "  %-12s %d\n", k, v)
 		}
 	}
 	if len(payload.ByLanguage) > 0 {
-		_, _ = fmt.Fprintln(out, "By language:")
+		fmt.Fprintln(out, "By language:")
 		for k, v := range payload.ByLanguage {
-			_, _ = fmt.Fprintf(out, "  %-12s %d\n", k, v)
+			fmt.Fprintf(out, "  %-12s %d\n", k, v)
 		}
 	}
 	return nil

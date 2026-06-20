@@ -163,12 +163,13 @@ func TestRunMCP_TTYvsPipe_Identical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("temp file: %v", err)
 	}
-	defer func() { _ = regularFile.Close() }()
+	defer regularFile.Close()
 	pipeR, pipeW, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	defer func() { _ = pipeR.Close(); _ = pipeW.Close() }()
+	defer pipeR.Close()
+	defer pipeW.Close()
 
 	stdins := map[string]*os.File{
 		"regular-file": regularFile,

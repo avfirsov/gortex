@@ -108,7 +108,7 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.IfaceImplementsRow
 	for rows.Next() {
@@ -151,7 +151,7 @@ ORDER BY e.id`
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	out := make(map[string][]graph.MemberMethodInfo)
 	seen := make(map[string]map[string]struct{})
@@ -206,7 +206,7 @@ ORDER BY e.id`
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.StructuralParentEdgeRow
 	for rows.Next() {
@@ -344,7 +344,7 @@ ORDER BY e.id`
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []graph.CrossRepoCandidateRow
 	for rows.Next() {

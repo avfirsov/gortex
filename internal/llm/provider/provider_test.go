@@ -26,7 +26,7 @@ func TestNew_AnthropicOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "anthropic" {
 		t.Errorf("Name()=%q want anthropic", p.Name())
 	}
@@ -38,7 +38,7 @@ func TestNew_OpenAIOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "openai" {
 		t.Errorf("Name()=%q want openai", p.Name())
 	}
@@ -56,7 +56,7 @@ func TestNew_OllamaOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "ollama" {
 		t.Errorf("Name()=%q want ollama", p.Name())
 	}
@@ -88,7 +88,7 @@ func TestNew_CodexOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "codex" {
 		t.Errorf("Name()=%q want codex", p.Name())
 	}
@@ -107,7 +107,7 @@ func TestNew_GeminiOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "gemini" {
 		t.Errorf("Name()=%q want gemini", p.Name())
 	}
@@ -132,7 +132,7 @@ func TestNew_BedrockOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "bedrock" {
 		t.Errorf("Name()=%q want bedrock", p.Name())
 	}
@@ -151,7 +151,7 @@ func TestNew_DeepSeekOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "deepseek" {
 		t.Errorf("Name()=%q want deepseek", p.Name())
 	}
@@ -170,7 +170,7 @@ func TestNew_ClaudeCLIOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "claudecli" {
 		t.Errorf("Name()=%q want claudecli", p.Name())
 	}

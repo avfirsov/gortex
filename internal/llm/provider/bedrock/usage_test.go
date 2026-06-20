@@ -28,7 +28,7 @@ func TestComplete_DecodesUsageBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -51,7 +51,7 @@ func TestComplete_NoUsageBlockIsZero(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "ak")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "sk")
 	p, _ := New(llm.BedrockConfig{ModelID: "amazon.nova-pro-v1:0", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

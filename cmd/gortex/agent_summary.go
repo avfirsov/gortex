@@ -30,19 +30,19 @@ func emitAgentSummary(w io.Writer, results []*agents.Result, opts agents.ApplyOp
 		totals.add(r.Files)
 	}
 
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 	if !totals.zero() || opts.DryRun {
-		_, _ = fmt.Fprintln(w, "  "+totalsStrip(totals, opts.DryRun))
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w, "  "+totalsStrip(totals, opts.DryRun))
+		fmt.Fprintln(w)
 	}
 
 	if len(detected) > 0 {
-		_, _ = fmt.Fprintln(w, "  "+progress.Heading("configured", strconv.Itoa(len(detected))))
+		fmt.Fprintln(w, "  "+progress.Heading("configured", strconv.Itoa(len(detected))))
 		for _, r := range detected {
 			detail := perAdapterDetail(r.Files)
-			_, _ = fmt.Fprintln(w, "   "+progress.Row(r.Name, detail, 14))
+			fmt.Fprintln(w, "   "+progress.Row(r.Name, detail, 14))
 		}
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 	}
 
 	// Non-fatal problems an adapter continued past (e.g. a profile config
@@ -54,28 +54,28 @@ func emitAgentSummary(w io.Writer, results []*agents.Result, opts agents.ApplyOp
 		}
 	}
 	if len(warned) > 0 {
-		_, _ = fmt.Fprintln(w, "  "+progress.Heading("warnings"))
+		fmt.Fprintln(w, "  "+progress.Heading("warnings"))
 		for _, r := range warned {
 			for _, msg := range r.Warnings {
-				_, _ = fmt.Fprintln(w, "   "+progress.Row(r.Name, msg, 14))
+				fmt.Fprintln(w, "   "+progress.Row(r.Name, msg, 14))
 			}
 		}
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 	}
 
 	if len(notDetected) > 0 {
 		names := progress.SortStrings(notDetected)
-		_, _ = fmt.Fprintln(w, "  "+progress.Heading("not detected", strconv.Itoa(len(notDetected))))
-		_, _ = fmt.Fprintln(w, "   "+progress.Chips(names, 0))
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w, "  "+progress.Heading("not detected", strconv.Itoa(len(notDetected))))
+		fmt.Fprintln(w, "   "+progress.Chips(names, 0))
+		fmt.Fprintln(w)
 	}
 
 	if len(nextSteps) > 0 {
-		_, _ = fmt.Fprintln(w, "  "+progress.Heading("next steps"))
+		fmt.Fprintln(w, "  "+progress.Heading("next steps"))
 		for i, s := range nextSteps {
-			_, _ = fmt.Fprintln(w, "   "+progress.Step(i+1, s))
+			fmt.Fprintln(w, "   "+progress.Step(i+1, s))
 		}
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 	}
 }
 

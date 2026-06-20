@@ -328,7 +328,7 @@ func loadVocab(path string) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	vocab := make(map[string]int64, 32000)
 	scanner := bufio.NewScanner(f)
@@ -352,13 +352,13 @@ func loadVocabGz(path string) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	vocab := make(map[string]int64, 32000)
 	scanner := bufio.NewScanner(gz)

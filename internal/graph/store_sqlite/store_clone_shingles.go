@@ -174,7 +174,7 @@ func (s *Store) LoadCloneShingles(repoPrefix string) (map[string][]uint64, error
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	out := make(map[string][]uint64)
 	for rows.Next() {

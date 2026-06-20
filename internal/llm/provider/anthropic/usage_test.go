@@ -28,7 +28,7 @@ func TestComplete_DecodesUsageBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -52,7 +52,7 @@ func TestComplete_NoUsageBlockIsZero(t *testing.T) {
 
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")
 	p, _ := New(llm.RemoteConfig{Model: "claude-x", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

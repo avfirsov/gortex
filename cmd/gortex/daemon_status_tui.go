@@ -97,7 +97,7 @@ func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		row += "   " + tuiHint.Render(truncate(shortenPath(r.path), pathW))
 	}
 
-	_, _ = fmt.Fprint(w, cursor+style.Render(row))
+	fmt.Fprint(w, cursor+style.Render(row))
 }
 
 // ---- model -------------------------------------------------------------

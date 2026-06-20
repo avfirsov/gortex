@@ -71,7 +71,7 @@ func (c *ServerClient) FetchHealth(ctx context.Context) (RemoteHealth, error) {
 	if err != nil {
 		return out, fmt.Errorf("fetch health from %q: %w", c.Entry.Slug, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return out, fmt.Errorf("health from %q: status %d", c.Entry.Slug, resp.StatusCode)
 	}

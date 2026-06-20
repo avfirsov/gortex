@@ -10,7 +10,7 @@ import (
 // TestRouter_For_NoSpec returns an error for unknown extensions.
 func TestRouter_For_NoSpec(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if _, err := r.For("README.md"); err == nil {
 		t.Fatal("expected error for unknown ext")
 	}
@@ -21,7 +21,7 @@ func TestRouter_For_NoSpec(t *testing.T) {
 // panic and returns a sane shape.
 func TestRouter_AvailableSpecs(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	specs := r.AvailableSpecs()
 	for _, s := range specs {
 		if s == nil {
@@ -37,7 +37,7 @@ func TestRouter_AvailableSpecs(t *testing.T) {
 // no live providers until For() succeeds.
 func TestRouter_Stats_EmptyOnConstruct(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if got := r.Stats(); len(got) != 0 {
 		t.Fatalf("expected empty stats, got %v", got)
 	}
@@ -48,7 +48,7 @@ func TestRouter_Stats_EmptyOnConstruct(t *testing.T) {
 // a sorted, deduplicated slice (possibly empty).
 func TestRouter_SupportedLanguages(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	langs := r.SupportedLanguages()
 	for i := 1; i < len(langs); i++ {
 		if langs[i-1] >= langs[i] {
@@ -60,7 +60,7 @@ func TestRouter_SupportedLanguages(t *testing.T) {
 // TestRouter_NoOpReap returns nothing when the router is empty.
 func TestRouter_NoOpReap(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop()).WithIdleTimeout(time.Millisecond)
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if names := r.Reap(); len(names) != 0 {
 		t.Fatalf("expected no names, got %v", names)
 	}
@@ -69,7 +69,7 @@ func TestRouter_NoOpReap(t *testing.T) {
 // TestRouter_LanguageIDForPath delegates to the package helper.
 func TestRouter_LanguageIDForPath(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if got := r.LanguageIDForPath("a.ts"); got != "typescript" {
 		t.Fatalf("got %q, want typescript", got)
 	}
@@ -80,7 +80,7 @@ func TestRouter_LanguageIDForPath(t *testing.T) {
 // that a nil spec is silently skipped.
 func TestRouter_RegisterSpec_Idempotent(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	spec := SpecByName("gopls")
 	if spec == nil {
@@ -102,7 +102,7 @@ func TestRouter_RegisterSpec_Idempotent(t *testing.T) {
 // CI-safe).
 func TestRouter_EnabledSpecNames(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	for _, name := range []string{"gopls", "rust-analyzer", "clangd"} {
 		if spec := SpecByName(name); spec != nil {
@@ -127,7 +127,7 @@ func TestRouter_EnabledSpecNames(t *testing.T) {
 // HasProviders-loop-walks-and-spawns regression.
 func TestRouter_SpecAvailable_NotRegistered(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if r.SpecAvailable("never-registered") {
 		t.Fatal("expected SpecAvailable=false for unregistered spec")
 	}
@@ -142,7 +142,7 @@ func TestRouter_SpecAvailable_NotRegistered(t *testing.T) {
 // spawning anything.
 func TestRouter_ProviderForSpec_Unregistered(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if _, err := r.ProviderForSpec("never-registered"); err == nil {
 		t.Fatal("expected error for unregistered spec")
 	}
@@ -160,7 +160,7 @@ func TestRouter_ProviderForSpec_Unregistered(t *testing.T) {
 // a binary on PATH).
 func TestRouter_SetDiagnosticsHook_PropagatesToExistingProvider(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	// Inject a placeholder provider directly into the router's map.
 	// This bypasses the real spawn path (which needs an LSP binary).
@@ -197,7 +197,7 @@ func TestRouter_SetDiagnosticsHook_PropagatesToExistingProvider(t *testing.T) {
 // providers — no calls should land after detach.
 func TestRouter_SetDiagnosticsHook_Nil(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	p := NewProvider("noop", nil, []string{"go"}, false, 1, zap.NewNop())
 	r.mu.Lock()
@@ -270,7 +270,7 @@ func TestProvider_SetDiagnosticsHook_DirectPath(t *testing.T) {
 // Names reflect both (spec, workspace) pairs.
 func TestRouter_PerWorkspaceCacheIsolation(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	specA := &ServerSpec{Name: "fake-spec", Languages: []string{"go"}}
 
@@ -311,7 +311,7 @@ func TestRouter_PerWorkspaceCacheIsolation(t *testing.T) {
 func TestRouter_DefaultWorkspace(t *testing.T) {
 	tmp := t.TempDir()
 	r := NewRouter(tmp, zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 	if got := r.DefaultWorkspace(); got == "" || got[len(got)-len(tmp):] != tmp {
 		t.Fatalf("DefaultWorkspace not resolved: got %q want suffix %q", got, tmp)
 	}
@@ -327,7 +327,7 @@ func timeNow() (t time.Time) { return time.Now() }
 // the same way on a CI box without any LSP binaries installed.
 func TestRouter_RegisterAvailable_RespectsDisabled(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	// Force-mark every known spec as available so the test isn't
 	// sensitive to the host's LSP install. Then exercise the
@@ -367,7 +367,7 @@ func TestRouter_RegisterAvailable_RespectsDisabled(t *testing.T) {
 // PATH-probe gate kicks in even when the disabled set is empty.
 func TestRouter_RegisterAvailable_SkipsBinariesNotOnPath(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	// Pre-poison avail to false for every spec so RegisterAvailable
 	// has to skip them all.
@@ -392,7 +392,7 @@ func TestRouter_RegisterAvailable_SkipsBinariesNotOnPath(t *testing.T) {
 // the bulk path.
 func TestRouter_RegisterAvailable_Idempotent(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	r.availMu.Lock()
 	for _, s := range AllSpecs() {
@@ -416,7 +416,7 @@ func TestRouter_RegisterAvailable_Idempotent(t *testing.T) {
 // with command / args / env overrides (the jdtls JRE-pin path).
 func TestRouter_RegisterAvailable_KeepsConfigOverride(t *testing.T) {
 	r := NewRouter(t.TempDir(), zap.NewNop())
-	defer func() { _ = r.Close() }()
+	defer r.Close()
 
 	r.availMu.Lock()
 	for _, s := range AllSpecs() {

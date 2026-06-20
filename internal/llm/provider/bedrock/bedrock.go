@@ -250,7 +250,7 @@ func (p *Provider) attempt(ctx context.Context, raw []byte, structured bool) htt
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("bedrock: request failed: %w", err)}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("bedrock: read response: %w", err)}

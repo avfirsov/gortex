@@ -593,7 +593,7 @@ func AppendInstructions(w io.Writer, path, body, sentinel string, opts ApplyOpts
 	existed := readErr == nil
 	if existed && strings.Contains(string(existing), sentinel) {
 		if w != nil {
-			_, _ = fmt.Fprintf(w, "[gortex init] skip %s (Gortex block already present)\n", path)
+			fmt.Fprintf(w, "[gortex init] skip %s (Gortex block already present)\n", path)
 		}
 		return FileAction{Path: path, Action: ActionSkip, Reason: "block-present"}, nil
 	}
@@ -620,12 +620,12 @@ func AppendInstructions(w io.Writer, path, body, sentinel string, opts ApplyOpts
 	if err != nil {
 		return FileAction{}, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	if _, err := f.WriteString(prefix + body); err != nil {
 		return FileAction{}, err
 	}
 	if w != nil {
-		_, _ = fmt.Fprintf(w, "[gortex init] appended Gortex block to %s\n", path)
+		fmt.Fprintf(w, "[gortex init] appended Gortex block to %s\n", path)
 	}
 	action := ActionMerge
 	if !existed {
@@ -740,7 +740,7 @@ func UpsertMarkedBlock(w io.Writer, path, body, startMarker, endMarker string, o
 		if !existed {
 			verb = "wrote"
 		}
-		_, _ = fmt.Fprintf(w, "[gortex init] %s %s (communities block)\n", verb, path)
+		fmt.Fprintf(w, "[gortex init] %s %s (communities block)\n", verb, path)
 	}
 	action := ActionMerge
 	if !existed {

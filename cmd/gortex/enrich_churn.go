@@ -48,7 +48,7 @@ func runEnrichChurn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	var out daemon.EnrichChurnResult
 	if err := controlEnrich(c, daemon.ControlEnrichChurn, daemon.EnrichChurnParams{

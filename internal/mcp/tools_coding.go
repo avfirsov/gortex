@@ -933,7 +933,7 @@ func readLines(path string, startLine, endLine, contextLines int) (string, int, 
 	if err != nil {
 		return "", 0, 0, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	from := startLine - contextLines
 	if from < 1 {
@@ -2742,7 +2742,7 @@ func readSingleLineAt(absPath string, lineNum int) string {
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	current := 0

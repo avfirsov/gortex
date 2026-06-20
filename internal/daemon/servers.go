@@ -436,7 +436,7 @@ func (c *ServerClient) ProxyToolCtx(ctx context.Context, toolName string, body [
 	if err != nil {
 		return nil, 0, fmt.Errorf("proxy %s/%s: %w", c.Entry.Slug, toolName, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	out, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read proxy response: %w", err)
@@ -465,7 +465,7 @@ func (c *ServerClient) FetchWorkspaceRoster(workspace string) ([]string, error) 
 	if err != nil {
 		return nil, fmt.Errorf("fetch roster from %q: %w", c.Entry.Slug, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrWorkspaceNotFound
 	}

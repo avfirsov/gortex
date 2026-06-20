@@ -401,7 +401,7 @@ func TestServerInitiatedPush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /mcp: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -818,7 +818,7 @@ func TestHTTPRoundTripEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}

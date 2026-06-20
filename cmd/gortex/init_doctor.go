@@ -140,7 +140,7 @@ func doctorEnvironment() DoctorEnvironment {
 		}
 		return out
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	out.DaemonRunning = true
 	out.DaemonVersion = c.Ack.DaemonVersion
 	return out
@@ -232,22 +232,22 @@ func inspectAdapter(a agents.Adapter, env agents.Env) DoctorAgentReport {
 // and the daemon handshake. These two lines answer "is the integration
 // actually live", not just "is the config file present".
 func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
-	_, _ = fmt.Fprintln(w, "Gortex init doctor — environment:")
+	fmt.Fprintln(w, "Gortex init doctor — environment:")
 	if env.BinaryOnPath {
-		_, _ = fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, env.BinaryPath)
+		fmt.Fprintf(w, "  %s gortex on PATH: %s\n", glyphCheck, env.BinaryPath)
 	} else {
-		_, _ = fmt.Fprintf(w, "  %s gortex not found on PATH (%s)\n", glyphCross, env.BinaryError)
+		fmt.Fprintf(w, "  %s gortex not found on PATH (%s)\n", glyphCross, env.BinaryError)
 	}
 	if env.DaemonRunning {
 		ver := env.DaemonVersion
 		if ver == "" {
 			ver = "ok"
 		}
-		_, _ = fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, env.DaemonSocket)
+		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, env.DaemonSocket)
 	} else {
-		_, _ = fmt.Fprintf(w, "  %s daemon handshake: %s\n", glyphCross, env.DaemonError)
+		fmt.Fprintf(w, "  %s daemon handshake: %s\n", glyphCross, env.DaemonError)
 	}
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 }
 
 // glyphCheck / glyphCross are the doctor's status markers.
@@ -260,8 +260,8 @@ const (
 // agent, with a nested file list. Columns line up for copy-paste
 // into issue reports.
 func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
-	_, _ = fmt.Fprintln(w, "Gortex init doctor — observed state of every adapter's planned files:")
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w, "Gortex init doctor — observed state of every adapter's planned files:")
+	fmt.Fprintln(w)
 
 	for _, r := range reports {
 		detMark := "–"
@@ -272,7 +272,7 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 		if r.Configured {
 			cfgMark = "✓"
 		}
-		_, _ = fmt.Fprintf(w, "  [%s detected] [%s any-file-present]  %s\n", detMark, cfgMark, r.Name)
+		fmt.Fprintf(w, "  [%s detected] [%s any-file-present]  %s\n", detMark, cfgMark, r.Name)
 		for _, f := range r.Files {
 			statusSym := "?"
 			switch f.Status {
@@ -302,11 +302,11 @@ func printDoctorHuman(w io.Writer, reports []DoctorAgentReport) {
 				}
 				extra = fmt.Sprintf(" (init would %s)", verb)
 			}
-			_, _ = fmt.Fprintf(w, "      %s %s%s\n", statusSym, f.Path, extra)
+			fmt.Fprintf(w, "      %s %s%s\n", statusSym, f.Path, extra)
 		}
 		if r.DocsURL != "" {
-			_, _ = fmt.Fprintf(w, "      docs: %s\n", r.DocsURL)
+			fmt.Fprintf(w, "      docs: %s\n", r.DocsURL)
 		}
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 	}
 }

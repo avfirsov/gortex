@@ -38,7 +38,7 @@ func TestComplete_StructuredUsesJSONSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages:  []llm.Message{{Role: llm.RoleUser, Content: "Query: auth"}},
@@ -75,7 +75,7 @@ func TestComplete_ToolCallShapeIsNonStrict(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "go"}},
@@ -103,7 +103,7 @@ func TestComplete_FreeformNoResponseFormat(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -129,7 +129,7 @@ func TestComplete_APIError(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -157,7 +157,7 @@ func TestComplete_SendsReasoningEffort(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "o4-mini", BaseURL: srv.URL, Effort: "high"})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
 	}); err != nil {
@@ -185,7 +185,7 @@ func TestComplete_HollowResponseRetriesThenSucceeds(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -214,7 +214,7 @@ func TestComplete_HollowResponseExhaustsRetries(t *testing.T) {
 
 	t.Setenv("OPENAI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

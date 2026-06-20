@@ -293,10 +293,10 @@ func runWorkspaceList(cmd *cobra.Command, _ []string) error {
 	if len(entries) == 0 {
 		if tty {
 			emitWorkspaceBanner(cmd.ErrOrStderr(), "list", "Workspace declarations across every tracked repo.")
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  "+progress.StyleHint.Render("◌  no tracked repos — run `gortex track <path>` to add one"))
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr())
+			fmt.Fprintln(cmd.ErrOrStderr(), "  "+progress.StyleHint.Render("◌  no tracked repos — run `gortex track <path>` to add one"))
+			fmt.Fprintln(cmd.ErrOrStderr())
 		} else {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos)")
+			fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos)")
 		}
 		return nil
 	}
@@ -378,9 +378,9 @@ func emitWorkspaceBanner(w io.Writer, mode, subtitle string) {
 		Title:    "gortex workspace — " + mode,
 		Subtitle: subtitle,
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w)
 }
 
 // emitWorkspaceSetSummary prints the post-set summary card showing the file
@@ -391,13 +391,13 @@ func emitWorkspaceSetSummary(cmd *cobra.Command, target, repo, workspace, projec
 	if !progress.IsTTY(w) || noProgress {
 		out := cmd.OutOrStdout()
 		if global {
-			_, _ = fmt.Fprintf(out, "updated %s: %s → workspace=%s project=%s\n",
+			fmt.Fprintf(out, "updated %s: %s → workspace=%s project=%s\n",
 				target, repo, workspace, project)
 		} else {
-			_, _ = fmt.Fprintf(out, "updated %s: workspace=%s project=%s\n",
+			fmt.Fprintf(out, "updated %s: workspace=%s project=%s\n",
 				target, workspace, project)
 		}
-		_, _ = fmt.Fprintln(out, "\nNote: a running daemon needs `gortex daemon reload` (or restart) to pick up the change.")
+		fmt.Fprintln(out, "\nNote: a running daemon needs `gortex daemon reload` (or restart) to pick up the change.")
 		return
 	}
 
@@ -407,18 +407,18 @@ func emitWorkspaceSetSummary(cmd *cobra.Command, target, repo, workspace, projec
 	}
 	emitWorkspaceBanner(w, mode, "Updated workspace declaration for "+repo+".")
 
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(repo))
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(repo))
 	stats := []string{
 		progress.Stat(workspace, "workspace", progress.StatGood),
 	}
 	if project != "" && project != workspace {
 		stats = append(stats, progress.Stat(project, "project", progress.StatNeutral))
 	}
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
-	_, _ = fmt.Fprintln(w, "     "+progress.Row("file", target, 8))
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "     "+progress.Caption("a running daemon needs `gortex daemon reload` (or restart) to pick up the change."))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "     "+progress.Row("file", target, 8))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "     "+progress.Caption("a running daemon needs `gortex daemon reload` (or restart) to pick up the change."))
+	fmt.Fprintln(w)
 }
 
 // stampWorkspace writes workspace+project into a repo's .gortex.yaml
@@ -480,7 +480,7 @@ func runWorkspaceSetAll(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if len(repos) == 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos to update)")
+		fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos to update)")
 		return nil
 	}
 
@@ -505,21 +505,21 @@ func runWorkspaceSetAll(cmd *cobra.Command, args []string) error {
 		planned = append(planned, r)
 	}
 	if len(planned) == 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos match --root)")
+		fmt.Fprintln(cmd.OutOrStdout(), "(no tracked repos match --root)")
 		return nil
 	}
 
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Plan: stamp workspace=%q (project=workspace) into %d repos:\n", workspace, len(planned))
+	fmt.Fprintf(cmd.OutOrStdout(), "Plan: stamp workspace=%q (project=workspace) into %d repos:\n", workspace, len(planned))
 	for _, r := range planned {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", r.Path)
+		fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", r.Path)
 	}
 	if !workspaceSetAll {
-		_, _ = fmt.Fprint(cmd.OutOrStdout(), "\nProceed? [y/N] ")
+		fmt.Fprint(cmd.OutOrStdout(), "\nProceed? [y/N] ")
 		var answer string
 		_, _ = fmt.Fscanln(os.Stdin, &answer)
 		answer = strings.TrimSpace(strings.ToLower(answer))
 		if answer != "y" && answer != "yes" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "aborted")
+			fmt.Fprintln(cmd.OutOrStdout(), "aborted")
 			return nil
 		}
 	}
@@ -539,13 +539,13 @@ func runWorkspaceSetAll(cmd *cobra.Command, args []string) error {
 		}
 		updated++
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\nupdated %d/%d repos\n", updated, len(planned))
+	fmt.Fprintf(cmd.OutOrStdout(), "\nupdated %d/%d repos\n", updated, len(planned))
 	if len(failures) > 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nfailures:")
+		fmt.Fprintln(cmd.OutOrStdout(), "\nfailures:")
 		for _, f := range failures {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", f)
+			fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", f)
 		}
 	}
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nNote: a running daemon needs `gortex daemon reload` (or restart) to pick up the change.")
+	fmt.Fprintln(cmd.OutOrStdout(), "\nNote: a running daemon needs `gortex daemon reload` (or restart) to pick up the change.")
 	return nil
 }

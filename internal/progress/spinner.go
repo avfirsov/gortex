@@ -277,7 +277,7 @@ func (s *Spinner) Start(label string) {
 	s.label = label
 	s.mu.Unlock()
 	if !s.enabled {
-		_, _ = fmt.Fprintf(s.w, "  %s\n", label)
+		fmt.Fprintf(s.w, "  %s\n", label)
 		return
 	}
 	if !s.started.CompareAndSwap(false, true) {
@@ -335,7 +335,7 @@ func (s *Spinner) Report(stage string, current, total int) {
 		s.lastStage = stage
 		s.mu.Unlock()
 		if newStage {
-			_, _ = fmt.Fprintf(s.w, "    %s\n", stage)
+			fmt.Fprintf(s.w, "    %s\n", stage)
 		}
 		return
 	}
@@ -367,9 +367,9 @@ func (s *Spinner) finish(state meshState, err error) {
 			if err != nil {
 				msg = fmt.Sprintf("%s: %v", label, err)
 			}
-			_, _ = fmt.Fprintf(s.w, "  %s %s\n", g.Fail, msg)
+			fmt.Fprintf(s.w, "  %s %s\n", g.Fail, msg)
 		} else {
-			_, _ = fmt.Fprintf(s.w, "  %s %s\n", g.OK, label)
+			fmt.Fprintf(s.w, "  %s %s\n", g.OK, label)
 		}
 		return
 	}

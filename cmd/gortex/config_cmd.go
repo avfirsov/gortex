@@ -456,7 +456,7 @@ func notifyDaemonReload() {
 	if err != nil {
 		return
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlReload, nil)
 	if err != nil || !resp.OK {
 		return

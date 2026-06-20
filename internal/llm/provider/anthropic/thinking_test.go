@@ -31,7 +31,7 @@ func captureWithOpts(t *testing.T, model string, req llm.CompletionRequest, opts
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if _, err := p.Complete(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}

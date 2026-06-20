@@ -135,7 +135,7 @@ func TestNewLocalProvider_ReturnsWorkingProvider(t *testing.T) {
 	}
 	p, err := NewLocalProvider()
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	// Default build walks ONNX → GoMLX → Hugot → Static and returns
 	// the first that initialises. With Hugot's onnx file pinned to

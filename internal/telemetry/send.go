@@ -168,7 +168,7 @@ func (s *Sender) post(ctx context.Context, payload Payload) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("telemetry ingest returned status %d", resp.StatusCode)

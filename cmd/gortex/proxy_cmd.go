@@ -219,7 +219,7 @@ func proxyApplyToRunningDaemon() {
 		fmt.Fprintln(os.Stderr, "[gortex] note: run `gortex daemon restart` to apply to the running daemon")
 		return
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlProxy, nil)
 	if err != nil || !resp.OK {
 		fmt.Fprintln(os.Stderr, "[gortex] note: run `gortex daemon restart` to apply to the running daemon")

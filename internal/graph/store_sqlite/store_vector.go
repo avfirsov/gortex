@@ -208,7 +208,7 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	// Max-heap keyed on distance: the root is the *worst* kept hit, so a
 	// candidate better than the root evicts it. This keeps the heap at

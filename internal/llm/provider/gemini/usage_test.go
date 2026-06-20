@@ -28,7 +28,7 @@ func TestComplete_DecodesUsageMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -50,7 +50,7 @@ func TestComplete_NoUsageMetadataIsZero(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "test-key")
 	p, _ := New(llm.RemoteConfig{Model: "gemini-2.5-pro", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

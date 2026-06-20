@@ -170,7 +170,7 @@ func readIgnoreFile(path string) []string {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	var patterns []string
 	scanner := bufio.NewScanner(f)

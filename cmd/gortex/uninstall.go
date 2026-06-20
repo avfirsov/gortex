@@ -134,7 +134,7 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		if !accepted {
-			_, _ = fmt.Fprintln(w, "  cancelled — no files removed.")
+			fmt.Fprintln(w, "  cancelled — no files removed.")
 			return nil
 		}
 	}
@@ -248,12 +248,12 @@ func executeUninstall(files, dirs []string) (int, []string) {
 // non-TTY, styled hint card on TTY.
 func emitUninstallNothingTodo(w io.Writer) {
 	if !progress.IsTTY(w) || noProgress {
-		_, _ = fmt.Fprintln(w, "[gortex uninstall] nothing to uninstall")
+		fmt.Fprintln(w, "[gortex uninstall] nothing to uninstall")
 		return
 	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleHint.Render("◌  nothing to uninstall — no Gortex artefacts found in this directory"))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  "+progress.StyleHint.Render("◌  nothing to uninstall — no Gortex artefacts found in this directory"))
+	fmt.Fprintln(w)
 }
 
 // emitUninstallSummary prints the post-uninstall summary. Signals:
@@ -264,49 +264,49 @@ func emitUninstallNothingTodo(w io.Writer) {
 func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPresent int, globalCleaned bool) {
 	if !progress.IsTTY(w) || noProgress {
 		if removed == 0 && len(failures) == 0 {
-			_, _ = fmt.Fprintln(w, "[gortex uninstall] nothing to uninstall")
+			fmt.Fprintln(w, "[gortex uninstall] nothing to uninstall")
 			return
 		}
 		for _, f := range failures {
-			_, _ = fmt.Fprintf(w, "[gortex uninstall] failed: %s\n", f)
+			fmt.Fprintf(w, "[gortex uninstall] failed: %s\n", f)
 		}
-		_, _ = fmt.Fprintf(w, "[gortex uninstall] done (%d/%d items removed)\n", removed, totalPresent)
+		fmt.Fprintf(w, "[gortex uninstall] done (%d/%d items removed)\n", removed, totalPresent)
 		if globalCleaned {
-			_, _ = fmt.Fprintln(w, "Note: the user-level Claude Code footprint was removed (CLAUDE.md rule block, MCP config, hooks, skills/commands/agents). Other content in those files was preserved.")
+			fmt.Fprintln(w, "Note: the user-level Claude Code footprint was removed (CLAUDE.md rule block, MCP config, hooks, skills/commands/agents). Other content in those files was preserved.")
 		} else {
-			_, _ = fmt.Fprintln(w, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed (or re-run with --global).")
+			fmt.Fprintln(w, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed (or re-run with --global).")
 		}
-		_, _ = fmt.Fprintln(w, "Note: .kiro/steering/ files with 'gortex-' prefix were removed. Other .kiro/ files were preserved.")
-		_, _ = fmt.Fprintln(w, "Note: Antigravity KIs are global and were not removed. Manually delete ~/.gemini/antigravity/knowledge/gortex-workflow if desired.")
-		_, _ = fmt.Fprintln(w, "Note: Hermes config is global and was not removed. Manually delete the gortex entry in ~/.hermes/config.yaml (+ profiles), the gortex pre_tool_call / pre_llm_call entries under its `hooks:` block, and the gortex / gortex-* skill directories under ~/.hermes/skills/ if desired.")
+		fmt.Fprintln(w, "Note: .kiro/steering/ files with 'gortex-' prefix were removed. Other .kiro/ files were preserved.")
+		fmt.Fprintln(w, "Note: Antigravity KIs are global and were not removed. Manually delete ~/.gemini/antigravity/knowledge/gortex-workflow if desired.")
+		fmt.Fprintln(w, "Note: Hermes config is global and was not removed. Manually delete the gortex entry in ~/.hermes/config.yaml (+ profiles), the gortex pre_tool_call / pre_llm_call entries under its `hooks:` block, and the gortex / gortex-* skill directories under ~/.hermes/skills/ if desired.")
 		return
 	}
 
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 	stats := []string{progress.Stat(strconv.Itoa(removed), "removed", progress.StatGood)}
 	if len(failures) > 0 {
 		stats = append(stats, progress.Stat(strconv.Itoa(len(failures)), "failed", progress.StatBad))
 	}
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("uninstall complete"))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render("uninstall complete"))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 
 	if len(failures) > 0 {
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "     "+progress.Heading("failures"))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "     "+progress.Heading("failures"))
 		for _, f := range failures {
-			_, _ = fmt.Fprintln(w, "       "+progress.StyleErr.Render("✗")+"  "+progress.StyleVal.Render(f))
+			fmt.Fprintln(w, "       "+progress.StyleErr.Render("✗")+"  "+progress.StyleVal.Render(f))
 		}
 	}
 
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "     "+progress.Heading("preserved"))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "     "+progress.Heading("preserved"))
 	if globalCleaned {
-		_, _ = fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("non-Gortex content in CLAUDE.md / settings / .claude.json (Gortex entries removed)"))
+		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("non-Gortex content in CLAUDE.md / settings / .claude.json (Gortex entries removed)"))
 	} else {
-		_, _ = fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("CLAUDE.md — remove the Gortex block manually if needed (or re-run with --global)"))
+		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("CLAUDE.md — remove the Gortex block manually if needed (or re-run with --global)"))
 	}
-	_, _ = fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render(".kiro/ files without the 'gortex-' prefix"))
-	_, _ = fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.gemini/antigravity/knowledge/gortex-workflow (global)"))
-	_, _ = fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.hermes/config.yaml + skills (global)"))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render(".kiro/ files without the 'gortex-' prefix"))
+	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.gemini/antigravity/knowledge/gortex-workflow (global)"))
+	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.hermes/config.yaml + skills (global)"))
+	fmt.Fprintln(w)
 }

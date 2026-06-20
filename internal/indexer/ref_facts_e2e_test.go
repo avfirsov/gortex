@@ -24,7 +24,7 @@ func TestRefFacts_PersistedOnIndex(t *testing.T) {
 
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "g.sqlite"))
 	require.NoError(t, err)
-	defer func() { _ = store.Close() }()
+	defer store.Close()
 
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)

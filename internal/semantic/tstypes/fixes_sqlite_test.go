@@ -100,7 +100,7 @@ public class App {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer func() { _ = s2.Close() }()
+	defer s2.Close()
 
 	e := outEdgeTo(s2, callerID, targetID)
 	if e == nil {

@@ -192,7 +192,7 @@ func gitBlobSHA(data []byte) string {
 	// hash.Hash's Write contract forbids non-nil errors. Discard
 	// both to keep the linter happy without inventing fake error
 	// handling.
-	_, _ = fmt.Fprintf(h, "blob %d\x00", len(data))
+	fmt.Fprintf(h, "blob %d\x00", len(data))
 	_, _ = h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -162,7 +162,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 
 	if indexWatch {
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "[gortex] watch mode not yet implemented")
+		fmt.Fprintln(cmd.ErrOrStderr(), "[gortex] watch mode not yet implemented")
 	}
 
 	return nil
@@ -177,7 +177,7 @@ func writeProfileReport(w interface {
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
 
-	_, _ = fmt.Fprintf(w, "\nprofile: %s\n", path)
+	fmt.Fprintf(w, "\nprofile: %s\n", path)
 	timer.WriteReport(w, time.Time{})
 
 	elapsed := time.Duration(result.DurationMs) * time.Millisecond
@@ -185,19 +185,19 @@ func writeProfileReport(w interface {
 	if elapsed > 0 {
 		filesPerSec = float64(result.FileCount) / elapsed.Seconds()
 	}
-	_, _ = fmt.Fprintf(w, "\nthroughput: %d files in %s  (%.0f files/s)\n",
+	fmt.Fprintf(w, "\nthroughput: %d files in %s  (%.0f files/s)\n",
 		result.FileCount, elapsed.Round(time.Millisecond), filesPerSec)
-	_, _ = fmt.Fprintf(w, "nodes:      %d\n", result.NodeCount)
-	_, _ = fmt.Fprintf(w, "edges:      %d\n", result.EdgeCount)
+	fmt.Fprintf(w, "nodes:      %d\n", result.NodeCount)
+	fmt.Fprintf(w, "edges:      %d\n", result.EdgeCount)
 
 	// Heap delta captures what indexing retained. Peak RSS requires OS
 	// hooks that aren't portable — callers who want RSS should wrap the
 	// binary in `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux).
-	_, _ = fmt.Fprintf(w, "heap:       +%s (%s → %s)\n",
+	fmt.Fprintf(w, "heap:       +%s (%s → %s)\n",
 		humanBytes(memAfter.HeapAlloc-memBefore.HeapAlloc),
 		humanBytes(memBefore.HeapAlloc),
 		humanBytes(memAfter.HeapAlloc))
-	_, _ = fmt.Fprintf(w, "gc:         %d cycles during index\n",
+	fmt.Fprintf(w, "gc:         %d cycles during index\n",
 		memAfter.NumGC-memBefore.NumGC)
 }
 

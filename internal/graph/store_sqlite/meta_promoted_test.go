@@ -17,7 +17,7 @@ func TestPromotedColumns_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 
 	s.AddNode(&graph.Node{
 		ID: "f.go::F", Kind: graph.KindFunction, Name: "F", FilePath: "f.go",
@@ -71,7 +71,7 @@ func TestPromotedColumns_ExternalFalse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 	s.AddNode(&graph.Node{
 		ID: "x", Kind: graph.KindFunction, Name: "x", FilePath: "x.go",
 		Meta: map[string]any{"external": false},
@@ -111,7 +111,7 @@ func TestPromotedColumns_Migration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open old-schema db: %v", err)
 	}
-	defer func() { _ = s.Close() }()
+	defer s.Close()
 	s.AddNode(&graph.Node{
 		ID: "m", Kind: graph.KindFunction, Name: "m", FilePath: "m.go",
 		Meta: map[string]any{"signature": "sig", "external": true},

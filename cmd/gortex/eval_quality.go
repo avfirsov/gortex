@@ -85,24 +85,24 @@ var evalQualityDriftCmd = &cobra.Command{
 			return nil
 		}
 		out := cmd.OutOrStdout()
-		_, _ = fmt.Fprintln(out, "# Embedder drift inspector")
-		_, _ = fmt.Fprintln(out)
+		fmt.Fprintln(out, "# Embedder drift inspector")
+		fmt.Fprintln(out)
 		if (prev == quality.EmbedderFingerprint{}) {
-			_, _ = fmt.Fprintln(out, "_No fingerprint recorded yet. Run `gortex eval embedders` (or wait for the daemon to warm an embedder) to seed one._")
+			fmt.Fprintln(out, "_No fingerprint recorded yet. Run `gortex eval embedders` (or wait for the daemon to warm an embedder) to seed one._")
 			return nil
 		}
-		_, _ = fmt.Fprintf(out, "**Stored fingerprint** (recorded %s):\n", prev.RecordedAt.Format(time.RFC3339))
-		_, _ = fmt.Fprintf(out, "- provider: `%s`\n", prev.Provider)
-		_, _ = fmt.Fprintf(out, "- model: `%s`\n", prev.Model)
+		fmt.Fprintf(out, "**Stored fingerprint** (recorded %s):\n", prev.RecordedAt.Format(time.RFC3339))
+		fmt.Fprintf(out, "- provider: `%s`\n", prev.Provider)
+		fmt.Fprintf(out, "- model: `%s`\n", prev.Model)
 		if prev.ModelRevision != "" {
-			_, _ = fmt.Fprintf(out, "- model_revision: `%s`\n", prev.ModelRevision)
+			fmt.Fprintf(out, "- model_revision: `%s`\n", prev.ModelRevision)
 		}
-		_, _ = fmt.Fprintf(out, "- embedding_dim: `%d`\n", prev.EmbeddingDim)
+		fmt.Fprintf(out, "- embedding_dim: `%d`\n", prev.EmbeddingDim)
 		if prev.SampleVecSHA256 != "" {
-			_, _ = fmt.Fprintf(out, "- sample_vec_sha256: `%s`\n", prev.SampleVecSHA256)
+			fmt.Fprintf(out, "- sample_vec_sha256: `%s`\n", prev.SampleVecSHA256)
 		}
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "_To check drift against a live embedder, run `gortex eval embedders` — that path fingerprints the active provider and surfaces drift inline._")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "_To check drift against a live embedder, run `gortex eval embedders` — that path fingerprints the active provider and surfaces drift inline._")
 		return nil
 	},
 }
@@ -132,20 +132,20 @@ var evalQualityConfidenceCmd = &cobra.Command{
 			return nil
 		}
 		out := cmd.OutOrStdout()
-		_, _ = fmt.Fprintln(out, "# Retrieval confidence summary")
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintf(out, "- log: `%s`\n", evalQualityConfidencePath)
-		_, _ = fmt.Fprintf(out, "- window: last `%s`\n", evalQualitySince)
-		_, _ = fmt.Fprintln(out)
+		fmt.Fprintln(out, "# Retrieval confidence summary")
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "- log: `%s`\n", evalQualityConfidencePath)
+		fmt.Fprintf(out, "- window: last `%s`\n", evalQualitySince)
+		fmt.Fprintln(out)
 		if summary.Count == 0 {
-			_, _ = fmt.Fprintln(out, "_No records in window. The confidence tracker is opt-in — wire it via the search-call site you want to measure._")
+			fmt.Fprintln(out, "_No records in window. The confidence tracker is opt-in — wire it via the search-call site you want to measure._")
 			return nil
 		}
-		_, _ = fmt.Fprintf(out, "- records: %d\n", summary.Count)
-		_, _ = fmt.Fprintf(out, "- median top-1 score: %.4f\n", summary.MedianTop1)
-		_, _ = fmt.Fprintf(out, "- median top-1/top-2 ratio: %.3f\n", summary.MedianRatio12)
-		_, _ = fmt.Fprintf(out, "- median std-dev: %.4f\n", summary.MedianStdDev)
-		_, _ = fmt.Fprintf(out, "- low-confidence records (ratio < 1.25): %d (%.1f%%)\n",
+		fmt.Fprintf(out, "- records: %d\n", summary.Count)
+		fmt.Fprintf(out, "- median top-1 score: %.4f\n", summary.MedianTop1)
+		fmt.Fprintf(out, "- median top-1/top-2 ratio: %.3f\n", summary.MedianRatio12)
+		fmt.Fprintf(out, "- median std-dev: %.4f\n", summary.MedianStdDev)
+		fmt.Fprintf(out, "- low-confidence records (ratio < 1.25): %d (%.1f%%)\n",
 			summary.LowConfidenceCount,
 			float64(summary.LowConfidenceCount)/float64(summary.Count)*100)
 		return nil
@@ -167,23 +167,23 @@ var evalQualityReplayCmd = &cobra.Command{
 		// quality package). We document that here rather than
 		// pretending the CLI can do it from flags alone.
 		out := cmd.OutOrStdout()
-		_, _ = fmt.Fprintln(out, "# Replay harness")
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "The replay analyzer ships as a Go API in `internal/eval/quality`:")
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "```go")
-		_, _ = fmt.Fprintln(out, `import "github.com/zzet/gortex/internal/eval/quality"`)
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "// queries: load from a JSONL file or build inline")
-		_, _ = fmt.Fprintln(out, "// baseline, candidate: quality.RankerFunc — closures over your search backend")
-		_, _ = fmt.Fprintln(out, "res, _ := quality.Replay(queries, baseline, candidate, 10)")
+		fmt.Fprintln(out, "# Replay harness")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "The replay analyzer ships as a Go API in `internal/eval/quality`:")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "```go")
+		fmt.Fprintln(out, `import "github.com/zzet/gortex/internal/eval/quality"`)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "// queries: load from a JSONL file or build inline")
+		fmt.Fprintln(out, "// baseline, candidate: quality.RankerFunc — closures over your search backend")
+		fmt.Fprintln(out, "res, _ := quality.Replay(queries, baseline, candidate, 10)")
 		// Write the example code-block line directly — Fprint /
 		// Fprintln both trip govet's printf checker on the embedded
 		// format specifiers, even when the call has no format args.
 		_, _ = out.Write([]byte("fmt.Printf(\"kendall=%.3f top1_churn=%.1f%% recall_delta=%+.3f\\n\", res.MeanKendall, res.Top1ChurnPct, res.RecallDelta)\n"))
-		_, _ = fmt.Fprintln(out, "```")
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "Two ranker comparisons that fit on the command line are wired up automatically; everything else is a few lines of Go using the quality package.")
+		fmt.Fprintln(out, "```")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Two ranker comparisons that fit on the command line are wired up automatically; everything else is a few lines of Go using the quality package.")
 		return nil
 	},
 }
@@ -200,9 +200,9 @@ var evalQualityTuneCmd = &cobra.Command{
 		// surface the tuning API + emit an empty-state report.
 		rows := quality.SuggestWeights(nil, 1.0)
 		md := quality.RenderTuningMarkdown(rows)
-		_, _ = fmt.Fprintln(out, md)
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "_The tuner ships as `quality.SuggestWeights(rows, nudge)` — wire the rows from your feedback log (`feedback action:query`) and pipe the markdown into a PR for review._")
+		fmt.Fprintln(out, md)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "_The tuner ships as `quality.SuggestWeights(rows, nudge)` — wire the rows from your feedback log (`feedback action:query`) and pipe the markdown into a PR for review._")
 		return nil
 	},
 }

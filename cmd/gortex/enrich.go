@@ -176,7 +176,7 @@ func runEnrichBlame(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	var out daemon.EnrichBlameResult
 	if err := controlEnrich(c, daemon.ControlEnrichBlame, daemon.EnrichBlameParams{Path: abs}, &out); err != nil {
@@ -213,7 +213,7 @@ func runEnrichCoverage(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	wire := make([]daemon.EnrichCoverageSegment, len(segments))
 	for i, s := range segments {
@@ -255,7 +255,7 @@ func runEnrichReleases(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	var out daemon.EnrichReleasesResult
 	if err := controlEnrich(c, daemon.ControlEnrichReleases, daemon.EnrichReleasesParams{Path: abs, Branch: enrichReleasesBranch}, &out); err != nil {
@@ -285,7 +285,7 @@ func runEnrichCochange(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	var out daemon.EnrichCochangeResult
 	if err := controlEnrich(c, daemon.ControlEnrichCochange, daemon.EnrichCochangeParams{Path: abs}, &out); err != nil {
@@ -333,7 +333,7 @@ func runEnrichAll(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	result := map[string]any{
 		"path": abs,
@@ -410,10 +410,10 @@ func runEnrichAll(cmd *cobra.Command, args []string) error {
 func printEnrichResult(payload map[string]any) error {
 	if progress.IsTTY(os.Stdout) {
 		if v, ok := payload["path"]; ok {
-			_, _ = fmt.Fprintln(os.Stdout, "  "+progress.Caption("path: "+fmt.Sprint(v)))
+			fmt.Fprintln(os.Stdout, "  "+progress.Caption("path: "+fmt.Sprint(v)))
 		}
 		if v, ok := payload["profile"]; ok {
-			_, _ = fmt.Fprintln(os.Stdout, "  "+progress.Caption("profile: "+fmt.Sprint(v)))
+			fmt.Fprintln(os.Stdout, "  "+progress.Caption("profile: "+fmt.Sprint(v)))
 		}
 		return nil
 	}

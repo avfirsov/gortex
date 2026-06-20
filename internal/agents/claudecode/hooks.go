@@ -94,7 +94,7 @@ func ResolveHookCommand(w io.Writer) string {
 		return shellSafeHookBinary(path) + " hook"
 	}
 	if w != nil {
-		_, _ = fmt.Fprintln(w,
+		fmt.Fprintln(w,
 			"[gortex init] warning: `gortex` not found on PATH; "+
 				"writing bare \"gortex hook\" into settings — install gortex to PATH for a stable hook command")
 	}
@@ -556,7 +556,7 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 		modeRewriteCount == 0 && postToolUseRemoved == 0 && !postToolUseAdded
 	if noChanges {
 		if w != nil {
-			_, _ = fmt.Fprintf(w, "[gortex init] all hooks already present in %s\n", settingsPath)
+			fmt.Fprintf(w, "[gortex init] all hooks already present in %s\n", settingsPath)
 		}
 		return agents.FileAction{Path: settingsPath, Action: agents.ActionSkip, Reason: "already-configured"}, nil
 	}
@@ -614,7 +614,7 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 		changes = append(changes, fmt.Sprintf("rewrote %d hook command(s) for mode=%s", modeRewriteCount, mode))
 	}
 	if w != nil {
-		_, _ = fmt.Fprintf(w, "[gortex init] %s in %s\n", strings.Join(changes, ", "), settingsPath)
+		fmt.Fprintf(w, "[gortex init] %s in %s\n", strings.Join(changes, ", "), settingsPath)
 	}
 	action := agents.ActionCreate
 	if existed {

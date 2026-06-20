@@ -66,12 +66,12 @@ func (r *TimingReporter) WriteReport(w io.Writer, end time.Time) {
 		end = time.Now()
 	}
 	if len(r.stages) == 0 {
-		_, _ = fmt.Fprintln(w, "no stages recorded")
+		fmt.Fprintln(w, "no stages recorded")
 		return
 	}
 
-	_, _ = fmt.Fprintf(w, "%-32s %12s %12s\n", "stage", "duration", "cumulative")
-	_, _ = fmt.Fprintf(w, "%-32s %12s %12s\n",
+	fmt.Fprintf(w, "%-32s %12s %12s\n", "stage", "duration", "cumulative")
+	fmt.Fprintf(w, "%-32s %12s %12s\n",
 		"--------------------------------", "------------", "------------")
 	for i, s := range r.stages {
 		var nextStart time.Time
@@ -82,7 +82,7 @@ func (r *TimingReporter) WriteReport(w io.Writer, end time.Time) {
 		}
 		duration := nextStart.Sub(s.seen)
 		cumulative := nextStart.Sub(r.start)
-		_, _ = fmt.Fprintf(w, "%-32s %12s %12s\n",
+		fmt.Fprintf(w, "%-32s %12s %12s\n",
 			s.name, formatMs(duration), formatMs(cumulative))
 	}
 }

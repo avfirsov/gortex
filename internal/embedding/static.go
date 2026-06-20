@@ -140,7 +140,7 @@ func (p *StaticProvider) loadVectors() error {
 	if err != nil {
 		return fmt.Errorf("decompress vectors: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	data, err := io.ReadAll(gz)
 	if err != nil {

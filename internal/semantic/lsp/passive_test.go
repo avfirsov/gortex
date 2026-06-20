@@ -307,10 +307,10 @@ func callMethod(t *testing.T, p *Provider, method string) error {
 // synthetic request confirms a round-trip works end-to-end.
 func TestPassiveProvider_TCPDialHappyPath(t *testing.T) {
 	server, addr := newFakeLSPSocketServer(t, "tcp")
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 
 	p := passiveProvider(t, "tcp", addr, false)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	require.NoError(t, p.EnsureClient(t.TempDir()))
 
@@ -344,10 +344,10 @@ func TestPassiveProvider_UnixDialHappyPath(t *testing.T) {
 		t.Skip("Unix-domain sockets are not exercised in the Windows CI image")
 	}
 	server, addr := newFakeLSPSocketServer(t, "unix")
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 
 	p := passiveProvider(t, "unix", addr, false)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	require.NoError(t, p.EnsureClient(t.TempDir()))
 
@@ -375,7 +375,7 @@ func TestPassiveProvider_DialFailsNoFallback(t *testing.T) {
 	require.NoError(t, ln.Close())
 
 	p := passiveProvider(t, "tcp", deadAddr, false)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	err = p.EnsureClient(t.TempDir())
 	require.Error(t, err, "EnsureClient should fail when dial fails with no fallback")
@@ -416,7 +416,7 @@ func TestPassiveProvider_DialFailsSpawnFallback(t *testing.T) {
 		},
 	}
 	p := NewProviderFromSpec(spec, zap.NewNop())
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	// We don't await initialize success — /bin/sleep is not a real
 	// LSP server, so the handshake will eventually time out. The
@@ -438,7 +438,7 @@ func TestPassiveProvider_DialFailsSpawnFallback(t *testing.T) {
 // LSP server. Only the socket is closed; the IDE keeps its server up.
 func TestPassiveProvider_ShutdownDoesNotSendExit(t *testing.T) {
 	server, addr := newFakeLSPSocketServer(t, "tcp")
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 
 	p := passiveProvider(t, "tcp", addr, false)
 	require.NoError(t, p.EnsureClient(t.TempDir()))
@@ -472,10 +472,10 @@ func TestPassiveProvider_ShutdownDoesNotSendExit(t *testing.T) {
 // initialize calls — one before, one after the reconnect.
 func TestPassiveProvider_ServerEOFReconnect(t *testing.T) {
 	server, addr := newFakeLSPSocketServer(t, "tcp")
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 
 	p := passiveProvider(t, "tcp", addr, false)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	require.NoError(t, p.EnsureClient(t.TempDir()))
 
@@ -529,10 +529,10 @@ func TestPassiveProvider_ServerEOFReconnect(t *testing.T) {
 // every fresh session.
 func TestPassiveProvider_CapabilityResetOnReconnect(t *testing.T) {
 	server, addr := newFakeLSPSocketServer(t, "tcp")
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 
 	p := passiveProvider(t, "tcp", addr, false)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	// First connection. Wire the handlers ensureClient would install,
 	// then complete the handshake.

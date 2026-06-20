@@ -86,7 +86,7 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 	// On non-TTY (or --no-progress / non-svg formats), preserve the legacy
 	// summary line so script parsers keep working.
 	if !progress.IsTTY(w) || noProgress || strings.ToLower(auditFormat) != "svg" {
-		_, _ = fmt.Fprintf(w,
+		fmt.Fprintf(w,
 			"[audit] %d callable symbols · mean complexity-health %.1f · grade %s\n",
 			report.SymbolCount, report.MeanScore, report.Grade)
 	} else {
@@ -109,8 +109,8 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 		if err := os.WriteFile(out, []byte(renderBadgeSVG(report)), 0o644); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[audit] wrote %s\n", out)
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		fmt.Fprintf(cmd.ErrOrStderr(), "[audit] wrote %s\n", out)
+		fmt.Fprintf(cmd.OutOrStdout(),
 			"![gortex audit](%s) · grade %s · score %.1f\n",
 			filepath.ToSlash(filepath.Clean(strings.TrimPrefix(out, abs+string(filepath.Separator)))),
 			report.Grade, report.MeanScore)
@@ -125,7 +125,7 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 	case "text":
 		line := fmt.Sprintf("%s · %.1f", report.Grade, report.MeanScore)
 		if auditOut == "" || auditOut == "-" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
+			fmt.Fprintln(cmd.OutOrStdout(), line)
 			return nil
 		}
 		return os.WriteFile(auditOut, []byte(line+"\n"), 0o644)
@@ -214,10 +214,10 @@ func emitAuditBanner(w io.Writer, repoPath string) {
 		Title:    "gortex audit",
 		Subtitle: "Complexity-axis health grade for " + filepath.Base(repoPath) + ".",
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w, "  "+progress.Row("repo", short, 8))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w, "  "+progress.Row("repo", short, 8))
+	fmt.Fprintln(w)
 }
 
 // emitAuditGradeCard renders the result panel: a colour-tiered grade chip,
@@ -230,7 +230,7 @@ func emitAuditGradeCard(w io.Writer, r auditReport) {
 		Padding(0, 2)
 	gradeChip := gradeStyle.Render(" " + r.Grade + " ")
 
-	_, _ = fmt.Fprintln(w, "  "+gradeChip+"   "+
+	fmt.Fprintln(w, "  "+gradeChip+"   "+
 		progress.StyleStrong.Render(fmt.Sprintf("%.1f", r.MeanScore))+
 		"  "+progress.StyleHint.Render("/ 100  ·  mean complexity-health"))
 
@@ -238,11 +238,11 @@ func emitAuditGradeCard(w io.Writer, r auditReport) {
 		progress.Stat(strconv.Itoa(r.SymbolCount), "callable symbols", progress.StatNeutral),
 	}
 	stats = append(stats, progress.Stat(gradeBlurb(r.Grade), "", auditStatSeverity(r.Grade)))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 
 	if len(r.GradeCounts) > 0 {
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "     "+progress.Heading("grade distribution"))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "     "+progress.Heading("grade distribution"))
 		parts := make([]string, 0, 5)
 		for _, k := range []string{"A", "B", "C", "D", "F"} {
 			parts = append(parts,
@@ -250,9 +250,9 @@ func emitAuditGradeCard(w io.Writer, r auditReport) {
 					"  "+progress.StyleVal.Render(strconv.Itoa(r.GradeCounts[k])),
 			)
 		}
-		_, _ = fmt.Fprintln(w, "     "+strings.Join(parts, progress.StyleHint.Render("   ·   ")))
+		fmt.Fprintln(w, "     "+strings.Join(parts, progress.StyleHint.Render("   ·   ")))
 	}
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 }
 
 // Coverage-grade badge colours — the shields.io standard palette, shared

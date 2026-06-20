@@ -166,7 +166,7 @@ func notifyDaemonTrack(absPath string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlTrack, daemon.TrackParams{
 		Path:       absPath,
 		Name:       trackName,
@@ -193,10 +193,10 @@ func emitTrackBanner(w io.Writer, absPath string, daemonUp bool) {
 		Title:    "gortex track",
 		Subtitle: sub,
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w, "  "+progress.Row("path", absPath, 6))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w, "  "+progress.Row("path", absPath, 6))
+	fmt.Fprintln(w)
 }
 
 // emitTrackSummary prints the post-track summary card. Three variants: via
@@ -212,11 +212,11 @@ func emitTrackSummary(w io.Writer, absPath string, r trackResult) {
 		}
 		switch {
 		case r.viaDaemon:
-			_, _ = fmt.Fprintf(w, "[gortex] tracked %s%s (via daemon)\n", absPath, suffix)
+			fmt.Fprintf(w, "[gortex] tracked %s%s (via daemon)\n", absPath, suffix)
 		case r.alreadyTracked:
-			_, _ = fmt.Fprintf(w, "[gortex] already tracked: %s\n", absPath)
+			fmt.Fprintf(w, "[gortex] already tracked: %s\n", absPath)
 		case r.configOnly:
-			_, _ = fmt.Fprintf(w, "[gortex] tracked %s%s (config only — start daemon to index)\n", absPath, suffix)
+			fmt.Fprintf(w, "[gortex] tracked %s%s (config only — start daemon to index)\n", absPath, suffix)
 		}
 		return
 	}
@@ -239,16 +239,16 @@ func emitTrackSummary(w io.Writer, absPath string, r trackResult) {
 		stats = append(stats, progress.Stat("daemon", "offline — start to index", progress.StatWarn))
 	}
 
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(absPath))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(absPath))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 
 	switch {
 	case r.viaDaemon:
-		_, _ = fmt.Fprintln(w, "\n     "+progress.Caption("watch progress: `gortex daemon status --watch`"))
+		fmt.Fprintln(w, "\n     "+progress.Caption("watch progress: `gortex daemon status --watch`"))
 	case r.configOnly:
-		_, _ = fmt.Fprintln(w, "\n     "+progress.Caption("next: `gortex daemon start --detach` to index this repo"))
+		fmt.Fprintln(w, "\n     "+progress.Caption("next: `gortex daemon start --detach` to index this repo"))
 	}
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 }
 
 func runUntrack(cmd *cobra.Command, args []string) error {
@@ -272,7 +272,7 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 	if daemon.IsRunning() {
 		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 		if err == nil {
-			defer func() { _ = c.Close() }()
+			defer c.Close()
 			resp, ctlErr := c.Control(daemon.ControlUntrack, daemon.UntrackParams{PathOrPrefix: target})
 			if ctlErr != nil {
 				return ctlErr
@@ -323,10 +323,10 @@ func emitUntrackBanner(w io.Writer, target string, daemonUp bool) {
 		Title:    "gortex untrack",
 		Subtitle: sub,
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w, "  "+progress.Row("target", target, 8))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w, "  "+progress.Row("target", target, 8))
+	fmt.Fprintln(w)
 }
 
 // emitUntrackSummary prints the post-untrack summary card. Same TTY vs.
@@ -335,9 +335,9 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 	if !progress.IsTTY(w) {
 		switch {
 		case r.viaDaemon:
-			_, _ = fmt.Fprintf(w, "[gortex] untracked %s (via daemon)\n", target)
+			fmt.Fprintf(w, "[gortex] untracked %s (via daemon)\n", target)
 		case r.configOnly:
-			_, _ = fmt.Fprintf(w, "[gortex] untracked %s (config only)\n", target)
+			fmt.Fprintf(w, "[gortex] untracked %s (config only)\n", target)
 		}
 		return
 	}
@@ -354,7 +354,7 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 		}
 	}
 
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(target))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(target))
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w)
 }

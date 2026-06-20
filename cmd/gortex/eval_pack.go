@@ -333,7 +333,7 @@ func anthropicAsker(apiKey, model string) packeval.Asker {
 		if err != nil {
 			return "", err
 		}
-		defer func() { _ = resp.Body.Close() }()
+		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 300 {
 			return "", fmt.Errorf("anthropic http %d: %s", resp.StatusCode, string(respBody))

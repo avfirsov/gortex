@@ -45,7 +45,7 @@ func TestComplete_StructuredUsesResponseSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -95,7 +95,7 @@ func TestComplete_FreeformNoSchema(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -125,7 +125,7 @@ func TestComplete_ToolResultBecomesUserTurn(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -161,7 +161,7 @@ func TestComplete_APIError(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -195,7 +195,7 @@ func TestComplete_HollowResponseRetriesThenSucceeds(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "k")
 	p, _ := New(llm.RemoteConfig{Model: "m", BaseURL: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

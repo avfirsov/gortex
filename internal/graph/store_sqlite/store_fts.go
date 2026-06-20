@@ -238,7 +238,7 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var hits []graph.SymbolHit
 	for rows.Next() {

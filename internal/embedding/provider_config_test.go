@@ -14,7 +14,7 @@ import (
 func TestNewProviderFromConfig_DefaultIsStatic(t *testing.T) {
 	p, err := NewProviderFromConfig(ProviderConfig{})
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, isStatic := p.(*StaticProvider)
 	assert.True(t, isStatic, "empty provider name must select the static GloVe provider")
@@ -26,7 +26,7 @@ func TestNewProviderFromConfig_DefaultIsStatic(t *testing.T) {
 func TestNewProviderFromConfig_ExplicitStatic(t *testing.T) {
 	p, err := NewProviderFromConfig(ProviderConfig{Provider: "static"})
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, isStatic := p.(*StaticProvider)
 	assert.True(t, isStatic)
@@ -42,7 +42,7 @@ func TestNewProviderFromConfig_API(t *testing.T) {
 		APIModel: "nomic-embed-text",
 	})
 	require.NoError(t, err)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	api, isAPI := p.(*APIProvider)
 	require.True(t, isAPI, "the api provider must construct an APIProvider")

@@ -127,7 +127,7 @@ func runGithookInstall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+	fmt.Fprintf(cmd.OutOrStdout(),
 		"installed %s hook at %s\nactions: mermaid=%t wiki=%t docs=%t churn=%t releases=%t\n",
 		hook, path, githookRegenMermaid, githookRegenWiki, githookRegenDocs, githookRegenChurn, githookRegenReleases)
 	return nil
@@ -147,9 +147,9 @@ func runGithookUninstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if removed {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "removed gortex block from %s\n", path)
+		fmt.Fprintf(cmd.OutOrStdout(), "removed gortex block from %s\n", path)
 	} else {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "no gortex block found at %s\n", path)
+		fmt.Fprintf(cmd.OutOrStdout(), "no gortex block found at %s\n", path)
 	}
 	return nil
 }
@@ -184,10 +184,10 @@ func runGithookStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 	out := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(out, "hook:      %s\n", hook)
-	_, _ = fmt.Fprintf(out, "hook_path: %s\n", hookPath)
-	_, _ = fmt.Fprintf(out, "exists:    %t\n", exists)
-	_, _ = fmt.Fprintf(out, "managed:   %t\n", managed)
+	fmt.Fprintf(out, "hook:      %s\n", hook)
+	fmt.Fprintf(out, "hook_path: %s\n", hookPath)
+	fmt.Fprintf(out, "exists:    %t\n", exists)
+	fmt.Fprintf(out, "managed:   %t\n", managed)
 	return nil
 }
 

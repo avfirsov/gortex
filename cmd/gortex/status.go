@@ -42,7 +42,7 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil {
 		return err
@@ -61,15 +61,15 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 	if progress.IsTTY(cmd.ErrOrStderr()) && !noProgress {
 		emitDaemonStatusCard(cmd.ErrOrStderr(), st)
 	} else {
-		_, _ = fmt.Fprintf(w, "daemon      %s (pid %d, uptime %s)\n",
+		fmt.Fprintf(w, "daemon      %s (pid %d, uptime %s)\n",
 			st.Version, st.PID, time.Duration(st.UptimeSeconds)*time.Second)
-		_, _ = fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
+		fmt.Fprintf(w, "sessions    %d\n", st.Sessions)
 		if st.MemoryBytes > 0 {
-			_, _ = fmt.Fprintf(w, "memory      %.1f MB\n", float64(st.MemoryBytes)/(1024*1024))
+			fmt.Fprintf(w, "memory      %.1f MB\n", float64(st.MemoryBytes)/(1024*1024))
 		}
 	}
 	if len(st.TrackedRepos) == 0 {
-		_, _ = fmt.Fprintln(w, "tracked repos: (none — run `gortex track <path>` to add one)")
+		fmt.Fprintln(w, "tracked repos: (none — run `gortex track <path>` to add one)")
 		return nil
 	}
 
@@ -84,14 +84,14 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 			}
 		}
 		if multiRepoWorkspaces == 0 {
-			_, _ = fmt.Fprintf(w, "workspaces  %d (one per repo, default)\n", len(st.Workspaces))
+			fmt.Fprintf(w, "workspaces  %d (one per repo, default)\n", len(st.Workspaces))
 		} else {
-			_, _ = fmt.Fprintf(w, "workspaces  %d (%d shared, %d default singletons)\n",
+			fmt.Fprintf(w, "workspaces  %d (%d shared, %d default singletons)\n",
 				len(st.Workspaces), multiRepoWorkspaces, len(st.Workspaces)-multiRepoWorkspaces)
 		}
 	}
 
-	_, _ = fmt.Fprintln(w, "tracked repos:")
+	fmt.Fprintln(w, "tracked repos:")
 	sort.Slice(st.TrackedRepos, func(i, j int) bool {
 		return st.TrackedRepos[i].Prefix < st.TrackedRepos[j].Prefix
 	})
@@ -110,10 +110,10 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 			if r.WorkspaceProject != "" && r.WorkspaceProject != ws {
 				ws = ws + "/" + r.WorkspaceProject
 			}
-			_, _ = fmt.Fprintf(w, "  %-24s [%-12s] %s  (%d files, %d nodes, %d edges)\n",
+			fmt.Fprintf(w, "  %-24s [%-12s] %s  (%d files, %d nodes, %d edges)\n",
 				r.Prefix, ws, r.Path, r.Files, r.Nodes, r.Edges)
 		} else {
-			_, _ = fmt.Fprintf(w, "  %-24s %s  (%d files, %d nodes, %d edges)\n",
+			fmt.Fprintf(w, "  %-24s %s  (%d files, %d nodes, %d edges)\n",
 				r.Prefix, r.Path, r.Files, r.Nodes, r.Edges)
 		}
 	}
@@ -131,9 +131,9 @@ func emitStatusBanner(w io.Writer, mode, subtitle string) {
 		Title:    "gortex status — " + mode,
 		Subtitle: subtitle,
 	}.Render()
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, banner)
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w)
 }
 
 // emitDaemonStatusCard renders the daemon view as a styled header card:
@@ -151,8 +151,8 @@ func emitDaemonStatusCard(w io.Writer, st daemon.StatusResponse) {
 			progress.Stat(fmt.Sprintf("%.1f MB", float64(st.MemoryBytes)/(1024*1024)),
 				"memory", progress.StatNeutral))
 	}
-	_, _ = fmt.Fprintln(w, "  "+progress.StyleOK.Render("●")+"  "+
+	fmt.Fprintln(w, "  "+progress.StyleOK.Render("●")+"  "+
 		progress.StyleStrong.Render("daemon up"))
-	_, _ = fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
+	fmt.Fprintln(w)
 }

@@ -70,7 +70,7 @@ func TestDaemon_MCPRoundTrip(t *testing.T) {
 		ClientName: "claude-code",
 	})
 	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
+	defer client.Close()
 
 	require.NotEmpty(t, client.Ack.SessionID)
 
@@ -121,7 +121,7 @@ func TestDaemon_MCPNoDispatcher(t *testing.T) {
 
 	client, err := DialTo(socket, Handshake{Mode: ModeMCP, CWD: "/tmp/x"})
 	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
+	defer client.Close()
 
 	replyBytes, err := client.ReadMCPFrame()
 	require.NoError(t, err)

@@ -119,10 +119,10 @@ func runProviderAdd(cmd *cobra.Command, args []string) error {
 	if err := registry.Add(name, cp); err != nil {
 		return fmt.Errorf("provider add %q: %w", name, err)
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Registered custom provider %q -> %s (model %s)\n", name, cp.BaseURL, cp.Model)
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Select it with: llm.provider: %s   (or GORTEX_LLM_PROVIDER=%s)\n", name, name)
+	fmt.Fprintf(cmd.OutOrStdout(), "Registered custom provider %q -> %s (model %s)\n", name, cp.BaseURL, cp.Model)
+	fmt.Fprintf(cmd.OutOrStdout(), "Select it with: llm.provider: %s   (or GORTEX_LLM_PROVIDER=%s)\n", name, name)
 	if cp.APIKeyEnv != "" {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Set the key in $%s before use.\n", cp.APIKeyEnv)
+		fmt.Fprintf(cmd.OutOrStdout(), "Set the key in $%s before use.\n", cp.APIKeyEnv)
 	}
 	return nil
 }
@@ -134,10 +134,10 @@ func runProviderRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("provider remove %q: %w", name, err)
 	}
 	if !removed {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "No custom provider named %q\n", name)
+		fmt.Fprintf(cmd.OutOrStdout(), "No custom provider named %q\n", name)
 		return nil
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed custom provider %q\n", name)
+	fmt.Fprintf(cmd.OutOrStdout(), "Removed custom provider %q\n", name)
 	return nil
 }
 
@@ -147,17 +147,17 @@ func runProviderList(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if len(entries) == 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "No custom providers registered.\nAdd one with: gortex provider add <name> --base-url <url> --model <model>\n")
+		fmt.Fprintf(cmd.OutOrStdout(), "No custom providers registered.\nAdd one with: gortex provider add <name> --base-url <url> --model <model>\n")
 		return nil
 	}
 	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", "NAME", "BASE_URL", "MODEL", "SCHEMA")
+	fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", "NAME", "BASE_URL", "MODEL", "SCHEMA")
 	for _, e := range entries {
 		mode := e.Provider.SchemaMode
 		if mode == "" {
 			mode = "json_schema"
 		}
-		_, _ = fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", e.Name, e.Provider.BaseURL, e.Provider.Model, mode)
+		fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", e.Name, e.Provider.BaseURL, e.Provider.Model, mode)
 	}
 	return nil
 }
@@ -172,25 +172,25 @@ func runProviderShow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no custom provider named %q", name)
 	}
 	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(w, "name:             %s\n", name)
-	_, _ = fmt.Fprintf(w, "base_url:         %s\n", cp.BaseURL)
-	_, _ = fmt.Fprintf(w, "model:            %s\n", cp.Model)
+	fmt.Fprintf(w, "name:             %s\n", name)
+	fmt.Fprintf(w, "base_url:         %s\n", cp.BaseURL)
+	fmt.Fprintf(w, "model:            %s\n", cp.Model)
 	if cp.APIKeyEnv != "" {
-		_, _ = fmt.Fprintf(w, "api_key_env:      %s\n", cp.APIKeyEnv)
+		fmt.Fprintf(w, "api_key_env:      %s\n", cp.APIKeyEnv)
 	}
 	mode := cp.SchemaMode
 	if mode == "" {
 		mode = "json_schema (default)"
 	}
-	_, _ = fmt.Fprintf(w, "schema_mode:      %s\n", mode)
+	fmt.Fprintf(w, "schema_mode:      %s\n", mode)
 	if cp.MaxTokensField != "" {
-		_, _ = fmt.Fprintf(w, "max_tokens_field: %s\n", cp.MaxTokensField)
+		fmt.Fprintf(w, "max_tokens_field: %s\n", cp.MaxTokensField)
 	}
 	if cp.Temperature != nil {
-		_, _ = fmt.Fprintf(w, "temperature:      %g\n", *cp.Temperature)
+		fmt.Fprintf(w, "temperature:      %g\n", *cp.Temperature)
 	}
 	if cp.ReasoningEffort != "" {
-		_, _ = fmt.Fprintf(w, "reasoning_effort: %s\n", cp.ReasoningEffort)
+		fmt.Fprintf(w, "reasoning_effort: %s\n", cp.ReasoningEffort)
 	}
 	if len(cp.Headers) > 0 {
 		keys := make([]string, 0, len(cp.Headers))
@@ -199,11 +199,11 @@ func runProviderShow(cmd *cobra.Command, args []string) error {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			_, _ = fmt.Fprintf(w, "header:           %s=%s\n", k, cp.Headers[k])
+			fmt.Fprintf(w, "header:           %s=%s\n", k, cp.Headers[k])
 		}
 	}
 	if cp.Pricing.Input != 0 || cp.Pricing.Output != 0 {
-		_, _ = fmt.Fprintf(w, "pricing:          $%.4f in / $%.4f out per 1M tokens\n", cp.Pricing.Input, cp.Pricing.Output)
+		fmt.Fprintf(w, "pricing:          $%.4f in / $%.4f out per 1M tokens\n", cp.Pricing.Input, cp.Pricing.Output)
 	}
 	return nil
 }

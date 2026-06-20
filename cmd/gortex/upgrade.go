@@ -115,7 +115,7 @@ func latestReleaseVersion() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	tag := tagFromReleaseLocation(resp.Header.Get("Location"))
 	if tag == "" {
 		return "", fmt.Errorf("could not read latest release tag from %s", upgradeRepoURL)
@@ -170,34 +170,34 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 		if latest, lerr := latestReleaseVersion(); lerr == nil {
 			target = normalizeSemver(latest)
 		} else {
-			_, _ = fmt.Fprintf(out, "could not check the latest version (%v); proceeding with the upgrade command\n", lerr)
+			fmt.Fprintf(out, "could not check the latest version (%v); proceeding with the upgrade command\n", lerr)
 		}
 	}
 
 	// Already current? Only short-circuit when we actually resolved a target
 	// and the user did not pin a (possibly older/specific) version.
 	if pin == "" && semver.IsValid(current) && semver.IsValid(target) && semver.Compare(current, target) >= 0 {
-		_, _ = fmt.Fprintf(out, "gortex %s is already the latest release.\n", version)
+		fmt.Fprintf(out, "gortex %s is already the latest release.\n", version)
 		return nil
 	}
 
 	command, manual := upgradeInstructions(method, pin)
 	if manual {
-		_, _ = fmt.Fprintf(out, "Installed via an unrecognised method — download the latest release from:\n  %s/releases/latest\n", upgradeRepoURL)
+		fmt.Fprintf(out, "Installed via an unrecognised method — download the latest release from:\n  %s/releases/latest\n", upgradeRepoURL)
 		return nil
 	}
 
 	if target != "" {
-		_, _ = fmt.Fprintf(out, "Upgrading gortex %s → %s (install method: %s)\n", version, target, method)
+		fmt.Fprintf(out, "Upgrading gortex %s → %s (install method: %s)\n", version, target, method)
 	} else {
-		_, _ = fmt.Fprintf(out, "Upgrading gortex (install method: %s)\n", method)
+		fmt.Fprintf(out, "Upgrading gortex (install method: %s)\n", method)
 	}
 
 	if !upgradeRun {
-		_, _ = fmt.Fprintf(out, "Run:\n  %s\n", command)
+		fmt.Fprintf(out, "Run:\n  %s\n", command)
 	} else {
 		parts := strings.Fields(command)
-		_, _ = fmt.Fprintf(out, "$ %s\n", command)
+		fmt.Fprintf(out, "$ %s\n", command)
 		ex := exec.CommandContext(cmd.Context(), parts[0], parts[1:]...) //nolint:gosec // command is one of the fixed install-method templates
 		ex.Stdout, ex.Stderr, ex.Stdin = out, cmd.ErrOrStderr(), os.Stdin
 		if rerr := ex.Run(); rerr != nil {
@@ -208,7 +208,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	// Post-upgrade advisory: a new binary may carry newer per-language
 	// extractors, so the indexed graph for an affected language is stale until
 	// reindexed. F2 enriches this with the exact stale languages per repo.
-	_, _ = fmt.Fprintln(out, "\nAfter upgrading, reindex so the graph picks up any extractor changes:\n  gortex index .")
+	fmt.Fprintln(out, "\nAfter upgrading, reindex so the graph picks up any extractor changes:\n  gortex index .")
 	return nil
 }
 

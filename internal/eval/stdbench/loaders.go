@@ -23,7 +23,7 @@ func scanJSONL(path string, fn func(rec map[string]any) error) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), maxJSONLLine)
@@ -147,7 +147,7 @@ func loadBEIRQrels(dir string) (map[string]map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	qrels := make(map[string]map[string]int)
 	sc := bufio.NewScanner(f)

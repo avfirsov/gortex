@@ -211,7 +211,7 @@ func benchVariant(name string, probeTexts []string, fixture recall.Fixture, cfg 
 	if err != nil {
 		return row, err
 	}
-	defer func() { _ = prov.Close() }()
+	defer prov.Close()
 	row.InitMs = time.Since(initStart).Milliseconds()
 	row.Dimensions = prov.Dimensions()
 	if row.ModelSizeMB == 0 {

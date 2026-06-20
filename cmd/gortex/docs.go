@@ -81,7 +81,7 @@ func runDocs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if writeToDisk {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex docs] daemon wrote the bundle to %s\n", absOut)
+		fmt.Fprintf(cmd.ErrOrStderr(), "[gortex docs] daemon wrote the bundle to %s\n", absOut)
 		return nil
 	}
 	_, err = cmd.OutOrStdout().Write(out)

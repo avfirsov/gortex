@@ -37,7 +37,7 @@ func hasColumn(t *testing.T, db *sql.DB, table, col string) bool {
 	if err != nil {
 		t.Fatalf("table_info(%s): %v", table, err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	for rows.Next() {
 		var (
 			cid         int
@@ -76,7 +76,7 @@ func hasObject(t *testing.T, db *sql.DB, objType, name string) bool {
 func makeShapeC(t *testing.T, path string) {
 	t.Helper()
 	db := openRaw(t, path)
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 	_, err := db.Exec(`
 CREATE TABLE savings_events (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +109,7 @@ func TestOpenSidecarFreshDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSidecar fresh: %v", err)
 	}
-	defer func() { _ = st.Close() }()
+	defer st.Close()
 
 	if !hasColumn(t, st.db, "savings_events", "model") || !hasColumn(t, st.db, "savings_events", "client") {
 		t.Fatal("fresh DB missing model/client columns")
@@ -134,7 +134,7 @@ func TestOpenSidecarMigratesShapeC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSidecar shape-C (the reported crash): %v", err)
 	}
-	defer func() { _ = st.Close() }()
+	defer st.Close()
 
 	for _, col := range []string{"model", "client"} {
 		if !hasColumn(t, st.db, "savings_events", col) {
@@ -166,7 +166,7 @@ func TestOpenSidecarShapeBCreatesMissingTables(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sidecar.sqlite")
 	func() {
 		db := openRaw(t, path)
-		defer func() { _ = db.Close() }()
+		defer db.Close()
 		// A v0.36-era DB: it has scopes (an early table with no secondary
 		// indexes, so it survives the base-schema rerun untouched) but not
 		// the later savings_* / suppressions tables.
@@ -180,7 +180,7 @@ INSERT INTO scopes (name, description) VALUES ('old-scope', 'keep me');`); err !
 	if err != nil {
 		t.Fatalf("OpenSidecar shape-B: %v", err)
 	}
-	defer func() { _ = st.Close() }()
+	defer st.Close()
 
 	for _, tbl := range []string{"savings_events", "suppressions", "memories", "notebooks"} {
 		if !hasObject(t, st.db, "table", tbl) {
@@ -217,7 +217,7 @@ func TestOpenSidecarIdempotentReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer func() { _ = st2.Close() }()
+	defer st2.Close()
 	if v := userVersion(t, st2.db); v != currentSidecarVersion {
 		t.Fatalf("user_version after reopen = %d, want %d", v, currentSidecarVersion)
 	}
@@ -228,7 +228,7 @@ func TestOpenSidecarIdempotentReopen(t *testing.T) {
 func TestApplyOneFailureLeavesVersionUnchanged(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.sqlite")
 	db := openRaw(t, path)
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
 	boom := migration{version: 1, name: "boom", fn: func(tx *sql.Tx) error {
 		if _, err := tx.Exec("CREATE TABLE partial (x TEXT)"); err != nil {
@@ -252,7 +252,7 @@ func TestApplyOneFailureLeavesVersionUnchanged(t *testing.T) {
 func TestAddColumnIfMissingTxScope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.sqlite")
 	db := openRaw(t, path)
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE t (a TEXT)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestOpenSidecarConcurrentProcesses(t *testing.T) {
 	}
 
 	db := openRaw(t, path)
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 	if v := userVersion(t, db); v != currentSidecarVersion {
 		t.Fatalf("user_version = %d after concurrent opens, want %d", v, currentSidecarVersion)
 	}

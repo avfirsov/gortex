@@ -185,7 +185,7 @@ func (c *ServerClient) GetSubGraph(ctx context.Context, id string, depth int) (*
 	if err != nil {
 		return nil, fmt.Errorf("fetch subgraph from %q: %w", c.Entry.Slug, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subgraph from %q: status %d", c.Entry.Slug, resp.StatusCode)
 	}
@@ -399,7 +399,7 @@ func (c *ServerClient) StreamEvents(ctx context.Context, onEvent func()) error {
 	if err != nil {
 		return fmt.Errorf("subscribe events on %q: %w", c.Entry.Slug, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("events from %q: status %d", c.Entry.Slug, resp.StatusCode)
 	}

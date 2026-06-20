@@ -181,7 +181,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("build server stack: %w", err)
 	}
-	defer func() { _ = ss.Close() }()
+	defer ss.Close()
 
 	g := ss.Graph
 	idx := ss.Indexer

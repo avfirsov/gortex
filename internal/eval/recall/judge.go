@@ -110,7 +110,7 @@ func (j *Judge) ask(query string, top []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
 		return false, fmt.Errorf("judge http %d: %s", resp.StatusCode, string(respBody))

@@ -67,7 +67,7 @@ func runFiles(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	paths := parseFindFilesPaths(raw)
-	_, _ = fmt.Fprint(cmd.OutOrStdout(), renderFiles(paths, filesFormat))
+	fmt.Fprint(cmd.OutOrStdout(), renderFiles(paths, filesFormat))
 	return nil
 }
 

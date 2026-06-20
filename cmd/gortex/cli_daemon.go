@@ -145,7 +145,7 @@ func daemonOwnsRepo(abs string) bool {
 	if err != nil {
 		return false
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlStatus, nil)
 	if err != nil || !resp.OK {
 		return false

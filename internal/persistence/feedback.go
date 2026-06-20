@@ -74,13 +74,13 @@ func LoadFeedback(dir string) (*FeedbackStore, error) {
 		}
 		return nil, fmt.Errorf("persistence: open feedback: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var store FeedbackStore
 	if err := gob.NewDecoder(gz).Decode(&store); err != nil {

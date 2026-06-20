@@ -79,7 +79,7 @@ func fetchDaemonStatus() (*daemon.StatusResponse, error) {
 		}
 		return nil, err
 	}
-	defer func() { _ = client.Close() }()
+	defer client.Close()
 
 	_ = client.Conn.SetDeadline(time.Now().Add(2 * time.Second))
 

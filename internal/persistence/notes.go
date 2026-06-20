@@ -68,13 +68,13 @@ func LoadNotes(dir string) (*NoteStore, error) {
 		}
 		return nil, fmt.Errorf("persistence: open notes: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader notes: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var store NoteStore
 	if err := gob.NewDecoder(gz).Decode(&store); err != nil {

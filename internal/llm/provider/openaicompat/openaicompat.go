@@ -250,7 +250,7 @@ func (c *Client) attempt(ctx context.Context, raw []byte) httpx.Result {
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("%s: request failed: %w", c.label(), err)}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("%s: read response: %w", c.label(), err)}

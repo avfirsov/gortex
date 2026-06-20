@@ -72,6 +72,6 @@ func logHookDecision(tool, pattern string, decision DecisionKind, hits int, dur 
 	if err != nil {
 		return
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	_, _ = f.Write(append(line, '\n'))
 }

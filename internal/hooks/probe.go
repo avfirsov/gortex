@@ -45,7 +45,7 @@ func probeViaDaemon(pattern string, timeout time.Duration) ([]grepSymbolHit, err
 			done <- probeResult{err: fmt.Errorf("dial daemon: %w", err)}
 			return
 		}
-		defer func() { _ = client.Close() }()
+		defer client.Close()
 
 		// Cap each socket op at the remaining budget so a stuck daemon
 		// can't pin the goroutine past timeout.

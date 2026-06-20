@@ -26,7 +26,7 @@ func TestStreamEvents_EvictsCachedProxies(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/events", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "event: graph_change\nid: 1\ndata: {}\n\n")
+		fmt.Fprint(w, "event: graph_change\nid: 1\ndata: {}\n\n")
 		if fl, ok := w.(http.Flusher); ok {
 			fl.Flush()
 		}

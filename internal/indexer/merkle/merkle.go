@@ -117,7 +117,7 @@ func hashFile(abs string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	h := blake3.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err

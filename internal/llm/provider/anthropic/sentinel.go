@@ -114,7 +114,7 @@ func discoverLatestModel(spec sentinelSpec, apiKey, baseURL string, client *http
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return ""
 	}

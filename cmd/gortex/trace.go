@@ -108,44 +108,44 @@ func printDaemonTracePath(cmd *cobra.Command, raw json.RawMessage) error {
 	if payload.Found {
 		for i, p := range payload.Paths {
 			if len(payload.Paths) > 1 {
-				_, _ = fmt.Fprintf(out, "Path %d (length %d, confidence %.2f, %s):\n", i+1, p.Length, p.Confidence, p.WorstTier)
+				fmt.Fprintf(out, "Path %d (length %d, confidence %.2f, %s):\n", i+1, p.Length, p.Confidence, p.WorstTier)
 			}
 			if len(p.Nodes) > 0 {
-				_, _ = fmt.Fprintf(out, "  %s\n", p.Nodes[0])
+				fmt.Fprintf(out, "  %s\n", p.Nodes[0])
 				for _, e := range p.Edges {
-					_, _ = fmt.Fprintf(out, "    --%s(%s)--> %s\n", e.Kind, e.Tier, e.To)
+					fmt.Fprintf(out, "    --%s(%s)--> %s\n", e.Kind, e.Tier, e.To)
 				}
 			}
 		}
 		return nil
 	}
 	if payload.Gap == nil {
-		_, _ = fmt.Fprintln(out, "no path found")
+		fmt.Fprintln(out, "no path found")
 		return nil
 	}
 	g := payload.Gap
-	_, _ = fmt.Fprintf(out, "No call path from %s to %s.\n", payload.SrcID, payload.SinkID)
-	_, _ = fmt.Fprintf(out, "Reason: %s\n", g.Reason)
+	fmt.Fprintf(out, "No call path from %s to %s.\n", payload.SrcID, payload.SinkID)
+	fmt.Fprintf(out, "Reason: %s\n", g.Reason)
 	if g.Message != "" {
-		_, _ = fmt.Fprintf(out, "  %s\n", g.Message)
+		fmt.Fprintf(out, "  %s\n", g.Message)
 	}
-	_, _ = fmt.Fprintf(out, "Forward reach: %d   Backward reach: %d\n", g.ForwardReached, g.BackwardReached)
+	fmt.Fprintf(out, "Forward reach: %d   Backward reach: %d\n", g.ForwardReached, g.BackwardReached)
 	if len(g.FurthestFromSource) > 0 {
-		_, _ = fmt.Fprintln(out, "Furthest reachable from source:")
+		fmt.Fprintln(out, "Furthest reachable from source:")
 		for _, n := range g.FurthestFromSource {
-			_, _ = fmt.Fprintf(out, "  %s (depth %d)\n", n.ID, n.Depth)
+			fmt.Fprintf(out, "  %s (depth %d)\n", n.ID, n.Depth)
 		}
 	}
 	if len(g.NearestToSink) > 0 {
-		_, _ = fmt.Fprintln(out, "Nearest that reach the sink:")
+		fmt.Fprintln(out, "Nearest that reach the sink:")
 		for _, n := range g.NearestToSink {
-			_, _ = fmt.Fprintf(out, "  %s (depth %d)\n", n.ID, n.Depth)
+			fmt.Fprintf(out, "  %s (depth %d)\n", n.ID, n.Depth)
 		}
 	}
 	if len(g.BoundaryHits) > 0 {
-		_, _ = fmt.Fprintln(out, "Boundaries where the chain breaks:")
+		fmt.Fprintln(out, "Boundaries where the chain breaks:")
 		for _, b := range g.BoundaryHits {
-			_, _ = fmt.Fprintf(out, "  %s -> %s [%s via %s]\n", b.From, b.Target, b.Reason, b.EdgeKind)
+			fmt.Fprintf(out, "  %s -> %s [%s via %s]\n", b.From, b.Target, b.Reason, b.EdgeKind)
 		}
 	}
 	return nil

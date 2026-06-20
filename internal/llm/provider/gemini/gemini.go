@@ -169,7 +169,7 @@ func (p *Provider) attempt(ctx context.Context, raw []byte) httpx.Result {
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("gemini: request failed: %w", err)}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return httpx.Result{Err: fmt.Errorf("gemini: read response: %w", err)}

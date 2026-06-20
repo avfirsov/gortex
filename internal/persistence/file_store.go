@@ -132,13 +132,13 @@ func (fs *FileStore) Load(repoPath, branch, commitHash string) (*Snapshot, error
 		}
 		return nil, fmt.Errorf("persistence: open snapshot: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var snap Snapshot
 	if err := gob.NewDecoder(gz).Decode(&snap); err != nil {

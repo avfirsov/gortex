@@ -104,7 +104,7 @@ func (t *ConfidenceTracker) Record(r ConfidenceRecord) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	body, err := json.Marshal(r)
 	if err != nil {
 		return err
@@ -128,7 +128,7 @@ func LoadConfidenceLog(path string, since time.Time) ([]ConfidenceRecord, error)
 		}
 		return nil, fmt.Errorf("open confidence log: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	r := bufio.NewReaderSize(f, 64*1024)
 	out := []ConfidenceRecord{}
 	for {

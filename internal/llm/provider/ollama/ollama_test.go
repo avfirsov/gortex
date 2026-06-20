@@ -23,7 +23,7 @@ func TestNew_DefaultsHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "ollama" {
 		t.Errorf("Name()=%q", p.Name())
 	}
@@ -45,7 +45,7 @@ func TestComplete_StructuredSendsFormatSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages:  []llm.Message{{Role: llm.RoleUser, Content: "verify"}},
@@ -80,7 +80,7 @@ func TestComplete_FreeformNoFormat(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := New(llm.OllamaConfig{Model: "m", Host: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -105,7 +105,7 @@ func TestComplete_APIError(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := New(llm.OllamaConfig{Model: "m", Host: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -122,7 +122,7 @@ func TestComplete_InlineErrorField(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := New(llm.OllamaConfig{Model: "m", Host: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -207,7 +207,7 @@ func TestComplete_SendsDerivedNumCtx(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := New(llm.OllamaConfig{Model: "m", Host: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -243,7 +243,7 @@ func TestComplete_HollowResponseRetriesThenSucceeds(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := New(llm.OllamaConfig{Model: "m", Host: srv.URL})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

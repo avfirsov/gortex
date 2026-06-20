@@ -33,7 +33,7 @@ func TestNew_CustomProviderDispatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if p.Name() != "custom" {
 		t.Errorf("Name()=%q want custom (frontier prompt tier)", p.Name())
@@ -73,7 +73,7 @@ func TestNew_CustomKeylessOmitsAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
 	}); err != nil {

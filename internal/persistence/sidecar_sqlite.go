@@ -392,7 +392,7 @@ func (s *SidecarStore) LoadNotesRows(repoKey string) ([]NoteEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("persistence: query notes: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []NoteEntry
 	for rows.Next() {
@@ -492,7 +492,7 @@ func (s *SidecarStore) LoadMemoriesRows(repoKey string) ([]MemoryEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("persistence: query memories: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []MemoryEntry
 	for rows.Next() {
@@ -625,7 +625,7 @@ func (s *SidecarStore) LoadScopes() ([]ScopeRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("persistence: query scopes: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []ScopeRow
 	for rows.Next() {
@@ -705,7 +705,7 @@ func (s *SidecarStore) LoadNotebookRows(repoKey string) ([]NotebookRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("persistence: query notebooks: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []NotebookRow
 	for rows.Next() {
@@ -873,7 +873,7 @@ func (s *SidecarStore) LoadSuppressions(repoKey string) ([]SuppressionEntry, err
 	if err != nil {
 		return nil, fmt.Errorf("persistence: query suppressions: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	var out []SuppressionEntry
 	for rows.Next() {

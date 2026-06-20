@@ -715,9 +715,9 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}()
 
 	insertNode := tx.Stmt(s.stmtInsertNode)
-	defer func() { _ = insertNode.Close() }()
+	defer insertNode.Close()
 	insertEdge := tx.Stmt(s.stmtInsertEdge)
-	defer func() { _ = insertEdge.Close() }()
+	defer insertEdge.Close()
 
 	for _, n := range nodes {
 		if n == nil || n.ID == "" {
@@ -1121,7 +1121,7 @@ func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
 		panicOnFatal(err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
 		n, err := scanNode(rows)
@@ -1173,7 +1173,7 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		panicOnFatal(err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdge(rows)
@@ -1195,7 +1195,7 @@ func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		panicOnFatal(err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdgeLight(rows)
@@ -1328,7 +1328,7 @@ func (s *Store) RepoPrefixes() []string {
 		panicOnFatal(err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []string
 	for rows.Next() {
 		var p string
@@ -1526,7 +1526,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {
 		e, err := scanEdge(rows)
@@ -1544,7 +1544,7 @@ func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 	var out []*graph.Node
 	for rows.Next() {
 		n, err := scanNode(rows)

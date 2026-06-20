@@ -75,7 +75,7 @@ func runAffected(cmd *cobra.Command, args []string) error {
 			_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"affected_tests": targets})
 		} else {
 			for _, t := range targets {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), t)
+				fmt.Fprintln(cmd.OutOrStdout(), t)
 			}
 		}
 	}

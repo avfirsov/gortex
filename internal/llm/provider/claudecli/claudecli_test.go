@@ -93,7 +93,7 @@ func TestNew_DefaultsBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	if p.Name() != "claudecli" {
 		t.Errorf("Name()=%q want claudecli", p.Name())
 	}
@@ -106,7 +106,7 @@ func TestComplete_FreeformSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{
@@ -140,7 +140,7 @@ func TestComplete_PassesModel(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Model: "sonnet"})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -158,7 +158,7 @@ func TestComplete_StructuredExtractsJSON(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: wrapped})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	resp, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "expand 'password hashing'"}},
@@ -181,7 +181,7 @@ func TestComplete_StructuredNoJSONErrors(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: "I cannot help with that."})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "x"}},
@@ -195,7 +195,7 @@ func TestComplete_NonZeroExit(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{exitCode: 2, stderr: "auth required"})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	_, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -212,7 +212,7 @@ func TestComplete_EmptyResponseErrors(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: ""})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -225,7 +225,7 @@ func TestComplete_ContextCancellation(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: "late", sleep: 2 * time.Second})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script, TimeoutSeconds: 1})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
@@ -238,7 +238,7 @@ func TestComplete_ExtraArgsForwarded(t *testing.T) {
 	script := fakeClaude(t, "", fakeOpts{stdout: "ok"})
 
 	p, _ := New(llm.ClaudeCLIConfig{Binary: script, Args: []string{"--allowed-tools", ""}})
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},

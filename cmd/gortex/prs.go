@@ -126,7 +126,7 @@ func runPRs(cmd *cobra.Command, args []string) error {
 	// dashboard, since both daemon tools self-serve from the forge.
 	if prsTriage || prsConflicts {
 		if !forgeAvailable(context.Background()) {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+			fmt.Fprintln(cmd.OutOrStdout(),
 				"no GitHub token found — set GH_TOKEN (or GITHUB_TOKEN) to triage pull requests")
 			return nil
 		}
@@ -153,7 +153,7 @@ func runPRList(cmd *cobra.Command, repoPath string) error {
 	ctx := context.Background()
 
 	if !forgeAvailable(ctx) {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+		fmt.Fprintln(cmd.OutOrStdout(),
 			"no GitHub token found — set GH_TOKEN (or GITHUB_TOKEN) to list pull requests")
 		return nil
 	}
@@ -233,7 +233,7 @@ func emitPRListJSON(cmd *cobra.Command, rows []prRow) error {
 func emitPRListTable(cmd *cobra.Command, rows []prRow, worktreeBranches map[string]bool) {
 	out := cmd.OutOrStdout()
 	if len(rows) == 0 {
-		_, _ = fmt.Fprintln(out, "No open pull requests.")
+		fmt.Fprintln(out, "No open pull requests.")
 		return
 	}
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
@@ -241,7 +241,7 @@ func emitPRListTable(cmd *cobra.Command, rows []prRow, worktreeBranches map[stri
 	if worktreeBranches != nil {
 		header += "\tWORKTREE"
 	}
-	_, _ = fmt.Fprintln(tw, header)
+	fmt.Fprintln(tw, header)
 	for _, r := range rows {
 		review := r.Review
 		if review == "" {
@@ -256,9 +256,9 @@ func emitPRListTable(cmd *cobra.Command, rows []prRow, worktreeBranches map[stri
 			}
 			line += "\t" + mark
 		}
-		_, _ = fmt.Fprintln(tw, line)
+		fmt.Fprintln(tw, line)
 	}
-	_ = tw.Flush()
+	tw.Flush()
 }
 
 // runPRDeepDive fetches a PR's changed files from the forge (when a token is
@@ -329,31 +329,31 @@ func printPRImpact(cmd *cobra.Command, number int, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	if p.Error != "" {
-		_, _ = fmt.Fprintf(out, "PR #%d: %s", number, p.Error)
+		fmt.Fprintf(out, "PR #%d: %s", number, p.Error)
 		if p.Hint != "" {
-			_, _ = fmt.Fprintf(out, " — %s", p.Hint)
+			fmt.Fprintf(out, " — %s", p.Hint)
 		}
-		_, _ = fmt.Fprintln(out)
+		fmt.Fprintln(out)
 		return nil
 	}
 
-	_, _ = fmt.Fprintf(out, "PR #%d — risk %s (score %.1f)\n", p.Number, p.Risk, p.Score)
+	fmt.Fprintf(out, "PR #%d — risk %s (score %.1f)\n", p.Number, p.Risk, p.Score)
 
-	_, _ = fmt.Fprintf(out, "\nChanged files (%d):\n", len(p.ChangedFiles))
+	fmt.Fprintf(out, "\nChanged files (%d):\n", len(p.ChangedFiles))
 	for _, f := range p.ChangedFiles {
-		_, _ = fmt.Fprintf(out, "  %s\n", f)
+		fmt.Fprintf(out, "  %s\n", f)
 	}
 
-	_, _ = fmt.Fprintf(out, "\nBlast radius: %d changed symbol(s), %d communit(ies)\n",
+	fmt.Fprintf(out, "\nBlast radius: %d changed symbol(s), %d communit(ies)\n",
 		len(p.ChangedSymbols), len(p.Communities))
 	for _, sym := range p.ChangedSymbols {
-		_, _ = fmt.Fprintf(out, "  %-8s %s\n", sym.Kind, sym.ID)
+		fmt.Fprintf(out, "  %-8s %s\n", sym.Kind, sym.ID)
 	}
 
 	if len(p.ReviewPriorities) > 0 {
-		_, _ = fmt.Fprintln(out, "\nReview priorities:")
+		fmt.Fprintln(out, "\nReview priorities:")
 		for _, pr := range p.ReviewPriorities {
-			_, _ = fmt.Fprintf(out, "  %-10s %5.1f  %s\n", pr.Axis, pr.Score, pr.Reason)
+			fmt.Fprintf(out, "  %-10s %5.1f  %s\n", pr.Axis, pr.Score, pr.Reason)
 		}
 	}
 	return nil
@@ -431,15 +431,15 @@ func printPRTriage(cmd *cobra.Command, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	if p.Error != "" {
-		_, _ = fmt.Fprintf(out, "triage: %s", p.Error)
+		fmt.Fprintf(out, "triage: %s", p.Error)
 		if p.Hint != "" {
-			_, _ = fmt.Fprintf(out, " — %s", p.Hint)
+			fmt.Fprintf(out, " — %s", p.Hint)
 		}
-		_, _ = fmt.Fprintln(out)
+		fmt.Fprintln(out)
 		return nil
 	}
 	if len(p.Ranked) == 0 {
-		_, _ = fmt.Fprintln(out, "No open pull requests to triage.")
+		fmt.Fprintln(out, "No open pull requests to triage.")
 		return nil
 	}
 
@@ -447,20 +447,20 @@ func printPRTriage(cmd *cobra.Command, raw json.RawMessage) error {
 	if p.LLMUsed {
 		header += " — LLM-reranked"
 	}
-	_, _ = fmt.Fprintln(out, header)
+	fmt.Fprintln(out, header)
 
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "RANK\t#\tRISK\tSCORE\tTITLE")
+	fmt.Fprintln(tw, "RANK\t#\tRISK\tSCORE\tTITLE")
 	for i, r := range p.Ranked {
-		_, _ = fmt.Fprintf(tw, "%d\t%d\t%s\t%.1f\t%s\n",
+		fmt.Fprintf(tw, "%d\t%d\t%s\t%.1f\t%s\n",
 			i+1, r.Number, r.Risk, r.Score, truncate(r.Title, 50))
 	}
-	_ = tw.Flush()
+	tw.Flush()
 
 	// Print any LLM rationales below the table so the queue stays scannable.
 	for _, r := range p.Ranked {
 		if rat := strings.TrimSpace(r.Rationale); rat != "" {
-			_, _ = fmt.Fprintf(out, "  PR #%d: %s\n", r.Number, rat)
+			fmt.Fprintf(out, "  PR #%d: %s\n", r.Number, rat)
 		}
 	}
 	return nil
@@ -491,26 +491,26 @@ func printPRConflicts(cmd *cobra.Command, raw json.RawMessage) error {
 		return emitDaemonJSON(cmd, raw)
 	}
 	if p.Error != "" {
-		_, _ = fmt.Fprintf(out, "conflicts: %s", p.Error)
+		fmt.Fprintf(out, "conflicts: %s", p.Error)
 		if p.Hint != "" {
-			_, _ = fmt.Fprintf(out, " — %s", p.Hint)
+			fmt.Fprintf(out, " — %s", p.Hint)
 		}
-		_, _ = fmt.Fprintln(out)
+		fmt.Fprintln(out)
 		return nil
 	}
 	if len(p.Conflicts) == 0 {
-		_, _ = fmt.Fprintln(out, "No merge-order conflicts: no community is touched by more than one open PR.")
+		fmt.Fprintln(out, "No merge-order conflicts: no community is touched by more than one open PR.")
 		return nil
 	}
 
-	_, _ = fmt.Fprintf(out, "Merge-order conflicts (%d cluster(s), highest-risk first)\n", len(p.Conflicts))
+	fmt.Fprintf(out, "Merge-order conflicts (%d cluster(s), highest-risk first)\n", len(p.Conflicts))
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "COMMUNITY\tSIZE\tRISK\tPRS\tMERGE ORDER")
+	fmt.Fprintln(tw, "COMMUNITY\tSIZE\tRISK\tPRS\tMERGE ORDER")
 	for _, c := range p.Conflicts {
-		_, _ = fmt.Fprintf(tw, "%s\t%d\t%.2f\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%d\t%.2f\t%s\t%s\n",
 			c.Community, c.Size, c.Risk, joinPRNumbers(c.PRs), joinPRNumbers(c.SuggestedOrder))
 	}
-	_ = tw.Flush()
+	tw.Flush()
 	return nil
 }
 
@@ -658,7 +658,7 @@ func runPRsBundle(cmd *cobra.Command, args []string) error {
 	if err := writeReviewerBundle(out, n, changed, impact, reviewers); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "wrote reviewer bundle for PR #%d to %s\n", n, out)
+	fmt.Fprintf(cmd.OutOrStdout(), "wrote reviewer bundle for PR #%d to %s\n", n, out)
 	return nil
 }
 

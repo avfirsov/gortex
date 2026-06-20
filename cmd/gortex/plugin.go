@@ -75,7 +75,7 @@ func runPluginEmit(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(rootCmd.OutOrStdout(), "Wrote %d files to %s (variant=%s, version=%s)\n", len(written), abs, pluginEmitVariant, v)
+	fmt.Fprintf(rootCmd.OutOrStdout(), "Wrote %d files to %s (variant=%s, version=%s)\n", len(written), abs, pluginEmitVariant, v)
 	return nil
 }
 

@@ -78,13 +78,13 @@ func LoadMemories(dir string) (*MemoryStore, error) {
 		}
 		return nil, fmt.Errorf("persistence: open memories: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader memories: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var store MemoryStore
 	if err := gob.NewDecoder(gz).Decode(&store); err != nil {

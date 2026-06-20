@@ -92,7 +92,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		if _, err := requireDaemonTool(repoPath, "export_graph", toolArgs); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex export] daemon wrote mermaid files under %s\n", abs)
+		fmt.Fprintf(cmd.ErrOrStderr(), "[gortex export] daemon wrote mermaid files under %s\n", abs)
 		return nil
 
 	case exportOut != "":
@@ -104,7 +104,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		if _, err := requireDaemonTool(repoPath, "export_graph", toolArgs); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[gortex export] daemon wrote the export to %s\n", abs)
+		fmt.Fprintf(cmd.ErrOrStderr(), "[gortex export] daemon wrote the export to %s\n", abs)
 		printLoadInstructions(format, exportOut)
 		return nil
 
@@ -122,22 +122,22 @@ func printLoadInstructions(format, path string) {
 	w := os.Stderr
 	switch format {
 	case "cypher":
-		_, _ = fmt.Fprintf(w, "\n[gortex export] To load into Memgraph (recommended for ad-hoc exploration):\n")
-		_, _ = fmt.Fprintf(w, "    docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform\n")
-		_, _ = fmt.Fprintf(w, "    # then in Memgraph Lab (http://localhost:3000) → Datasets → Import\n")
-		_, _ = fmt.Fprintf(w, "    # OR via mgconsole:  cat %s | mgconsole\n", path)
-		_, _ = fmt.Fprintf(w, "    # First, create an id index for fast edge MATCHes:\n")
-		_, _ = fmt.Fprintf(w, "    #   CREATE INDEX ON :GortexNode(id);\n")
-		_, _ = fmt.Fprintf(w, "\n[gortex export] To load into Neo4j:\n")
-		_, _ = fmt.Fprintf(w, "    cypher-shell -u neo4j -p <pw> -f %s\n", path)
-		_, _ = fmt.Fprintf(w, "    # First, create the index:\n")
-		_, _ = fmt.Fprintf(w, "    #   CREATE INDEX FOR (n:GortexNode) ON (n.id);\n")
-		_, _ = fmt.Fprintf(w, "\n[gortex export] To wipe a previous export before re-loading:\n")
-		_, _ = fmt.Fprintf(w, "    MATCH (n:GortexNode) DETACH DELETE n;\n")
+		fmt.Fprintf(w, "\n[gortex export] To load into Memgraph (recommended for ad-hoc exploration):\n")
+		fmt.Fprintf(w, "    docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform\n")
+		fmt.Fprintf(w, "    # then in Memgraph Lab (http://localhost:3000) → Datasets → Import\n")
+		fmt.Fprintf(w, "    # OR via mgconsole:  cat %s | mgconsole\n", path)
+		fmt.Fprintf(w, "    # First, create an id index for fast edge MATCHes:\n")
+		fmt.Fprintf(w, "    #   CREATE INDEX ON :GortexNode(id);\n")
+		fmt.Fprintf(w, "\n[gortex export] To load into Neo4j:\n")
+		fmt.Fprintf(w, "    cypher-shell -u neo4j -p <pw> -f %s\n", path)
+		fmt.Fprintf(w, "    # First, create the index:\n")
+		fmt.Fprintf(w, "    #   CREATE INDEX FOR (n:GortexNode) ON (n.id);\n")
+		fmt.Fprintf(w, "\n[gortex export] To wipe a previous export before re-loading:\n")
+		fmt.Fprintf(w, "    MATCH (n:GortexNode) DETACH DELETE n;\n")
 	case "graphml":
-		_, _ = fmt.Fprintf(w, "\n[gortex export] Open %s in:\n", path)
-		_, _ = fmt.Fprintf(w, "    Gephi:     File → Open\n")
-		_, _ = fmt.Fprintf(w, "    yEd:       File → Open\n")
-		_, _ = fmt.Fprintf(w, "    Cytoscape: File → Import → Network from File\n")
+		fmt.Fprintf(w, "\n[gortex export] Open %s in:\n", path)
+		fmt.Fprintf(w, "    Gephi:     File → Open\n")
+		fmt.Fprintf(w, "    yEd:       File → Open\n")
+		fmt.Fprintf(w, "    Cytoscape: File → Import → Network from File\n")
 	}
 }

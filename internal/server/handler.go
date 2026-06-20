@@ -770,7 +770,7 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// close so clients can distinguish "no events ever" from "stream
 	// dropped mid-session".
 	if h.eventHub == nil {
-		_, _ = fmt.Fprintf(w, ": watch mode not active\n\n")
+		fmt.Fprintf(w, ": watch mode not active\n\n")
 		flusher.Flush()
 		return
 	}
@@ -791,12 +791,12 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			data, _ := json.Marshal(ev)
-			_, _ = fmt.Fprintf(w, "event: graph_change\nid: %d\ndata: %s\n\n",
+			fmt.Fprintf(w, "event: graph_change\nid: %d\ndata: %s\n\n",
 				ev.Timestamp.UnixMilli(), string(data))
 			flusher.Flush()
 
 		case <-keepalive.C:
-			_, _ = fmt.Fprintf(w, ": keepalive\n\n")
+			fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
 
 		case <-ctx.Done():

@@ -56,13 +56,13 @@ func LoadCombo(dir string) (*ComboStore, error) {
 		}
 		return nil, fmt.Errorf("persistence: open combo: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: gzip reader combo: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer gz.Close()
 
 	var store ComboStore
 	if err := gob.NewDecoder(gz).Decode(&store); err != nil {

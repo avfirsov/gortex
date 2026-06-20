@@ -123,7 +123,7 @@ func execute() {
 		var ec *exitCodeError
 		if errors.As(err, &ec) {
 			if ec.msg != "" {
-				_, _ = fmt.Fprintln(os.Stderr, ec.msg)
+				fmt.Fprintln(os.Stderr, ec.msg)
 			}
 			os.Exit(ec.code)
 		}

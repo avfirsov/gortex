@@ -107,7 +107,7 @@ func TestRouter_ProxyToRemote(t *testing.T) {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprint(w, `{"ok":true,"server":"remote"}`)
+		fmt.Fprint(w, `{"ok":true,"server":"remote"}`)
 	}))
 	defer upstream.Close()
 
@@ -151,7 +151,7 @@ func TestRouter_ProxyToRemote(t *testing.T) {
 func TestRouter_CwdResolution(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprint(w, `{"ok":true}`)
+		fmt.Fprint(w, `{"ok":true}`)
 	}))
 	defer upstream.Close()
 

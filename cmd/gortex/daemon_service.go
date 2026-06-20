@@ -131,7 +131,7 @@ func runDaemonInstallService(cmd *cobra.Command, _ []string) error {
 	// Stop any manual daemon that's currently running so the service
 	// doesn't fight with it over the socket.
 	if daemon.IsRunning() {
-		_, _ = fmt.Fprintln(w, "[gortex daemon] stopping existing daemon before install")
+		fmt.Fprintln(w, "[gortex daemon] stopping existing daemon before install")
 		// This is an internal lifecycle bounce — the supervisor starts the
 		// daemon right after — not a user "stay down". Suppress the stop-intent
 		// marker (as `daemon restart` does) so a failed install can't leave
@@ -286,9 +286,9 @@ func installLaunchd(w io.Writer, exe string) error {
 	if err := runCmd(w, "launchctl", "load", "-w", path); err != nil {
 		return fmt.Errorf("launchctl load: %w", err)
 	}
-	_, _ = fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
-	_, _ = fmt.Fprintf(w, "  logs: %s\n", daemon.LogFilePath())
-	_, _ = fmt.Fprintf(w, "  check: gortex daemon service-status\n")
+	fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
+	fmt.Fprintf(w, "  logs: %s\n", daemon.LogFilePath())
+	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
 	return nil
 }
 
@@ -303,7 +303,7 @@ func uninstallLaunchd(w io.Writer) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove plist: %w", err)
 	}
-	_, _ = fmt.Fprintln(w, "[gortex daemon] service uninstalled")
+	fmt.Fprintln(w, "[gortex daemon] service uninstalled")
 	return nil
 }
 
@@ -313,24 +313,24 @@ func statusLaunchd(w io.Writer) error {
 		return err
 	}
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		_, _ = fmt.Fprintf(w, "launchd: not installed (expected %s)\n", path)
+		fmt.Fprintf(w, "launchd: not installed (expected %s)\n", path)
 		return nil
 	}
-	_, _ = fmt.Fprintf(w, "launchd: installed at %s\n", path)
+	fmt.Fprintf(w, "launchd: installed at %s\n", path)
 
 	// `launchctl list <label>` returns 0 and a plist-ish blob when loaded,
 	// non-zero otherwise.
 	out, err := exec.Command("launchctl", "list", daemonServiceName).CombinedOutput()
 	if err != nil {
-		_, _ = fmt.Fprintln(w, "status: not loaded — try `launchctl load ~/Library/LaunchAgents/"+daemonServiceName+".plist`")
+		fmt.Fprintln(w, "status: not loaded — try `launchctl load ~/Library/LaunchAgents/"+daemonServiceName+".plist`")
 		return nil
 	}
-	_, _ = fmt.Fprintln(w, "status: loaded")
+	fmt.Fprintln(w, "status: loaded")
 	// Extract PID and LastExitStatus lines for a concise summary.
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "\"PID\"") || strings.HasPrefix(line, "\"LastExitStatus\"") {
-			_, _ = fmt.Fprintln(w, "  "+line)
+			fmt.Fprintln(w, "  "+line)
 		}
 	}
 	return nil
@@ -413,9 +413,9 @@ func installSystemd(w io.Writer, exe string) error {
 	if err := runCmd(w, "systemctl", "--user", "enable", "--now", daemonServiceName); err != nil {
 		return fmt.Errorf("systemctl enable --now: %w", err)
 	}
-	_, _ = fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
-	_, _ = fmt.Fprintf(w, "  logs: %s (or `journalctl --user -u %s -f`)\n", daemon.LogFilePath(), daemonServiceName)
-	_, _ = fmt.Fprintf(w, "  check: gortex daemon service-status\n")
+	fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
+	fmt.Fprintf(w, "  logs: %s (or `journalctl --user -u %s -f`)\n", daemon.LogFilePath(), daemonServiceName)
+	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
 	return nil
 }
 
@@ -432,7 +432,7 @@ func uninstallSystemd(w io.Writer) error {
 		return fmt.Errorf("remove unit: %w", err)
 	}
 	_ = runCmd(w, "systemctl", "--user", "daemon-reload")
-	_, _ = fmt.Fprintln(w, "[gortex daemon] service uninstalled")
+	fmt.Fprintln(w, "[gortex daemon] service uninstalled")
 	return nil
 }
 
@@ -442,19 +442,19 @@ func statusSystemd(w io.Writer) error {
 		return err
 	}
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		_, _ = fmt.Fprintf(w, "systemd: not installed (expected %s)\n", path)
+		fmt.Fprintf(w, "systemd: not installed (expected %s)\n", path)
 		return nil
 	}
-	_, _ = fmt.Fprintf(w, "systemd: installed at %s\n", path)
+	fmt.Fprintf(w, "systemd: installed at %s\n", path)
 	out, err := exec.Command("systemctl", "--user", "is-active", daemonServiceName).CombinedOutput()
 	status := strings.TrimSpace(string(out))
-	_, _ = fmt.Fprintf(w, "status: %s", status)
+	fmt.Fprintf(w, "status: %s", status)
 	if err != nil {
 		// is-active exits 3 for "inactive" — not really a CLI error.
-		_, _ = fmt.Fprintln(w)
+		fmt.Fprintln(w)
 		return nil
 	}
-	_, _ = fmt.Fprintln(w)
+	fmt.Fprintln(w)
 	return nil
 }
 

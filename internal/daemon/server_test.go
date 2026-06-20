@@ -168,7 +168,7 @@ func TestDaemon_ControlStatus(t *testing.T) {
 
 	c, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "cli"})
 	require.NoError(t, err)
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	require.NotEmpty(t, c.Ack.SessionID, "ack must carry session id")
 	require.Equal(t, "test-0.0.0", c.Ack.DaemonVersion)
@@ -192,7 +192,7 @@ func TestDaemon_ControlTrackUntrack(t *testing.T) {
 
 	c, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "cli"})
 	require.NoError(t, err)
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	trackResp, err := c.Control(ControlTrack, TrackParams{Path: "/tmp/myapp", Name: "myapp"})
 	require.NoError(t, err)
@@ -222,7 +222,7 @@ func TestDaemon_ControlEnrichDispatch(t *testing.T) {
 
 	c, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "cli"})
 	require.NoError(t, err)
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 
 	// churn
 	churnResp, err := c.Control(ControlEnrichChurn, EnrichChurnParams{Path: "/r", Branch: "main"})

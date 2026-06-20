@@ -22,7 +22,7 @@ func appendLegacyEventLine(t *testing.T, path string, ev Event) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		t.Fatal(err)
 	}

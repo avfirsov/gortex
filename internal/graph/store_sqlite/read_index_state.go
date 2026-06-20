@@ -42,7 +42,7 @@ func ReadRepoIndexStates(path string) (map[string]graph.RepoIndexState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store %q: %w", path, err)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 	db.SetMaxOpenConns(1)
 
 	rows, err := db.Query(`
@@ -54,7 +54,7 @@ SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, ed
 		// status command must never hard-fail on a degraded cache.
 		return map[string]graph.RepoIndexState{}, nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
 	out := map[string]graph.RepoIndexState{}
 	for rows.Next() {

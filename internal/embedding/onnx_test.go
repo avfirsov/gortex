@@ -15,7 +15,7 @@ func TestONNXProvider_Embed(t *testing.T) {
 	if err != nil {
 		t.Skipf("ONNX provider not available: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	assert.Equal(t, onnxDims, p.Dimensions())
 
@@ -46,7 +46,7 @@ func TestONNXProvider_EmbedBatch(t *testing.T) {
 	if err != nil {
 		t.Skipf("ONNX provider not available: %v", err)
 	}
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 
 	ctx := context.Background()
 	vecs, err := p.EmbedBatch(ctx, []string{

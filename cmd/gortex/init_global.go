@@ -70,7 +70,7 @@ func trackViaDaemon(absPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	resp, err := c.Control(daemon.ControlTrack, daemon.TrackParams{Path: absPath})
 	if err != nil {
 		return "", err

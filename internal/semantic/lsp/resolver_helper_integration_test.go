@@ -53,7 +53,7 @@ export function callIt(): number {
 
 	provider := NewProviderFromSpec(spec, zap.NewNop())
 	helper := NewResolverHelper(provider, workspace, 10*time.Second, zap.NewNop())
-	defer func() { _ = helper.Close() }()
+	defer helper.Close()
 
 	// Warm tsserver up by asking once and discarding the result —
 	// the workspace project graph loads asynchronously and the first
@@ -100,7 +100,7 @@ const a = 1;
 	spec := SpecByName("typescript-language-server")
 	provider := NewProviderFromSpec(spec, zap.NewNop())
 	helper := NewResolverHelper(provider, workspace, 5*time.Second, zap.NewNop())
-	defer func() { _ = helper.Close() }()
+	defer helper.Close()
 
 	// "ghostFunction" doesn't appear on line 2 — tsserver should
 	// return an empty location set, the helper should report
