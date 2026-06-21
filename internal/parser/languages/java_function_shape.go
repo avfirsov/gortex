@@ -152,6 +152,28 @@ func emitJavaReturnEdges(ownerID, returnText, filePath string, line int, result 
 	})
 }
 
+// emitJavaTypeUseEdges parses a local-variable / field type annotation
+// and emits one EdgeTypedAs to unresolved::<type>, so a type used only
+// in declaration position (`HttpResponse resp = client.get();`) is a
+// first-class cross-file reference the name-based resolver can land
+// without an LSP. Bare-type canonicalization (strip generics <…>, array
+// [], varargs …, package prefix) and primitive skipping reuse the same
+// helpers as the param / return type edges. Mirrors emitJavaReturnEdges.
+func emitJavaTypeUseEdges(ownerID, typeText, filePath string, line int, result *parser.ExtractionResult) {
+	t := canonicalizeJavaTypeRef(typeText)
+	if t == "" || isJavaPrimitive(t) {
+		return
+	}
+	result.Edges = append(result.Edges, &graph.Edge{
+		From:     ownerID,
+		To:       "unresolved::" + t,
+		Kind:     graph.EdgeTypedAs,
+		FilePath: filePath,
+		Line:     line,
+		Origin:   graph.OriginASTInferred,
+	})
+}
+
 func emitJavaGenericParamNodes(ownerID string, methodNode *sitter.Node, src []byte, filePath string, line int, result *parser.ExtractionResult) {
 	tparams := methodNode.ChildByFieldName("type_parameters")
 	if tparams == nil {

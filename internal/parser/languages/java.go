@@ -165,6 +165,17 @@ type javaDeferredVar struct {
 	isLocal  bool
 }
 
+// javaTypeUse buffers a local-variable / field type annotation whose
+// EdgeTypedAs is emitted after funcRanges is built, so the reference is
+// attributed to its enclosing method (falling back to the file node).
+// The raw annotation text is kept verbatim — emitJavaTypeUseEdges
+// canonicalizes it (strip generics / array / package prefix) and skips
+// primitives, mirroring the param / return type edges.
+type javaTypeUse struct {
+	typeText string
+	line     int // 1-based
+}
+
 func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	tree, err := parser.ParseFile(src, e.lang)
 	if err != nil {
@@ -190,6 +201,7 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 
 	var calls []javaDeferredCall
 	var varBuf []javaDeferredVar
+	var typeUses []javaTypeUse
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -226,6 +238,12 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				defNode:  m.Captures["fvar.def"].Node,
 				isLocal:  false,
 			})
+			// A typed field (`Foo bar;`) references type Foo — buffer it
+			// so find_usages(Foo) surfaces the declaration without an LSP.
+			typeUses = append(typeUses, javaTypeUse{
+				typeText: m.Captures["fvar.type"].Text,
+				line:     m.Captures["fvar.def"].StartLine + 1,
+			})
 
 		case m.Captures["lvar.def"] != nil:
 			varBuf = append(varBuf, javaDeferredVar{
@@ -233,6 +251,13 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 				explicit: normalizeJavaTypeName(m.Captures["lvar.type"].Text),
 				defNode:  m.Captures["lvar.def"].Node,
 				isLocal:  true,
+			})
+			// A typed local (`HttpResponse resp = …`) references its type
+			// in declaration position — buffer the EdgeTypedAs so it's a
+			// first-class cross-file reference even without an LSP.
+			typeUses = append(typeUses, javaTypeUse{
+				typeText: m.Captures["lvar.type"].Text,
+				line:     m.Captures["lvar.def"].StartLine + 1,
 			})
 
 		case m.Captures["import.def"] != nil:
@@ -329,6 +354,22 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// All function/method nodes have been emitted; map call sites to
 	// their enclosing definition.
 	funcRanges := buildFuncRanges(result)
+
+	// Type-use edges: a `Foo x = …` local declaration or a `Foo bar;`
+	// field declaration references type Foo. Attributed to the enclosing
+	// method (fallback: the file node) so find_usages(Foo) surfaces every
+	// declaration site without an LSP. EdgeTypedAs mirrors the param /
+	// return type edges; the resolver lands it cross-file via the same
+	// name-based pass. Params / return types already emit their own
+	// EdgeTypedAs via emitJavaFunctionShape, so this only covers the
+	// local / field annotation positions that were previously edge-less.
+	for _, tu := range typeUses {
+		ownerID := findEnclosingFunc(funcRanges, tu.line)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		emitJavaTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
+	}
 	// @Value("${key:Default}") fields → their literal defaults, for invoker
 	// dispatch through a Spring-injected field (built only when invoker
 	// detection is configured).
