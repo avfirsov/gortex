@@ -149,6 +149,17 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		}
 	})
 
+	// Recover type containers the tree-sitter query missed. The vendored
+	// Swift grammar occasionally mis-parses a type declaration — typically a
+	// large `class Foo: @unchecked Sendable { ... }` whose attributed
+	// inheritance clause derails the parse — into an ERROR-wrapped
+	// function_declaration, so the class_declaration pattern never matches
+	// and no type node is emitted (its members still parse and attribute to
+	// the type via an extension's range). A brace-matched text scan re-emits
+	// any such missing container. The `seen` gate makes this provably inert
+	// for files the query already covered.
+	e.recoverMissingTypeContainers(src, filePath, fileID, result, seen, &typeRanges)
+
 	// Stamp protocol method names onto protocol nodes' Meta["methods"].
 	for _, n := range result.Nodes {
 		if n.Kind != graph.KindInterface {
@@ -162,9 +173,17 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		}
 	}
 
-	// Resolve calls against funcRanges.
+	// Resolve calls against funcRanges. A Capitalized callee (`Foo(...)`) is a
+	// Swift construction, not a free-function call — emitSwiftReferenceForms
+	// already emits it as graph.EdgeInstantiates to the type, which resolves to
+	// the type node. Emitting a parallel EdgeCalls to unresolved::Foo would
+	// leave that construction permanently stranded on the unresolved target, so
+	// such callees are skipped here to avoid the redundant unresolved edge.
 	funcRanges := buildFuncRanges(result)
 	for _, c := range calls {
+		if isSwiftCapitalized(c.name) && !isSwiftPrimitive(c.name) {
+			continue // construction — handled as EdgeInstantiates
+		}
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
 			continue
@@ -593,6 +612,90 @@ func swiftStampFuncMeta(meta map[string]any, returnType string, isAsync, isStati
 }
 
 var swiftExtensionRe = regexp.MustCompile(`(?m)^[ \t]*(?:(?:public|private|internal|fileprivate|open|final)[ \t]+)*extension[ \t]+([A-Za-z_][\w.]*)`)
+
+// swiftTypeDeclRe matches a Swift nominal-type declaration head (class /
+// struct / enum / actor) with its leading access/behaviour modifiers, capturing
+// the declared name (backtick escaping tolerated). Protocols are intentionally
+// excluded — their members differ and the grammar parses them reliably. Used
+// only by the ERROR-recovery scan, which re-emits a type container the
+// tree-sitter query failed to capture.
+var swiftTypeDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:(?:public|private|internal|fileprivate|open|final|indirect|@objc)[ \t]+)*(class|struct|enum|actor)[ \t]+` + "`?" + `([A-Za-z_]\w*)` + "`?")
+
+// recoverMissingTypeContainers re-emits class / struct / enum / actor container
+// nodes the tree-sitter query missed. The vendored Swift grammar can drop a
+// type declaration into an ERROR node (most often a large
+// `class Foo: @unchecked Sendable { ... }`), so its class_declaration pattern
+// never matches and no type node is produced even though the type's members
+// parse correctly and attribute to it. A brace-matched text scan finds each
+// declaration; one whose id is already in `seen` (the query already emitted it)
+// is skipped, so the pass is inert on cleanly-parsed files. A recovered enum is
+// stamped Meta["kind"]="enum"; the recovered node's range is folded into the
+// type-range table so any later member classification stays consistent.
+func (e *SwiftExtractor) recoverMissingTypeContainers(src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool, typeRanges *[]swiftTypeRange) {
+	s := string(src)
+	for _, loc := range swiftTypeDeclRe.FindAllStringSubmatchIndex(s, -1) {
+		keyword := s[loc[2]:loc[3]]
+		name := s[loc[4]:loc[5]]
+		if name == "" {
+			continue
+		}
+		id := filePath + "::" + name
+		if seen[id] {
+			continue // query path already emitted this container
+		}
+		// Brace-match from the declaration head to bound the range.
+		rel := strings.IndexByte(s[loc[1]:], '{')
+		if rel < 0 {
+			continue
+		}
+		open := loc[1] + rel
+		end := swiftMatchBrace(s, open)
+		startLine := strings.Count(s[:loc[0]], "\n")
+		endLine := startLine
+		if end >= 0 {
+			endLine = strings.Count(s[:end], "\n")
+		}
+
+		seen[id] = true
+		meta := map[string]any{"visibility": swiftVisibilityFromModifiers(s[loc[0]:loc[1]])}
+		if keyword == "enum" {
+			meta["kind"] = "enum"
+		}
+		if doc := ExtractDocAbove(src, startLine, DocLangSlashSlash); doc != "" {
+			meta["doc"] = doc
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindType, Name: name,
+			FilePath: filePath, StartLine: startLine + 1, EndLine: endLine + 1,
+			Language: "swift",
+			Meta:     meta,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine + 1,
+		})
+		*typeRanges = append(*typeRanges, swiftTypeRange{
+			name:      name,
+			startLine: startLine,
+			endLine:   endLine,
+		})
+	}
+}
+
+// swiftVisibilityFromModifiers reads an access level out of a leading modifier
+// band (the text before the type keyword). Swift defaults to "internal".
+func swiftVisibilityFromModifiers(modifiers string) string {
+	for _, f := range strings.Fields(modifiers) {
+		switch f {
+		case "public", "open":
+			return VisibilityPublic
+		case "private", "fileprivate":
+			return VisibilityPrivate
+		case "internal":
+			return VisibilityInternal
+		}
+	}
+	return VisibilityInternal
+}
 
 // swiftExtensionRanges returns a type-range per `extension Foo { ... }` block in
 // src (Foo collapsed to its last dotted segment), found by a brace-matched text
