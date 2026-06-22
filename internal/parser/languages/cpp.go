@@ -166,6 +166,13 @@ func (e *CppExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	// walk above, so they're already in result.Edges.
 	collectCppTypeUseEdges(root, funcRanges, filePath, src, result)
 
+	// Emit the remaining reference forms a type can appear in beyond a
+	// declaration position: construction (new / stack), base-class
+	// inheritance, casts, and Capitalized scope/static access. These are
+	// EdgeInstantiates (construction) and EdgeReferences with a
+	// ref_context subkind (inherit / cast / static_access).
+	emitCppReferenceForms(root, src, filePath, fileID, funcRanges, result)
+
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
