@@ -96,3 +96,24 @@ func TestResolveStoreFactoryCalls_Idempotent(t *testing.T) {
 		t.Errorf("expected idempotent resolve count 1/1, got %d/%d", first, second)
 	}
 }
+
+func TestResolveStoreFactoryCalls_PiniaGetterDisambiguates(t *testing.T) {
+	// Two stores each define `login`, keyed by their getter name. A
+	// useUserStore-bound call must reach the user store's login, never the
+	// cart store's — even with the caller in neither store file.
+	g := graph.New()
+	storeAction(g, "user.ts::useUserStore.login@3", "user.ts", "useUserStore", "login")
+	storeAction(g, "cart.ts::useCartStore.login@3", "cart.ts", "useCartStore", "login")
+	storeCall(g, "Profile.vue::go", "Profile.vue", "useUserStore", "login")
+
+	ResolveStoreFactoryCalls(g)
+	var bound string
+	for _, e := range g.GetOutEdges("Profile.vue::go") {
+		if e.Kind == graph.EdgeCalls && e.Meta["synthesized_by"] == SynthStoreFactory {
+			bound = e.To
+		}
+	}
+	if bound != "user.ts::useUserStore.login@3" {
+		t.Fatalf("useUserStore.login() bound to %q (want user.ts login)", bound)
+	}
+}

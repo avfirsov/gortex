@@ -439,6 +439,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	captureReduxThunkDispatches(result, root, filePath, src)
 	captureObjectRegistryDispatches(result, root, filePath, src)
 	captureRTKQueryEndpoints(result, root, filePath, "javascript", src)
+	capturePiniaStoreCalls(result, root, filePath, src)
 	return result, nil
 }
 
