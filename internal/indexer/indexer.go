@@ -2465,6 +2465,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// per-edge path during cold-start warmup.
 					idx.graph.AddBatch(result.Nodes, result.Edges)
 					idx.persistConstValues(result)
+					idx.persistFileMeta(relPath, src, result)
 
 					if !skipped && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
@@ -3037,6 +3038,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	idx.graph.AddBatch(result.Nodes, result.Edges)
 	idx.persistConstValues(result)
+	idx.persistFileMeta(relPath, src, result)
 
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.

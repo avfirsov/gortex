@@ -2756,14 +2756,24 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 	// can see WHY a file is missing from the graph (size / timeout /
 	// minified / parse_failed / parse_panic) instead of guessing.
 	skipped := map[string]int{}
+	repoPrefixes := map[string]struct{}{}
 	for n := range s.graph.NodesByKind(graph.KindFile) {
-		if n == nil || n.Meta == nil {
+		if n == nil {
+			continue
+		}
+		repoPrefixes[n.RepoPrefix] = struct{}{}
+		if n.Meta == nil {
 			continue
 		}
 		if reason, _ := n.Meta["skip_reason"].(string); reason != "" {
 			skipped[reason]++
 		}
 	}
+
+	// Per-file rollup from the files sidecar (when the backend records it):
+	// the files that failed to parse, with their error locations + node
+	// counts. Bounded so a pathological repo can't bloat the payload.
+	filesWithErrors, indexedFileCount := s.buildIndexHealthFileRollup(repoPrefixes)
 
 	// Density plausibility: even a trivial source file yields a file node
 	// plus at least one symbol, so a populated graph averaging barely more
@@ -2822,6 +2832,12 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		"edges_ok":             edgesOK,
 		"nodes_per_file":       nodesPerFile,
 	}
+	if indexedFileCount > 0 {
+		result["indexed_file_count"] = indexedFileCount
+	}
+	if len(filesWithErrors) > 0 {
+		result["files_with_parse_errors"] = filesWithErrors
+	}
 	if len(skipped) > 0 {
 		result["skipped"] = skipped
 	}
@@ -2836,6 +2852,41 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 	}
 
 	return result
+}
+
+// buildIndexHealthFileRollup reads the per-file metadata sidecar (when the
+// backend implements graph.FileMetaReader) across the supplied repo prefixes
+// and returns the files that recorded parse errors — each with its error
+// locations + node count — plus the total indexed-file count. The error list
+// is bounded so a badly-broken repo can't bloat the index_health payload.
+func (s *Server) buildIndexHealthFileRollup(repoPrefixes map[string]struct{}) (filesWithErrors []map[string]any, indexedFileCount int) {
+	reader, ok := s.graph.(graph.FileMetaReader)
+	if !ok {
+		return nil, 0
+	}
+	const maxErrorFiles = 100
+	for prefix := range repoPrefixes {
+		rows, err := reader.FileMetasForRepo(prefix)
+		if err != nil {
+			continue
+		}
+		indexedFileCount += len(rows)
+		for _, r := range rows {
+			if r.Errors == "" || len(filesWithErrors) >= maxErrorFiles {
+				continue
+			}
+			entry := map[string]any{
+				"file":       r.FilePath,
+				"node_count": r.NodeCount,
+			}
+			var locs []string
+			if json.Unmarshal([]byte(r.Errors), &locs) == nil && len(locs) > 0 {
+				entry["errors"] = locs
+			}
+			filesWithErrors = append(filesWithErrors, entry)
+		}
+	}
+	return filesWithErrors, indexedFileCount
 }
 
 // ---------------------------------------------------------------------------

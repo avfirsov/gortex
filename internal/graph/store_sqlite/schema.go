@@ -155,6 +155,26 @@ CREATE TABLE IF NOT EXISTS constant_values (
 
 CREATE INDEX IF NOT EXISTS constant_values_by_file ON constant_values(repo_prefix, file_path);
 
+-- files is the per-file metadata sidecar: one row per indexed file carrying
+-- the BLAKE3 content hash (the Merkle leaf), byte size, extracted node count,
+-- and a JSON array of parse-error locations. The Merkle tree stays the
+-- authoritative change detector; this table is queryable supplementary
+-- metadata (index_health reports per-file parse errors + node counts from it).
+-- PK is (repo_prefix, file_path) so a reindex replaces the row in place;
+-- WITHOUT ROWID — the PK index IS the table, like file_mtimes.
+CREATE TABLE IF NOT EXISTS files (
+    repo_prefix  TEXT NOT NULL DEFAULT '',
+    file_path    TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    size         INTEGER NOT NULL DEFAULT 0,
+    node_count   INTEGER NOT NULL DEFAULT 0,
+    errors       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo_prefix, file_path)
+) WITHOUT ROWID;
+-- files_with_errors backs the index_health "files with parse errors" rollup
+-- so it scans only the (usually tiny) set of erroring files, not every row.
+CREATE INDEX IF NOT EXISTS files_with_errors ON files(repo_prefix) WHERE errors <> '';
+
 -- ref_facts is the resolved-reference sidecar: one row per reference edge
 -- that resolved to a concrete target, recording the target + the provenance
 -- tier that resolved it. Denormalized file_path + lang make "all reference

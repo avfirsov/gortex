@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"sync/atomic"
 
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -133,5 +134,40 @@ func walkParseErrors(n *sitter.Node, count *int) {
 	childCount := int(n.ChildCount())
 	for i := 0; i < childCount; i++ {
 		walkParseErrors(n.Child(i), count)
+	}
+}
+
+// parseErrorLocationCap bounds the number of error locations collected so a
+// pathologically broken file can't produce a multi-kilobyte errors blob.
+const parseErrorLocationCap = 50
+
+// ParseErrorLocations returns the 1-based "row:col" location of each ERROR /
+// MISSING node, capped at parseErrorLocationCap. Returns nil when the tree is
+// nil or clean — the per-file metadata sidecar stores these as a JSON array
+// so index_health can point at where a file failed to parse.
+func (pt *ParseTree) ParseErrorLocations() []string {
+	if pt == nil || pt.tree == nil {
+		return nil
+	}
+	root := pt.tree.RootNode()
+	if root == nil {
+		return nil
+	}
+	var locs []string
+	walkParseErrorLocations(root, &locs)
+	return locs
+}
+
+func walkParseErrorLocations(n *sitter.Node, locs *[]string) {
+	if n == nil || len(*locs) >= parseErrorLocationCap {
+		return
+	}
+	if n.Type() == "ERROR" || n.IsMissing() {
+		p := n.StartPoint()
+		*locs = append(*locs, fmt.Sprintf("%d:%d", p.Row+1, p.Column+1))
+	}
+	childCount := int(n.ChildCount())
+	for i := 0; i < childCount && len(*locs) < parseErrorLocationCap; i++ {
+		walkParseErrorLocations(n.Child(i), locs)
 	}
 }

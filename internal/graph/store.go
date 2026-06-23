@@ -1100,6 +1100,32 @@ type ConstantValueRow struct {
 	Value    string
 }
 
+// FileMetaRow is one per-file metadata record: the BLAKE3 content hash (the
+// Merkle leaf), byte size, extracted node count, and a JSON array of
+// parse-error locations ("" when clean). The Merkle tree stays the
+// authoritative change detector; this row is queryable supplementary metadata
+// that index_health surfaces per file.
+type FileMetaRow struct {
+	FilePath    string
+	ContentHash string
+	Size        int
+	NodeCount   int
+	Errors      string
+}
+
+// FileMetaWriter persists per-file metadata rows. Implemented by the on-disk
+// and in-memory backends; the indexer writes through it after each file's
+// nodes are batched.
+type FileMetaWriter interface {
+	SetFileMetas(repoPrefix string, rows []FileMetaRow) error
+	DeleteFileMetasByFiles(repoPrefix string, files []string) error
+}
+
+// FileMetaReader is the read side: every recorded file row for a repo prefix.
+type FileMetaReader interface {
+	FileMetasForRepo(repoPrefix string) ([]FileMetaRow, error)
+}
+
 // RefFact is one durable resolved-reference fact: a reference edge from
 // FromID resolved TO ToID with the provenance tier that resolved it. Persisted
 // per source file so a reference's resolution is an auditable, diffable record

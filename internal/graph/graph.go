@@ -501,6 +501,11 @@ type Graph struct {
 	// prefix. Guarded by constValuesMu.
 	constValuesMu sync.Mutex
 	constValues   map[string]constValueEntry
+
+	// fileMetas holds per-file metadata rows keyed by repoPrefix -> filePath
+	// (the files sidecar feeding index_health). Guarded by fileMetasMu.
+	fileMetasMu sync.Mutex
+	fileMetas   map[string]map[string]FileMetaRow
 }
 
 // cloneShingleEntry is one in-memory clone_shingles row: the owning
@@ -687,6 +692,63 @@ func (g *Graph) ConstantValuesByNodeIDs(nodeIDs []string) (map[string]string, er
 		if entry, ok := g.constValues[id]; ok {
 			out[id] = entry.value
 		}
+	}
+	return out, nil
+}
+
+// SetFileMetas is the in-memory FileMetaWriter. It records each per-file row
+// for one repo prefix, replacing any prior row in place. Empty input is a
+// no-op.
+func (g *Graph) SetFileMetas(repoPrefix string, rows []FileMetaRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.fileMetasMu.Lock()
+	defer g.fileMetasMu.Unlock()
+	if g.fileMetas == nil {
+		g.fileMetas = make(map[string]map[string]FileMetaRow)
+	}
+	byFile := g.fileMetas[repoPrefix]
+	if byFile == nil {
+		byFile = make(map[string]FileMetaRow, len(rows))
+		g.fileMetas[repoPrefix] = byFile
+	}
+	for _, r := range rows {
+		if r.FilePath == "" {
+			continue
+		}
+		byFile[r.FilePath] = r
+	}
+	return nil
+}
+
+// DeleteFileMetasByFiles drops the rows for the supplied files in one repo
+// prefix so a reindex replaces them cleanly.
+func (g *Graph) DeleteFileMetasByFiles(repoPrefix string, files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	g.fileMetasMu.Lock()
+	defer g.fileMetasMu.Unlock()
+	byFile := g.fileMetas[repoPrefix]
+	if byFile == nil {
+		return nil
+	}
+	for _, f := range files {
+		delete(byFile, f)
+	}
+	return nil
+}
+
+// FileMetasForRepo is the in-memory FileMetaReader: every recorded file row
+// for the repo prefix. Always non-nil.
+func (g *Graph) FileMetasForRepo(repoPrefix string) ([]FileMetaRow, error) {
+	g.fileMetasMu.Lock()
+	defer g.fileMetasMu.Unlock()
+	byFile := g.fileMetas[repoPrefix]
+	out := make([]FileMetaRow, 0, len(byFile))
+	for _, r := range byFile {
+		out = append(out, r)
 	}
 	return out, nil
 }
