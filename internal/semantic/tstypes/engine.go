@@ -628,7 +628,29 @@ func (a *applier) confirmAST(e *graph.Edge) bool {
 	// clobber both their tier and their semantic_source — so the only
 	// gate is the effective-rank comparison.
 	if graph.OriginRank(effectiveOrigin(e)) >= graph.OriginRank(graph.OriginASTResolved) {
-		return false
+		// Origin is already AST-or-better — never downgrade it. But an edge the
+		// extractor emitted carries OriginASTResolved with NO semantic_source
+		// (e.g. an AST-level extends/implements reference form); the engine
+		// grounded this relation, so still credit the provider and raise
+		// confidence to the AST ceiling when those are missing, without
+		// touching the origin/tier.
+		changed := false
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		if s, _ := e.Meta["semantic_source"].(string); s == "" {
+			e.Meta["semantic_source"] = a.provider
+			changed = true
+		}
+		if e.Confidence < astConfidence {
+			e.Confidence = astConfidence
+			e.ConfidenceLabel = graph.ConfidenceLabelFor(e.Kind, e.Confidence)
+			changed = true
+		}
+		if changed {
+			a.persistEdgeRow(e)
+		}
+		return changed
 	}
 	a.persistConfirmedAST(e)
 	return true

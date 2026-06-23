@@ -557,6 +557,17 @@ func tsTypeRefs(typeText string) []string {
 		if t == "" {
 			return
 		}
+		// Indexed-access (lookup) type `T[K]` — distinct from the array
+		// suffix `T[]` already stripped above. The object type T is a real
+		// reference (`ExcalidrawElement["type"]` references ExcalidrawElement);
+		// a non-literal key (`T[Key]`) is a type reference too, a string /
+		// number literal key is dropped by addTSRef. Split at the matching
+		// top-level `[` so the wrapped object type and the key both surface.
+		if obj, key, ok := splitTSLookupType(t); ok {
+			walk(obj)
+			walk(key)
+			return
+		}
 		if parts := splitTSUnionType(t); len(parts) > 1 {
 			for _, p := range parts {
 				walk(p)
@@ -643,6 +654,44 @@ func splitTSTypeArgs(s string) []string {
 		parts = append(parts, last)
 	}
 	return parts
+}
+
+// splitTSLookupType decomposes an indexed-access (lookup) type `T[K]` into
+// its object type T and key K. It only fires when the trailing `[…]` is a
+// non-empty index whose opening `[` is at top-level (not inside a generic
+// argument or nested bracket) — the array suffix `T[]` is empty and is
+// stripped by the caller before this runs, so it never matches here.
+// Returns (object, key, true) on a lookup type, ("", "", false) otherwise.
+func splitTSLookupType(t string) (string, string, bool) {
+	t = strings.TrimSpace(t)
+	if len(t) < 3 || !strings.HasSuffix(t, "]") {
+		return "", "", false
+	}
+	// Find the matching `[` for the trailing `]`, respecting nesting.
+	depth := 0
+	open := -1
+	for i := len(t) - 1; i >= 0; i-- {
+		switch t[i] {
+		case ']', ')', '}', '>':
+			depth++
+		case '[', '(', '{', '<':
+			depth--
+			if depth == 0 {
+				open = i
+				goto found
+			}
+		}
+	}
+found:
+	if open <= 0 {
+		return "", "", false
+	}
+	obj := strings.TrimSpace(t[:open])
+	key := strings.TrimSpace(t[open+1 : len(t)-1])
+	if obj == "" || key == "" {
+		return "", "", false
+	}
+	return obj, key, true
 }
 
 // emitTSGenericParamNodes turns a TS function/class declaration's

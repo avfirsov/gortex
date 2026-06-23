@@ -379,6 +379,14 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	// assertion. Attributed to the enclosing function (fallback: file).
 	emitTSCastTypeRefs(root, src, filePath, fileID, funcRanges, result)
 
+	// Reference forms the type-use / cast / render passes miss but that
+	// find_usages should count: JSX component sites (`<App/>`), type-only
+	// import / re-export bindings (`import type { X }`), and class /
+	// interface heritage (`extends` / `implements`). Each emits a
+	// usage-counted edge (references / extends / implements) attributed to
+	// the enclosing function (JSX) or the declaring type / file.
+	emitTSReferenceForms(root, src, filePath, fileID, funcRanges, result)
+
 	// Instantiation edges: `new Foo(...)` constructs Foo. Emitted as a typed
 	// EdgeInstantiates (not a flat call) attributed to the enclosing function,
 	// so the resolver lands it on the class and impact/trace see construction.
