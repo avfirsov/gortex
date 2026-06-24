@@ -75,3 +75,31 @@ func TestLoadCompileCommands_None(t *testing.T) {
 	t.Cleanup(func() { clearCppIncludeDirCache(root) })
 	assert.Empty(t, loadCompileCommands(root), "no compile_commands.json yields empty map")
 }
+
+// TestLoadCompileCommands_CacheAndClear pins the cache-and-invalidate contract:
+// a second load returns the cached include dirs even after the file changes on
+// disk, and clearing the cache (as an incremental reindex does) re-reads it —
+// so an edited compile_commands.json takes effect without a daemon restart.
+func TestLoadCompileCommands_CacheAndClear(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "compile_commands.json")
+	t.Cleanup(func() { clearCppIncludeDirCache(root) })
+
+	write := func(incDir string) {
+		body := `[{"directory":"` + root + `","file":"src/main.c","command":"cc -I` + incDir + ` -c src/main.c"}]`
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+	}
+
+	write("inc1")
+	require.Equal(t, []string{"inc1"}, loadCompileCommands(root)["src/main.c"].includeDirs)
+
+	// Editing the DB on disk is not observed until the cache is invalidated.
+	write("inc2")
+	assert.Equal(t, []string{"inc1"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+		"second load returns the cached result")
+
+	// Clearing the cache (the incremental-reindex hook) re-reads the new dir.
+	clearCppIncludeDirCache(root)
+	assert.Equal(t, []string{"inc2"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+		"after clear the edited -I dir is picked up")
+}
