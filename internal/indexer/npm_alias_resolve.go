@@ -2,7 +2,9 @@ package indexer
 
 import (
 	"encoding/json"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -43,6 +45,11 @@ type npmAliasIndex struct {
 	// "read, but no usable `exports` field / missing file" so a miss
 	// is not re-parsed on every import edge.
 	exportsCache map[string]*packageExports
+	// wsNames maps a monorepo workspace package's `name` (from its
+	// package.json) to its graph-path directory, built lazily once from the
+	// root manifests' `workspaces` globs. A non-nil empty map records "built,
+	// no workspaces" so it is not re-scanned.
+	wsNames map[string]string
 }
 
 // packageExports is one package.json's parsed `exports` field: the
@@ -97,6 +104,16 @@ func (x *npmAliasIndex) Resolve(callerFile, specifier string) string {
 	root, relDir, ok := x.locate(callerFile)
 	if !ok {
 		return ""
+	}
+	// Workspace-package rewrite (longest-name-wins): a bare specifier whose
+	// leading segments name a monorepo workspace package rewrites to that
+	// package's directory + remaining sub-path. Returned as a relative
+	// specifier (resolved against the importing file) so it lands on the
+	// in-repo file regardless of tsconfig `paths`, and only when the file
+	// actually exists on disk — otherwise it falls through to the npm-alias /
+	// tsconfig resolution below.
+	if rel := x.workspaceRewrite(root, relDir, specifier); rel != "" {
+		return rel
 	}
 	pkgName, subPath := splitPackageSpecifier(specifier)
 	if pkgName == "" {
@@ -417,4 +434,175 @@ func isJSTSFile(filePath string) bool {
 		return true
 	}
 	return false
+}
+
+// workspaceRewrite resolves a specifier whose leading segments name a monorepo
+// workspace package to a relative import of the matching in-repo file. The
+// longest workspace-package name that is a segment-prefix of the specifier
+// wins (so `@acme/ui-core/button` binds `@acme/ui-core`, never `@acme/ui`).
+// Returns a `../`-relative specifier from relDir to the resolved file stem, or
+// "" when no workspace package matches or no file exists on disk.
+func (x *npmAliasIndex) workspaceRewrite(root, relDir, specifier string) string {
+	names := x.workspaceNames()
+	if len(names) == 0 {
+		return ""
+	}
+	segs := strings.Split(specifier, "/")
+	minSegs := 1
+	if strings.HasPrefix(specifier, "@") {
+		minSegs = 2
+	}
+	for n := len(segs); n >= minSegs; n-- {
+		dir, ok := names[strings.Join(segs[:n], "/")]
+		if !ok {
+			continue
+		}
+		stem := dir
+		if sub := strings.Join(segs[n:], "/"); sub != "" {
+			stem = dir + "/" + sub
+		}
+		if !workspaceFileExists(root, stem) {
+			return ""
+		}
+		return relativeImportSpecifier(relDir, stem)
+	}
+	return ""
+}
+
+// workspaceFileExists reports whether the repo-relative JS/TS module stem
+// resolves to a file on disk under root — either `stem.<ext>` or
+// `stem/index.<ext>`.
+func workspaceFileExists(root, stem string) bool {
+	abs := filepath.Join(root, filepath.FromSlash(stem))
+	for _, ext := range []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"} {
+		if fi, err := os.Stat(abs + ext); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	for _, ext := range []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"} {
+		if fi, err := os.Stat(filepath.Join(abs, "index"+ext)); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+// relativeImportSpecifier returns a `./`/`../`-prefixed specifier that resolves
+// from the importing file's directory fromDir to the repo-relative target stem.
+func relativeImportSpecifier(fromDir, toStem string) string {
+	fromSegs := splitNonEmptyPath(fromDir)
+	toSegs := splitNonEmptyPath(toStem)
+	i := 0
+	for i < len(fromSegs) && i < len(toSegs) && fromSegs[i] == toSegs[i] {
+		i++
+	}
+	var rel []string
+	for j := i; j < len(fromSegs); j++ {
+		rel = append(rel, "..")
+	}
+	rel = append(rel, toSegs[i:]...)
+	if len(rel) == 0 {
+		return "."
+	}
+	p := strings.Join(rel, "/")
+	if !strings.HasPrefix(p, ".") {
+		p = "./" + p
+	}
+	return p
+}
+
+func splitNonEmptyPath(p string) []string {
+	var out []string
+	for _, seg := range strings.Split(p, "/") {
+		if seg != "" && seg != "." {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
+
+// workspaceNames builds (once) the workspace-package name → graph-path-dir map
+// from each root manifest's `workspaces` globs.
+func (x *npmAliasIndex) workspaceNames() map[string]string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.wsNames != nil {
+		return x.wsNames
+	}
+	names := map[string]string{}
+	for prefix, root := range x.roots {
+		for _, pkgDir := range workspacePackageDirs(root) {
+			src, ok := readDiskFile(joinPath(root, joinRel(pkgDir, "package.json")))
+			if !ok {
+				continue
+			}
+			var m struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(src, &m) != nil || m.Name == "" {
+				continue
+			}
+			dir := pkgDir
+			if prefix != "" {
+				dir = prefix + "/" + pkgDir
+			}
+			names[m.Name] = dir
+		}
+	}
+	x.wsNames = names
+	return names
+}
+
+// workspacePackageDirs returns the repo-relative directories of every workspace
+// package declared by the root package.json's `workspaces` field (npm/yarn
+// array form and the yarn `{ "packages": [...] }` object form), expanding each
+// glob against disk.
+func workspacePackageDirs(root string) []string {
+	src, ok := readDiskFile(joinPath(root, "package.json"))
+	if !ok {
+		return nil
+	}
+	var m struct {
+		Workspaces json.RawMessage `json:"workspaces"`
+	}
+	if json.Unmarshal(src, &m) != nil {
+		return nil
+	}
+	var dirs []string
+	for _, glob := range parseWorkspacesField(m.Workspaces) {
+		matches, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(glob)))
+		if err != nil {
+			continue
+		}
+		for _, abs := range matches {
+			if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+				continue
+			}
+			rel, err := filepath.Rel(root, abs)
+			if err != nil {
+				continue
+			}
+			dirs = append(dirs, filepath.ToSlash(rel))
+		}
+	}
+	return dirs
+}
+
+// parseWorkspacesField normalises the two `workspaces` shapes (a bare array of
+// globs, or a `{ "packages": [...] }` object) to a glob list.
+func parseWorkspacesField(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var asArray []string
+	if json.Unmarshal(raw, &asArray) == nil {
+		return asArray
+	}
+	var asObj struct {
+		Packages []string `json:"packages"`
+	}
+	if json.Unmarshal(raw, &asObj) == nil {
+		return asObj.Packages
+	}
+	return nil
 }

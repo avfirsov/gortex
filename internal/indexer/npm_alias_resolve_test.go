@@ -113,6 +113,49 @@ func TestNpmAliasIndex_NilRootsYieldsNil(t *testing.T) {
 	assert.Nil(t, newNpmAliasIndex(map[string]string{"repo": ""}))
 }
 
+// TestNpmAliasIndex_WorkspaceRewrite pins the workspace-package rewrite:
+// `@acme/ui-core/button` binds the longer-named `@acme/ui-core` package, never
+// the shorter `@acme/ui`, returning a relative specifier onto the in-repo file.
+func TestNpmAliasIndex_WorkspaceRewrite(t *testing.T) {
+	root := t.TempDir()
+	writePackageJSON(t, root, `{"name":"monorepo-root","workspaces":["packages/*"]}`)
+	writePackageJSON(t, filepath.Join(root, "packages", "ui"), `{"name":"@acme/ui"}`)
+	writePackageJSON(t, filepath.Join(root, "packages", "ui-core"), `{"name":"@acme/ui-core"}`)
+	// The actual module files the imports resolve to.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "packages", "ui", "widget.ts"), []byte("export const w = 1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "packages", "ui-core", "button.ts"), []byte("export const b = 1\n"), 0o644))
+
+	idx := newNpmAliasIndex(map[string]string{"": root})
+	require.NotNil(t, idx)
+
+	caller := "apps/web/src/app.ts"
+	cases := []struct {
+		name, specifier, want string
+	}{
+		{"longest-name-wins picks ui-core", "@acme/ui-core/button", "../../../packages/ui-core/button"},
+		{"shorter package still resolves", "@acme/ui/widget", "../../../packages/ui/widget"},
+		{"missing file falls through", "@acme/ui-core/missing", ""},
+		{"non-workspace specifier falls through", "@acme/unknown/x", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, idx.Resolve(caller, c.specifier))
+		})
+	}
+}
+
+func TestRelativeImportSpecifier(t *testing.T) {
+	cases := []struct{ from, to, want string }{
+		{"apps/web/src", "packages/ui-core/button", "../../../packages/ui-core/button"},
+		{"packages/app/src", "packages/ui/x", "../../ui/x"},
+		{"src", "src/foo/bar", "./foo/bar"},
+		{"", "foo/bar", "./foo/bar"},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, relativeImportSpecifier(c.from, c.to), "from=%q to=%q", c.from, c.to)
+	}
+}
+
 // TestParsePackageExports covers every `exports` shape the parser
 // recognises: string subpath targets, conditional-object targets
 // (`import` preferred over `default`), the `"."` root key, a bare
