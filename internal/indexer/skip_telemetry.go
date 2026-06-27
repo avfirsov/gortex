@@ -52,6 +52,10 @@ type skippedFile struct {
 	lang    string
 	size    int64
 	cause   string
+	// reason is the content-admission skip reason (large_document /
+	// vector_data / large_data_asset) for files the asset gate dropped at
+	// the walk; empty for size / parse-failure skips.
+	reason string
 }
 
 // walkedFile records a file that survived the walk-time filters,

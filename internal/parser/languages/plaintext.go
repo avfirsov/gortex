@@ -19,10 +19,14 @@ type TextExtractor struct{}
 
 func NewTextExtractor() *TextExtractor { return &TextExtractor{} }
 
-func (e *TextExtractor) Language() string     { return "text" }
-func (e *TextExtractor) Extensions() []string { return []string{".txt", ".text"} }
+func (e *TextExtractor) Language() string              { return "text" }
+func (e *TextExtractor) Extensions() []string          { return []string{".txt", ".text"} }
+func (e *TextExtractor) AssetClass() parser.AssetClass { return parser.AssetDocument }
 
-var _ parser.StreamingExtractor = (*TextExtractor)(nil)
+var (
+	_ parser.StreamingExtractor = (*TextExtractor)(nil)
+	_ parser.AssetExtractor     = (*TextExtractor)(nil)
+)
 
 func (e *TextExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	res := &parser.ExtractionResult{}

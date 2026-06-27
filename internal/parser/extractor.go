@@ -60,6 +60,49 @@ type StreamingExtractor interface {
 	ExtractStream(filePath string, r io.ReaderAt, size int64, emit func(*graph.Node, []*graph.Edge)) error
 }
 
+// AssetClass labels a non-code extractor by the kind of large
+// binary/document/data artifact it ingests, so the indexer can apply
+// corpus-admission caps before a heavy file is ever read and extracted.
+// Code extractors return the empty class and are never gated.
+type AssetClass string
+
+const (
+	// AssetDocument is a human document ingested as searchable content
+	// (one KindDoc node per page / slide / sheet): PDF, pptx, xlsx,
+	// plain text. Large ones dominate parse memory, so they are subject
+	// to a per-file size cap.
+	AssetDocument AssetClass = "document"
+	// AssetData is a pure binary / columnar / vector artifact recorded
+	// as a metadata-only node and never parsed: parquet, npy, lance, …
+	// Not code-intelligence content; admitted only when opted in.
+	AssetData AssetClass = "data"
+	// AssetImage is an image asset (metadata-only node). Cheap to
+	// admit; kept un-gated by default.
+	AssetImage AssetClass = "image"
+)
+
+// AssetExtractor is an optional Extractor capability: a non-code extractor
+// that ingests large binary/document/data artifacts rather than source.
+// The indexer reads AssetClass at walk time (via the registry, keyed by the
+// detected language) to decide admission — a per-file size cap for documents
+// and an opt-in gate for data assets — so a content-heavy corpus can't pull
+// gigabytes of non-source artifacts into the parse pipeline. Extractors that
+// don't implement it are treated as code (always admitted).
+type AssetExtractor interface {
+	Extractor
+	AssetClass() AssetClass
+}
+
+// AssetClassOf returns e's AssetClass when e implements AssetExtractor, or the
+// empty class (code) otherwise. The single place callers map an extractor to
+// its admission class.
+func AssetClassOf(e Extractor) AssetClass {
+	if a, ok := e.(AssetExtractor); ok {
+		return a.AssetClass()
+	}
+	return ""
+}
+
 // ExtractionResult holds the nodes and edges extracted from a single
 // file, plus an optional handle to the parse tree the extractor used.
 //

@@ -45,6 +45,9 @@ func (e *ImageAssetExtractor) Language() string { return "image" }
 func (e *ImageAssetExtractor) Extensions() []string {
 	return []string{".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico", ".svg"}
 }
+func (e *ImageAssetExtractor) AssetClass() parser.AssetClass { return parser.AssetImage }
+
+var _ parser.AssetExtractor = (*ImageAssetExtractor)(nil)
 
 var svgOpenRe = regexp.MustCompile(`(?is)<svg\b[^>]*>`)
 var svgAttrRe = regexp.MustCompile(`(?i)\b(width|height)\s*=\s*["']?\s*([0-9.]+)`)
@@ -151,8 +154,9 @@ type PDFExtractor struct{}
 
 func NewPDFExtractor() *PDFExtractor { return &PDFExtractor{} }
 
-func (e *PDFExtractor) Language() string     { return "pdf" }
-func (e *PDFExtractor) Extensions() []string { return []string{".pdf"} }
+func (e *PDFExtractor) Language() string              { return "pdf" }
+func (e *PDFExtractor) Extensions() []string          { return []string{".pdf"} }
+func (e *PDFExtractor) AssetClass() parser.AssetClass { return parser.AssetDocument }
 
 // pdfPageTextCap bounds the per-page text stored on a KindDoc node so a
 // large PDF can't bloat the graph; the head of each page is enough for
@@ -160,8 +164,12 @@ func (e *PDFExtractor) Extensions() []string { return []string{".pdf"} }
 const pdfPageTextCap = 4000
 
 // compile-time guarantee that PDFExtractor offers the streaming route the
-// indexer prefers (one page at a time, never the whole file in memory).
-var _ parser.StreamingExtractor = (*PDFExtractor)(nil)
+// indexer prefers (one page at a time, never the whole file in memory), and
+// that it is gated as a document asset.
+var (
+	_ parser.StreamingExtractor = (*PDFExtractor)(nil)
+	_ parser.AssetExtractor     = (*PDFExtractor)(nil)
+)
 
 func (e *PDFExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	result := &parser.ExtractionResult{}

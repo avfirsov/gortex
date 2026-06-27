@@ -73,10 +73,12 @@ type IndexResult struct {
 	// Meta["parse_error"] node. Zero unless crash isolation is on.
 	QuarantinedFiles int `json:"quarantined_files,omitempty"`
 	// SkippedFiles is the number of files skipped by the size cap
-	// (MaxFileSize) or the per-file extraction timeout
-	// (MaxExtractMillis). Each is recorded in the graph as a synthetic
-	// file node carrying skipped_due_to_size / skipped_due_to_timeout
-	// telemetry. Zero unless one of those caps is set.
+	// (MaxFileSize), the per-file extraction timeout (MaxExtractMillis),
+	// or the content-admission policy (index.content — oversized documents
+	// and, by default, binary/vector data assets). Each is recorded in the
+	// graph as a synthetic file node carrying skipped_due_to_size /
+	// skipped_due_to_timeout / skipped_due_to_content telemetry. Zero
+	// unless one of those gates fires.
 	SkippedFiles int `json:"skipped_files,omitempty"`
 	// DeletedFileCount is the number of previously-indexed files that
 	// were evicted this pass because they no longer exist on disk (only
@@ -1945,10 +1947,18 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// syscall per file regardless; trading one walk-time stat for two
 	// later stats is the net win.
 	maxSize := idx.config.MaxFileSize
+	// Corpus-admission gate: drops oversized document assets and (by
+	// default) binary/vector data artifacts at the walk, before they are
+	// read and extracted, so a content-heavy repo can't pull gigabytes of
+	// non-source files into the parse pipeline and OOM (#120). Inert for
+	// all-code repos.
+	contentGate := idx.newContentAdmissionGate()
 	var files []walkedFile
 	var skippedLarge int
 	var skippedBytes int64
 	var skippedBySize []skippedFile
+	var skippedByContent []skippedFile
+	var skippedContentBytes int64
 	var parseFailedFiles []skippedFile
 	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -1982,6 +1992,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			})
 			return nil
 		}
+		if reason, skip := contentGate.skip(lang, info.Size()); skip {
+			skippedContentBytes += info.Size()
+			rel, _ := filepath.Rel(absRoot, path)
+			skippedByContent = append(skippedByContent, skippedFile{
+				relPath: filepath.ToSlash(rel), lang: lang, size: info.Size(), reason: reason,
+			})
+			return nil
+		}
 		files = append(files, walkedFile{
 			path:      path,
 			lang:      lang,
@@ -1998,6 +2016,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			zap.Int("count", skippedLarge),
 			zap.Int64("total_bytes", skippedBytes),
 			zap.Int64("limit_bytes", maxSize))
+	}
+	if len(skippedByContent) > 0 {
+		idx.logger.Info("indexer: skipped content/data assets by admission policy",
+			zap.Int("count", len(skippedByContent)),
+			zap.Int64("total_bytes", skippedContentBytes))
 	}
 	reporter.Report("walking files", len(files), len(files))
 
@@ -2614,6 +2637,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// they stay visible in the graph with skip telemetry attached
 	// instead of vanishing silently.
 	idx.emitSizeSkipNodes(skippedBySize)
+	idx.emitContentSkipNodes(skippedByContent)
 	idx.emitParseFailedSkipNodes(parseFailedFiles)
 
 	// Populate fileMtimes for all detected files. Keyed through
@@ -2896,7 +2920,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		EdgeCount:        edges,
 		FileCount:        int(fileCount),
 		QuarantinedFiles: quarantine.Len(),
-		SkippedFiles:     len(skippedBySize) + int(skippedByTimeout) + int(skippedByMinified),
+		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified),
 		DurationMs:       time.Since(start).Milliseconds(),
 		Errors:           errors,
 	}
@@ -3013,6 +3037,20 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		n := sizeSkipNode(skippedFile{
 			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)),
 		}, maxSize)
+		idx.applyRepoPrefix([]*graph.Node{n}, nil)
+		evictExisting()
+		idx.graph.AddBatch([]*graph.Node{n}, nil)
+		return nil
+	}
+
+	// Honour the content-admission gate on the incremental path too, so a
+	// document over its cap (or a data asset, by default) the cold walk
+	// would skip doesn't get parsed back in when the watcher re-indexes it
+	// — same synthetic-skip-node treatment as the size cap above.
+	if reason, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
+		n := contentSkipNode(skippedFile{
+			relPath: filepath.ToSlash(relPath), lang: lang, size: int64(len(src)), reason: reason,
+		})
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
 		evictExisting()
 		idx.graph.AddBatch([]*graph.Node{n}, nil)

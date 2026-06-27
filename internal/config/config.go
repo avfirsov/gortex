@@ -741,6 +741,74 @@ type IndexConfig struct {
 	// .gortex.yaml; the CODEGRAPH_EVENT_CONFIG env var (a JSON list)
 	// overrides it for drop-in compatibility with pygraph/tsgraph.
 	EventBus []EventBusBoundarySpec `mapstructure:"event_bus" yaml:"event_bus,omitempty"`
+
+	// Content bounds admission of large non-source content / data
+	// artifacts — PDF / office documents and binary / columnar / vector
+	// data files — so a content-heavy corpus (a RAG repo of hundreds of
+	// decks, spreadsheets, and dataset shards) can't pull gigabytes of
+	// non-code files into the parse pipeline and OOM the indexer (#120).
+	// Documents over a per-file cap and (by default) all data assets are
+	// dropped at the walk with a skip-telemetry node, so they stay
+	// listable without being read or extracted. See
+	// ContentAdmissionConfig. Configured under `index.content`.
+	Content ContentAdmissionConfig `mapstructure:"content" yaml:"content,omitempty"`
+}
+
+// ContentAdmissionConfig gates which large non-source artifacts enter the
+// index. The defaults keep the multimodal feature working for normal-size
+// documents while bounding the corpus-admission memory blow-up that a
+// content-heavy repo otherwise triggers.
+type ContentAdmissionConfig struct {
+	// MaxDocumentBytes caps individual document assets — PDF, pptx, xlsx,
+	// plain text — that are ingested as searchable content (one KindDoc
+	// node per page / slide / sheet). A file larger than the cap is
+	// skipped at the walk with a `large_document` telemetry node instead
+	// of being read and extracted. Tri-state: >0 caps at that many bytes;
+	// 0 (absent) uses the built-in default (defaultMaxDocumentBytes,
+	// 10 MiB); <0 disables the cap (index documents of any size).
+	// Configured under `index.content.max_document_bytes`.
+	MaxDocumentBytes int64 `mapstructure:"max_document_bytes" yaml:"max_document_bytes,omitempty"`
+	// IndexData admits binary / columnar / vector data artifacts
+	// (.parquet, .npy, .npz, .lance, .arrow, .feather) as metadata-only
+	// nodes. Off by default: these are never code-intelligence content and
+	// in a RAG / data repo they dominate the admitted byte weight, so they
+	// are skipped at the walk with a `vector_data` telemetry node unless
+	// explicitly opted in. Configured under `index.content.index_data`.
+	IndexData bool `mapstructure:"index_data" yaml:"index_data,omitempty"`
+	// MaxDataBytes caps data assets when IndexData is on — a guard against
+	// admitting a multi-GB shard even when data indexing is wanted. Same
+	// tri-state as MaxDocumentBytes (>0 caps; 0 uses the built-in default,
+	// defaultMaxDataBytes; <0 disables the cap). Ignored when IndexData is
+	// off. Configured under `index.content.max_data_bytes`.
+	MaxDataBytes int64 `mapstructure:"max_data_bytes" yaml:"max_data_bytes,omitempty"`
+}
+
+// EffectiveMaxDocumentBytes resolves MaxDocumentBytes' tri-state into a
+// concrete cap. capped is false when documents are admitted at any size
+// (the field was set negative); otherwise limit is the active per-file cap.
+func (c ContentAdmissionConfig) EffectiveMaxDocumentBytes() (limit int64, capped bool) {
+	switch {
+	case c.MaxDocumentBytes < 0:
+		return 0, false
+	case c.MaxDocumentBytes == 0:
+		return defaultMaxDocumentBytes, true
+	default:
+		return c.MaxDocumentBytes, true
+	}
+}
+
+// EffectiveMaxDataBytes resolves MaxDataBytes' tri-state into a concrete
+// cap, used only when IndexData is on. capped is false when admitted data
+// assets are uncapped (the field was set negative).
+func (c ContentAdmissionConfig) EffectiveMaxDataBytes() (limit int64, capped bool) {
+	switch {
+	case c.MaxDataBytes < 0:
+		return 0, false
+	case c.MaxDataBytes == 0:
+		return defaultMaxDataBytes, true
+	default:
+		return c.MaxDataBytes, true
+	}
 }
 
 // EventBusBoundarySpec declares one producer or consumer boundary of a
@@ -1515,6 +1583,17 @@ type MCPToolsConfig struct {
 // content assets (PDFs, office documents, datasets).
 const defaultMaxParseBytesInFlight = 512 << 20
 
+// defaultMaxDocumentBytes is the built-in per-file cap for document
+// assets (PDF / pptx / xlsx / text). 10 MiB keeps normal-size documents
+// searchable while dropping the few huge decks / spreadsheets that
+// dominate a content repo's admitted bytes and blow up parse memory.
+const defaultMaxDocumentBytes = 10 << 20
+
+// defaultMaxDataBytes is the built-in per-file cap applied to data assets
+// only when index.content.index_data opts them in — a backstop against a
+// multi-GB shard. Matches the data extractor's stream-hash ceiling.
+const defaultMaxDataBytes = 64 << 20
+
 // Default returns a Config with sensible defaults.
 //
 // Exclude is intentionally empty here — the builtin baseline lives in
@@ -1531,6 +1610,13 @@ func Default() *Config {
 			// Prose indexing is on by default; the ConfigManager
 			// re-derives this from search.index_prose.
 			IndexProse: true,
+			// Corpus-admission defaults: cap document assets at 10 MiB
+			// and skip binary/vector data assets unless opted in (#120).
+			Content: ContentAdmissionConfig{
+				MaxDocumentBytes: defaultMaxDocumentBytes,
+				IndexData:        false,
+				MaxDataBytes:     defaultMaxDataBytes,
+			},
 		},
 		Watch: WatchConfig{
 			Enabled:    false,

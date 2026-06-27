@@ -26,8 +26,12 @@ func (e *DataAssetExtractor) Language() string { return "data" }
 func (e *DataAssetExtractor) Extensions() []string {
 	return []string{".parquet", ".npy", ".npz", ".lance", ".arrow", ".feather"}
 }
+func (e *DataAssetExtractor) AssetClass() parser.AssetClass { return parser.AssetData }
 
-var _ parser.StreamingExtractor = (*DataAssetExtractor)(nil)
+var (
+	_ parser.StreamingExtractor = (*DataAssetExtractor)(nil)
+	_ parser.AssetExtractor     = (*DataAssetExtractor)(nil)
+)
 
 func (e *DataAssetExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	sum := sha256.Sum256(src)

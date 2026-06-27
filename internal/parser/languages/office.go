@@ -121,10 +121,14 @@ type PptxExtractor struct{}
 
 func NewPptxExtractor() *PptxExtractor { return &PptxExtractor{} }
 
-func (e *PptxExtractor) Language() string     { return "pptx" }
-func (e *PptxExtractor) Extensions() []string { return []string{".pptx"} }
+func (e *PptxExtractor) Language() string              { return "pptx" }
+func (e *PptxExtractor) Extensions() []string          { return []string{".pptx"} }
+func (e *PptxExtractor) AssetClass() parser.AssetClass { return parser.AssetDocument }
 
-var _ parser.StreamingExtractor = (*PptxExtractor)(nil)
+var (
+	_ parser.StreamingExtractor = (*PptxExtractor)(nil)
+	_ parser.AssetExtractor     = (*PptxExtractor)(nil)
+)
 
 func (e *PptxExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	res := &parser.ExtractionResult{}
@@ -177,10 +181,14 @@ type XlsxExtractor struct{}
 
 func NewXlsxExtractor() *XlsxExtractor { return &XlsxExtractor{} }
 
-func (e *XlsxExtractor) Language() string     { return "xlsx" }
-func (e *XlsxExtractor) Extensions() []string { return []string{".xlsx"} }
+func (e *XlsxExtractor) Language() string              { return "xlsx" }
+func (e *XlsxExtractor) Extensions() []string          { return []string{".xlsx"} }
+func (e *XlsxExtractor) AssetClass() parser.AssetClass { return parser.AssetDocument }
 
-var _ parser.StreamingExtractor = (*XlsxExtractor)(nil)
+var (
+	_ parser.StreamingExtractor = (*XlsxExtractor)(nil)
+	_ parser.AssetExtractor     = (*XlsxExtractor)(nil)
+)
 
 func (e *XlsxExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
 	res := &parser.ExtractionResult{}

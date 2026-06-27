@@ -1,0 +1,192 @@
+package indexer
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
+)
+
+// newAssetTestIndexer registers the code + asset extractors the
+// content-admission gate keys off, so a temp repo of documents / data
+// files exercises the real walk-time gate.
+func newAssetTestIndexer(g graph.Store) *Indexer {
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	reg.Register(languages.NewTextExtractor())
+	reg.Register(languages.NewPDFExtractor())
+	reg.Register(languages.NewPptxExtractor())
+	reg.Register(languages.NewXlsxExtractor())
+	reg.Register(languages.NewDataAssetExtractor())
+	cfg := config.Default().Index
+	cfg.Workers = 2
+	return New(g, reg, cfg, zap.NewNop())
+}
+
+func TestContentAdmissionConfig_EffectiveCaps(t *testing.T) {
+	// 0 (absent) → built-in default, capped.
+	lim, capped := config.ContentAdmissionConfig{MaxDocumentBytes: 0}.EffectiveMaxDocumentBytes()
+	require.True(t, capped)
+	require.Equal(t, int64(10<<20), lim)
+
+	// >0 → explicit cap.
+	lim, capped = config.ContentAdmissionConfig{MaxDocumentBytes: 4096}.EffectiveMaxDocumentBytes()
+	require.True(t, capped)
+	require.Equal(t, int64(4096), lim)
+
+	// <0 → no cap.
+	_, capped = config.ContentAdmissionConfig{MaxDocumentBytes: -1}.EffectiveMaxDocumentBytes()
+	require.False(t, capped)
+
+	// Same tri-state for data.
+	_, capped = config.ContentAdmissionConfig{MaxDataBytes: -1}.EffectiveMaxDataBytes()
+	require.False(t, capped)
+	lim, capped = config.ContentAdmissionConfig{MaxDataBytes: 7}.EffectiveMaxDataBytes()
+	require.True(t, capped)
+	require.Equal(t, int64(7), lim)
+}
+
+func TestContentAdmissionGate_Skip(t *testing.T) {
+	idx := newAssetTestIndexer(graph.New())
+
+	// Default policy: documents capped at 10 MiB, data skipped.
+	idx.config.Content = config.Default().Index.Content
+	gate := idx.newContentAdmissionGate()
+	require.NotNil(t, gate)
+
+	// Code is never gated.
+	_, skip := gate.skip("go", 1<<30)
+	require.False(t, skip)
+
+	// A small document is admitted; a huge one is dropped.
+	_, skip = gate.skip("text", 1024)
+	require.False(t, skip)
+	reason, skip := gate.skip("text", 11<<20)
+	require.True(t, skip)
+	require.Equal(t, skipReasonLargeDocument, reason)
+
+	// Data assets are skipped by default at any size.
+	reason, skip = gate.skip("data", 1)
+	require.True(t, skip)
+	require.Equal(t, skipReasonVectorData, reason)
+
+	// Opting data in admits it, subject to its own cap.
+	idx.config.Content.IndexData = true
+	idx.config.Content.MaxDataBytes = 1024
+	gate = idx.newContentAdmissionGate()
+	_, skip = gate.skip("data", 512)
+	require.False(t, skip)
+	reason, skip = gate.skip("data", 4096)
+	require.True(t, skip)
+	require.Equal(t, skipReasonLargeData, reason)
+
+	// A negative document cap disables document gating entirely.
+	idx.config.Content = config.ContentAdmissionConfig{MaxDocumentBytes: -1}
+	gate = idx.newContentAdmissionGate()
+	_, skip = gate.skip("text", 1<<30)
+	require.False(t, skip)
+}
+
+// TestContentAdmissionGate_NilInert verifies a nil gate (no asset extractors
+// registered) never skips — the all-code-repo fast path.
+func TestContentAdmissionGate_NilInert(t *testing.T) {
+	var g *contentAdmissionGate
+	_, skip := g.skip("text", 1<<30)
+	require.False(t, skip)
+}
+
+func TestContentSkipNode(t *testing.T) {
+	n := contentSkipNode(skippedFile{
+		relPath: "data/deck.pptx", lang: "pptx", size: 50 << 20, reason: skipReasonLargeDocument,
+	})
+	require.Equal(t, graph.KindFile, n.Kind)
+	require.Equal(t, "data/deck.pptx", n.ID)
+	require.Equal(t, "deck.pptx", n.Name)
+	require.Equal(t, "pptx", n.Language)
+	require.Equal(t, skipReasonLargeDocument, n.Meta["skip_reason"])
+	require.Equal(t, true, n.Meta["skipped_due_to_content"])
+	require.Equal(t, int64(50<<20), n.Meta["file_size_bytes"])
+}
+
+// TestIndex_DocumentCapSkip verifies a document over the cap becomes a
+// large_document skip node while a small one is still ingested as content.
+func TestIndex_DocumentCapSkip(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "small.txt"), "a short note")
+	writeFile(t, filepath.Join(dir, "big.txt"), strings.Repeat("filler text ", 400)) // ~4.8 KiB
+	writeFile(t, filepath.Join(dir, "code.go"), "package main\n\nfunc A() {}\n")
+
+	g := graph.New()
+	idx := newAssetTestIndexer(g)
+	idx.config.Content.MaxDocumentBytes = 1024 // big.txt is over the cap
+
+	result, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.SkippedFiles)
+
+	big := g.GetNode("big.txt")
+	require.NotNil(t, big, "an over-cap document must still leave a skip node")
+	require.Equal(t, skipReasonLargeDocument, big.Meta["skip_reason"])
+	require.Equal(t, true, big.Meta["skipped_due_to_content"])
+
+	// The small document was admitted (no skip reason).
+	small := g.GetNode("small.txt")
+	require.NotNil(t, small)
+	require.Nil(t, small.Meta["skip_reason"])
+}
+
+// TestIndex_DataAssetSkippedByDefault verifies a vector/data artifact is
+// dropped by default and admitted as a metadata node when opted in.
+func TestIndex_DataAssetSkippedByDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "embeddings.npy"), "NUMPY-array-placeholder-bytes")
+
+	// Default: skipped with vector_data.
+	g := graph.New()
+	idx := newAssetTestIndexer(g)
+	result, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.SkippedFiles)
+	n := g.GetNode("embeddings.npy")
+	require.NotNil(t, n)
+	require.Equal(t, skipReasonVectorData, n.Meta["skip_reason"])
+
+	// Opt in: admitted as a data metadata node, no skip reason.
+	g2 := graph.New()
+	idx2 := newAssetTestIndexer(g2)
+	idx2.config.Content.IndexData = true
+	_, err = idx2.Index(dir)
+	require.NoError(t, err)
+	n2 := g2.GetNode("embeddings.npy")
+	require.NotNil(t, n2)
+	require.Nil(t, n2.Meta["skip_reason"])
+	require.Equal(t, "data", n2.Meta["data_class"])
+}
+
+// TestIndexFile_ContentSkip verifies the incremental (watcher) path applies
+// the same gate, so a document the cold walk would skip doesn't get parsed
+// back in on re-index.
+func TestIndexFile_ContentSkip(t *testing.T) {
+	dir := t.TempDir()
+	g := graph.New()
+	idx := newAssetTestIndexer(g)
+	idx.config.Content.MaxDocumentBytes = 1024
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	big := filepath.Join(dir, "report.txt")
+	writeFile(t, big, strings.Repeat("report line ", 400))
+	require.NoError(t, idx.indexFile(big, false))
+
+	n := g.GetNode("report.txt")
+	require.NotNil(t, n)
+	require.Equal(t, skipReasonLargeDocument, n.Meta["skip_reason"])
+}

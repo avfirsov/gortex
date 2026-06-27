@@ -115,3 +115,18 @@ func (r *Registry) SupportedLanguages() []string {
 	}
 	return langs
 }
+
+// AssetClasses maps each registered language whose extractor is an
+// AssetExtractor to its AssetClass. Languages backed by ordinary code
+// extractors are absent. The indexer builds this once before a walk so it
+// can apply corpus-admission caps by language without a per-file interface
+// assertion.
+func (r *Registry) AssetClasses() map[string]AssetClass {
+	out := make(map[string]AssetClass)
+	for lang, ext := range r.extractors {
+		if class := AssetClassOf(ext); class != "" {
+			out[lang] = class
+		}
+	}
+	return out
+}
