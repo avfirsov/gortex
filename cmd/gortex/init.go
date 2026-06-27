@@ -33,6 +33,7 @@ import (
 	"github.com/zzet/gortex/internal/claudemd"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -266,10 +267,11 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		if prog.Enabled() {
 			idxLogger = zap.NewNop()
 		}
-		g, idxErr := indexRepoForInit(ctx, absRoot, idxLogger)
+		g, cleanup, idxErr := indexRepoForInit(ctx, absRoot, idxLogger)
 		if idxErr != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex init] indexing failed: %v — proceeding without analysis/skills\n", idxErr)
 		} else {
+			defer cleanup()
 			prog.StageDone(stageIndex, "")
 			if initAnalyze {
 				prog.Stage(stageAnalyze, "")
@@ -365,7 +367,16 @@ func toEnvSkills(src []genskills.GeneratedSkill) []agents.GeneratedSkill {
 // stage transitions ("walking files", "parsing", …) as sub-status.
 // Pass a Nop logger when running under an animated spinner so structured
 // info logs don't duplicate the mesh frame.
-func indexRepoForInit(ctx context.Context, root string, logger *zap.Logger) (*graph.Graph, error) {
+//
+// It indexes into a temporary on-disk sqlite store rather than an
+// all-in-memory graph: nodes persist per file and the content sink leans
+// document / section text to disk, so a content-heavy repo (a RAG corpus
+// of decks, spreadsheets, and dataset shards) can't pin the whole
+// post-parse graph in RAM and OOM `gortex init` (#120). The store inherits
+// the indexer's shadow / byte-budget guards. The returned cleanup closes
+// the store and removes the temp dir; callers MUST call it once they are
+// done reading the returned graph.
+func indexRepoForInit(ctx context.Context, root string, logger *zap.Logger) (graph.Store, func(), error) {
 	if logger == nil {
 		logger = newLogger()
 	}
@@ -376,15 +387,29 @@ func indexRepoForInit(ctx context.Context, root string, logger *zap.Logger) (*gr
 		cfg = &config.Config{}
 	}
 
-	g := graph.New()
+	tmpDir, err := os.MkdirTemp("", "gortex-init-store-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := store_sqlite.Open(filepath.Join(tmpDir, "init.sqlite"))
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = st.Close()
+		_ = os.RemoveAll(tmpDir)
+	}
+
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 
-	idx := indexer.New(g, reg, cfg.Index, logger)
-	if _, err := idx.IndexCtx(ctx, root); err != nil {
-		return nil, err
+	idx := indexer.New(st, reg, cfg.Index, logger)
+	if _, ierr := idx.IndexCtx(ctx, root); ierr != nil {
+		cleanup()
+		return nil, nil, ierr
 	}
-	return g, nil
+	return st, cleanup, nil
 }
 
 // emitJSONReport writes a single JSON object to w. Shape kept

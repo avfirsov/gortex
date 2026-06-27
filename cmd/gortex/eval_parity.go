@@ -64,12 +64,14 @@ func runEvalParity(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  clone failed: %v — skipping\n", err)
 			continue
 		}
-		g, err := indexRepoForInit(ctx, dir, zap.NewNop())
+		g, cleanup, err := indexRepoForInit(ctx, dir, zap.NewNop())
 		if err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  index failed: %v — skipping\n", err)
 			continue
 		}
-		for _, c := range parity.CoverageOf(g) {
+		covs := parity.CoverageOf(g)
+		cleanup() // release the temp store before the next repo
+		for _, c := range covs {
 			if c.Language != repo.Language {
 				continue // a Go repo may carry a few yaml/json files; measure its own language
 			}
