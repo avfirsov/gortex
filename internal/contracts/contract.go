@@ -31,6 +31,12 @@ const (
 	// consumers. A matched pair has the same `di::<token>` ID on
 	// both sides so orphan detection works via the standard matcher.
 	ContractDI ContractType = "di"
+	// ContractTRPC covers tRPC routers and client procedure calls. The
+	// provider side is the procedures of a createTRPCRouter / t.router
+	// object; the consumer side is the typed proxy chain
+	// (trpc.<router>.<procedure>.useQuery()). Both sides share the
+	// canonical ID `trpc::<router>.<procedure>` so the matcher pairs them.
+	ContractTRPC ContractType = "trpc"
 )
 
 // Role indicates whether a symbol provides or consumes a contract.

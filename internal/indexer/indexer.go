@@ -4828,6 +4828,7 @@ func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map
 		&contracts.GRPCExtractor{},
 		&contracts.ThriftExtractor{},
 		&contracts.GraphQLExtractor{},
+		&contracts.TRPCExtractor{},
 		&contracts.OpenAPIExtractor{},
 		&contracts.TopicExtractor{},
 		&contracts.WebSocketExtractor{},
