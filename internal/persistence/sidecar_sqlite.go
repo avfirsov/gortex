@@ -252,9 +252,13 @@ func OpenSidecar(path string) (*SidecarStore, error) {
 	// takes a brief EXCLUSIVE lock to convert the file. Unlike the graph store
 	// (one process), the sidecar is opened concurrently by the daemon, every
 	// per-repo `gortex mcp` subprocess, and the CLI — so that conversion races.
-	// With busy_timeout set first the loser blocks and retries; set after
-	// journal_mode it would still be 0 during the conversion and fail
-	// immediately with SQLITE_BUSY.
+	// Ordering busy_timeout first installs the busy handler before any later
+	// pragma or BEGIN, so write-lock contention blocks-and-retries instead of
+	// failing fast (set after journal_mode the timeout would still be 0 during
+	// the conversion). The journal-mode CONVERSION itself is NOT covered by the
+	// busy handler — SQLite returns an immediate SQLITE_BUSY for a mode change
+	// while another connection has the file open — so withSidecarBusyRetry in
+	// OpenSidecar is the backstop for that residual race.
 	//
 	// _txlock=immediate makes db.Begin() emit BEGIN IMMEDIATE so a write
 	// transaction takes the reserved lock at BEGIN. Both runBaseSchema (the
@@ -276,7 +280,10 @@ func OpenSidecar(path string) (*SidecarStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("persistence: open sidecar: %w", err)
 	}
-	if err := runBaseSchema(db); err != nil {
+	// busy_timeout does not cover the rollback->WAL conversion the first opener
+	// performs, so wrap the lock-taking schema + migration steps in a bounded
+	// BUSY/LOCKED retry (see withSidecarBusyRetry). Both steps are idempotent.
+	if err := withSidecarBusyRetry(func() error { return runBaseSchema(db) }); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("persistence: sidecar schema: %w", err)
 	}
@@ -284,7 +291,7 @@ func OpenSidecar(path string) (*SidecarStore, error) {
 	// and column-dependent indexes that CREATE TABLE IF NOT EXISTS cannot add
 	// to a pre-existing table. Forward-only, additive, and safe when several
 	// gortex processes open the same file at once (see runMigrations).
-	if err := runMigrations(db); err != nil {
+	if err := withSidecarBusyRetry(func() error { return runMigrations(db) }); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

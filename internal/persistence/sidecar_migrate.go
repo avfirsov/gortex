@@ -2,8 +2,12 @@ package persistence
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
+
+	sqlite "modernc.org/sqlite"
 )
 
 // Sidecar schema migrations.
@@ -56,6 +60,55 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// isSidecarBusyErr reports whether err is a SQLite BUSY/LOCKED result code
+// from the modernc driver (matching extended codes by their base value).
+func isSidecarBusyErr(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	// Mask the high byte so extended codes (SQLITE_BUSY_SNAPSHOT, ...) match
+	// their base SQLITE_BUSY (5) / SQLITE_LOCKED (6).
+	switch se.Code() & 0xff {
+	case 5, 6:
+		return true
+	}
+	return false
+}
+
+// withSidecarBusyRetry runs fn, retrying on a SQLite BUSY/LOCKED error with
+// bounded exponential backoff.
+//
+// busy_timeout (set in the sidecar DSN) covers ordinary write-lock contention
+// once the file is in WAL mode, but it does NOT cover the rollback-journal ->
+// WAL conversion the very first opener performs: that conversion takes a brief
+// EXCLUSIVE lock whose acquisition SQLite answers with an immediate, un-retried
+// SQLITE_BUSY (the busy handler is not consulted for a journal-mode change)
+// when another process has the file open. The daemon, every per-repo
+// `gortex mcp` subprocess, and the CLI can all open a fresh/stale sidecar at
+// the same instant, so a bounded application-level retry is required on top of
+// busy_timeout. fn must be idempotent — runBaseSchema (CREATE ... IF NOT
+// EXISTS) and runMigrations (user_version-gated) both are.
+func withSidecarBusyRetry(fn func() error) error {
+	const (
+		maxAttempts = 40
+		baseDelay   = 5 * time.Millisecond
+		maxDelay    = 250 * time.Millisecond
+	)
+	delay := baseDelay
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err = fn(); err == nil || !isSidecarBusyErr(err) {
+			return err
+		}
+		time.Sleep(delay)
+		if delay *= 2; delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	return err
 }
 
 // runBaseSchema applies the idempotent base shape (sidecarSchema) inside one
