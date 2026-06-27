@@ -21,68 +21,92 @@ import (
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
 
-// ensureFresh checks if any of the given file paths are stale (modified on disk
-// since last index) and re-indexes up to 5 of them when watch mode is not active.
-// Returns the list of file paths that were refreshed.
+// ensureFresh re-indexes any of the given file paths whose on-disk content has
+// drifted from the indexed snapshot, so a subsequent graph read serves current
+// data instead of a stale body. Returns the paths that were refreshed (capped at
+// a handful per call).
+//
+// The self-heal is gated on IsTrackedStale, which is false for untracked, new,
+// or already-current files — only a genuinely changed, already-indexed file is
+// re-indexed. That gate is what makes this safe in multi-repo mode: an earlier
+// version keyed the staleness check off the lone single-Indexer, whose mtime
+// map is empty for cross-repo paths, so every file looked stale and the
+// resulting mass re-index raced the live read surface and crashed the transport.
+// Routing each path to its owning per-repo indexer keeps the check accurate and
+// the work bounded to the file the caller is about to read.
 func (s *Server) ensureFresh(filePaths []string) []string {
-	// Skip when watcher is active — it handles updates.
-	if s.watcher != nil {
-		return nil
-	}
-	// In multi-repo mode the legacy single-Indexer's fileMtimes is
-	// always empty for cross-repo paths, so IsStale returns true for
-	// every file → IndexFile fires → race with the daemon's read
-	// surface, which has been observed to crash the MCP transport
-	// (a concurrency hazard against the live read surface). The MultiIndexer's own
-	// per-repo watcher / Reconcile path owns freshness here; the
-	// single-Indexer auto-refresh is dead weight that does more harm
-	// than good.
-	if s.multiIndexer != nil {
-		return nil
-	}
-	if s.indexer == nil {
-		return nil
-	}
-
 	var refreshed []string
-	limit := 5
+	const limit = 5
 	for _, fp := range filePaths {
 		if len(refreshed) >= limit {
 			break
 		}
-		if s.indexer.IsStale(fp) {
-			absPath := fp
-			if root := s.indexer.RootPath(); root != "" {
-				absPath = filepath.Join(root, fp)
-			}
-
-			// In multi-repo mode, the file path may be prefixed with a repo name
-			// (e.g. "ade/internal/..."). If the resolved path doesn't exist, try
-			// resolving via the MultiIndexer which knows each repo's root.
-			if _, statErr := os.Stat(absPath); statErr != nil && s.multiIndexer != nil {
-				resolved := s.multiIndexer.ResolveFilePath(fp)
-				if resolved != "" {
-					absPath = resolved
-				}
-			}
-
-			if err := s.indexer.IndexFile(absPath); err != nil {
-				s.logger.Warn("auto re-index failed",
-					zap.String("file", fp),
-					zap.String("resolved", absPath),
-					zap.Error(err))
-				continue
-			}
-			refreshed = append(refreshed, fp)
+		idx, absPath := s.freshnessIndexer(fp)
+		if idx == nil {
+			continue
 		}
+		root := idx.RootPath()
+		if root == "" {
+			continue
+		}
+		rel, err := filepath.Rel(root, absPath)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		// IsTrackedStale is false for untracked / new / current files, so
+		// only a known-and-changed file triggers a re-index — no mass churn.
+		if !idx.IsTrackedStale(rel) {
+			continue
+		}
+		if err := idx.IndexFile(absPath); err != nil {
+			s.logger.Warn("auto re-index failed",
+				zap.String("file", fp),
+				zap.String("resolved", absPath),
+				zap.Error(err))
+			continue
+		}
+		// Advance the recorded mtime so a follow-up read in the same window
+		// sees the file as current and skips a redundant re-index.
+		idx.RefreshFileMtime(absPath)
+		refreshed = append(refreshed, fp)
 	}
 	return refreshed
+}
+
+// freshnessIndexer resolves a repo-prefixed, repo-relative, or absolute path to
+// the indexer that owns it and the file's absolute path, for both single- and
+// multi-repo daemons. In single-repo mode an active file watcher already owns
+// freshness, so on-read auto-refresh stands down rather than fight it; in
+// multi-repo mode each path is routed to its per-repo indexer, whose mtime map
+// is populated — which is what makes the staleness check trustworthy.
+func (s *Server) freshnessIndexer(fp string) (*indexer.Indexer, string) {
+	if s.multiIndexer != nil {
+		abs := fp
+		if !filepath.IsAbs(abs) {
+			if resolved := s.multiIndexer.ResolveFilePath(fp); resolved != "" {
+				abs = resolved
+			}
+		}
+		idx, _ := s.multiIndexer.IndexerForFile(abs)
+		return idx, abs
+	}
+	if s.indexer == nil || s.watcher != nil {
+		return nil, ""
+	}
+	abs := fp
+	if !filepath.IsAbs(abs) {
+		if root := s.indexer.RootPath(); root != "" {
+			abs = filepath.Join(root, fp)
+		}
+	}
+	return s.indexer, abs
 }
 
 func (s *Server) registerEnhancementTools() {
