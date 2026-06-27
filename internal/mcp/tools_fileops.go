@@ -947,10 +947,15 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info.IsDir() {
 		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 	}
-	// Honour the editor-buffer overlay if one is active for this path.
+	// Honour the editor-buffer overlay if one is active for this path. A
+	// drifted overlay is already rejected upstream by the overlay view
+	// guard; what reaches here is a live buffer, which we flag as such so
+	// the caller knows the bytes are an unsaved editor view, not disk.
 	var content []byte
+	servedFromOverlay := false
 	if buf, ok := s.overlayContentFor(ctx, absPath); ok {
 		content = []byte(buf)
+		servedFromOverlay = true
 	} else {
 		b, rerr := os.ReadFile(absPath)
 		if rerr != nil {
@@ -1040,6 +1045,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if secretsRedacted {
 		result["secrets_redacted"] = true
 	}
+	if servedFromOverlay {
+		result["served_from"] = "overlay"
+	}
 	if bodiesElided {
 		result["bodies_elided"] = true
 		if len(keptSymbols) > 0 {
@@ -1060,6 +1068,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// Omission notes: tell the model what the payload deliberately
 	// leaves out or reshapes, so it does not reason about absent code.
 	omissions := pathOmissions(relPath)
+	if servedFromOverlay {
+		omissions = append(omissions, omission("overlay",
+			"served from an active editor-buffer overlay, not the file currently on disk"))
+	}
 	if isBinary {
 		omissions = append(omissions, omission("binary",
 			"file is binary — the content field holds raw bytes, not source text"))
