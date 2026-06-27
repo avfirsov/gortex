@@ -226,3 +226,28 @@ func internalHelper() {}
 		t.Fatalf("internalHelper.vis = %q", internalFn.Meta["visibility"])
 	}
 }
+
+func TestSwiftExtractor_FactoryChainReceiver(t *testing.T) {
+	src := `struct Widget { func withX() -> Widget { return self } }
+func builder() -> Widget { return Widget() }
+func run() {
+  builder().withX().build()
+}
+`
+	res, err := NewSwiftExtractor().Extract("w.swift", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var build *graph.Edge
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.To == "unresolved::*.build" {
+			build = e
+		}
+	}
+	if build == nil {
+		t.Fatal("build() call edge not found")
+	}
+	if build.Meta["receiver_type"] != "Widget" {
+		t.Errorf("receiver_type = %v, want Widget (chain builder().withX() returns Widget)", build.Meta["receiver_type"])
+	}
+}

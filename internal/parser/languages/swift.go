@@ -45,6 +45,10 @@ const qSwiftAll = `
 
   (call_expression
     (simple_identifier) @call.name) @call.expr
+
+  (call_expression
+    (navigation_expression
+      (navigation_suffix (simple_identifier) @callm.name)) @callm.nav) @callm.expr
 ]
 `
 
@@ -68,8 +72,10 @@ func (e *SwiftExtractor) Extensions() []string { return []string{".swift"} }
 // --- Deferred match buffers ----------------------------------------
 
 type swiftDeferredCall struct {
-	name string
-	line int
+	name     string
+	line     int
+	isMember bool
+	receiver string
 }
 
 type swiftTypeRange struct {
@@ -157,6 +163,24 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 				name: m.Captures["call.name"].Text,
 				line: expr.StartLine + 1,
 			})
+
+		case m.Captures["callm.expr"] != nil:
+			expr := m.Captures["callm.expr"]
+			recv := ""
+			if nav := m.Captures["callm.nav"]; nav != nil && nav.Node != nil && nav.Node.NamedChildCount() > 0 {
+				recv = strings.TrimSpace(nav.Node.NamedChild(0).Content(src))
+			}
+			// Only chained-factory member calls (the receiver is itself a call)
+			// are captured here, so the bare-identifier query stays authoritative
+			// for ordinary obj.method() and the graph is not flooded.
+			if strings.Contains(recv, "(") {
+				calls = append(calls, swiftDeferredCall{
+					name:     m.Captures["callm.name"].Text,
+					line:     expr.StartLine + 1,
+					isMember: true,
+					receiver: recv,
+				})
+			}
 		}
 	})
 
@@ -200,10 +224,18 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		if callerID == "" {
 			continue
 		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + c.name,
+		to := "unresolved::" + c.name
+		if c.isMember {
+			to = "unresolved::*." + c.name
+		}
+		edge := &graph.Edge{
+			From: callerID, To: to,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
-		})
+		}
+		if c.isMember && c.receiver != "" {
+			stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, nil, result))
+		}
+		result.Edges = append(result.Edges, edge)
 	}
 
 	// React Native native event emits pair with the JS addListener handler.
