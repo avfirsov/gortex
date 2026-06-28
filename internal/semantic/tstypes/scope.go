@@ -406,6 +406,17 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 		}
 	}
 
+	// Subject-dispatch narrowing: a `when (x) { is Foo -> … }` refines the
+	// subject within each type-matched arm. Gated on SubjectNarrowings so
+	// every language that leaves it nil descends the construct through the
+	// generic child walk exactly as before (nil hook = no-op).
+	if b.spec.SubjectNarrowings != nil {
+		if m, ok := b.spec.SubjectNarrowings(n, b.src); ok {
+			b.walkSubject(m, env)
+			return
+		}
+	}
+
 	b.walkChildren(n, env)
 }
 
@@ -465,6 +476,43 @@ func (b *binder) walkIf(n, cond, body *sitter.Node, env *scopeEnv) {
 				b.bindNarrow(env, f.Variable, f.Type)
 			}
 		}
+	}
+}
+
+// walkSubject descends a subject-dispatch construct (Kotlin `when`),
+// applying per-arm type narrowing. Reached only when the spec wires
+// SubjectNarrowings. The subject expression and every arm pattern are
+// walked unrefined (for any calls they hold); each arm body is walked
+// under a child scope that shadows the subject with the arm's non-negated
+// facts — the same shadowing the if then-branch uses — so a call inside a
+// type-matched arm resolves on the narrowed type and grades inferred. An
+// arm that narrows nothing (an `else` arm, or an ambiguous multi-pattern
+// arm) is walked unrefined. Every node of the construct is walked exactly
+// once, so no call / local the generic walk would record is lost.
+func (b *binder) walkSubject(m SubjectMatch, env *scopeEnv) {
+	if m.Subject != nil {
+		b.walk(m.Subject, env)
+	}
+	for _, br := range m.Branches {
+		for _, c := range br.Conds {
+			if c != nil {
+				b.walk(c, env)
+			}
+		}
+		if br.Body == nil {
+			continue
+		}
+		armEnv := env
+		for _, f := range br.Facts {
+			if f.Negated {
+				continue
+			}
+			if armEnv == env {
+				armEnv = newScope(env, scopeBlock)
+			}
+			b.bindNarrow(armEnv, f.Variable, f.Type)
+		}
+		b.walk(br.Body, armEnv)
 	}
 }
 

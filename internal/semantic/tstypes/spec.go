@@ -160,6 +160,30 @@ type NarrowFact struct {
 	Negated  bool
 }
 
+// SubjectMatch is the decomposition of a subject-dispatch construct — a
+// match / switch on a single subject value (Kotlin `when (x) { is Foo -> … }`)
+// — into the subject expression and its branches. The binder walks the
+// subject and each branch's pattern unrefined, and walks each branch body
+// under a child scope carrying that branch's narrowing facts (so a
+// type-matched branch resolves calls on the narrowed type). It is the
+// grammar adapter that lets the shared binder narrow a match arm without
+// baking per-grammar node names into the binder.
+type SubjectMatch struct {
+	Subject  *sitter.Node
+	Branches []SubjectBranch
+}
+
+// SubjectBranch is one arm of a SubjectMatch: the pattern condition nodes
+// (walked unrefined, for any calls they hold), the arm body, and the type
+// refinements the pattern imposes on the subject within that body. Facts is
+// nil for an arm that narrows nothing (an `else` arm, or an ambiguous
+// multi-pattern arm) — its body is then walked unrefined.
+type SubjectBranch struct {
+	Conds []*sitter.Node
+	Body  *sitter.Node
+	Facts []NarrowFact
+}
+
 // SyntheticCall is one member call an expression desugars to: an operator
 // expression is sugar for a named member function (Kotlin `a + b` is
 // `a.plus(b)`, `a[i]` is `a.get(i)`, `a in b` is `b.contains(a)`). Receiver
@@ -350,6 +374,19 @@ type LangSpec struct {
 	// disables operator desugaring entirely, so a language that leaves it
 	// unset behaves byte-for-byte as before.
 	SyntheticCalls func(n *sitter.Node, src []byte) []SyntheticCall
+
+	// SubjectNarrowings decodes a subject-dispatch node (Kotlin
+	// `when (x) { is Foo -> … }`) into a SubjectMatch, returning ok=false
+	// for any other node. The binder, gated on this hook, walks the
+	// returned subject and branch patterns unrefined and walks each branch
+	// body under a child scope that shadows the subject with the branch's
+	// narrowing facts — reusing the exact then-branch machinery if-narrowing
+	// uses, so a `when` type-match arm resolves calls on the narrowed type at
+	// the inferred confidence band. nil (the default) disables subject
+	// narrowing: the construct is then descended through the generic child
+	// walk exactly as before, so a language that leaves it unset behaves
+	// byte-for-byte as before.
+	SubjectNarrowings func(n *sitter.Node, src []byte) (SubjectMatch, bool)
 }
 
 // inheritEdgeKinds returns the edge kinds methodOn climbs when looking

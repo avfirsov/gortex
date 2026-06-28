@@ -575,3 +575,174 @@ func TestKotlin_EnrichFileScopesToOneFile(t *testing.T) {
 	other := nodeByNameKind(t, g, "go", graph.KindMethod)
 	assertUntouched(t, g, other.ID, "baz", "kotlin-types")
 }
+
+// An `is` smart-cast narrows a variable inside the then-branch:
+// `if (x is Foo) { x.bar() }` resolves x.bar() to Foo::bar. The edge is
+// graded inferred — it is derived from a guard, not a direct binding.
+func TestKotlin_IsCheckThenBranchNarrows(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun bar() {}
+}
+`,
+		"App.kt": `fun f(x: Any) {
+    if (x is Foo) {
+        x.bar()
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "f", graph.KindFunction)
+	target := nodeByNameKind(t, g, "bar", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("is-check then-branch narrowing did not resolve x.bar() to Foo::bar; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Origin != graph.OriginASTResolved {
+		t.Errorf("narrowed edge origin = %q, want %q", e.Origin, graph.OriginASTResolved)
+	}
+	if e.Meta["semantic_source"] != "kotlin-types" {
+		t.Errorf("narrowed edge semantic_source = %v, want kotlin-types", e.Meta["semantic_source"])
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("narrowed edge resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+	if e.Confidence != inferredConfidence {
+		t.Errorf("narrowed edge confidence = %v, want %v", e.Confidence, inferredConfidence)
+	}
+}
+
+// A `!= null` check resolves a call on a nullable-typed receiver:
+// `fun f(x: Foo?) { if (x != null) { x.bar() } }` resolves x.bar() to
+// Foo::bar. In this engine the nullable annotation `Foo?` is already
+// reduced to its non-null base `Foo` at bind time (normalizeKotlinType
+// strips the `?`), so the receiver resolves on `Foo` through the existing
+// param binding at the DIRECT band — the null check's only role is to not
+// block that resolution.
+func TestKotlin_NotNullThenBranchResolves(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun bar() {}
+}
+`,
+		"App.kt": `fun f(x: Foo?) {
+    if (x != null) {
+        x.bar()
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "f", graph.KindFunction)
+	target := nodeByNameKind(t, g, "bar", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("null-check branch did not resolve x.bar() to Foo::bar; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	assertASTProvenance(t, e, "kotlin-types")
+}
+
+// A negated `!is` guard with an early-exit body narrows the TAIL:
+// `if (x !is Foo) return; x.bar()` resolves the trailing x.bar() to
+// Foo::bar, because control past the guard implies x is Foo.
+func TestKotlin_NotIsGuardTailNarrows(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun bar() {}
+}
+`,
+		"App.kt": `fun f(x: Any) {
+    if (x !is Foo) return
+    x.bar()
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "f", graph.KindFunction)
+	target := nodeByNameKind(t, g, "bar", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("guard-tail narrowing did not resolve x.bar() to Foo::bar; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("guard-tail edge resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+	if e.Confidence != inferredConfidence {
+		t.Errorf("guard-tail edge confidence = %v, want %v", e.Confidence, inferredConfidence)
+	}
+}
+
+// The else branch is NOT narrowed: in
+// `if (x is Foo) {} else { x.bar() }` the call in the else branch (where x
+// is provably NOT Foo) must not resolve to Foo::bar.
+func TestKotlin_IsCheckElseBranchNotNarrowed(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun bar() {}
+}
+`,
+		"App.kt": `fun f(x: Any) {
+    if (x is Foo) {
+    } else {
+        x.bar()
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "f", graph.KindFunction)
+	assertUntouched(t, g, caller.ID, "bar", "kotlin-types")
+}
+
+// A `when` type-match arm smart-casts the subject within that arm:
+// `when (x) { is Foo -> x.bar() }` resolves x.bar() to Foo::bar at the
+// inferred band.
+func TestKotlin_WhenIsArmNarrows(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun bar() {}
+}
+`,
+		"App.kt": `fun f(x: Any) {
+    when (x) {
+        is Foo -> x.bar()
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "f", graph.KindFunction)
+	target := nodeByNameKind(t, g, "bar", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("when is-arm narrowing did not resolve x.bar() to Foo::bar; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Origin != graph.OriginASTResolved {
+		t.Errorf("when-arm edge origin = %q, want %q", e.Origin, graph.OriginASTResolved)
+	}
+	if e.Meta["semantic_source"] != "kotlin-types" {
+		t.Errorf("when-arm edge semantic_source = %v, want kotlin-types", e.Meta["semantic_source"])
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("when-arm edge resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+	if e.Confidence != inferredConfidence {
+		t.Errorf("when-arm edge confidence = %v, want %v", e.Confidence, inferredConfidence)
+	}
+}

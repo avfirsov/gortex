@@ -65,6 +65,15 @@ func KotlinSpec() *LangSpec {
 		// function resolves to that function — while an operator on a
 		// primitive (`1 + 2`) resolves to nothing.
 		SyntheticCalls: kotlinSyntheticCalls,
+		// Smart-cast narrowing: an `is` check in an `if` guard or a `when`
+		// arm refines the subject's type in the guarded scope, so a call on
+		// the narrowed type resolves. The `if` cases reuse the shared
+		// narrowing binder via Narrowings + IfStmt + EarlyExit; the `when`
+		// case is decoded by SubjectNarrowings.
+		Narrowings:        kotlinNarrowings,
+		IfStmt:            kotlinIfStmt,
+		EarlyExit:         kotlinEarlyExit,
+		SubjectNarrowings: kotlinSubjectNarrowings,
 	}
 }
 
@@ -641,4 +650,168 @@ func kotlinLastNamedChild(n *sitter.Node) *sitter.Node {
 		return nil
 	}
 	return n.NamedChild(cnt - 1)
+}
+
+// kotlinIfStmt decomposes a Kotlin if into its condition and then-branch.
+// tree-sitter-kotlin models `if` as an if_expression (it is an expression,
+// `val y = if (c) a else b`) carrying a `condition` field and a
+// `consequence` field (the then control_structure_body); the `else` branch
+// is the `alternative` field, left for the binder to walk generically
+// without narrowing. ok=false for any non-if node.
+func kotlinIfStmt(n *sitter.Node, _ []byte) (cond, body *sitter.Node, ok bool) {
+	if n.Type() != "if_expression" {
+		return nil, nil, false
+	}
+	return n.ChildByFieldName("condition"), n.ChildByFieldName("consequence"), true
+}
+
+// kotlinNarrowings decodes an if condition into type refinements. It
+// recognises the smart-cast type check `x is Foo` — a check_expression
+// whose left operand is a bare variable (simple_identifier) and whose
+// `is` operator token is followed by the checked type — and its negation
+// `x !is Foo`, marked by a leading `!` token. `x is Foo` yields
+// {"x", "Foo", false}; `x !is Foo` yields {"x", "Foo", true} (true where
+// the check is FALSE — the tail of an early-exit guard). The membership
+// test `x in coll` shares check_expression but carries no `is` token and
+// is left alone (it is a collection call, desugared by SyntheticCalls, not
+// a type refinement). A null check (`x != null`) is NOT emitted as a fact:
+// a nullable annotation is already reduced to its non-null base by
+// normalizeKotlinType at bind time, so the variable resolves on its base
+// type inside the guard without an explicit narrowing — emitting one would
+// only re-bind the same type at a weaker band. A property / call / indexed
+// receiver is left unresolved — precision over recall.
+func kotlinNarrowings(cond *sitter.Node, src []byte) []NarrowFact {
+	if cond == nil || cond.Type() != "check_expression" {
+		return nil
+	}
+	isCheck, negated := false, false
+	for i := 0; i < int(cond.ChildCount()); i++ {
+		c := cond.Child(i)
+		if c == nil || c.IsNamed() {
+			continue
+		}
+		switch c.Content(src) {
+		case "is":
+			isCheck = true
+		case "!":
+			negated = true
+		}
+	}
+	if !isCheck {
+		return nil
+	}
+	lhs := cond.NamedChild(0)
+	if lhs == nil || lhs.Type() != "simple_identifier" {
+		return nil
+	}
+	typeNode := kotlinCheckType(cond)
+	if typeNode == nil {
+		return nil
+	}
+	variable := strings.TrimSpace(lhs.Content(src))
+	typ := strings.TrimSpace(typeNode.Content(src))
+	if variable == "" || typ == "" {
+		return nil
+	}
+	return []NarrowFact{{Variable: variable, Type: typ, Negated: negated}}
+}
+
+// kotlinCheckType returns the type node of a check_expression (`x is Foo`):
+// its user_type / nullable_type named child, nil when absent.
+func kotlinCheckType(cond *sitter.Node) *sitter.Node {
+	var typeNode *sitter.Node
+	for c := range cond.NamedChildren() {
+		switch c.Type() {
+		case "user_type", "nullable_type":
+			typeNode = c
+		}
+	}
+	return typeNode
+}
+
+// kotlinEarlyExit reports whether an if then-branch is a guard clause whose
+// control unconditionally leaves the surrounding flow. The body is the
+// `consequence` control_structure_body: a brace-less `if (…) return` holds
+// the jump_expression directly, while a braced `if (…) { … ; return }`
+// wraps its statements in a `statements` node, whose LAST statement decides
+// (any preceding statements still run, then control leaves). Kotlin folds
+// return / break / continue / throw all into a single jump_expression node.
+func kotlinEarlyExit(body *sitter.Node, _ []byte) bool {
+	if body == nil {
+		return false
+	}
+	last := body
+	if stmts := firstChildOfType(body, "statements"); stmts != nil {
+		last = kotlinLastNamedChild(stmts)
+	} else if body.Type() == "control_structure_body" {
+		last = kotlinLastNamedChild(body)
+	}
+	return last != nil && last.Type() == "jump_expression"
+}
+
+// kotlinSubjectNarrowings decodes a `when (x) { is Foo -> … }` into a
+// SubjectMatch. The subject is narrowable only when it is a bare variable
+// (`when (x)`, a simple_identifier) — a `when (val y = …)` declaration or a
+// computed subject names nothing to refine. An arm narrows the subject only
+// when it carries exactly one `is Type` pattern (a multi-pattern
+// `is A, is B ->` arm is ambiguous and narrows nothing; an `else` arm has
+// no pattern). Every arm's body is returned so the binder walks it — under
+// the narrowed scope when facts are present, unrefined otherwise. ok=false
+// for any non-when node.
+func kotlinSubjectNarrowings(n *sitter.Node, src []byte) (SubjectMatch, bool) {
+	if n.Type() != "when_expression" {
+		return SubjectMatch{}, false
+	}
+	subj := firstChildOfType(n, "when_subject")
+	subjVar := ""
+	if subj != nil {
+		subjVar = kotlinSimpleIdent(subj, src)
+	}
+	var branches []SubjectBranch
+	for c := range n.NamedChildren() {
+		if c.Type() != "when_entry" {
+			continue
+		}
+		var conds []*sitter.Node
+		for cc := range c.NamedChildren() {
+			if cc.Type() == "when_condition" {
+				conds = append(conds, cc)
+			}
+		}
+		var facts []NarrowFact
+		if subjVar != "" && len(conds) == 1 {
+			if typ := kotlinTypeTestName(conds[0], src); typ != "" {
+				facts = []NarrowFact{{Variable: subjVar, Type: typ, Negated: false}}
+			}
+		}
+		branches = append(branches, SubjectBranch{
+			Conds: conds,
+			Body:  firstChildOfType(c, "control_structure_body"),
+			Facts: facts,
+		})
+	}
+	return SubjectMatch{Subject: subj, Branches: branches}, true
+}
+
+// kotlinTypeTestName returns the type named by a when_condition's positive
+// `is Type` test, "" otherwise. A negated `!is Type` test narrows the
+// complement, not the type, so it is skipped (the leading `!` token).
+func kotlinTypeTestName(cond *sitter.Node, src []byte) string {
+	tt := firstChildOfType(cond, "type_test")
+	if tt == nil {
+		return ""
+	}
+	for i := 0; i < int(tt.ChildCount()); i++ {
+		c := tt.Child(i)
+		if c != nil && !c.IsNamed() && c.Content(src) == "!" {
+			return ""
+		}
+	}
+	for c := range tt.NamedChildren() {
+		switch c.Type() {
+		case "user_type", "nullable_type":
+			return strings.TrimSpace(c.Content(src))
+		}
+	}
+	return ""
 }
