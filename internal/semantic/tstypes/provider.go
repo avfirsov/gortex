@@ -43,6 +43,7 @@ func DefaultProviders(logger *zap.Logger) []*Provider {
 		NewProvider(TypeScriptSpec(), logger),
 		NewProvider(CSharpSpec(), logger),
 		NewProvider(PHPSpec(), logger),
+		NewProvider(KotlinSpec(), logger),
 	}
 }
 

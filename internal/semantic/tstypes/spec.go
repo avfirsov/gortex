@@ -408,11 +408,14 @@ func firstChildOfType(n *sitter.Node, t string) *sitter.Node {
 // identifierLike reports whether the node is a bare single-token name
 // usable for scope lookup. "name" is tree-sitter-php's bare identifier
 // node — it is the scope of a static `Foo::bar()` call, so it must be
-// recognised for the type-qualified receiver path; no other registered
-// grammar emits a "name" node in receiver / initializer position.
+// recognised for the type-qualified receiver path. "simple_identifier"
+// is tree-sitter-kotlin's bare identifier — the receiver of a Kotlin
+// `dep.bar()` and the right-hand side of a `val x = y` propagation. No
+// other registered grammar emits a "name" / "simple_identifier" node in
+// receiver / initializer position, so adding them is additive per-grammar.
 func identifierLike(t string) bool {
 	switch t {
-	case "identifier", "constant", "type_identifier", "variable_name", "local_variable", "name":
+	case "identifier", "constant", "type_identifier", "variable_name", "local_variable", "name", "simple_identifier":
 		return true
 	}
 	return false
