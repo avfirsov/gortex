@@ -525,3 +525,131 @@ public class App {
 	}
 	assertASTProvenance(t, e, "java-types")
 }
+
+// SAM lambda re-bind: a higher-order collection call whose receiver carries a
+// declared element type binds the lambda parameter to that element, so an
+// inner member call resolves. `List<Foo> xs = …; xs.forEach(x -> x.foo())`
+// resolves `x.foo()` to Foo::foo at the inferred band.
+func TestJava_CollectionLambdaForEachResolves(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.java": `package a;
+public class Foo {
+    public void foo() {}
+}
+`,
+		"App.java": `package a;
+import java.util.List;
+public class App {
+    void main(List<Foo> xs) {
+        xs.forEach(x -> x.foo());
+    }
+}
+`,
+	})
+	p := NewProvider(JavaSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	target := nodeByNameKind(t, g, "foo", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("xs.forEach(x -> x.foo()) not resolved to Foo::foo; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Origin != graph.OriginASTResolved {
+		t.Errorf("origin = %q, want %q", e.Origin, graph.OriginASTResolved)
+	}
+	if e.Meta["semantic_source"] != "java-types" {
+		t.Errorf("semantic_source = %v, want java-types", e.Meta["semantic_source"])
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+	if e.Confidence != inferredConfidence {
+		t.Errorf("confidence = %v, want %v", e.Confidence, inferredConfidence)
+	}
+}
+
+// The same re-bind from a local declaration with an explicit generic type.
+func TestJava_CollectionLambdaLocalResolves(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.java": `package a;
+public class Foo {
+    public void foo() {}
+}
+`,
+		"App.java": `package a;
+import java.util.List;
+public class App {
+    void main() {
+        List<Foo> xs = mk();
+        xs.filter(x -> x.foo());
+    }
+    List<Foo> mk() { return null; }
+}
+`,
+	})
+	p := NewProvider(JavaSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	target := nodeByNameKind(t, g, "foo", graph.KindMethod)
+	if e := callEdgeTo(g, caller.ID, target.ID); e == nil {
+		t.Fatalf("xs.filter(x -> x.foo()) not resolved to Foo::foo; edges: %v", g.GetOutEdges(caller.ID))
+	}
+}
+
+// HONESTY: a higher-order call on a raw (non-generic) collection has no
+// captured element type, so the lambda parameter is not bound and the inner
+// call stays unresolved.
+func TestJava_CollectionLambdaRawCollectionSkipped(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.java": `package a;
+public class Foo {
+    public void foo() {}
+}
+`,
+		"App.java": `package a;
+import java.util.List;
+public class App {
+    void main(List xs) {
+        xs.forEach(x -> x.foo());
+    }
+}
+`,
+	})
+	p := NewProvider(JavaSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	assertUntouched(t, g, caller.ID, "foo", "java-types")
+}
+
+// PARTIAL (documented): a `.stream()`-chained receiver is not element-typed —
+// the engine does not thread an element type through stream(), so the inner
+// lambda call honestly stays unresolved rather than guessing.
+func TestJava_CollectionLambdaStreamReceiverNotThreaded(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.java": `package a;
+public class Foo {
+    public void foo() {}
+}
+`,
+		"App.java": `package a;
+import java.util.List;
+public class App {
+    void main(List<Foo> xs) {
+        xs.stream().filter(y -> y.foo());
+    }
+}
+`,
+	})
+	p := NewProvider(JavaSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	assertUntouched(t, g, caller.ID, "foo", "java-types")
+}

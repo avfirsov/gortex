@@ -115,6 +115,13 @@ type bindingState struct {
 	typ           string
 	pendingCallee string
 	poisoned      bool
+	// elem is the ELEMENT type captured from a generic collection
+	// annotation (`List<Foo>` -> "Foo"), normalized to the bare name; ""
+	// when the binding's declared type carried no angle-bracket type
+	// argument. It is consulted only by the higher-order collection-lambda
+	// path, which binds a callback parameter to the receiver's element type
+	// so an inner member call on it resolves.
+	elem string
 	// inferred marks a binding whose type came from an inferential source
 	// rather than a direct native annotation — a guard narrowing
 	// (`if ($x instanceof Foo)`) or a documentation-comment type hint
@@ -182,7 +189,7 @@ func (s *scopeEnv) nearestTypeScope() *scopeEnv {
 // to unknown (poisoned), permanently for this scope chain. inferred marks
 // the fresh binding as derived from an inferential source (a doc-comment
 // type hint) so a call through it is graded at the inferred band.
-func (s *scopeEnv) bind(name string, typ, pendingCallee string, inferred bool) {
+func (s *scopeEnv) bind(name string, typ, pendingCallee, elem string, inferred bool) {
 	if name == "" {
 		return
 	}
@@ -193,11 +200,12 @@ func (s *scopeEnv) bind(name string, typ, pendingCallee string, inferred bool) {
 		if typ != st.typ || pendingCallee != st.pendingCallee {
 			st.typ = ""
 			st.pendingCallee = ""
+			st.elem = ""
 			st.poisoned = true
 		}
 		return
 	}
-	s.vars[name] = &bindingState{typ: typ, pendingCallee: pendingCallee, inferred: inferred}
+	s.vars[name] = &bindingState{typ: typ, pendingCallee: pendingCallee, elem: elem, inferred: inferred}
 }
 
 // fieldType is one prepass field binding: its resolved type plus whether
@@ -205,6 +213,7 @@ func (s *scopeEnv) bind(name string, typ, pendingCallee string, inferred bool) {
 // than a native annotation, so the seeded binding grades calls honestly.
 type fieldType struct {
 	typ      string
+	elem     string // element type of a generic collection field (`List<Foo>` -> "Foo")
 	inferred bool
 }
 
@@ -258,7 +267,7 @@ func (b *binder) prepassFields(n *sitter.Node) {
 					fields[f.Name] = fieldType{}
 					continue
 				}
-				fields[f.Name] = fieldType{typ: typ, inferred: f.Inferred}
+				fields[f.Name] = fieldType{typ: typ, elem: b.spec.normalize(firstTypeArg(f.Type)), inferred: f.Inferred}
 				if typ != "" {
 					b.facts.metas = append(b.facts.metas, metaFact{
 						key: "semantic_type", value: typ, owner: name, name: f.Name,
@@ -306,7 +315,7 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 			tEnv := newScope(env, scopeType)
 			tEnv.typeName = name
 			for fname, ft := range b.fieldsByType[name] {
-				tEnv.vars[fname] = &bindingState{typ: ft.typ, inferred: ft.inferred}
+				tEnv.vars[fname] = &bindingState{typ: ft.typ, elem: ft.elem, inferred: ft.inferred}
 			}
 			b.walkChildren(n, tEnv)
 			return
@@ -332,7 +341,7 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 						typ, inferred = dt, true
 					}
 				}
-				fEnv.vars[p.Name] = &bindingState{typ: typ, inferred: inferred}
+				fEnv.vars[p.Name] = &bindingState{typ: typ, elem: b.spec.normalize(firstTypeArg(p.Type)), inferred: inferred}
 			}
 		}
 		rt := ""
@@ -357,6 +366,11 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 	if b.spec.LocalBinding != nil {
 		if lb, ok := b.spec.LocalBinding(n, b.src); ok {
 			typ := b.spec.normalize(lb.DeclType)
+			// Capture the declared collection element type (`List<Foo>` ->
+			// "Foo") so a higher-order call on this local can bind its lambda
+			// parameter to the element. Only the native declared annotation
+			// carries one; the inference / docblock paths below leave it "".
+			elem := b.spec.normalize(firstTypeArg(lb.DeclType))
 			pending := ""
 			inferred := false
 			if typ == "" || isInferenceKeyword(typ) {
@@ -378,10 +392,10 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 			}
 			if lb.Field {
 				if ts := env.nearestTypeScope(); ts != nil {
-					ts.bind(lb.Name, typ, pending, inferred)
+					ts.bind(lb.Name, typ, pending, elem, inferred)
 				}
 			} else {
-				env.bind(lb.Name, typ, pending, inferred)
+				env.bind(lb.Name, typ, pending, elem, inferred)
 			}
 			// Fall through: the initializer may contain calls worth
 			// recording.
@@ -422,6 +436,24 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 				cf.method = sc.Method
 				b.facts.calls = append(b.facts.calls, cf)
 			}
+		}
+	}
+
+	// Higher-order collection lambda: a call like `xs.filter { it.foo() }`
+	// (Kotlin) / `xs.forEach(x -> x.foo())` (Java) whose callback's first
+	// parameter IS the receiver collection's element type. Gated on
+	// CollectionLambda so every language that leaves the hook nil never
+	// enters here (byte-for-byte no-op). The Call branch above has already
+	// emitted the outer call fact (it falls through); this block re-walks
+	// the lambda body under a child scope that binds the parameter to the
+	// receiver's element type, so an inner member call on the parameter
+	// resolves on that type. When the element type is unknown the body is
+	// walked unrefined, exactly as before — so a collection without a known
+	// element type, or a non-element-callback method, regresses nothing.
+	if b.spec.CollectionLambda != nil {
+		if lc, ok := b.spec.CollectionLambda(n, b.src); ok {
+			b.walkCollectionLambda(n, lc, env)
+			return
 		}
 	}
 
@@ -563,6 +595,65 @@ func (b *binder) bindNarrow(env *scopeEnv, name, typ string) {
 		return
 	}
 	env.vars[name] = &bindingState{typ: typ, inferred: true}
+}
+
+// walkCollectionLambda re-binds a higher-order collection call's lambda
+// parameter to the receiver's element type and walks the lambda body under
+// that binding, so an inner member call on the parameter resolves on the
+// element type at the inferred band. Reached only when the spec wires
+// CollectionLambda. When the receiver yields no known element type (a
+// non-generic / untyped collection, or a chained `.stream()` receiver this
+// engine does not thread an element type through), the whole call is walked
+// generically — identical to the pre-hook behavior, so nothing the body
+// holds is lost and no false edge is minted.
+func (b *binder) walkCollectionLambda(n *sitter.Node, lc CollectionLambdaCall, env *scopeEnv) {
+	elem := b.receiverElementType(lc.Receiver, env)
+	if elem == "" || lc.Param == "" || lc.Body == nil {
+		b.walkChildren(n, env)
+		return
+	}
+	// The receiver subtree may itself hold calls worth recording
+	// (`xs.stream().filter { … }` — the inner `stream()` call); walk it
+	// under the outer scope. The element-callback methods take exactly one
+	// lambda argument, so the receiver and the body are the only subtrees
+	// that carry facts.
+	if lc.Receiver != nil {
+		b.walk(lc.Receiver, env)
+	}
+	bodyEnv := newScope(env, scopeBlock)
+	// The element type is an inference (the receiver's declared generic
+	// argument), so a call grounded through it grades at the inferred band.
+	bodyEnv.vars[lc.Param] = &bindingState{typ: elem, inferred: true}
+	b.walk(lc.Body, bodyEnv)
+}
+
+// receiverElementType returns the ELEMENT type of a higher-order call's
+// collection receiver: a local / parameter identifier's captured element
+// type (`xs : List<Foo>` -> "Foo"), or a `this.field` collection's element
+// type. Returns "" when the receiver is not a directly-typed collection in
+// scope — a poisoned binding, an untyped or non-generic collection, or a
+// chained-call receiver (`xs.stream()`), which this engine does not thread
+// an element type through. The returned name is already normalized.
+func (b *binder) receiverElementType(recv *sitter.Node, env *scopeEnv) string {
+	if recv == nil {
+		return ""
+	}
+	if identifierLike(recv.Type()) {
+		if st := env.lookup(recv.Content(b.src)); st != nil && !st.poisoned {
+			return st.elem
+		}
+		return ""
+	}
+	if b.spec.FieldRef != nil {
+		if fname, ok := b.spec.FieldRef(recv, b.src); ok {
+			if ts := env.nearestTypeScope(); ts != nil {
+				if st, found := ts.vars[fname]; found && !st.poisoned {
+					return st.elem
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (b *binder) walkChildren(n *sitter.Node, env *scopeEnv) {

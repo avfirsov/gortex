@@ -91,6 +91,11 @@ func KotlinSpec() *LangSpec {
 		// `mutableListOf<Foo>().first()` to its element.
 		StdlibReturnType:    kotlinStdlibReturnType,
 		StdlibElementAccess: kotlinStdlibElementAccess,
+		// A higher-order collection call whose lambda's first parameter is the
+		// element type (`xs.filter { it.foo() }`, `xs.map { x -> x.bar() }`)
+		// binds that parameter to the receiver's element type and re-walks the
+		// body, so an inner member call on the element resolves.
+		CollectionLambda: kotlinCollectionLambda,
 	}
 }
 
@@ -948,4 +953,94 @@ var kotlinElementAccessors = map[string]bool{
 // out of a `builder<Elem>()` collection, so the chain types to Elem.
 func kotlinStdlibElementAccess(builder, method string) bool {
 	return kotlinListBuilders[builder] && kotlinElementAccessors[method]
+}
+
+// kotlinElementCallbacks is the curated set of higher-order collection
+// methods whose lambda's FIRST (and, for these, only) parameter is the
+// receiver's element type. Kept tiny and honest: a method whose callback
+// takes something other than a single element (an accumulator fold, an
+// index+element pair) is deliberately excluded, so the parameter is never
+// bound to the wrong type.
+var kotlinElementCallbacks = map[string]bool{
+	"filter":      true,
+	"filterNot":   true,
+	"map":         true,
+	"mapNotNull":  true,
+	"flatMap":     true,
+	"forEach":     true,
+	"onEach":      true,
+	"any":         true,
+	"all":         true,
+	"none":        true,
+	"find":        true,
+	"takeWhile":   true,
+	"dropWhile":   true,
+	"sortedBy":    true,
+	"groupBy":     true,
+	"associateBy": true,
+}
+
+// kotlinCollectionLambda decodes a higher-order collection call whose lambda
+// callback's first parameter is the receiver's element type — the trailing
+// lambda forms `xs.filter { it.foo() }` (implicit `it`) and
+// `xs.map { x -> x.bar() }` (explicit parameter). It reuses kotlinCall to
+// ground the receiver and method, gates the method on the element-callback
+// set, and extracts the trailing lambda's parameter and body. A
+// parenthesized lambda argument (`xs.filter({ … })`) and a multi-parameter /
+// destructuring lambda are not decoded — ok=false leaves them to the generic
+// walk.
+func kotlinCollectionLambda(n *sitter.Node, src []byte) (CollectionLambdaCall, bool) {
+	recv, method, ok := kotlinCall(n, src)
+	if !ok || !kotlinElementCallbacks[method] {
+		return CollectionLambdaCall{}, false
+	}
+	lambda := kotlinTrailingLambda(n)
+	if lambda == nil {
+		return CollectionLambdaCall{}, false
+	}
+	body := firstChildOfType(lambda, "statements")
+	param := kotlinLambdaParam(lambda, src)
+	if body == nil || param == "" {
+		return CollectionLambdaCall{}, false
+	}
+	return CollectionLambdaCall{Receiver: recv, Param: param, Body: body}, true
+}
+
+// kotlinTrailingLambda returns the lambda_literal of a call's trailing lambda
+// argument (`xs.filter { … }`): call_suffix > annotated_lambda >
+// lambda_literal. nil when the call carries no trailing lambda.
+func kotlinTrailingLambda(call *sitter.Node) *sitter.Node {
+	suffix := firstChildOfType(call, "call_suffix")
+	if suffix == nil {
+		return nil
+	}
+	al := firstChildOfType(suffix, "annotated_lambda")
+	if al == nil {
+		return nil
+	}
+	return firstChildOfType(al, "lambda_literal")
+}
+
+// kotlinLambdaParam returns the single parameter name of a lambda_literal: the
+// implicit `it` when the lambda declares no parameter list, or the lone
+// explicit parameter (`{ x -> … }`). "" when the lambda binds more than one
+// parameter or a destructuring pattern — those are not a plain element bind.
+func kotlinLambdaParam(lambda *sitter.Node, src []byte) string {
+	lp := firstChildOfType(lambda, "lambda_parameters")
+	if lp == nil {
+		return "it"
+	}
+	var only *sitter.Node
+	count := 0
+	for c := range lp.NamedChildren() {
+		if c.Type() != "variable_declaration" {
+			continue
+		}
+		count++
+		only = c
+	}
+	if count != 1 {
+		return ""
+	}
+	return kotlinSimpleIdent(only, src)
 }

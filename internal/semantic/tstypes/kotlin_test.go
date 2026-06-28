@@ -1080,3 +1080,126 @@ func TestKotlin_StdlibListTransformChain(t *testing.T) {
 		t.Errorf("resolution_strategy = %v, want %q (seed-derived)", e.Meta["resolution_strategy"], strategyInferred)
 	}
 }
+
+// SAM lambda re-bind: a higher-order collection call whose receiver carries a
+// declared element type binds the lambda's implicit `it` to that element, so
+// an inner member call resolves. `val xs: List<Foo> = …; xs.filter { it.foo() }`
+// resolves `it.foo()` to Foo::foo at the inferred band (the element type is an
+// inference from the receiver's declared generic argument).
+func TestKotlin_CollectionLambdaImplicitItResolves(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun foo() {}
+}
+`,
+		"App.kt": `class App {
+    fun main(xs: List<Foo>) {
+        xs.filter { it.foo() }
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	target := nodeByNameKind(t, g, "foo", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("xs.filter { it.foo() } not resolved to Foo::foo; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Origin != graph.OriginASTResolved {
+		t.Errorf("origin = %q, want %q", e.Origin, graph.OriginASTResolved)
+	}
+	if e.Meta["semantic_source"] != "kotlin-types" {
+		t.Errorf("semantic_source = %v, want kotlin-types", e.Meta["semantic_source"])
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+	if e.Confidence != inferredConfidence {
+		t.Errorf("confidence = %v, want %v", e.Confidence, inferredConfidence)
+	}
+}
+
+// SAM lambda re-bind with an explicit parameter and a local declaration:
+// `val xs: List<Foo> = …; xs.map { x -> x.foo() }` binds `x` to Foo and
+// resolves `x.foo()` to Foo::foo.
+func TestKotlin_CollectionLambdaExplicitParamResolves(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun foo() {}
+}
+`,
+		"App.kt": `class App {
+    fun main() {
+        val xs: List<Foo> = ArrayList()
+        xs.map { x -> x.foo() }
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	target := nodeByNameKind(t, g, "foo", graph.KindMethod)
+	e := callEdgeTo(g, caller.ID, target.ID)
+	if e == nil {
+		t.Fatalf("xs.map { x -> x.foo() } not resolved to Foo::foo; edges: %v", g.GetOutEdges(caller.ID))
+	}
+	if e.Meta["resolution_strategy"] != string(strategyInferred) {
+		t.Errorf("resolution_strategy = %v, want %q", e.Meta["resolution_strategy"], strategyInferred)
+	}
+}
+
+// HONESTY: a higher-order call on a collection with NO captured element type
+// (an untyped receiver) does NOT bind the lambda parameter, so the inner call
+// stays unresolved rather than minting a false edge.
+func TestKotlin_CollectionLambdaNoElementTypeSkipped(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun foo() {}
+}
+`,
+		"App.kt": `class App {
+    fun main() {
+        val xs = mystery()
+        xs.filter { it.foo() }
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	assertUntouched(t, g, caller.ID, "foo", "kotlin-types")
+}
+
+// HONESTY: a lambda on an element-typed collection but a method that is NOT in
+// the element-callback set does NOT bind the parameter — the callback's first
+// parameter is only known to be the element for the curated method set.
+func TestKotlin_CollectionLambdaNonCallbackMethodSkipped(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Foo.kt": `class Foo {
+    fun foo() {}
+}
+`,
+		"App.kt": `class App {
+    fun main(xs: List<Foo>) {
+        xs.fold { it.foo() }
+    }
+}
+`,
+	})
+	p := NewProvider(KotlinSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	caller := nodeByNameKind(t, g, "main", graph.KindMethod)
+	assertUntouched(t, g, caller.ID, "foo", "kotlin-types")
+}

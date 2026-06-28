@@ -58,6 +58,11 @@ func JavaSpec() *LangSpec {
 			return fieldText(n, "field", src), true
 		},
 		Imports: javaImports,
+		// A higher-order collection call whose lambda's first parameter is the
+		// element type (`xs.forEach(x -> x.foo())`) binds that parameter to the
+		// receiver's element type and re-walks the body, so an inner member call
+		// on the element resolves.
+		CollectionLambda: javaCollectionLambda,
 	}
 }
 
@@ -240,6 +245,109 @@ func javaCallArgCount(n *sitter.Node, _ []byte) (int, bool) {
 		count++
 	}
 	return count, true
+}
+
+// javaElementCallbacks is the curated set of Stream / Iterable higher-order
+// methods whose lambda's first (and only) parameter is the receiver's element
+// type. Kept tiny and honest: a fold (`reduce`) or a comparator-taking
+// `sorted` is excluded, so the parameter is never bound to the wrong type.
+var javaElementCallbacks = map[string]bool{
+	"forEach":        true,
+	"forEachOrdered": true,
+	"filter":         true,
+	"map":            true,
+	"anyMatch":       true,
+	"allMatch":       true,
+	"noneMatch":      true,
+	"takeWhile":      true,
+	"dropWhile":      true,
+	"peek":           true,
+	"removeIf":       true,
+}
+
+// javaCollectionLambda decodes a higher-order collection call whose lambda's
+// first parameter is the receiver's element type — `xs.forEach(x -> x.foo())`.
+// It grounds the receiver (the call's `object`) and gates the method on the
+// element-callback set, then requires the sole argument to be a
+// single-parameter lambda it can decode. The receiver may be a chained call
+// (`xs.stream().filter(…)`); the binder declines to element-type a
+// chained-call receiver, so that form is walked generically. ok=false for any
+// other call.
+func javaCollectionLambda(n *sitter.Node, src []byte) (CollectionLambdaCall, bool) {
+	if n.Type() != "method_invocation" {
+		return CollectionLambdaCall{}, false
+	}
+	obj := n.ChildByFieldName("object")
+	if obj == nil || !javaElementCallbacks[fieldText(n, "name", src)] {
+		return CollectionLambdaCall{}, false
+	}
+	lambda := javaSingleLambdaArg(n)
+	if lambda == nil {
+		return CollectionLambdaCall{}, false
+	}
+	param := javaLambdaParam(lambda, src)
+	body := lambda.ChildByFieldName("body")
+	if param == "" || body == nil {
+		return CollectionLambdaCall{}, false
+	}
+	return CollectionLambdaCall{Receiver: obj, Param: param, Body: body}, true
+}
+
+// javaSingleLambdaArg returns the lambda_expression when it is the SOLE
+// argument of a method invocation, nil otherwise (zero, multiple, or
+// non-lambda arguments). Comment extras the grammar admits are ignored so
+// they never inflate the count.
+func javaSingleLambdaArg(n *sitter.Node) *sitter.Node {
+	args := n.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	var lambda *sitter.Node
+	count := 0
+	for c := range args.NamedChildren() {
+		switch c.Type() {
+		case "line_comment", "block_comment":
+			continue
+		}
+		count++
+		if c.Type() == "lambda_expression" {
+			lambda = c
+		}
+	}
+	if count != 1 {
+		return nil
+	}
+	return lambda
+}
+
+// javaLambdaParam returns the single parameter name of a lambda_expression:
+// the bare `x -> …` identifier, or the lone identifier / formal parameter of a
+// parenthesized `(x) -> …` / `(Foo x) -> …` list. "" when the lambda binds
+// more than one parameter — those are not a plain element bind.
+func javaLambdaParam(lambda *sitter.Node, src []byte) string {
+	params := lambda.ChildByFieldName("parameters")
+	if params == nil {
+		return ""
+	}
+	if params.Type() == "identifier" {
+		return params.Content(src)
+	}
+	var only string
+	count := 0
+	for c := range params.NamedChildren() {
+		switch c.Type() {
+		case "identifier":
+			count++
+			only = c.Content(src)
+		case "formal_parameter":
+			count++
+			only = fieldText(c, "name", src)
+		}
+	}
+	if count != 1 {
+		return ""
+	}
+	return only
 }
 
 func javaImports(root *sitter.Node, src []byte) []Import {

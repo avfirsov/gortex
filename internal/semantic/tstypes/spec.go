@@ -199,6 +199,23 @@ type SyntheticCall struct {
 	Args     []*sitter.Node
 }
 
+// CollectionLambdaCall is the decomposition of a higher-order collection
+// call whose callback's first parameter is the receiver collection's element
+// type — Kotlin `xs.filter { it.foo() }`, Java `xs.forEach(x -> x.foo())`.
+// Receiver is the collection receiver node (the binder reads its captured
+// element type), Param is the callback's first parameter name (the implicit
+// `it` for a Kotlin lambda with no parameter list, or the written name), and
+// Body is the lambda body to re-walk under the element binding. A language's
+// hook returns ok=true only for a call whose method is in that language's
+// element-callback set and whose sole argument is a single-parameter lambda
+// it can decode — so a non-element-callback method, or a multi-parameter /
+// destructuring lambda, decodes to nothing and is walked generically.
+type CollectionLambdaCall struct {
+	Receiver *sitter.Node
+	Param    string
+	Body     *sitter.Node
+}
+
 // LangSpec adapts the shared engine to one language's tree-sitter
 // grammar. The node-type sets drive the generic walk; the hooks decode
 // the handful of shapes that differ per grammar. Hooks may be nil when
@@ -433,6 +450,24 @@ type LangSpec struct {
 	// inferred band. Consulted only when both the builder and a captured
 	// element type are present. nil (the default) disables element typing.
 	StdlibElementAccess func(builder, method string) bool
+
+	// CollectionLambda decodes a higher-order collection call whose
+	// callback's first parameter is the receiver collection's element type
+	// (Kotlin `xs.filter { it.foo() }`, Java `xs.forEach(x -> x.foo())`),
+	// returning ok=false for any other call. The hook owns the per-language
+	// element-callback method set (only methods whose callback's first
+	// parameter is the element — `filter` / `map` / `forEach` / `anyMatch`
+	// / …) and the lambda-shape decode. When it returns ok=true, the binder,
+	// having captured the receiver's declared generic element type
+	// (`List<Foo>` -> "Foo") at bind time, binds the callback parameter to
+	// that element type in a child scope and re-walks the body, so an inner
+	// member call on the parameter resolves on the element type at the
+	// inferred confidence band. When the receiver's element type is unknown
+	// (a non-generic / untyped collection, or a `.stream()`-chained
+	// receiver) the body is walked unrefined, so resolution honestly stops
+	// rather than guessing. nil (the default) disables the path entirely, so
+	// a language that leaves it unset behaves byte-for-byte as before.
+	CollectionLambda func(n *sitter.Node, src []byte) (CollectionLambdaCall, bool)
 }
 
 // inheritEdgeKinds returns the edge kinds methodOn climbs when looking
@@ -503,6 +538,36 @@ func NormalizeTypeName(t string) string {
 		t = t[i+1:]
 	}
 	return strings.TrimSpace(t)
+}
+
+// firstTypeArg returns the first generic type argument written in a type, as
+// written: "List<Foo>" -> "Foo", "Map<String, Foo>" -> "String",
+// "List<Map<K,V>>" -> "Map<K,V>". "" when the type carries no angle-bracket
+// type arguments. The caller normalizes the result to the bare type name.
+// Nested generics are tracked by depth so a top-level comma or the matching
+// close bracket terminates the first argument correctly.
+func firstTypeArg(t string) string {
+	open := strings.IndexByte(t, '<')
+	if open < 0 {
+		return ""
+	}
+	depth := 0
+	for i := open; i < len(t); i++ {
+		switch t[i] {
+		case '<':
+			depth++
+		case '>':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(t[open+1 : i])
+			}
+		case ',':
+			if depth == 1 {
+				return strings.TrimSpace(t[open+1 : i])
+			}
+		}
+	}
+	return ""
 }
 
 // nodeLine returns the 1-based start line of n.
