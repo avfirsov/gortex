@@ -234,7 +234,7 @@ func (e *CppExtractor) emitClass(m parser.QueryResult, filePath, fileID string, 
 		return
 	}
 	seen[classID] = true
-	meta := map[string]any{}
+	meta := map[string]any{"type_flavor": "class"}
 	if ns := enclosingCppNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
@@ -366,7 +366,7 @@ func (e *CppExtractor) emitStruct(m parser.QueryResult, filePath, fileID string,
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "cpp",
+		Language: "cpp", Meta: map[string]any{"type_flavor": "struct"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -419,7 +419,7 @@ func (e *CppExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, r
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "cpp",
+		Language: "cpp", Meta: map[string]any{"type_flavor": "enum"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,

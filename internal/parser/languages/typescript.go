@@ -869,6 +869,7 @@ func (e *TypeScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 	if tp := tsTypeParams(def.Node, src); len(tp) > 0 {
 		meta["type_params"] = tp
 	}
+	meta["type_flavor"] = "class"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -906,7 +907,7 @@ func (e *TypeScriptExtractor) emitInterface(m parser.QueryResult, filePath, file
 	if def.Node != nil {
 		methods = extractTSInterfaceMethods(def.Node, src)
 	}
-	meta := map[string]any{"methods": methods}
+	meta := map[string]any{"methods": methods, "type_flavor": "interface"}
 	docRow, exported := tsDocStartRow(def)
 	if doc := ExtractDocAbove(src, docRow, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
@@ -1046,6 +1047,7 @@ func (e *TypeScriptExtractor) emitTypeAlias(m parser.QueryResult, filePath, file
 		meta["doc"] = doc
 	}
 	meta["visibility"] = tsTopLevelVisibility(exported)
+	meta["type_flavor"] = "type_alias"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -1078,7 +1080,7 @@ func (e *TypeScriptExtractor) emitEnum(m parser.QueryResult, filePath, fileID st
 	def := m.Captures["enum.def"]
 	id := filePath + "::" + name
 
-	meta := map[string]any{"kind": "enum"}
+	meta := map[string]any{"kind": "enum", "type_flavor": "enum"}
 	docRow, exported := tsDocStartRow(def)
 	if doc := ExtractDocAbove(src, docRow, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc

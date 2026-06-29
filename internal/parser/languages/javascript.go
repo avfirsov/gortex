@@ -544,6 +544,7 @@ func (e *JavaScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript",
+		Meta:     map[string]any{"type_flavor": "class"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,

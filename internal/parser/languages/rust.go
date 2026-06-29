@@ -804,6 +804,7 @@ func (e *RustExtractor) emitStruct(m parser.QueryResult, filePath, fileID string
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "struct"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -826,8 +827,9 @@ func (e *RustExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, 
 	}
 	seen[id] = true
 	meta := map[string]any{
-		"kind":       "enum",
-		"visibility": rustVisibility(def.Node, src),
+		"kind":        "enum",
+		"type_flavor": "enum",
+		"visibility":  rustVisibility(def.Node, src),
 	}
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
@@ -860,6 +862,7 @@ func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string,
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "trait"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindInterface, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,

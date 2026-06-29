@@ -422,8 +422,12 @@ func (e *KotlinExtractor) emitClassOrInterface(m parser.QueryResult, filePath, f
 	switch {
 	case isInterface:
 		kind = graph.KindInterface
+		meta["type_flavor"] = "interface"
 	case enumBody != nil:
 		meta["kind"] = "enum"
+		meta["type_flavor"] = "enum"
+	default:
+		meta["type_flavor"] = "class"
 	}
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
@@ -633,6 +637,7 @@ func (e *KotlinExtractor) emitObject(m parser.QueryResult, filePath, fileID stri
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "object"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,

@@ -514,6 +514,7 @@ func (e *JavaExtractor) emitClass(m parser.QueryResult, filePath, fileID string,
 	if parent := extractJavaParentClass(def.Node, src); parent != "" {
 		meta["scope_parent"] = parent
 	}
+	meta["type_flavor"] = "class"
 	anns := javaCollectAnnotations(def.Node, src)
 	node := &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
@@ -556,7 +557,7 @@ func (e *JavaExtractor) emitAnonymousClass(m parser.QueryResult, filePath, fileI
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: line, EndLine: def.EndLine + 1,
 		Language: "java",
-		Meta:     map[string]any{"anonymous": true, "scope_parent": baseType},
+		Meta:     map[string]any{"anonymous": true, "scope_parent": baseType, "type_flavor": "anonymous_class"},
 	})
 	result.Edges = append(result.Edges,
 		&graph.Edge{From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line},
@@ -606,6 +607,7 @@ func (e *JavaExtractor) emitInterface(m parser.QueryResult, filePath, fileID str
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "interface"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindInterface, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -628,8 +630,9 @@ func (e *JavaExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, 
 	}
 	seen[id] = true
 	meta := map[string]any{
-		"kind":       "enum",
-		"visibility": javaVisibility(def.Node, src, VisibilityPackage),
+		"kind":        "enum",
+		"type_flavor": "enum",
+		"visibility":  javaVisibility(def.Node, src, VisibilityPackage),
 	}
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangBlockStar); doc != "" {
 		meta["doc"] = doc

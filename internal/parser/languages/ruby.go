@@ -377,6 +377,7 @@ func (e *RubyExtractor) emitClass(m parser.QueryResult, filePath, fileID string,
 	if doc := ExtractDocAbove(src, def.StartLine, DocLangHash); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "class"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,

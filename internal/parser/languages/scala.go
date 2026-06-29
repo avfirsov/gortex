@@ -159,9 +159,10 @@ func (e *ScalaExtractor) extractTrait(
 		ID: id, Kind: graph.KindInterface, Name: name,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
 		Language: "scala",
+		Meta:     map[string]any{"type_flavor": "trait"},
 	}
 	if len(methodNames) > 0 {
-		traitNode.Meta = map[string]any{"methods": methodNames}
+		traitNode.Meta["methods"] = methodNames
 	}
 	result.Nodes = append(result.Nodes, traitNode)
 	result.Edges = append(result.Edges, &graph.Edge{
@@ -193,6 +194,7 @@ func (e *ScalaExtractor) extractClass(
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
 		Language: "scala",
+		Meta:     map[string]any{"type_flavor": "class"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
@@ -227,6 +229,7 @@ func (e *ScalaExtractor) extractObject(
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
 		Language: "scala",
+		Meta:     map[string]any{"type_flavor": "object"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
@@ -315,7 +318,7 @@ func (e *ScalaExtractor) extractEnum(node *sitter.Node, src []byte, filePath str
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: startLine, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "scala", Meta: map[string]any{"kind": "enum"},
+		Language: "scala", Meta: map[string]any{"kind": "enum", "type_flavor": "enum"},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine})
 

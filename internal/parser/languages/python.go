@@ -568,7 +568,7 @@ func (e *PythonExtractor) emitClass(m parser.QueryResult, filePath, fileID strin
 		return
 	}
 	seen[id] = true
-	meta := map[string]any{"visibility": VisibilityByUnderscore(name)}
+	meta := map[string]any{"visibility": VisibilityByUnderscore(name), "type_flavor": "class"}
 	if doc := pyDocstringFromDef(def.Node, src); doc != "" {
 		meta["doc"] = doc
 	}

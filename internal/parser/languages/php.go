@@ -188,6 +188,7 @@ func (e *PHPExtractor) extractClass(
 	if parent := extractPhpParentClass(node, src); parent != "" {
 		meta["scope_parent"] = parent
 	}
+	meta["type_flavor"] = "class"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: className,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
@@ -242,6 +243,7 @@ func (e *PHPExtractor) extractInterface(
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
+	meta["type_flavor"] = "interface"
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindInterface, Name: ifaceName,
 		FilePath: filePath, StartLine: startLine, EndLine: endLine,
@@ -309,7 +311,7 @@ func (e *PHPExtractor) extractTrait(
 	}
 	seen[id] = true
 	startLine := int(node.StartPoint().Row) + 1
-	meta := map[string]any{"visibility": VisibilityPublic, "kind": "trait"}
+	meta := map[string]any{"visibility": VisibilityPublic, "kind": "trait", "type_flavor": "trait"}
 	if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangBlockStar); doc != "" {
 		meta["doc"] = doc
 	}
@@ -343,7 +345,7 @@ func (e *PHPExtractor) extractEnum(
 	}
 	seen[id] = true
 	startLine := int(node.StartPoint().Row) + 1
-	meta := map[string]any{"visibility": VisibilityPublic, "kind": "enum"}
+	meta := map[string]any{"visibility": VisibilityPublic, "kind": "enum", "type_flavor": "enum"}
 	if bt := e.findChildByType(node, "primitive_type"); bt != nil {
 		meta["backing_type"] = strings.TrimSpace(bt.Content(src))
 	}

@@ -279,7 +279,7 @@ func (e *CExtractor) emitKindType(m parser.QueryResult, prefix, filePath, fileID
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
-		Language: "c",
+		Language: "c", Meta: map[string]any{"type_flavor": prefix},
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
