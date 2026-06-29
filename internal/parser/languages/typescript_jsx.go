@@ -318,6 +318,31 @@ func jsxClassExtendsName(classNode *sitter.Node, src []byte) string {
 	return ""
 }
 
+// tsClassHasComponentDecorator reports whether a class declaration
+// carries an `@Component` decorator (Angular). Decorators sit either as
+// PrevSiblings of the class node or as its leading children, depending
+// on the grammar version — scan both.
+func tsClassHasComponentDecorator(classNode *sitter.Node, src []byte) bool {
+	isComponent := func(dec *sitter.Node) bool {
+		if dec == nil || dec.Type() != "decorator" {
+			return false
+		}
+		name, _ := tsDecoratorNameAndArgs(dec, src)
+		return name == "Component"
+	}
+	for sib := classNode.PrevSibling(); sib != nil && sib.Type() == "decorator"; sib = sib.PrevSibling() {
+		if isComponent(sib) {
+			return true
+		}
+	}
+	for i, _nc := 0, int(classNode.ChildCount()); i < _nc; i++ {
+		if isComponent(classNode.Child(i)) {
+			return true
+		}
+	}
+	return false
+}
+
 // classHeritageComponentUI maps a class's extends-base name to its UI
 // component framework + sub-kind: React-family base classes resolve the
 // framework from imports (component_kind=class); the Web-Components base

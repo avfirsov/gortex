@@ -884,6 +884,11 @@ func (e *TypeScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 			meta["component_kind"] = ck
 		}
 	}
+	// Angular: a class carrying an @Component decorator is a component.
+	if _, has := meta["ui_component"]; !has && tsClassHasComponentDecorator(def.Node, src) {
+		meta["ui_component"] = "angular"
+		meta["component_kind"] = "class"
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindType, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,

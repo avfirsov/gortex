@@ -716,6 +716,7 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 		if rt := extractKotlinReturnType(def.Node, src); rt != "" {
 			meta["return_type"] = rt
 		}
+		kotlinMarkComposable(meta, def.Node, src)
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindMethod, Name: name,
 			FilePath: filePath, StartLine: startLine1, EndLine: endLine1,
@@ -786,6 +787,7 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 	if doc != "" {
 		meta["doc"] = doc
 	}
+	kotlinMarkComposable(meta, def.Node, src)
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: startLine1, EndLine: endLine1,
@@ -805,6 +807,19 @@ func (e *KotlinExtractor) emitFunction(m parser.QueryResult, filePath, fileID st
 // kotlinCollectAnnotations walks a Kotlin declaration's modifiers
 // child for annotation nodes and returns the bare annotation names
 // plus their args (typically `(...)` text after the annotation name).
+// kotlinMarkComposable stamps the Jetpack Compose component marker onto
+// a function's meta map when the function carries a @Composable
+// annotation. Zero false-positive risk — the annotation is the signal.
+func kotlinMarkComposable(meta map[string]any, decl *sitter.Node, src []byte) {
+	for _, a := range kotlinCollectAnnotations(decl, src) {
+		if a.name == "Composable" {
+			meta["ui_component"] = "compose"
+			meta["component_kind"] = "function"
+			return
+		}
+	}
+}
+
 func kotlinCollectAnnotations(decl *sitter.Node, src []byte) []javaAnnotation {
 	if decl == nil {
 		return nil

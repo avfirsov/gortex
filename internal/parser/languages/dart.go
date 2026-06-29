@@ -152,6 +152,9 @@ func (e *DartExtractor) extractTypes(
 		if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangSlashSlash); doc != "" {
 			meta["doc"] = doc
 		}
+		if node.Type() == "class_definition" {
+			e.dartMarkFlutterWidget(meta, node, src)
+		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: kind, Name: name,
 			FilePath: filePath, StartLine: startLine, EndLine: endLine,
@@ -165,6 +168,41 @@ func (e *DartExtractor) extractTypes(
 			e.emitDartMixinEdges(node, src, id, filePath, result)
 		}
 	})
+}
+
+// dartSuperclassName returns the name of a class's `extends` base — the
+// direct type_identifier child of the `superclass` node (the `with` /
+// `implements` types are nested under mixins / interfaces). Returns ""
+// when the class has no extends base.
+func (e *DartExtractor) dartSuperclassName(classNode *sitter.Node, src []byte) string {
+	for i, _nc := 0, int(classNode.ChildCount()); i < _nc; i++ {
+		sup := classNode.Child(i)
+		if sup == nil || sup.Type() != "superclass" {
+			continue
+		}
+		for j, _nc := 0, int(sup.ChildCount()); j < _nc; j++ {
+			c := sup.Child(j)
+			if c != nil && c.Type() == "type_identifier" {
+				return c.Content(src)
+			}
+		}
+	}
+	return ""
+}
+
+// dartMarkFlutterWidget stamps the Flutter component marker onto a class
+// meta map when the class extends StatelessWidget / StatefulWidget.
+func (e *DartExtractor) dartMarkFlutterWidget(meta map[string]any, classNode *sitter.Node, src []byte) {
+	switch e.dartSuperclassName(classNode, src) {
+	case "StatelessWidget":
+		meta["ui_component"] = "flutter"
+		meta["component_kind"] = "stateless"
+		meta["type_flavor"] = "class"
+	case "StatefulWidget":
+		meta["ui_component"] = "flutter"
+		meta["component_kind"] = "stateful"
+		meta["type_flavor"] = "class"
+	}
 }
 
 // emitDartMixinEdges emits an EdgeExtends edge (Meta via="mixin") from a class
