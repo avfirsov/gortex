@@ -265,6 +265,14 @@ const (
 	KindContractBridge NodeKind = "contract_bridge"
 )
 
+// IsValidNodeKind reports whether s names a known node kind. Used by
+// the search layer to tell a real node-kind clause apart from a
+// flavor value that only looks like a kind (e.g. codegraph's
+// `kind:class`).
+func IsValidNodeKind(s string) bool {
+	return validNodeKinds[NodeKind(s)]
+}
+
 var validNodeKinds = map[NodeKind]bool{
 	KindFile: true, KindPackage: true, KindFunction: true,
 	KindMethod: true, KindType: true, KindInterface: true,

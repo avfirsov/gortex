@@ -25,6 +25,10 @@ func TestParseFieldQuery(t *testing.T) {
 		{"kind: thing", fieldQuery{Text: "kind: thing"}},
 		// A repeated field keeps the last value.
 		{"kind:function kind:method x", fieldQuery{Text: "x", Kind: "method"}},
+		// flavor: lifts out like kind:.
+		{"flavor:struct Foo", fieldQuery{Text: "Foo", Flavor: "struct"}},
+		// A pkg::Type token is not mis-parsed as a flavor clause.
+		{"pkg::Type flavor:enum", fieldQuery{Text: "pkg::Type", Flavor: "enum"}},
 	}
 	for _, tc := range cases {
 		got := parseFieldQuery(tc.raw)
@@ -58,7 +62,7 @@ func TestFieldQueryHasFieldFilters(t *testing.T) {
 	if (fieldQuery{Project: "web"}).hasFieldFilters() {
 		t.Errorf("project: alone is scope, not a post-filter")
 	}
-	for _, fq := range []fieldQuery{{Kind: "function"}, {Lang: "go"}, {Path: "src/"}, {Repo: "gortex"}} {
+	for _, fq := range []fieldQuery{{Kind: "function"}, {Flavor: "struct"}, {Lang: "go"}, {Path: "src/"}, {Repo: "gortex"}} {
 		if !fq.hasFieldFilters() {
 			t.Errorf("%+v must report a field filter", fq)
 		}
@@ -132,5 +136,72 @@ func TestNameClauseFilter(t *testing.T) {
 	}
 	if ids["b"] {
 		t.Error("name:handler should have dropped authMiddleware")
+	}
+}
+
+func TestApplyFlavorFilter(t *testing.T) {
+	nodes := []*graph.Node{
+		{ID: "s", Meta: map[string]any{"type_flavor": "struct"}},
+		{ID: "e", Meta: map[string]any{"type_flavor": "enum"}},
+		{ID: "react", Kind: graph.KindFunction, Meta: map[string]any{"ui_component": "react"}},
+		{ID: "svelte", Meta: map[string]any{"type_flavor": "component", "ui_component": "svelte"}},
+		{ID: "plain", Meta: map[string]any{}},
+		{ID: "nilmeta"},
+	}
+	ids := func(ns []*graph.Node) []string {
+		out := make([]string, len(ns))
+		for i, n := range ns {
+			out[i] = n.ID
+		}
+		return out
+	}
+	if got := ids(applyFlavorFilter(nodes, "struct")); !equalStrings(got, []string{"s"}) {
+		t.Errorf("flavor:struct = %v, want [s]", got)
+	}
+	// Case-insensitive on both sides.
+	if got := ids(applyFlavorFilter(nodes, "Struct")); !equalStrings(got, []string{"s"}) {
+		t.Errorf("flavor:Struct (case) = %v, want [s]", got)
+	}
+	// Comma union.
+	if got := ids(applyFlavorFilter(nodes, "struct,enum")); !equalStrings(got, []string{"s", "e"}) {
+		t.Errorf("flavor:struct,enum = %v, want [s e]", got)
+	}
+	// component bridges ui_component != "" and type_flavor == component.
+	if got := ids(applyFlavorFilter(nodes, "component")); !equalStrings(got, []string{"react", "svelte"}) {
+		t.Errorf("flavor:component = %v, want [react svelte]", got)
+	}
+	// Empty arg is a no-op.
+	if got := applyFlavorFilter(nodes, ""); len(got) != len(nodes) {
+		t.Errorf("empty flavor must keep all nodes, got %d", len(got))
+	}
+}
+
+// TestReclassifyKindFlavor pins the codegraph-compat shim: a kind: value
+// that is a flavor but not a real node kind routes to the flavor filter.
+func TestReclassifyKindFlavor(t *testing.T) {
+	cases := []struct {
+		in          string
+		wantKinds   string
+		wantFlavors string
+	}{
+		{"function", "function", ""},
+		{"class", "", "class"},
+		{"struct", "", "struct"},
+		{"enum", "", "enum"},
+		{"component", "", "component"},
+		// interface / table / module are BOTH — keep the node-kind meaning.
+		{"interface", "interface", ""},
+		{"table", "table", ""},
+		{"module", "module", ""},
+		// Mixed list partitions into kinds and flavors.
+		{"function,class", "function", "class"},
+		// An unknown value (neither kind nor flavor) stays a kind (graceful).
+		{"widget", "widget", ""},
+	}
+	for _, tc := range cases {
+		ks, fs := reclassifyKindFlavor(tc.in)
+		if ks != tc.wantKinds || fs != tc.wantFlavors {
+			t.Errorf("reclassifyKindFlavor(%q) = (%q,%q), want (%q,%q)", tc.in, ks, fs, tc.wantKinds, tc.wantFlavors)
+		}
 	}
 }

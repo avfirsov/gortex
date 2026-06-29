@@ -14,6 +14,7 @@ import (
 type fieldQuery struct {
 	Text    string // residual free text after clauses are removed
 	Kind    string // kind: clause — comma-separated node kinds
+	Flavor  string // flavor: clause — comma-separated structural flavors
 	Lang    string // lang: / language: clause — node language
 	Path    string // path: clause — file-path substring
 	Repo    string // repo: clause — repository prefix
@@ -25,7 +26,7 @@ type fieldQuery struct {
 // / path / repo) was supplied. project: is excluded — it merges into
 // the query scope rather than acting as a post-filter.
 func (fq fieldQuery) hasFieldFilters() bool {
-	return fq.Kind != "" || fq.Lang != "" || fq.Path != "" || fq.Repo != "" || fq.Name != ""
+	return fq.Kind != "" || fq.Flavor != "" || fq.Lang != "" || fq.Path != "" || fq.Repo != "" || fq.Name != ""
 }
 
 // parseFieldQuery splits a raw search string into its free text and
@@ -48,6 +49,8 @@ func parseFieldQuery(raw string) fieldQuery {
 		switch strings.ToLower(name) {
 		case "kind":
 			fq.Kind = value
+		case "flavor":
+			fq.Flavor = value
 		case "lang", "language":
 			fq.Lang = value
 		case "path":
@@ -236,4 +239,111 @@ func (s *Server) resolvePathFilter(req mcp.CallToolRequest, fq fieldQuery) []str
 		}
 	}
 	return paths
+}
+
+// knownFlavorValues is the closed structural-flavor vocabulary that
+// producers stamp onto Meta["type_flavor"] (plus the cross-key
+// "component" bridge). It is what the codegraph-compat shim consults
+// to tell a flavor value apart from a real node kind.
+var knownFlavorValues = map[string]struct{}{
+	"class": {}, "struct": {}, "enum": {}, "interface": {}, "trait": {},
+	"protocol": {}, "object": {}, "record": {}, "type_alias": {}, "newtype": {},
+	"anonymous_class": {}, "component": {}, "message": {}, "service": {},
+	"table": {}, "view": {}, "module": {}, "signature": {}, "type_def": {},
+	"instance": {}, "hook": {}, "play": {}, "typedef": {},
+}
+
+// isKnownFlavor reports whether v (case-insensitive) is in the closed
+// flavor vocabulary.
+func isKnownFlavor(v string) bool {
+	_, ok := knownFlavorValues[strings.ToLower(strings.TrimSpace(v))]
+	return ok
+}
+
+// splitFlavors splits a comma-separated flavor argument into its
+// non-empty, trimmed values (the OR set).
+func splitFlavors(arg string) []string {
+	var out []string
+	for _, f := range strings.Split(arg, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// nodeMatchesFlavor reports whether a node matches any of the given
+// flavor values (case-insensitive on both sides). The value
+// "component" is a special bridging sentinel: it matches any node
+// carrying a non-empty Meta["ui_component"] OR a
+// Meta["type_flavor"]=="component" — so a React function component
+// (KindFunction, ui_component=react, no type_flavor) and a Svelte SFC
+// type (type_flavor=component) both match. Every other value is an
+// exact, case-insensitive match against Meta["type_flavor"].
+func nodeMatchesFlavor(n *graph.Node, flavors []string) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	tf, _ := n.Meta["type_flavor"].(string)
+	tf = strings.ToLower(tf)
+	uc, _ := n.Meta["ui_component"].(string)
+	for _, f := range flavors {
+		f = strings.ToLower(strings.TrimSpace(f))
+		if f == "" {
+			continue
+		}
+		if f == "component" {
+			if uc != "" || tf == "component" {
+				return true
+			}
+			continue
+		}
+		if tf == f {
+			return true
+		}
+	}
+	return false
+}
+
+// applyFlavorFilter narrows a node slice to those whose structural
+// flavor matches the comma-separated flavor argument (union / OR). An
+// empty argument is a no-op.
+func applyFlavorFilter(nodes []*graph.Node, flavorArg string) []*graph.Node {
+	flavors := splitFlavors(flavorArg)
+	if len(flavors) == 0 {
+		return nodes
+	}
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if nodeMatchesFlavor(n, flavors) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// reclassifyKindFlavor is the codegraph-compatibility shim. codegraph
+// exposes structural kinds as kind:class|struct|enum|component, but
+// those are flavor values, not gortex node kinds — a bare
+// filterNodesByKind on them returns empty. This splits a
+// comma-separated kind argument into the values that are real node
+// kinds (returned as kinds) and the values that are flavor-only
+// (returned as flavors), so the caller can route each to the right
+// filter. A value that is both a kind and a flavor (interface, table,
+// module) keeps its node-kind meaning. Returns the original kindArg
+// and an empty flavors when nothing reclassifies.
+func reclassifyKindFlavor(kindArg string) (kinds string, flavors string) {
+	var ks, fs []string
+	for _, v := range strings.Split(kindArg, ",") {
+		t := strings.TrimSpace(v)
+		if t == "" {
+			continue
+		}
+		if !graph.IsValidNodeKind(strings.ToLower(t)) && isKnownFlavor(t) {
+			fs = append(fs, t)
+		} else {
+			ks = append(ks, t)
+		}
+	}
+	return strings.Join(ks, ","), strings.Join(fs, ",")
 }
