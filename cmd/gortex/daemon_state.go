@@ -294,6 +294,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// pure recomputation and get skipped, which is what makes a true warm
 	// restart near-instant instead of replaying the full cold-warmup cost.
 	var changedRepos atomic.Int64
+	// changedPrefixes records the repo prefix of every repo that did indexing
+	// work, so the end-of-warmup RunGlobalGraphPasses can scope the per-repo
+	// clone detection + Rebuild to just those repos instead of every tracked
+	// repo. scopeUnknown trips when a changed repo's prefix can't be
+	// determined (e.g. a failed reconcile) — then the scope is dropped and the
+	// whole-workspace clone pass runs, degrading toward correctness.
+	var changedPrefixes sync.Map
+	var scopeUnknown atomic.Bool
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -372,16 +380,27 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							// passes still run — degrade toward correctness, not
 							// toward the fast path, when we can't trust the delta.
 							changedRepos.Add(1)
+							scopeUnknown.Store(true)
 						case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0):
 							changedRepos.Add(1)
+							if res.RepoPrefix != "" {
+								changedPrefixes.Store(res.RepoPrefix, struct{}{})
+							} else {
+								scopeUnknown.Store(true)
+							}
 						}
 					} else {
 						// No prior mtimes → full cold (re)index of this repo,
 						// which is "changed" by definition.
 						changedRepos.Add(1)
-						if _, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
+						if res, err := state.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
 							logger.Warn("daemon: startup track failed",
 								zap.String("path", entry.Path), zap.Error(err))
+							scopeUnknown.Store(true)
+						} else if res != nil && res.RepoPrefix != "" {
+							changedPrefixes.Store(res.RepoPrefix, struct{}{})
+						} else {
+							scopeUnknown.Store(true)
 						}
 					}
 					elapsed := time.Since(repoStart)
@@ -562,6 +581,23 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// path (nothing changed) ResetBatch clears the deferred-batch flags
 	// without re-running those passes — the persisted graph already has
 	// the derived edges.
+	// Scope the per-repo clone detection + clone-index Rebuild in the
+	// end_batch graph passes to the repos that actually re-indexed this
+	// warmup. Dropped when a changed repo's prefix was indeterminate
+	// (scopeUnknown) so a repo whose clones genuinely need recomputing is
+	// never skipped. ArmBatchScope is a no-op when scoped global passes are
+	// disabled or the set is empty (run every repo, the prior behaviour).
+	if anyChanged && !scopeUnknown.Load() {
+		changed := make(map[string]struct{})
+		changedPrefixes.Range(func(k, _ any) bool {
+			if p, ok := k.(string); ok {
+				changed[p] = struct{}{}
+			}
+			return true
+		})
+		state.multiIndexer.ArmBatchScope(changed)
+	}
+
 	phaseStart = time.Now()
 	publishReadinessPhase(state, "end_batch", true, nil)
 	if anyChanged {

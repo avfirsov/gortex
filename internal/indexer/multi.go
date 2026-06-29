@@ -106,6 +106,20 @@ type MultiIndexer struct {
 	// flag covers a separate (cheaper) set of O(global) walks.
 	deferResolve bool
 
+	// batchChangedPrefixes scopes the per-repo clone-detection and
+	// clone-index Rebuild passes in RunGlobalGraphPasses to the repos that
+	// actually re-indexed in the current batch. nil — the default, and what
+	// every one-off EndBatch caller leaves it as — means "run the clone
+	// passes for every tracked repo", the prior whole-workspace behaviour.
+	// The daemon warmup arms it (ArmBatchScope) before EndBatch so an
+	// N-repo warm restart where only one repo changed stops paying ~N
+	// full-graph clone walks for repos whose clone edges are already on
+	// disk. Clone edges are per-repo (no cross-repo pair is ever formed),
+	// so an unchanged repo's persisted edges stay valid; its in-memory
+	// incremental clone index is reseeded lazily on its first later edit.
+	// Consumed and cleared by RunGlobalGraphPasses. Guarded by mi.mu.
+	batchChangedPrefixes map[string]struct{}
+
 	// resolverLSPHelper is the resolve-time LSP helper propagated
 	// onto every per-repo Indexer and onto the global post-pass
 	// resolver in RunDeferredPassesAll. nil means no LSP hot-path
@@ -526,6 +540,48 @@ func enrichConcurrency(repos int) int {
 // markTestSymbolsAndEmitEdges) once against the shared graph. Restores
 // the per-Indexer flag too so a subsequent one-off TrackRepoCtx call
 // runs the passes inline as expected.
+// ArmBatchScope records the prefixes of the repos that re-indexed in the
+// batch about to be ended, so the next RunGlobalGraphPasses runs the
+// per-repo clone-detection + clone-index Rebuild passes only for those
+// repos instead of for every tracked repo. An empty set, or scoped global
+// passes being disabled, leaves the scope nil (run all). Only the daemon
+// warmup arms it; every other EndBatch caller keeps the whole-workspace
+// behaviour.
+func (mi *MultiIndexer) ArmBatchScope(changedPrefixes map[string]struct{}) {
+	if mi == nil || len(changedPrefixes) == 0 || !mi.scopedGlobalPassesEnabled() {
+		return
+	}
+	mi.mu.Lock()
+	mi.batchChangedPrefixes = changedPrefixes
+	mi.mu.Unlock()
+}
+
+// takeBatchScope returns the armed clone-pass scope and clears it, so the
+// scope governs exactly one RunGlobalGraphPasses run. A nil result means
+// "no scope — run the clone passes for every repo".
+func (mi *MultiIndexer) takeBatchScope() map[string]struct{} {
+	mi.mu.Lock()
+	scope := mi.batchChangedPrefixes
+	mi.batchChangedPrefixes = nil
+	mi.mu.Unlock()
+	return scope
+}
+
+// scopedGlobalPassesEnabled reports whether per-repo global passes may be
+// scoped to the changed-repo set. GORTEX_INDEX_SCOPED_GLOBAL_PASSES
+// overrides the config key; default ON, mirroring Indexer.scopedGlobalPassesEnabled.
+func (mi *MultiIndexer) scopedGlobalPassesEnabled() bool {
+	if v := os.Getenv("GORTEX_INDEX_SCOPED_GLOBAL_PASSES"); v != "" {
+		return v == "1" || strings.EqualFold(v, "true")
+	}
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for _, idx := range mi.indexers {
+		return idx.config.ScopedGlobalPassesEnabledOrDefault()
+	}
+	return true
+}
+
 func (mi *MultiIndexer) EndBatch() {
 	mi.mu.Lock()
 	mi.deferGlobalPasses = false
@@ -602,7 +658,27 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 		cloneIdx = append(cloneIdx, idx)
 	}
 	mi.mu.RUnlock()
+	// Scope to the repos that re-indexed this batch when the warmup armed a
+	// batch scope. An unchanged repo's clone edges are already on disk and
+	// its incremental clone index is reseeded lazily on its first later edit
+	// (indexFile: if !built → Rebuild), so skipping its full-graph detect +
+	// Rebuild here is sound and cuts an N-repo warm restart from N full-graph
+	// clone walks to just the changed repos'. A nil scope runs every repo.
+	scope := mi.takeBatchScope()
+	inCloneScope := func(prefix string) bool {
+		if scope == nil {
+			return true
+		}
+		_, ok := scope[prefix]
+		return ok
+	}
+	cloneDetectStart := time.Now()
+	clonesDetected := 0
 	for _, idx := range cloneIdx {
+		if !inCloneScope(idx.repoPrefix) {
+			continue
+		}
+		clonesDetected++
 		// Per-repo threshold, NOT a max-over-repos value: the batch must use
 		// the same cutoff the per-repo incremental maintainer uses
 		// (UpdateFuncs/Rebuild → idx.cloneThreshold()), or the batch and
@@ -625,11 +701,29 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// freshly-baselined signatures + sidecar (scoped to that repo's
 	// prefix) so steady-state single-file edits after this batch go
 	// incremental instead of re-running the whole-graph pass per file.
+	cloneRebuildStart := time.Now()
+	clonesRebuilt := 0
 	for _, idx := range cloneIdx {
+		if !inCloneScope(idx.repoPrefix) {
+			continue
+		}
 		if idx.cloneIndex != nil {
 			idx.cloneIndex.Rebuild(mi.graph, idx.repoPrefix)
+			clonesRebuilt++
 		}
 	}
+	// Aggregate timing for the clone passes — previously the most expensive
+	// and least observable part of a warm restart (the per-repo logs above
+	// only fire when a repo actually has clone pairs, so a long run could
+	// pass with no breadcrumbs).
+	mi.logger.Info("clone passes done (global)",
+		zap.Bool("scoped", scope != nil),
+		zap.Int("repos_total", len(cloneIdx)),
+		zap.Int("detected", clonesDetected),
+		zap.Int("rebuilt", clonesRebuilt),
+		zap.Duration("detect_elapsed", cloneRebuildStart.Sub(cloneDetectStart)),
+		zap.Duration("rebuild_elapsed", time.Since(cloneRebuildStart)),
+	)
 	// Framework dynamic-dispatch synthesis (gRPC stubs, Temporal
 	// workflow→activity, in-process / native event channels, native
 	// bridges). After InferImplements/InferOverrides (the

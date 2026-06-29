@@ -329,7 +329,15 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			goMode = goanalysis.ModeCallGraph
 		}
 		goProvider := goanalysis.NewProvider(goMode, false, logger)
-		semMgr.RegisterProvider(goProvider)
+		// The go/packages "go-types" provider is a full `go list ./...` +
+		// go/types pass over the module on every index — tens of seconds per
+		// Go module per warmup, and on an already-resolved graph it routinely
+		// confirms zero new edges (the always-on go-ast-types tree-sitter
+		// floor already covers Go). Keep it as the contracts binding resolver,
+		// but only register it for enrichment when explicitly opted in.
+		if goTypesEnrichEnabled(conf.Semantic) {
+			semMgr.RegisterProvider(goProvider)
+		}
 		contracts.SetBindingResolver(goProvider)
 
 		// In-process tree-sitter type resolvers — always-available
@@ -604,4 +612,15 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 
 	return s, nil
+}
+
+// goTypesEnrichEnabled reports whether the heavyweight go/packages
+// "go-types" enrichment provider should be registered. Default OFF — the
+// always-on go-ast-types tree-sitter floor serves Go resolution at a
+// fraction of the cost. GORTEX_GO_TYPES=1/0 overrides the config key.
+func goTypesEnrichEnabled(sem config.SemanticConfig) bool {
+	if v := os.Getenv("GORTEX_GO_TYPES"); v != "" {
+		return v == "1" || strings.EqualFold(v, "true")
+	}
+	return sem.GoTypesEnabledOrDefault()
 }

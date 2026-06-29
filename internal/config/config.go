@@ -216,6 +216,16 @@ type SemanticConfig struct {
 	WatchDebounceMs   int                      `mapstructure:"watch_debounce_ms" yaml:"watch_debounce_ms,omitempty"`
 	RefuteUnconfirmed bool                     `mapstructure:"refute_unconfirmed" yaml:"refute_unconfirmed,omitempty"`
 	Providers         []SemanticProviderConfig `mapstructure:"providers" yaml:"providers,omitempty"`
+	// GoTypes enables the heavyweight go/packages type-check provider
+	// ("go-types"): a full `go list ./...` + go/types pass over the module
+	// (and its dependencies) on every index. The in-process tree-sitter Go
+	// resolver (go-ast-types) is the always-on floor and resolves the common
+	// receiver / cross-file call cases with no toolchain; the go/packages
+	// provider adds full cross-package / generic type precision but costs
+	// tens of seconds per Go module per warmup and, on an already-resolved
+	// graph, frequently confirms zero new edges. Tri-state, DEFAULT OFF —
+	// opt in for maximum Go type precision. Env override GORTEX_GO_TYPES=1/0.
+	GoTypes *bool `mapstructure:"go_types" yaml:"go_types,omitempty"`
 	// AdditionalWorkspaceFolders are extra directory roots passed to
 	// every LSP server's `initialize` request as workspace folders.
 	// This is how cross-package resolution works for a TypeScript (or
@@ -250,6 +260,17 @@ type SemanticConfig struct {
 	// anything that isn't worth embedding usually isn't worth
 	// full-text-indexing either. See DefaultSkipSearch.
 	SkipSearch []SkipEmbedRule `mapstructure:"skip_search" yaml:"skip_search,omitempty"`
+}
+
+// GoTypesEnabledOrDefault resolves the tri-state SemanticConfig.GoTypes.
+// The heavyweight go/packages type-check provider is OFF by default — the
+// always-on tree-sitter Go floor (go-ast-types) serves Go resolution — so
+// opt in explicitly for full cross-package type precision.
+func (s SemanticConfig) GoTypesEnabledOrDefault() bool {
+	if s.GoTypes == nil {
+		return false
+	}
+	return *s.GoTypes
 }
 
 // SkipEmbedRule says: when a node's Language matches Language AND its
@@ -1434,14 +1455,18 @@ func (c SearchConfig) EffectiveKeywordSoupRewrite() string {
 // HybridBackend down-weights the vector channel for identifier-shaped
 // queries — never a replacement for text search. The default provider
 // is `static` (baked GloVe word vectors): it needs zero download and
-// is CPU-only, so semantic search is on by default at no setup cost.
+// is CPU-only. As of the lean-index default, the static provider no
+// longer builds a vector index automatically — FTS5/BM25 text search
+// serves the default, and the semantic channel turns on when a real
+// `local`/`api` provider (or `embedding.enabled: true`) is configured.
 type EmbeddingConfig struct {
 	// Enabled is tri-state. A nil pointer means "not configured" —
-	// the caller falls back to the default (semantic search ON with
-	// the static provider). An explicit `embedding.enabled: false`
-	// turns the vector channel off; `true` forces it on. Pointer so
-	// the loader can tell "absent" from "explicitly false", mirroring
-	// RespectGitignore.
+	// the vector channel is then built only when a real `local`/`api`
+	// provider is configured (the static default stays text-only). An
+	// explicit `embedding.enabled: false` turns the vector channel off;
+	// `true` forces it on, building whatever provider is configured
+	// (including the static one). Pointer so the loader can tell
+	// "absent" from "explicitly false", mirroring RespectGitignore.
 	Enabled *bool `mapstructure:"enabled" yaml:"enabled,omitempty"`
 
 	// Provider selects the embedding backend: `static` (baked GloVe,

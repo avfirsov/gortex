@@ -55,10 +55,41 @@ func ResolveEmbedder(req EmbedderRequest, cfg *config.Config) (embedding.Provide
 		return buildConfiguredEmbedder(embCfg, "enabled by flag/env")
 	}
 
-	if !embCfg.EmbeddingEnabledOrDefault() {
+	// No explicit flag/env toggle. An explicit `embedding.enabled: false`
+	// still wins and disables the vector channel.
+	if embCfg.Enabled != nil && !*embCfg.Enabled {
 		return nil, "", nil
 	}
-	return buildConfiguredEmbedder(embCfg, "enabled by config default")
+	// An explicit `embedding.enabled: true` builds whatever provider is
+	// configured, including the baked static GloVe one.
+	if embCfg.Enabled != nil && *embCfg.Enabled {
+		return buildConfiguredEmbedder(embCfg, "enabled by config")
+	}
+	// Otherwise (the default, unset state) build a vector index ONLY when
+	// the user has configured a real, model-backed embedder. The static
+	// GloVe provider's dim-50 word vectors add little over FTS5/BM25 text
+	// search yet cost 0.6-0.7s of every index to build, so it is now
+	// opt-in: FTS5 text search serves the default, and semantic search
+	// turns on when a `local`/`api` provider (or embedding.enabled: true,
+	// or GORTEX_EMBEDDINGS=1) is configured.
+	if isRealEmbedder(embCfg.EmbeddingProviderOrDefault()) {
+		return buildConfiguredEmbedder(embCfg, "real embedder configured")
+	}
+	return nil, "", nil
+}
+
+// isRealEmbedder reports whether the named provider is a model-backed
+// embedder worth the index-time vector build. The baked `static` GloVe
+// provider is excluded: its dim-50 averaged word vectors add little over
+// FTS5 text search, so it no longer builds a vector index by default
+// (opt in with embedding.enabled: true or GORTEX_EMBEDDINGS=1).
+func isRealEmbedder(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "local", "api":
+		return true
+	default:
+		return false
+	}
 }
 
 // explicitEmbeddingToggle reports whether the caller gave an explicit

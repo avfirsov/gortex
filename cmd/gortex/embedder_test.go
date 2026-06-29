@@ -17,24 +17,41 @@ func withEnv(t *testing.T, key, val string) {
 	t.Setenv(key, val)
 }
 
-// TestResolveEmbedder_DefaultOnStatic asserts the core default-on
-// behaviour: with no `--embeddings` flag, no GORTEX_EMBEDDINGS env, and
-// a config whose Embedding block is the zero value (Enabled == nil),
-// resolveEmbedder returns a working static GloVe provider.
-func TestResolveEmbedder_DefaultOnStatic(t *testing.T) {
+// TestResolveEmbedder_DefaultSkipsStatic asserts the FTS5-only default:
+// with no `--embeddings` flag, no GORTEX_EMBEDDINGS env, and a config whose
+// Embedding block is the zero value (Enabled == nil), resolveEmbedder builds
+// NO embedder. The baked static GloVe provider is opt-in, so the default index
+// skips the vector pass and relies on FTS5 text search.
+func TestResolveEmbedder_DefaultSkipsStatic(t *testing.T) {
 	withEnv(t, "GORTEX_EMBEDDINGS", "")
 	withEnv(t, "GORTEX_EMBEDDINGS_URL", "")
 
 	cfg := config.Default()
 	require.Nil(t, cfg.Embedding.Enabled, "precondition: default config leaves Enabled nil")
 
+	emb, _, err := resolveEmbedder(embedderRequest{}, cfg)
+	require.NoError(t, err)
+	assert.Nil(t, emb, "the static GloVe provider is opt-in; the default must build no embedder")
+}
+
+// TestResolveEmbedder_EnabledBuildsStatic asserts the opt-in: an explicit
+// `embedding.enabled: true` with the default (static) provider turns the baked
+// GloVe vector index back on.
+func TestResolveEmbedder_EnabledBuildsStatic(t *testing.T) {
+	withEnv(t, "GORTEX_EMBEDDINGS", "")
+	withEnv(t, "GORTEX_EMBEDDINGS_URL", "")
+
+	enabled := true
+	cfg := config.Default()
+	cfg.Embedding.Enabled = &enabled
+
 	emb, desc, err := resolveEmbedder(embedderRequest{}, cfg)
 	require.NoError(t, err)
-	require.NotNil(t, emb, "default-on must produce an embedder")
+	require.NotNil(t, emb, "embedding.enabled: true must build the static embedder")
 	defer emb.Close()
 
 	_, isStatic := emb.(*embedding.StaticProvider)
-	assert.True(t, isStatic, "the default-on embedder must be the static GloVe provider, got %T", emb)
+	assert.True(t, isStatic, "the opt-in default-provider embedder must be the static GloVe provider, got %T", emb)
 	assert.Contains(t, desc, "static")
 }
 
@@ -70,13 +87,13 @@ func TestResolveEmbedder_FlagOverridesConfig(t *testing.T) {
 	assert.Nil(t, emb, "an explicit --embeddings=false flag must override config-enabled")
 }
 
-// TestResolveEmbedder_EnvOverridesConfig asserts GORTEX_EMBEDDINGS=0
-// overrides a config that would otherwise enable the default-on path.
+// TestResolveEmbedder_EnvOverridesConfig asserts GORTEX_EMBEDDINGS=0 is an
+// explicit off that yields no embedder regardless of config.
 func TestResolveEmbedder_EnvOverridesConfig(t *testing.T) {
 	withEnv(t, "GORTEX_EMBEDDINGS", "0")
 	withEnv(t, "GORTEX_EMBEDDINGS_URL", "")
 
-	cfg := config.Default() // Enabled nil → default-on
+	cfg := config.Default() // Enabled nil; GORTEX_EMBEDDINGS=0 forces off
 
 	emb, _, err := resolveEmbedder(embedderRequest{}, cfg)
 	require.NoError(t, err)

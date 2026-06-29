@@ -74,6 +74,13 @@ type Resolver struct {
 	// `RegisterAll` resolving to `OverlayManager.Register` simply
 	// because "OverlayManager" sorts before "Registry".
 	reachableDirsByFile map[string]map[string]struct{}
+	// dirByFilePath memoises filepath.Dir(path) for every indexed file,
+	// built once alongside reachableDirsByFile. filterByReachability runs in
+	// the parallel resolver workers and otherwise recomputes filepath.Dir
+	// per candidate per edge — ~20% of resolution CPU on a large TS monorepo
+	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
+	// workers share it lock-free.
+	dirByFilePath map[string]string
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes emitted from go.mod. Keyed by RepoPrefix (the dep node's
 	// owning repo) so we never link an import in repo A to a dep
@@ -107,6 +114,12 @@ type Resolver struct {
 	nodeByID        map[string]*graph.Node
 	nodesByName     map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
+
+	// incrementalSkip holds the source-shapes of a single re-resolved file's
+	// out-edges that were already unresolved before the edit; the forward
+	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
+	// single-file index path. nil on every batch/whole-graph pass.
+	incrementalSkip map[string]struct{}
 
 	// lspHelper, when non-nil, is consulted before falling back to
 	// AST heuristics for cross-file dispatch in languages whose
@@ -724,7 +737,26 @@ func (r *Resolver) cachedFindNodesByNameInRepo(name, repo string) []*graph.Node 
 	}
 	if r.nodesByName != nil {
 		if hits, ok := r.nodesByName[name]; ok {
-			var out []*graph.Node
+			// Count repo matches before allocating. When every hit is in
+			// repo -- always so in single-repo mode, and common otherwise --
+			// hand back the cached slice (capped so a caller's append cannot
+			// scribble into the cache) instead of copying it. The per-call
+			// copy + growslice here was the largest allocation source during
+			// resolution on a large index; callers treat the result as
+			// read-only.
+			match := 0
+			for _, n := range hits {
+				if n != nil && n.RepoPrefix == repo {
+					match++
+				}
+			}
+			switch {
+			case match == 0:
+				return nil
+			case match == len(hits):
+				return hits[:len(hits):len(hits)]
+			}
+			out := make([]*graph.Node, 0, match)
 			for _, n := range hits {
 				if n != nil && n.RepoPrefix == repo {
 					out = append(out, n)
@@ -860,12 +892,19 @@ func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge
 	defNodes := r.graph.GetFileNodes(filePath)
 	var pending []*graph.Edge
 	seenNames := make(map[string]struct{}, len(defNodes))
+	defIDs := make([]string, 0, len(defNodes))
+	for _, n := range defNodes {
+		if n != nil {
+			defIDs = append(defIDs, n.ID)
+		}
+	}
+	outByNode := graph.OutEdgesForNodes(r.graph, defIDs)
 	for _, n := range defNodes {
 		if n == nil {
 			continue
 		}
-		for _, e := range r.graph.GetOutEdges(n.ID) {
-			if graph.IsUnresolvedTarget(e.To) {
+		for _, e := range outByNode[n.ID] {
+			if graph.IsUnresolvedTarget(e.To) && !r.incrementalSkipped(e) {
 				pending = append(pending, e)
 			}
 		}
@@ -930,9 +969,14 @@ func (r *Resolver) resolveFileLocked(filePath string, stats *ResolveStats) {
 // so this is the complete candidate set for those passes.
 func (r *Resolver) fileOutEdges(filePath string) []*graph.Edge {
 	nodes := r.graph.GetFileNodes(filePath)
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	byNode := graph.OutEdgesForNodes(r.graph, ids)
 	var out []*graph.Edge
 	for _, n := range nodes {
-		out = append(out, r.graph.GetOutEdges(n.ID)...)
+		out = append(out, byNode[n.ID]...)
 	}
 	return out
 }
@@ -952,10 +996,22 @@ func (r *Resolver) resolveFileEdgesLocked(filePath string, stats *ResolveStats) 
 	var jobs []reindexJob
 	var reindexBatch []graph.EdgeReindex
 	nodes := r.graph.GetFileNodes(filePath)
+	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		edges := r.graph.GetOutEdges(n.ID)
+		ids = append(ids, n.ID)
+	}
+	byNode := graph.OutEdgesForNodes(r.graph, ids)
+	for _, n := range nodes {
+		edges := byNode[n.ID]
 		for _, e := range edges {
 			if !graph.IsUnresolvedTarget(e.To) {
+				continue
+			}
+			// Carry-over reference unchanged since the last resolve and
+			// already unresolved then — leave it for the incoming pass
+			// instead of re-running the cascade (the bulk of edit latency
+			// on reference-heavy files).
+			if r.incrementalSkipped(e) {
 				continue
 			}
 			oldTo, changed := r.resolveEdge(e, stats)
@@ -1021,7 +1077,7 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 	r.rebindGoMethodReceiversForFile(filePath)
 	r.bindBareNameScopeRefsForFile(filePath)
-	r.bindGenericParamRefs()
+	r.bindGenericParamRefsForFile(filePath)
 	r.attributeGoBuiltinsForFile(filePath)
 	r.attributeGoExternalCallsForFile(filePath)
 }
@@ -1384,7 +1440,7 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
 			continue
 		}
-		dir := filepath.Dir(c.FilePath)
+		dir := r.dirFor(c.FilePath)
 		crossRepo := callerRepo != "" && c.RepoPrefix != "" && c.RepoPrefix != callerRepo
 		var matches bool
 		if crossRepo {
@@ -1631,10 +1687,10 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 
 	// Prefer same-package (same directory) match.
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 	for _, c := range candidates {
 		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
-			filepath.Dir(c.FilePath) == callerDir {
+			r.dirFor(c.FilePath) == callerDir {
 			e.To = c.ID
 			stats.Resolved++
 			return
@@ -1667,7 +1723,7 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 		return
 	}
 
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 
 	// Land the edge on the canonical type/interface definition (real,
 	// exported, top-level, non-test), preferring same-package only as a
@@ -1684,7 +1740,7 @@ func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveS
 	// If no type found, try as function (e.g., bare function name passed as value).
 	for _, c := range candidates {
 		if c.Kind == graph.KindFunction || c.Kind == graph.KindMethod {
-			if filepath.Dir(c.FilePath) == callerDir {
+			if r.dirFor(c.FilePath) == callerDir {
 				e.To = c.ID
 				stats.Resolved++
 				return
@@ -1720,7 +1776,7 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 		stats.Unresolved++
 		return
 	}
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 
 	// Land the edge on the canonical type/interface definition. The
 	// ranker prefers a real, exported, top-level, non-test definition
@@ -1748,13 +1804,13 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 	if len(candidates) == 0 {
 		return false
 	}
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 
 	// Pass 1: same-directory + exact-receiver-type field.
 	if receiverType != "" {
 		for _, c := range candidates {
 			if c.Kind == graph.KindField &&
-				filepath.Dir(c.FilePath) == callerDir &&
+				r.dirFor(c.FilePath) == callerDir &&
 				nodeReceiverType(c) == receiverType {
 				e.To = c.ID
 				e.Confidence = 0.95
@@ -1791,7 +1847,7 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 	// Pass 4: same-directory field of any owner type — last resort
 	// before falling through to method resolution.
 	for _, c := range candidates {
-		if c.Kind == graph.KindField && filepath.Dir(c.FilePath) == callerDir {
+		if c.Kind == graph.KindField && r.dirFor(c.FilePath) == callerDir {
 			e.To = c.ID
 			e.Confidence = 0.6
 			stats.Resolved++
@@ -1838,7 +1894,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		return
 	}
 
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 	receiverType := edgeReceiverType(e)
 
 	// If we have a type hint, try exact type match first.
@@ -1846,7 +1902,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		// Pass 1: same-directory + exact type match (highest confidence).
 		for _, c := range candidates {
 			if c.Kind == graph.KindMethod &&
-				filepath.Dir(c.FilePath) == callerDir &&
+				r.dirFor(c.FilePath) == callerDir &&
 				nodeReceiverType(c) == receiverType {
 				e.To = c.ID
 				e.Confidence = 0.95
@@ -1904,7 +1960,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 			// Same receiver type + same directory = very high confidence.
 			for _, c := range candidates {
 				if c.Kind == graph.KindMethod &&
-					filepath.Dir(c.FilePath) == callerDir &&
+					r.dirFor(c.FilePath) == callerDir &&
 					nodeReceiverType(c) == callerRecv {
 					e.To = c.ID
 					e.Confidence = 0.9
@@ -1946,14 +2002,14 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		switch c.Kind {
 		case graph.KindMethod:
 			methodCount++
-			if filepath.Dir(c.FilePath) == callerDir && sameDirMethod == nil {
+			if r.dirFor(c.FilePath) == callerDir && sameDirMethod == nil {
 				sameDirMethod = c
 			}
 			if anyMethod == nil {
 				anyMethod = c
 			}
 		case graph.KindFunction:
-			if filepath.Dir(c.FilePath) == callerDir && sameDirFunc == nil {
+			if r.dirFor(c.FilePath) == callerDir && sameDirFunc == nil {
 				sameDirFunc = c
 			}
 			if anyFunc == nil {
@@ -2060,9 +2116,9 @@ func (r *Resolver) resolveTokenRef(e *graph.Edge, name string, stats *ResolveSta
 		stats.Unresolved++
 		return
 	}
-	callerDir := filepath.Dir(e.FilePath)
+	callerDir := r.dirFor(e.FilePath)
 	for _, c := range candidates {
-		if filepath.Dir(c.FilePath) == callerDir {
+		if r.dirFor(c.FilePath) == callerDir {
 			e.To = c.ID
 			e.Confidence = 0.9
 			stats.Resolved++
@@ -2161,9 +2217,13 @@ func (r *Resolver) buildReachabilityIndex() {
 		set[dir] = struct{}{}
 	}
 
-	// Seed with each indexed file's own directory.
+	// Seed with each indexed file's own directory, and memoise the per-file
+	// dir so filterByReachability never recomputes filepath.Dir per edge.
+	dirByPath := make(map[string]string)
 	for n := range r.graph.NodesByKind(graph.KindFile) {
-		addDir(n.ID, filepath.Dir(n.FilePath))
+		dir := filepath.Dir(n.FilePath)
+		dirByPath[n.FilePath] = dir
+		addDir(n.ID, dir)
 	}
 
 	// Materialise the import edges and batch-load the endpoints of the
@@ -2216,9 +2276,25 @@ func (r *Resolver) buildReachabilityIndex() {
 	}
 
 	r.reachableDirsByFile = idx
+	r.dirByFilePath = dirByPath
 }
 
-func (r *Resolver) clearReachabilityIndex() { r.reachableDirsByFile = nil }
+func (r *Resolver) clearReachabilityIndex() {
+	r.reachableDirsByFile = nil
+	r.dirByFilePath = nil
+}
+
+// dirFor returns filepath.Dir(path), served from the per-file memo built in
+// buildReachabilityIndex (every indexed file is keyed) and falling back to a
+// live computation for paths not in the index. The memo turns the per-edge
+// filepath.Dir in filterByReachability — ~20% of resolution CPU on a large
+// monorepo — into a map lookup.
+func (r *Resolver) dirFor(path string) string {
+	if d, ok := r.dirByFilePath[path]; ok {
+		return d
+	}
+	return filepath.Dir(path)
+}
 
 // filterByReachability narrows candidates to those whose defining file
 // sits in a package reachable from the caller file. "Reachable" means:
@@ -2238,7 +2314,7 @@ func (r *Resolver) filterByReachability(callerFileID string, candidates []*graph
 	}
 	out := candidates[:0:0]
 	for _, c := range candidates {
-		if _, ok := reachable[filepath.Dir(c.FilePath)]; ok {
+		if _, ok := reachable[r.dirFor(c.FilePath)]; ok {
 			out = append(out, c)
 		}
 	}

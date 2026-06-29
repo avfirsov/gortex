@@ -3191,8 +3191,16 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// reverse graph on a transient parse failure. A failure that yields no
 	// symbols is not the same as a symbol genuinely deleted from source.
 	var abSnap *affectedBySnapshot
+	var reuseIdx map[reuseKey]*reuseVal
+	var priorUnresolved []*graph.Edge
 	if resolve && !idx.deferGlobalPasses && !skipped {
 		abSnap = idx.snapshotAffectedBy(graphPath)
+		// Snapshot the file's outgoing edges before eviction: resolved ones so
+		// the re-parse recovers unchanged resolutions (reuseIdx), and the ones
+		// still unresolved so the forward pass can skip re-trying them
+		// (priorUnresolved). Together this makes a save re-resolve only the
+		// references it actually changed instead of the whole file.
+		reuseIdx, priorUnresolved = captureIncrementalState(idx.graph, graphPath)
 	}
 
 	// We hold a usable result: evict the old state now, then add the
@@ -3207,6 +3215,14 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	}
 
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
+
+	// Reuse prior resolutions for edges whose source-side shape is unchanged
+	// (the common case on a small edit), so the resolver below only handles
+	// genuinely-new references instead of re-resolving the whole file.
+	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx); reused > 0 {
+		idx.logger.Debug("indexer: reused prior resolutions",
+			zap.Int("edges", reused), zap.String("file", graphPath))
+	}
 
 	// Content (incremental): clear this file's prior content rows, then
 	// re-stream + lean — mirrors the full-index per-file path so an edited
@@ -3255,7 +3271,14 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// evicted. Scoped to this file's names — not a whole-graph
 		// ResolveAll — and run as one combined pass so the resolver's
 		// per-pass indexes are built once per save, not twice.
+		//
+		// Skip re-resolving references that were already unresolved before the
+		// edit and are unchanged: they stay parked on their stubs for the
+		// incoming pass, so a small edit to a reference-heavy file no longer
+		// re-runs the candidate cascade on thousands of stdlib/external calls.
+		idx.resolver.SetIncrementalSkip(priorUnresolved)
 		idx.resolver.ResolveFileAndIncoming(graphPath)
+		idx.resolver.SetIncrementalSkip(nil)
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
 		// ResolveFile, so re-run the dataflow materialisation pass
@@ -3274,7 +3297,15 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// Skipped under deferGlobalPasses — a batch caller (ReconcileAll,
 		// warmup) runs the global pass once at the end.
 		if !idx.deferGlobalPasses {
-			if idx.cloneIndex != nil && idx.cloneIndex.built {
+			if idx.cloneIndex != nil {
+				// Seed the incremental clone index on first use — e.g. after a
+				// warm restart that loaded the graph from disk without a full
+				// re-index, `built` is false. Without this we'd fall to the
+				// whole-graph recompute on EVERY save; instead pay it once and
+				// then run the O(edited file) update.
+				if !idx.cloneIndex.built {
+					idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+				}
 				idx.cloneIndex.EvictFuncs(idx.graph, oldFuncIDs)
 				idx.cloneIndex.UpdateFuncs(idx.graph, idx.repoPrefix, cloneFuncNodes(result.Nodes), idx.cloneThreshold())
 			} else {
@@ -4747,17 +4778,19 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			idx.resolver.InferOverrides()
 		}
 		// Capability edges (reads_env / executes_process / accesses_field)
-		// re-derived from the freshly re-indexed files' base edges so the
-		// daemon's capability surface — what a supply-chain / least-privilege
-		// audit traverses — stays fresh between full indexes. Whole-graph but
-		// idempotent (AddEdge dedupes), matching the other synthesis passes
-		// re-run here.
-		synthesizeCapabilityEdges(idx.graph)
-		// Framework dynamic-dispatch synthesis — re-run because eviction
-		// may have dropped a handler, a registration edge, or an emit /
-		// listen edge, and each synthesizer's index must be rebuilt
-		// against the fresh graph. Every pass is a full recompute.
-		resolver.RunFrameworkSynthesizers(idx.graph)
+		// and framework dynamic-dispatch synthesis are whole-graph recomputes
+		// that derive edges only from structural nodes in the changed files.
+		// When nothing structural changed — no stale code file (a doc/config
+		// edit or a true zero-change reconcile) and no deletion — they can
+		// produce no new edge, so re-running them is pure cost: the dominant
+		// waste in a no-op IncrementalReindex, which the periodic janitor runs
+		// per repo per tick. Gate them on the same predicate the path-scoped
+		// IncrementalReindexPaths already uses. Deletions still trigger a
+		// re-run because an evicted file may have been a dispatch endpoint.
+		if len(deletedFiles) > 0 || idx.staleFilesAffectDerivedEdges(staleFiles) {
+			synthesizeCapabilityEdges(idx.graph)
+			resolver.RunFrameworkSynthesizers(idx.graph)
+		}
 		// External-call synthesis (opt-in) — file-scoped to the reindexed
 		// files (O(edited files)), not a full-graph recompute. Eviction
 		// already dropped a removed file's synthetic edges; a re-indexed

@@ -58,19 +58,134 @@ type Node struct {
 	// call and no allocation. Nil means "not stamped" — Type() then
 	// derives the language, which is slower but still correct.
 	langKey unsafe.Pointer
+	// arena bump-allocates Node wrappers in chunks so a deep tree walk
+	// produces a few large backing arrays instead of millions of tiny heap
+	// objects. The per-object GC mark cost dominated CPU when indexing a
+	// large TS monorepo (vscode: ~70% of cycles in GC, scanning millions of
+	// 1-node spans). Chunks are never explicitly freed — they are reachable
+	// only through the Nodes that point into them and are reclaimed by the
+	// GC once the tree's nodes are dropped. A nil arena falls back to a plain
+	// heap Node (zero-value and SetInner-pooled nodes have no arena).
+	arena *nodeArena
+}
+
+// nodeArena is a per-tree bump allocator for Node wrappers. It is not
+// safe for concurrent use; each parse tree is walked by a single
+// goroutine, and distinct files use distinct trees (and arenas).
+//
+// Arenas are pooled and reused across files (see arenaPool): a Tree takes
+// one on its first RootNode() and returns it on Close(). reset() rewinds
+// the allocation cursor but RETAINS the backing chunks, so a warm pool
+// serves each file's node count with no fresh allocation. This is the
+// dominant GC-pressure lever on a large index: profiling vscode and
+// kubernetes put tree-sitter Node wrappers at 70–82% of every byte
+// allocated, almost all of it per-file chunk garbage. Retaining the chunks
+// turns that churn into a bounded, reused working set.
+type nodeArena struct {
+	chunks [][]Node // backing arrays, retained across resets for reuse
+	ci     int      // index of the current chunk within chunks
+	used   int      // slots used in chunks[ci]
+}
+
+const (
+	// arenaFirstChunk keeps the first backing array small so a file with a
+	// handful of nodes (the common case in a many-small-files repo) wastes
+	// little; chunks then double up to arenaMaxChunk so a deep file still
+	// ends up with only a few large objects.
+	arenaFirstChunk = 64
+	arenaMaxChunk   = 4096
+)
+
+func newNodeArena() *nodeArena { return &nodeArena{} }
+
+// alloc returns a pointer to a fresh Node. The pointer is stable for the
+// life of the arena: a chunk is never resized in place — when the current
+// chunk fills, allocation advances to the next retained chunk, or appends a
+// geometrically larger one past the high-water mark, so earlier &chunk[i]
+// pointers never move. Callers overwrite all fields of the returned Node
+// immediately, so a reused slot needs no zeroing here; reset() clears stale
+// slots when the arena is recycled.
+func (a *nodeArena) alloc() *Node {
+	switch {
+	case len(a.chunks) == 0:
+		a.chunks = append(a.chunks, make([]Node, arenaFirstChunk))
+		a.ci, a.used = 0, 0
+	case a.used >= len(a.chunks[a.ci]):
+		a.ci++
+		if a.ci >= len(a.chunks) {
+			size := len(a.chunks[a.ci-1]) * 2
+			if size > arenaMaxChunk {
+				size = arenaMaxChunk
+			}
+			a.chunks = append(a.chunks, make([]Node, size))
+		}
+		a.used = 0
+	}
+	n := &a.chunks[a.ci][a.used]
+	a.used++
+	return n
+}
+
+// reset rewinds the allocation cursor to the start while retaining the
+// backing chunks for reuse. It clears the slots touched since the last
+// reset so a stale Node value — whose embedded ts.Node pins its now-closed
+// *ts.Tree — cannot survive into the next file and leak. Clearing only the
+// used prefix keeps the cost proportional to the file just processed, not
+// the high-water capacity.
+func (a *nodeArena) reset() {
+	for i := 0; i <= a.ci && i < len(a.chunks); i++ {
+		end := len(a.chunks[i])
+		if i == a.ci {
+			end = a.used
+		}
+		clear(a.chunks[i][:end])
+	}
+	a.ci, a.used = 0, 0
+}
+
+// arenaPool recycles per-tree arenas — with their retained chunks — across
+// files. A Tree gets one lazily on its first RootNode() and returns it on
+// Close(). sync.Pool may drop entries under GC pressure; a cold Get then
+// just starts with no chunks and warms up again, so correctness never
+// depends on retention.
+var arenaPool = sync.Pool{New: func() any { return &nodeArena{} }}
+
+func getArena() *nodeArena { return arenaPool.Get().(*nodeArena) }
+
+func putArena(a *nodeArena) {
+	if a == nil {
+		return
+	}
+	a.reset()
+	arenaPool.Put(a)
 }
 
 // WrapNode wraps a value Node from the new API into our shim. It derives
-// the language key eagerly so navigation from the result stays alloc-free.
+// the language key eagerly so navigation from the result stays alloc-free,
+// and seeds a fresh arena so the subtree walk below it allocates in chunks.
 func WrapNode(n ts.Node) *Node {
-	return &Node{inner: n, valid: true, langKey: unsafe.Pointer(n.Language().Inner)}
+	a := newNodeArena()
+	nn := a.alloc()
+	nn.inner = n
+	nn.valid = true
+	nn.langKey = unsafe.Pointer(n.Language().Inner)
+	nn.arena = a
+	return nn
 }
 
 // WrapVal wraps a ts.Node reached from n (e.g. a query capture),
 // carrying n's language key so Type() on the result and its descendants
 // needs neither CGO nor allocation.
 func (n *Node) WrapVal(c ts.Node) *Node {
-	return &Node{inner: c, valid: true, langKey: n.langKey}
+	if n.arena == nil {
+		return &Node{inner: c, valid: true, langKey: n.langKey}
+	}
+	nn := n.arena.alloc()
+	nn.inner = c
+	nn.valid = true
+	nn.langKey = n.langKey
+	nn.arena = n.arena
+	return nn
 }
 
 // SetInner overwrites the receiver's wrapped ts.Node and marks it
@@ -81,16 +196,6 @@ func (n *Node) WrapVal(c ts.Node) *Node {
 func (n *Node) SetInner(inner ts.Node) {
 	n.inner = inner
 	n.valid = true
-}
-
-// wrap wraps a nullable *ts.Node reached by navigating from n, carrying
-// n's language key so Type() stays allocation-free across a tree walk.
-// Returns nil for nil input.
-func (n *Node) wrap(c *ts.Node) *Node {
-	if c == nil {
-		return nil
-	}
-	return &Node{inner: *c, valid: true, langKey: n.langKey}
 }
 
 // Inner returns a pointer to the underlying ts.Node. Internal use by
@@ -168,20 +273,31 @@ func (n *Node) ChildCount() uint32 { return uint32(n.inner.ChildCount()) }
 // NamedChildCount returns the number of named children.
 func (n *Node) NamedChildCount() uint32 { return uint32(n.inner.NamedChildCount()) }
 
-// Child returns the i-th child (named or anonymous) or nil.
+// Child returns the i-th child (named or anonymous) or nil. It reaches the
+// child through a direct C call that returns the node by value, so the result
+// is bump-allocated in the arena with no go-tree-sitter heap node (newNode).
 func (n *Node) Child(i int) *Node {
 	if i < 0 {
 		return nil
 	}
-	return n.wrap(n.inner.Child(uint(i)))
+	c, ok := childDirect(n.inner, i)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
 }
 
-// NamedChild returns the i-th named child or nil.
+// NamedChild returns the i-th named child or nil. Like Child, it avoids
+// go-tree-sitter's per-node heap allocation.
 func (n *Node) NamedChild(i int) *Node {
 	if i < 0 {
 		return nil
 	}
-	return n.wrap(n.inner.NamedChild(uint(i)))
+	c, ok := namedChildDirect(n.inner, i)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
 }
 
 // NamedChildren yields n's named children, in order, walking the sibling
@@ -209,9 +325,9 @@ func (n *Node) NamedChildren() iter.Seq[*Node] {
 			return
 		}
 		for {
-			c := cursor.Node()
+			c := cursorCurrentNode(cursor)
 			if c.IsNamed() {
-				if !yield(n.WrapVal(*c)) {
+				if !yield(n.WrapVal(c)) {
 					return
 				}
 			}
@@ -223,8 +339,13 @@ func (n *Node) NamedChildren() iter.Seq[*Node] {
 }
 
 // ChildByFieldName returns the first child with the given field name or nil.
+// Uses a direct C call so the result is arena-allocated with no heap node.
 func (n *Node) ChildByFieldName(name string) *Node {
-	return n.wrap(n.inner.ChildByFieldName(name))
+	c, ok := childByFieldNameDirect(n.inner, name)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
 }
 
 // FieldNameForChild returns the field name of the i-th child, or "" if none.
@@ -235,20 +356,52 @@ func (n *Node) FieldNameForChild(i int) string {
 	return n.inner.FieldNameForChild(uint32(i))
 }
 
-// Parent returns the parent node or nil for the root.
-func (n *Node) Parent() *Node { return n.wrap(n.inner.Parent()) }
+// Parent returns the parent node or nil for the root. Avoids
+// go-tree-sitter's per-node heap allocation via a direct C call.
+func (n *Node) Parent() *Node {
+	c, ok := parentDirect(n.inner)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
+}
 
-// NextSibling returns the next sibling (named or anonymous) or nil.
-func (n *Node) NextSibling() *Node { return n.wrap(n.inner.NextSibling()) }
+// NextSibling returns the next sibling (named or anonymous) or nil. Direct C
+// call, arena-allocated result, no heap node.
+func (n *Node) NextSibling() *Node {
+	c, ok := nextSiblingDirect(n.inner)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
+}
 
 // PrevSibling returns the previous sibling (named or anonymous) or nil.
-func (n *Node) PrevSibling() *Node { return n.wrap(n.inner.PrevSibling()) }
+func (n *Node) PrevSibling() *Node {
+	c, ok := prevSiblingDirect(n.inner)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
+}
 
 // NextNamedSibling returns the next named sibling or nil.
-func (n *Node) NextNamedSibling() *Node { return n.wrap(n.inner.NextNamedSibling()) }
+func (n *Node) NextNamedSibling() *Node {
+	c, ok := nextNamedSiblingDirect(n.inner)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
+}
 
 // PrevNamedSibling returns the previous named sibling or nil.
-func (n *Node) PrevNamedSibling() *Node { return n.wrap(n.inner.PrevNamedSibling()) }
+func (n *Node) PrevNamedSibling() *Node {
+	c, ok := prevNamedSiblingDirect(n.inner)
+	if !ok {
+		return nil
+	}
+	return n.WrapVal(c)
+}
 
 // IsNamed reports whether the node corresponds to a named grammar rule.
 func (n *Node) IsNamed() bool { return n.inner.IsNamed() }
@@ -289,6 +442,7 @@ func (n *Node) Equal(other *Node) bool {
 // Tree wraps *ts.Tree.
 type Tree struct {
 	inner *ts.Tree
+	arena *nodeArena // pooled; taken lazily on first RootNode, returned on Close
 }
 
 // WrapTree wraps a *ts.Tree for internal use by the parser package.
@@ -304,18 +458,38 @@ func (t *Tree) RootNode() *Node {
 	if root == nil {
 		return nil
 	}
-	return &Node{
-		inner:   *root,
-		valid:   true,
-		langKey: unsafe.Pointer(root.Language().Inner),
+	// Take a pooled arena on first use and reuse it for any later RootNode
+	// call on the same tree, so every node walked from this tree allocates
+	// into one recycled arena. Close() returns it to the pool.
+	if t.arena == nil {
+		t.arena = getArena()
 	}
+	a := t.arena
+	nn := a.alloc()
+	nn.inner = *root
+	nn.valid = true
+	nn.langKey = unsafe.Pointer(root.Language().Inner)
+	nn.arena = a
+	return nn
 }
 
-// Close releases the tree's C resources.
+// Close releases the tree's C resources and recycles its node arena.
+//
+// The arena is returned to the pool AFTER the C tree is freed: by the
+// Tree's contract every Node wrapper is dead once Close returns, so the
+// chunks the arena retains hold nothing live. putArena's reset() clears any
+// stale slot, so a recycled arena never pins a closed tree.
 func (t *Tree) Close() {
-	if t != nil && t.inner != nil {
+	if t == nil {
+		return
+	}
+	if t.inner != nil {
 		t.inner.Close()
 		t.inner = nil
+	}
+	if t.arena != nil {
+		putArena(t.arena)
+		t.arena = nil
 	}
 }
 
