@@ -328,7 +328,7 @@ func (sg *SubGraph) SuppressRedundantTextMatches() {
 		// Drop exactly the text_matched tier. Untagged edges (rank 0)
 		// stay: they predate origin stamping and carry unknown — not
 		// low — confidence.
-		if graph.OriginRank(effectiveOrigin(e)) == textRank {
+		if e.Origin == graph.OriginTextMatched {
 			dropped++
 			continue
 		}
