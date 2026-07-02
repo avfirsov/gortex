@@ -133,6 +133,16 @@ func sniffAmbiguous(filePath, ext string, content []byte) (string, bool) {
 		if hasCppMarkers(probe) {
 			return "cpp", true
 		}
+	case ".inc":
+		// A contested extension: assembly, PHP, and Pascal each claim it by
+		// default. Reroute to C only when the fragment carries an unmistakable
+		// C signal (a C preprocessor directive, or a C block comment alongside
+		// braces) and none of the other claimants' markers — so an X-macro /
+		// generated-C ".inc" is parsed as C while PHP / Pascal / asm includes
+		// keep their default language untouched.
+		if hasCFragmentMarkers(probe) && !hasPHPMarkers(probe) && !hasPascalMarkers(probe) {
+			return "c", true
+		}
 	case ".m":
 		// Objective-C / MATLAB / Mathematica source.
 		if hasObjCMarkers(probe) {
@@ -212,6 +222,53 @@ func hasCppMarkers(b []byte) bool {
 	} {
 		if bytes.Contains(b, []byte(m)) {
 			return true
+		}
+	}
+	return false
+}
+
+// hasCFragmentMarkers reports whether a contested-extension file carries an
+// unmistakable C signal — a line-leading C preprocessor directive, or a C block
+// comment together with a brace (the shape of a generated initializer / X-macro
+// table). Deliberately conservative so it never steals a PHP / Pascal / asm
+// include.
+func hasCFragmentMarkers(b []byte) bool {
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		t := bytes.TrimLeft(line, " \t")
+		for _, d := range [][]byte{
+			[]byte("#include"), []byte("#define"), []byte("#ifndef"),
+			[]byte("#ifdef"), []byte("#pragma"), []byte("#undef"), []byte("#if "),
+		} {
+			if bytes.HasPrefix(t, d) {
+				return true
+			}
+		}
+	}
+	return bytes.Contains(b, []byte("/*")) && bytes.Contains(b, []byte("{"))
+}
+
+// hasPHPMarkers reports whether the content opens a PHP block — the marker that
+// keeps a Drupal `.inc` / `.module` include on the PHP extractor.
+func hasPHPMarkers(b []byte) bool {
+	return bytes.Contains(b, []byte("<?php")) || bytes.Contains(b, []byte("<?=")) ||
+		bytes.Contains(b, []byte("<?\n")) || bytes.Contains(b, []byte("<? "))
+}
+
+// hasPascalMarkers reports whether the content looks like a Pascal / Delphi
+// include — a unit/section keyword or a `{$...}` compiler directive.
+func hasPascalMarkers(b []byte) bool {
+	if bytes.Contains(b, []byte("{$")) {
+		return true
+	}
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		t := bytes.ToLower(bytes.TrimLeft(line, " \t"))
+		for _, kw := range [][]byte{
+			[]byte("unit "), []byte("program "), []byte("interface"),
+			[]byte("implementation"), []byte("procedure "), []byte("uses "),
+		} {
+			if bytes.HasPrefix(t, kw) {
+				return true
+			}
 		}
 	}
 	return false

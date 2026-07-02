@@ -117,6 +117,33 @@ func TestDetectLanguageContent_AmbiguousHeader(t *testing.T) {
 	assert.Equal(t, "objc", lang)
 }
 
+func TestDetectLanguageContent_CFragments(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&mockExtractor{lang: "c", exts: []string{".c", ".h", ".def"}})
+	r.Register(&mockExtractor{lang: "php", exts: []string{".php", ".inc"}})
+	r.Register(&mockExtractor{lang: "pascal", exts: []string{".pas", ".inc"}})
+	r.Register(&mockExtractor{lang: "assembly", exts: []string{".asm", ".inc"}})
+
+	// A generated .def command table maps to C unconditionally (uncontested).
+	lang, ok := r.DetectLanguageContent("src/commands.def", []byte("{MAKE_CMD(\"get\", getCommand, 2)},\n"))
+	assert.True(t, ok)
+	assert.Equal(t, "c", lang)
+
+	// A clearly-C .inc fragment is content-routed to C despite the contested
+	// extension.
+	lang, ok = r.DetectLanguageContent("src/table.inc", []byte("#include \"server.h\"\n{MAKE_CMD(\"x\", xCommand)},\n"))
+	assert.True(t, ok)
+	assert.Equal(t, "c", lang)
+
+	// A PHP include is never stolen by the C reroute.
+	lang, _ = r.DetectLanguageContent("web/util.inc", []byte("<?php\nfunction f() {}\n"))
+	assert.NotEqual(t, "c", lang, "php include must not be detected as C")
+
+	// A Pascal include is never stolen by the C reroute.
+	lang, _ = r.DetectLanguageContent("src/types.inc", []byte("unit Types;\ninterface\nprocedure Foo;\n"))
+	assert.NotEqual(t, "c", lang, "pascal include must not be detected as C")
+}
+
 func TestDetectLanguageContent_AmbiguousDotM(t *testing.T) {
 	r := ambiguityRegistry()
 

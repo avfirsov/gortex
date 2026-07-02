@@ -425,11 +425,8 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
 	// repo's language nodes — the references pass below confirms / refutes
 	// them. The indexed GetRepoEdges scan + the id-set replaces the AllEdges
-	// walk with a per-edge GetNode.
-	type enrichTarget struct {
-		node *graph.Node
-		edge *graph.Edge
-	}
+	// walk with a per-edge GetNode. (enrichTarget is package-scoped so the
+	// confirm-pass grouping / matching helpers can take it.)
 	var targets []enrichTarget
 	for _, e := range p.repoScopedEdges(g, repoPrefix) {
 		if e.Confidence >= 1.0 {
@@ -486,10 +483,27 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// graph tiers and find_usages accuracy, while hover only stamps type
 	// strings. Each item commits to the graph as soon as it resolves, so
 	// a deadline cut loses only the un-visited remainder.
+	//
+	// Deadline budgeting: the reference-confirm pass is round-trip bound and
+	// can, on a medium repo, consume the entire per-repo deadline before the
+	// hover / hierarchy add phase runs at all — leaving edges_added stuck at 0.
+	// targetedCtx caps the targeted-edge passes (implementations + confirm) at
+	// a fraction of the window, reserving the remainder for the sweep so both
+	// phases make progress. With no deadline (tests) it is the parent context.
+	targetedCtx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		window := dl.Sub(start)
+		reserve := time.Duration(float64(window) * enrichSweepReserveFraction)
+		if reserve > 0 && reserve < window {
+			var cancelTargeted context.CancelFunc
+			targetedCtx, cancelTargeted = context.WithDeadline(ctx, dl.Add(-reserve))
+			defer cancelTargeted()
+		}
+	}
 
 	// Query implementations for interface nodes.
 	for _, n := range langNodes {
-		if ctx.Err() != nil {
+		if targetedCtx.Err() != nil {
 			break
 		}
 		if n.Kind != graph.KindInterface {
@@ -501,6 +515,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 
 		rel := nodeRelPath(n)
+		if !p.servesFile(rel) {
+			continue // never open a file this server can't compile
+		}
 		// Per-item doc lifecycle (no bulk pre-open): open this interface's
 		// file, query, close immediately so memory stays bounded.
 		if err := p.openDocument(absRoot, rel); err != nil {
@@ -550,100 +567,130 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// of the wrong target inside the caller's span rubber-stamped the
 	// edge bound at the OTHER member's line — a compiler-grade tier
 	// serving the wrong declaration.
+	//
+	// The sweep fans out across maxParallel, grouped by the referent's file
+	// so each file is opened once (per-goroutine, via enrichOpenDoc) and
+	// serves every target sharing it — turning the ~7 edges/s sequential
+	// round-trip loop into maxParallel-wide throughput. The definition-rebind
+	// fallback opens arbitrary call-site files, so it runs serially afterward
+	// over the targets the sweep left unconfirmed, keeping document open/close
+	// from overlapping across goroutines.
+	confirmGroups := p.groupConfirmTargets(g, targets)
+	var confirmMu sync.Mutex
+	var fallback []enrichTarget
+	{
+		sem := make(chan struct{}, p.maxParallel)
+		var wg sync.WaitGroup
+		for _, grp := range confirmGroups {
+			if targetedCtx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(grp *confirmGroup) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				if targetedCtx.Err() != nil {
+					return
+				}
+				absPath := filepath.Join(absRoot, grp.rel)
+				content, err := os.ReadFile(absPath)
+				if err != nil {
+					return
+				}
+				// Per-goroutine didOpen against the shared client — the file
+				// is unique to this group, so no two goroutines open it.
+				if err := p.enrichOpenDoc(p.client, absPath, content); err != nil {
+					return
+				}
+				defer func() { _ = p.enrichCloseDoc(p.client, absPath) }()
+				for _, t := range grp.targets {
+					if targetedCtx.Err() != nil {
+						return
+					}
+					toNode := g.GetNode(t.edge.To)
+					if toNode == nil {
+						continue
+					}
+					line, ok := lspLine(toNode)
+					if !ok {
+						continue
+					}
+					col := identifierColumn(content, toNode.StartLine, toNode.Name)
+					refs, err := p.findReferences(absRoot, grp.rel, line, col)
+					if err != nil {
+						continue
+					}
+					if p.confirmRefMatchesSite(refs, absRoot, repoPrefix, t) {
+						rmu.Lock()
+						semantic.ConfirmEdge(t.edge, p.Name())
+						semantic.PersistEdge(g, t.edge)
+						rmu.Unlock()
+						confirmMu.Lock()
+						result.EdgesConfirmed++
+						confirmMu.Unlock()
+						continue
+					}
+					// Unconfirmed with a recorded site line: defer to the
+					// serial definition-rebind fallback below.
+					if t.edge.Line > 0 {
+						confirmMu.Lock()
+						fallback = append(fallback, t)
+						confirmMu.Unlock()
+					}
+				}
+			}(grp)
+		}
+		wg.Wait()
+	}
+
+	// Serial definition-rebind fallback: for a site the reference sweep did
+	// not tie to the edge's target, ask the server what the site actually
+	// resolves to (textDocument/definition at the site identifier). When the
+	// definition lands back on the target we confirm anyway (reference lists
+	// can be incomplete); when it names a DIFFERENT known declaration we
+	// rebind the edge to the correct target instead of leaving a
+	// misattribution behind. Runs after the parallel sweep so arbitrary
+	// call-site document opens never overlap across goroutines.
 	defSiteCache := map[string]*graph.Node{}
-	for _, t := range targets {
-		if ctx.Err() != nil {
+	for _, t := range fallback {
+		if targetedCtx.Err() != nil {
 			break
 		}
 		toNode := g.GetNode(t.edge.To)
 		if toNode == nil {
 			continue
 		}
-		line, ok := lspLine(toNode)
-		if !ok {
-			continue
-		}
-
-		toRel := nodeRelPath(toNode)
-		// Per-item doc lifecycle (no bulk pre-open): open the referent's
-		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, toRel); err != nil {
-			continue
-		}
-		col := identifierColumn(p.getSource(absRoot, toRel), toNode.StartLine, toNode.Name)
-		refs, err := p.findReferences(absRoot, toRel, line, col)
-		_ = p.closeDocument(filepath.Join(absRoot, toRel))
-		if err != nil {
-			continue
-		}
-
-		// uriToPath returns a repo-relative path while node/edge FilePaths
-		// are prefixed, so compare against stripped paths.
 		callerRel := nodeRelPath(t.node)
 		siteRel := edgeSiteRelPath(t.edge, repoPrefix, callerRel)
+		if !p.servesFile(siteRel) {
+			continue // never open a call-site file this server can't compile
+		}
 		siteLine := t.edge.Line
-
-		confirmed := false
-		for _, ref := range refs {
-			refPath := uriToPath(ref.URI, absRoot)
-			refLine := ref.Range.Start.Line + 1
-			if siteLine > 0 {
-				// Site-anchored: a reference of the target declaration at
-				// the edge's recorded line proves this site binds to this
-				// declaration. ±1 tolerates wrapped call expressions where
-				// the extractor and the server anchor on adjacent lines.
-				if refPath == siteRel && refLine >= siteLine-1 && refLine <= siteLine+1 {
-					confirmed = true
-					break
-				}
-				continue
-			}
-			// Legacy fallback for edges without a recorded site line:
-			// containment in the caller's span is the best we can do.
-			if refPath == callerRel &&
-				refLine >= t.node.StartLine &&
-				refLine <= t.node.EndLine {
-				confirmed = true
-				break
-			}
-		}
-
-		if !confirmed && siteLine > 0 {
-			// The reference sweep did not tie this site to the edge's
-			// target. Ask the server what the site actually resolves to
-			// (textDocument/definition at the site identifier): when the
-			// definition lands back on the target we confirm anyway
-			// (reference lists can be incomplete); when it names a
-			// DIFFERENT known declaration we rebind the edge to the
-			// correct target instead of leaving a misattribution behind.
-			cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, defSiteCache)
-			switch {
-			case !ok || cand == nil:
-				// No verdict — leave the edge at its heuristic tier so
-				// min_tier filtering excludes it.
-			case cand.ID == toNode.ID:
-				confirmed = true
-			case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(g, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
-				rmu.Lock()
-				// Mutate the full edge state BEFORE ReindexEdge: disk
-				// backends persist the post-mutation struct verbatim
-				// (delete old key + insert current state), so anything
-				// stamped afterwards would be dropped.
-				oldTo := t.edge.To
-				t.edge.To = cand.ID
-				semantic.ConfirmEdge(t.edge, p.Name())
-				t.edge.Meta["rebound_from"] = oldTo
-				g.ReindexEdge(t.edge, oldTo)
-				rmu.Unlock()
-				result.EdgesConfirmed++
-				continue
-			}
-		}
-
-		if confirmed {
+		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, defSiteCache)
+		switch {
+		case !ok || cand == nil:
+			// No verdict — leave the edge at its heuristic tier so
+			// min_tier filtering excludes it.
+		case cand.ID == toNode.ID:
 			rmu.Lock()
 			semantic.ConfirmEdge(t.edge, p.Name())
 			semantic.PersistEdge(g, t.edge)
+			rmu.Unlock()
+			result.EdgesConfirmed++
+		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(g, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
+			rmu.Lock()
+			// Mutate the full edge state BEFORE ReindexEdge: disk
+			// backends persist the post-mutation struct verbatim
+			// (delete old key + insert current state), so anything
+			// stamped afterwards would be dropped.
+			oldTo := t.edge.To
+			t.edge.To = cand.ID
+			semantic.ConfirmEdge(t.edge, p.Name())
+			t.edge.Meta["rebound_from"] = oldTo
+			g.ReindexEdge(t.edge, oldTo)
 			rmu.Unlock()
 			result.EdgesConfirmed++
 		}
@@ -689,6 +736,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	var aborted atomic.Bool
 	var abortErr error
 	var abortOnce sync.Once
+	// reconnectCycles counts distinct reconnect cycles this pass — a server
+	// that connects fine but keeps exiting mid-request (e.g. clangd crashing in
+	// a lint matcher) would otherwise reconnect endlessly, repeating work and
+	// pinning the process at high CPU. The crash-loop guard caps it.
+	var reconnectCycles atomic.Int64
 
 	// reconnect serialises mid-flight recovery so that when a burst of
 	// goroutines observe the same dead client only the first rebuilds it;
@@ -701,6 +753,25 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		if cur := activeClient.Load(); cur != stale {
 			return cur, nil // someone else already reconnected
+		}
+		// Crash-loop guard: past the per-pass cap, abandon this provider's
+		// enrichment for the repo rather than reconnect again. Whatever already
+		// flushed stays in the graph; the caller sees the failure and the log
+		// names the provider, repo, and reconnect count.
+		if cycles := reconnectCycles.Add(1); cycles > maxEnrichReconnectCycles {
+			err := fmt.Errorf("LSP provider %q exited %d times during enrichment of repo %q; abandoning pass",
+				p.Name(), cycles, repoPrefix)
+			abortOnce.Do(func() {
+				abortErr = err
+				aborted.Store(true)
+			})
+			p.logger.Warn("LSP enrich: crash-loop guard tripped, abandoning provider",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Int64("reconnect_cycles", cycles),
+				zap.Int64("reconnect_attempts", p.reconnectAttempts.Load()),
+			)
+			return nil, err
 		}
 		newC, err := p.reconnectWithBackoff(absRoot)
 		if err != nil {
@@ -724,9 +795,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	var fileList []*fileTargets
 	fileIndex := map[string]*fileTargets{}
 	for _, n := range langNodes {
+		rel := nodeRelPath(n)
+		if !p.servesFile(rel) {
+			continue // never open a file this server can't compile
+		}
 		ft := fileIndex[n.FilePath]
 		if ft == nil {
-			ft = &fileTargets{rel: nodeRelPath(n)}
+			ft = &fileTargets{rel: rel}
 			fileIndex[n.FilePath] = ft
 			fileList = append(fileList, ft)
 		}
@@ -1932,6 +2007,13 @@ func isServerExitError(err error) bool {
 // at a time; backoff prevents a tight retry loop against a persistently
 // dead server.
 // KEYWORDS — lsp, reconnect, backoff, recovery
+// maxEnrichReconnectCycles caps how many times a single enrichment pass will
+// reconnect to a provider that keeps exiting mid-request. reconnectWithBackoff
+// (below) caps the connection retries within ONE cycle; this caps the number of
+// cycles, so a server that reconnects cleanly but crashes again on the next
+// request can't pin the pass in an endless crash -> reconnect -> crash loop.
+const maxEnrichReconnectCycles = 5
+
 func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
 	const maxReconnectAttempts = 5
 	backoff := p.dialBackoffStart
@@ -2390,6 +2472,30 @@ func addOverrideEdges(g graph.Store, child, parent *graph.Node, provider, origin
 func (p *Provider) languageMatches(lang string) bool {
 	for _, l := range p.languages {
 		if l == lang {
+			return true
+		}
+	}
+	return false
+}
+
+// servesFile reports whether relPath's extension is one this provider's server
+// can actually compile — the guard that stops enrichment from ever sending a
+// language server a file outside its coverage. Without it, an ambiguous edge
+// or interface whose file is an asset (.png/.svg) or an unrelated script (.sh)
+// would be opened on, say, clangd, which then tries to build an AST with an
+// inferred C++ compile command and logs invalid-AST churn for zero signal.
+// With no ServerSpec (unit-test providers) it defaults to true so fakes that
+// drive arbitrary extensions are unaffected.
+func (p *Provider) servesFile(relPath string) bool {
+	if p.spec == nil || len(p.spec.Extensions) == 0 {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if ext == "" {
+		return false
+	}
+	for _, e := range p.spec.Extensions {
+		if strings.ToLower(e) == ext {
 			return true
 		}
 	}
