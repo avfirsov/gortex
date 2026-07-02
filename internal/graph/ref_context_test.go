@@ -23,7 +23,9 @@ func TestRefContextOf(t *testing.T) {
 		{"call", EdgeCalls, KindFunction, nil, RefContextCall},
 		{"instantiate", EdgeInstantiates, KindFunction, nil, RefContextCall},
 		{"meta_override", EdgeReferences, KindFunction, map[string]any{"ref_context": RefContextGenericArg}, RefContextGenericArg},
-		{"no_context", EdgeImports, KindFile, nil, ""},
+		{"import", EdgeImports, KindFile, nil, RefContextImport},
+		{"re_export", EdgeReExports, KindFile, nil, RefContextImport},
+		{"no_context", EdgeContains, KindFile, nil, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

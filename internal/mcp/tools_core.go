@@ -29,7 +29,10 @@ const minTierParamDescription = "Filter edges by minimum confidence tier. " +
 	"lsp_dispatch (interface→impl via semantic provider), " +
 	"ast_resolved (tree-sitter direct match), " +
 	"ast_inferred (type heuristic), " +
-	"text_matched (name-only). Omit for no filter. " +
+	"text_matched (name-only). When omitted, text_matched edges are " +
+	"auto-suppressed whenever resolver-verified evidence exists — the " +
+	"response then carries text_matched_suppressed with the hidden count; " +
+	"pass min_tier:\"text_matched\" to include them. " +
 	"Use lsp_resolved for high-stakes refactors where false positives are expensive."
 
 const includeSpeculativeParamDescription = "Include best-guess speculative " +
@@ -1092,7 +1095,7 @@ func (s *Server) registerCoreTools() {
 			mcp.WithBoolean("include_speculative", mcp.Description(includeSpeculativeParamDescription)),
 			mcp.WithBoolean("exclude_tests", mcp.Description("Drop references originating in test functions (set true to see only production usages)")),
 			mcp.WithString("group_by", mcp.Description("Set to \"file\" to bucket the usages by the file each reference originates in -- each group carries the per-file use count and the enclosing symbol of every reference. Omit for the default flat result.")),
-			mcp.WithString("context", mcp.Description("Filter usages by their reference context — the role the symbol plays at each site: parameter_type, return_type, field, value, type, attribute, generic_arg, or call. Every returned usage also carries its classified context. Omit for all usages.")),
+			mcp.WithString("context", mcp.Description("Filter usages by their reference context — the role the symbol plays at each site: parameter_type, return_type, field, value, type, attribute, generic_arg, call, or import (import / re-export statement lines). Every returned usage also carries its classified context. Omit for all usages.")),
 			mcp.WithString("return_usage", mcp.Description("Filter call-site usages by how they consume the callee's return value: discarded, assigned, partially_ignored, returned, goroutine, deferred, argument, or condition. Every returned call usage also carries its classification when the extractor recorded one. Use before changing a function's return signature to see who actually uses the return. Omit for all usages.")),
 			mcp.WithString("flavor", mcp.Description("Filter usages by the structural flavor of where they originate (comma-separated, union). A type flavor (class, struct, enum, interface, trait, …) keeps usages whose FROM site sits inside an enclosing type of that flavor — \"usages from inside a struct\". The special value `component` keeps usages from inside a UI component (React / Vue / SwiftUI / …). Each returned usage carries the resolved from_type_flavor / from_ui_component.")),
 		),
@@ -1819,6 +1822,16 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if nextCursor != "" {
 		resp["next_cursor"] = nextCursor
 	}
+	// A repo-narrowed zero is indistinguishable from "not indexed" in
+	// clients that never render _meta. Say it in the body — and since the
+	// result is empty anyway, pay one extra BM25 fetch to report whether
+	// widening would actually help.
+	if total == 0 && len(resolved.RepoAllow) > 0 {
+		wide := scope
+		wide.RepoAllow = nil
+		wideNodes, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
+		resp["scope_note"] = scopeZeroNote(resolved, len(wideNodes))
+	}
 	if filtersRelaxed {
 		resp["filters_relaxed"] = true
 	}
@@ -2227,6 +2240,11 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	sg = filterSubGraphByResolvedScope(sg, resolved)
 	sg.FilterByMinTier(minTier)
 	sg.FilterSpeculative(req.GetBool("include_speculative", false))
+	if minTier == "" {
+		// Same adaptive default as find_usages: hide the name-only
+		// fan-out once resolver-verified callers exist.
+		sg.SuppressRedundantTextMatches()
+	}
 	enrichSubGraphEdges(sg)
 	annotateCallerConcurrency(eng.Reader(), sg, id)
 	if len(sg.Edges) == 0 {
@@ -2440,6 +2458,12 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	sg = filterSubGraphByResolvedScope(sg, resolved)
 	sg.FilterByMinTier(minTier)
 	sg.FilterSpeculative(req.GetBool("include_speculative", false))
+	if minTier == "" {
+		// Adaptive default: with resolver-verified usages present, the
+		// text_matched fan-out is noise — suppress it and report the count
+		// via text_matched_suppressed. min_tier:"text_matched" restores it.
+		sg.SuppressRedundantTextMatches()
+	}
 	enrichSubGraphEdges(sg)
 	// Classify each usage's reference context (parameter_type / return_type
 	// / field / value / type / attribute / call) and optionally filter to

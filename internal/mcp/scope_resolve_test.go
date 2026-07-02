@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -667,4 +668,236 @@ func containsStr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ─── single-repo (unprefixed) regression ────────────────────────────────────
+
+// newLoneRepoServer builds the fresh-install shape: a daemon tracking
+// exactly ONE repo, no .gortex.yaml. Single-repo indexing mints
+// UNPREFIXED node IDs (RepoMetadata.Unprefixed) while the registry —
+// and therefore ScopeForCWD / every RepoAllow set — keys the repo by
+// its config name.
+func newLoneRepoServer(t *testing.T, flagOn bool) (*Server, string) {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), "lone-repo")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
+		[]byte("package main\n\nfunc LoneThing() {}\n"), 0o644))
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{{Path: dir, Name: "lone-repo"}},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	bm := search.NewBM25()
+	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	eng := query.NewEngine(g)
+	eng.SetSearch(bm)
+
+	flagVal := flagOn
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+		MultiIndexer:        mi,
+		ConfigManager:       cm,
+		ScopeIntentDefaults: &flagVal,
+	})
+	return srv, dir
+}
+
+// TestIntentDefaults_SearchSymbols_LoneUnprefixedRepo is the
+// fresh-install zero-rows regression: with intent defaults ON, a
+// session bound inside the lone tracked repo runs search_symbols; the
+// Locate default narrows RepoAllow to the registry prefix
+// ("lone-repo") while every node carries RepoPrefix == "". The
+// RepoAllow filter must admit the lone repo's own unprefixed nodes.
+func TestIntentDefaults_SearchSymbols_LoneUnprefixedRepo(t *testing.T) {
+	srv, dir := newLoneRepoServer(t, true)
+	ctx := sessionCtx("s-lone", dir)
+
+	// Precondition: this fixture really is unprefixed single-repo mode.
+	sym := srv.graph.GetNode("main.go::LoneThing")
+	require.NotNil(t, sym, "single-repo indexing must mint unprefixed node IDs")
+	require.Empty(t, sym.RepoPrefix, "single-repo nodes must carry no RepoPrefix")
+
+	// And the Locate intent default really narrows to the registry prefix.
+	scope, errRes := srv.resolveScope(ctx, makeReq("search_symbols", nil), IntentLocate)
+	require.Nil(t, errRes)
+	require.True(t, scope.RepoAllow["lone-repo"],
+		"bound-session Locate default must narrow to the home repo prefix")
+
+	req := makeReq("search_symbols", map[string]any{"query": "LoneThing"})
+	res, err := srv.handleSearchSymbols(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError, "search_symbols must not error")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	ids := resultIDs(resp)
+	require.NotEmpty(t, ids,
+		"search_symbols must find the lone repo's symbols (fresh-install zero-rows regression)")
+	foundLone := false
+	for _, id := range ids {
+		if containsStr(id, "LoneThing") {
+			foundLone = true
+		}
+	}
+	assert.True(t, foundLone, "LoneThing must be in results")
+}
+
+// TestIntentDefaults_ExplicitRepoArg_LoneUnprefixedRepo covers the
+// explicit-narrowing variant of the same regression: `repo:` naming
+// the lone repo (what the CLI's inline field query lowers to) must
+// also admit the unprefixed nodes.
+func TestIntentDefaults_ExplicitRepoArg_LoneUnprefixedRepo(t *testing.T) {
+	srv, dir := newLoneRepoServer(t, true)
+	ctx := sessionCtx("s-lone", dir)
+
+	req := makeReq("search_symbols", map[string]any{"query": "LoneThing", "repo": "lone-repo"})
+	res, err := srv.handleSearchSymbols(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError, "search_symbols must not error")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	require.NotEmpty(t, resultIDs(resp),
+		"explicit repo narrowing must not hide the lone repo's own nodes")
+}
+
+// TestFilterTextMatches_LoneUnprefixedRepoAttribution covers the
+// search_text arm of the regression: GrepTextForRepos stamps the
+// registry prefix onto match paths ("lone-repo/main.go") while the
+// graph keys files unprefixed ("main.go"). Node attribution must
+// strip the stamped prefix for an Unprefixed repo instead of
+// fail-closed-dropping every match.
+func TestFilterTextMatches_LoneUnprefixedRepoAttribution(t *testing.T) {
+	srv, _ := newLoneRepoServer(t, true)
+
+	require.NotNil(t, srv.graph.GetNode("main.go"), "file node must exist unprefixed")
+
+	matches := []trigram.Match{{Path: "lone-repo/main.go", Line: 3, Text: "func LoneThing() {}"}}
+	resolved := ResolvedScope{
+		WorkspaceID: "lone-repo",
+		RepoAllow:   map[string]bool{"lone-repo": true},
+	}
+	kept := srv.filterTextMatchesByResolvedScope(matches, resolved)
+	require.Len(t, kept, 1,
+		"a stamped match in an unprefixed lone repo must attribute to its graph node")
+}
+
+// newTwoRepoServer builds a server tracking two repos ("alpha" holding
+// AlphaThing, "beta" holding ZebraWidget) — multi-repo mode, so nodes carry
+// registry prefixes and the Locate intent default genuinely narrows.
+func newTwoRepoServer(t *testing.T) (*Server, string) {
+	t.Helper()
+
+	alphaDir := filepath.Join(t.TempDir(), "alpha")
+	betaDir := filepath.Join(t.TempDir(), "beta")
+	require.NoError(t, os.MkdirAll(alphaDir, 0o755))
+	require.NoError(t, os.MkdirAll(betaDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(alphaDir, "main.go"),
+		[]byte("package main\n\nfunc AlphaThing() {}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(betaDir, "main.go"),
+		[]byte("package main\n\nfunc ZebraWidget() {}\n"), 0o644))
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	// Both repos share one declared workspace: repo:"*" widens RepoAllow
+	// but never crosses workspaces, so the "candidates outside the scope"
+	// recheck is only meaningful inside a shared workspace.
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: alphaDir, Name: "alpha", Workspace: "shared"},
+			{Path: betaDir, Name: "beta", Workspace: "shared"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	bm := search.NewBM25()
+	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
+	_, err = mi.IndexScoped("", "")
+	require.NoError(t, err)
+
+	eng := query.NewEngine(g)
+	eng.SetSearch(bm)
+
+	flagVal := true
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+		MultiIndexer:        mi,
+		ConfigManager:       cm,
+		ScopeIntentDefaults: &flagVal,
+	})
+	return srv, alphaDir
+}
+
+// TestScopeNote_SearchSymbols_NarrowedZeroIsBodyVisible: a session bound
+// in repo alpha searches for a symbol that lives only in repo beta. The
+// Locate default narrows to alpha → 0 results — and the response BODY
+// must say so, including that candidates exist outside the scope. The
+// _meta-only disclosure is invisible in CLI output and most clients.
+func TestScopeNote_SearchSymbols_NarrowedZeroIsBodyVisible(t *testing.T) {
+	srv, alphaDir := newTwoRepoServer(t)
+	ctx := sessionCtx("s-note", alphaDir)
+
+	req := makeReq("search_symbols", map[string]any{"query": "ZebraWidget"})
+	res, err := srv.handleSearchSymbols(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	require.Empty(t, resultIDs(resp), "ZebraWidget must be filtered out by the alpha narrowing")
+
+	note, _ := resp["scope_note"].(string)
+	require.NotEmpty(t, note, "a scope-narrowed zero must carry a body-visible scope_note")
+	assert.Contains(t, note, "outside", "the recheck must report candidates beyond the scope")
+	assert.Contains(t, note, `repo:"*"`, "the note must teach the widen escape hatch")
+}
+
+// TestScopeNote_SearchSymbols_AbsentOnHitsAndOnTrueZero: no note rides a
+// result that has hits, and a query matching nothing anywhere reports the
+// recheck came back empty too.
+func TestScopeNote_SearchSymbols_AbsentOnHitsAndOnTrueZero(t *testing.T) {
+	srv, alphaDir := newTwoRepoServer(t)
+	ctx := sessionCtx("s-note2", alphaDir)
+
+	res, err := srv.handleSearchSymbols(ctx, makeReq("search_symbols", map[string]any{"query": "AlphaThing"}))
+	require.NoError(t, err)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	require.NotEmpty(t, resultIDs(resp))
+	_, hasNote := resp["scope_note"]
+	assert.False(t, hasNote, "results with hits must not carry a scope_note")
+
+	res, err = srv.handleSearchSymbols(ctx, makeReq("search_symbols", map[string]any{"query": "NoSuchIdentifierAnywhere"}))
+	require.NoError(t, err)
+	resp = map[string]any{}
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	if note, ok := resp["scope_note"].(string); ok {
+		assert.Contains(t, note, "also found nothing",
+			"a true zero must say the workspace-wide recheck found nothing")
+	}
+}
+
+func TestScopeZeroNote_Branches(t *testing.T) {
+	scope := ResolvedScope{RepoAllow: map[string]bool{"alpha": true}, Applied: "repo:alpha"}
+	assert.Contains(t, scopeZeroNote(scope, 3), "3 candidate(s)")
+	assert.Contains(t, scopeZeroNote(scope, 0), "also found nothing")
+	assert.Contains(t, scopeZeroNote(scope, -1), `widen with repo:"*"`)
 }

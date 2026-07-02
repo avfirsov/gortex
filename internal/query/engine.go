@@ -1526,6 +1526,13 @@ func isUsageEdgeKind(k graph.EdgeKind) bool {
 		graph.EdgeReturns, graph.EdgeTypedAs,
 		graph.EdgeImplements, graph.EdgeExtends,
 		graph.EdgeComposes,
+		// Import / re-export statements ARE usages: every LSP reference
+		// set counts the `from x import name` / `export {name} from …`
+		// line, and a symbol whose only consumers import it through a
+		// façade otherwise looks unused. These edges point at symbol
+		// nodes only where extractors bind them (Python, JS/TS); Go
+		// imports target package nodes, so Go results are unaffected.
+		graph.EdgeImports, graph.EdgeReExports,
 		graph.EdgeProvides, graph.EdgeConsumes,
 		graph.EdgeReadsConfig, graph.EdgeWritesConfig,
 		graph.EdgeUsesEnv, graph.EdgeConfigures,

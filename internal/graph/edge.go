@@ -912,6 +912,11 @@ const (
 	RefContextAttribute     = "attribute"
 	RefContextGenericArg    = "generic_arg"
 	RefContextCall          = "call"
+	// RefContextImport marks an import / re-export statement that names the
+	// symbol (`from x import name`, `import {name} from …`, `export {name}
+	// from …`). LSP reference sets include these lines; find_usages can
+	// isolate or exclude them via context:"import".
+	RefContextImport = "import"
 	// RefContextCallback marks a function referenced as a value to be invoked
 	// later — registered as a callback / handler rather than called directly.
 	RefContextCallback = "callback"
@@ -991,6 +996,8 @@ func RefContextOf(e *Edge, fromKind NodeKind) string {
 		return RefContextType
 	case EdgeCalls, EdgeInstantiates:
 		return RefContextCall
+	case EdgeImports, EdgeReExports:
+		return RefContextImport
 	}
 	return ""
 }

@@ -16,6 +16,12 @@ type SubGraph struct {
 	TotalNodes int           `json:"total_nodes"`
 	TotalEdges int           `json:"total_edges"`
 	Truncated  bool          `json:"truncated"`
+	// TextMatchedSuppressed counts name-only (text_matched) edges dropped
+	// by the adaptive default: once the result carries resolver-verified
+	// evidence for the symbol, the name-only fan-out is redundant noise.
+	// Zero — and omitted — when nothing was suppressed. Re-run with
+	// min_tier:"text_matched" to include the hidden rows.
+	TextMatchedSuppressed int `json:"text_matched_suppressed,omitempty"`
 	// Caveat is attached only when an edge-returning query (find_usages,
 	// get_callers) comes back with no edges, classifying whether the
 	// empty result reflects genuinely unused code or an extraction gap.
@@ -240,7 +246,14 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 			}
 		}
 	}
-	if len(o.RepoAllow) > 0 && !o.RepoAllow[n.RepoPrefix] {
+	// A node with an empty RepoPrefix was minted in single-repo
+	// (unprefixed) mode — the RepoAllow keys are registry prefixes,
+	// which unprefixed nodes never carry, so a repo narrow can only
+	// ever be satisfied vacuously. Admit the node: the workspace /
+	// project checks above still bound it for scoped sessions. Same
+	// carve-out the MCP layer's filterNodes / field-query / API-impact
+	// filters already apply.
+	if len(o.RepoAllow) > 0 && n.RepoPrefix != "" && !o.RepoAllow[n.RepoPrefix] {
 		return false
 	}
 	return true
@@ -269,16 +282,75 @@ func (sg *SubGraph) FilterByMinTier(minTier string) {
 	}
 	kept := make([]*graph.Edge, 0, len(sg.Edges))
 	for _, e := range sg.Edges {
-		origin := e.Origin
-		if origin == "" {
-			src, _ := e.Meta["semantic_source"].(string)
-			origin = graph.DefaultOriginFor(e.Kind, e.Confidence, src)
-		}
-		if graph.MeetsMinTier(origin, minTier) {
+		if graph.MeetsMinTier(effectiveOrigin(e), minTier) {
 			kept = append(kept, e)
 		}
 	}
 	sg.Edges = kept
+}
+
+// effectiveOrigin returns the edge's origin tier, backfilled for edges
+// produced before Origin existed (or by providers not yet stamping it).
+func effectiveOrigin(e *graph.Edge) string {
+	if e.Origin != "" {
+		return e.Origin
+	}
+	src, _ := e.Meta["semantic_source"].(string)
+	return graph.DefaultOriginFor(e.Kind, e.Confidence, src)
+}
+
+// SuppressRedundantTextMatches drops text_matched edges when the result
+// also carries resolver-verified evidence (ast_inferred or better): once a
+// symbol has real resolved references, the name-only fan-out — every
+// same-named token in the repo — buries them. When text matches are the
+// ONLY evidence they are all kept, so recall through dynamic code paths
+// never regresses. Orphaned nodes are pruned; the drop count lands in
+// TextMatchedSuppressed. Callers apply this only when the user did not
+// pass an explicit min_tier.
+func (sg *SubGraph) SuppressRedundantTextMatches() {
+	if sg == nil || len(sg.Edges) == 0 {
+		return
+	}
+	textRank := graph.OriginRank(graph.OriginTextMatched)
+	stronger := false
+	for _, e := range sg.Edges {
+		if graph.OriginRank(effectiveOrigin(e)) > textRank {
+			stronger = true
+			break
+		}
+	}
+	if !stronger {
+		return
+	}
+	kept := make([]*graph.Edge, 0, len(sg.Edges))
+	dropped := 0
+	for _, e := range sg.Edges {
+		// Drop exactly the text_matched tier. Untagged edges (rank 0)
+		// stay: they predate origin stamping and carry unknown — not
+		// low — confidence.
+		if graph.OriginRank(effectiveOrigin(e)) == textRank {
+			dropped++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if dropped == 0 {
+		return
+	}
+	sg.Edges = kept
+	sg.TextMatchedSuppressed = dropped
+	referenced := make(map[string]struct{}, len(kept)*2)
+	for _, e := range kept {
+		referenced[e.From] = struct{}{}
+		referenced[e.To] = struct{}{}
+	}
+	nodes := make([]*graph.Node, 0, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if _, ok := referenced[n.ID]; ok {
+			nodes = append(nodes, n)
+		}
+	}
+	sg.Nodes = nodes
 }
 
 // FilterSpeculative drops best-guess speculative edges (Meta[speculative]=true)

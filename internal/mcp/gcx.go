@@ -391,6 +391,9 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
 	meta = append(meta, zeroEdgeCaveatMeta(sg.Caveat)...)
+	if sg.TextMatchedSuppressed > 0 {
+		meta = append(meta, "text_matched_suppressed", fmt.Sprintf("%d", sg.TextMatchedSuppressed))
+	}
 	enc := newGCX(&buf, "find_usages",
 		[]string{"from", "to", "edge_kind", "context", "return_usage", "origin", "tier", "confidence", "from_name", "from_path", "from_line", "from_is_test", "from_test_role", "from_test_runner", "from_type_flavor", "from_ui_component"},
 		meta...,
@@ -478,6 +481,9 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 	}
 	edgeMeta := []string{"count", fmt.Sprintf("%d", len(sg.Edges))}
 	edgeMeta = append(edgeMeta, zeroEdgeCaveatMeta(sg.Caveat)...)
+	if sg.TextMatchedSuppressed > 0 {
+		edgeMeta = append(edgeMeta, "text_matched_suppressed", fmt.Sprintf("%d", sg.TextMatchedSuppressed))
+	}
 	edgeEnc := newGCX(&buf, tool+".edges",
 		// line + file_path on the edge let the caller distinguish two
 		// call sites with the same (from, to, kind). Without them

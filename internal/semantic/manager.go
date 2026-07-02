@@ -1,6 +1,7 @@
 package semantic
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -92,15 +93,21 @@ type Manager struct {
 
 	mu          sync.RWMutex
 	lastResults map[string]*EnrichResult // provider name → last result
+	// enrichStatus tracks the lifecycle of every per-(repo, provider)
+	// enrichment pass (running / completed / partial / abandoned /
+	// failed) so index_health can surface an un-enriched graph instead
+	// of reporting green. Keyed by repo + "\x00" + provider name.
+	enrichStatus map[string]*EnrichmentStatus
 }
 
 // NewManager creates a Manager from configuration.
 // It registers providers based on config, probes availability, and logs results.
 func NewManager(cfg Config, logger *zap.Logger) *Manager {
 	m := &Manager{
-		config:      cfg,
-		logger:      logger,
-		lastResults: make(map[string]*EnrichResult),
+		config:       cfg,
+		logger:       logger,
+		lastResults:  make(map[string]*EnrichResult),
+		enrichStatus: make(map[string]*EnrichmentStatus),
 	}
 	return m
 }
@@ -156,7 +163,9 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 	// has indexed symbols (present is non-empty) but none in a provider's
 	// languages. An empty / unindexed graph yields no evidence, so we don't
 	// gate — providers fall through to their own per-pass gate as before.
-	present := m.repoLanguages(g, roots)
+	// nodeCounts (enrichable nodes per repo) feeds the size-scaled per-repo
+	// deadline — see enrichRepoTimeout.
+	present, nodeCounts := m.repoLanguages(g, roots)
 	gateOnPresence := len(present) > 0
 	if gateOnPresence {
 		langs := make([]string, 0, len(present))
@@ -187,7 +196,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 			continue
 		}
 
-		results = m.runEnrichForProvider(g, roots, lang, provider, results)
+		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, results)
 	}
 
 	// Router-backed LSP providers: arbitrate by priority per language
@@ -260,7 +269,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, results)
+					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], results)
 				}()
 			}
 		}
@@ -280,7 +289,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 		if gateOnPresence && !anyLangPresent(langs, present) {
 			continue
 		}
-		results = m.runEnrichForProvider(g, roots, langs[0], p, results)
+		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, results)
 	}
 
 	return results, nil
@@ -292,8 +301,13 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 // trigger — for languages a repo set does not contain. Mirrors the
 // node-language condition the per-provider EnrichRepo gate applies, so a
 // provider is gated here exactly when its own pass would have found no work.
-func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) map[string]bool {
+//
+// The second return value counts the enrichable nodes per repo (same
+// filters), which sizes the per-repo enrichment deadline — see
+// enrichRepoTimeout.
+func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[string]bool, map[string]int) {
 	present := make(map[string]bool)
+	counts := make(map[string]int, len(roots))
 	for repoPrefix := range roots {
 		// Code-only enumeration: content (data_class=content) sections carry
 		// no enrichable language (pdf/text have no semantic provider), so
@@ -316,9 +330,10 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) map[stri
 				continue
 			}
 			present[n.Language] = true
+			counts[repoPrefix]++
 		}
 	}
-	return present
+	return present, counts
 }
 
 // anyLangPresent reports whether any of langs is in the present set.
@@ -359,39 +374,116 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, results []*EnrichResult) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, results []*EnrichResult) []*EnrichResult {
 	for repoName, repoRoot := range roots {
-		results = m.runEnrichOne(g, repoName, repoRoot, lang, provider, results)
+		results = m.runEnrichOne(g, repoName, repoRoot, lang, provider, nodeCounts[repoName], results)
 	}
 	return results
 }
 
-// defaultEnrichRepoTimeout caps how long one provider's per-repo
-// enrichment may run before the manager abandons it and moves on. The
-// per-call LSP timeout (see lsp.Provider.ensureClient) already bounds a
-// single wedged request; this bounds a provider that is merely slow
-// across many symbols — e.g. a server stuck behind a never-finishing
-// MSBuild/Roslyn load — so it can no longer pin the enrichment WaitGroup
-// for hours. Generous on purpose: a legitimately large repo enriches
-// well within it. 0 / "off" disables the bound.
-const defaultEnrichRepoTimeout = 10 * time.Minute
+// Per-repo enrichment deadline sizing. The floor covers server spin-up
+// plus a small repo's sweep; the per-node term tracks the real cost
+// driver (one hover + up to three hierarchy calls per symbol node,
+// maxParallel-wide); the ceiling stops a monorepo from pinning the
+// enrichment WaitGroup for hours. The per-call LSP timeout (see
+// lsp.Provider.ensureClient) already bounds a single wedged request —
+// this bounds a provider that is merely slow across many symbols.
+// GORTEX_LSP_ENRICH_TIMEOUT overrides the computed value verbatim;
+// 0 / "off" disables the bound.
+const (
+	defaultEnrichRepoTimeout = 10 * time.Minute
+	enrichTimeoutPerNode     = 40 * time.Millisecond
+	maxEnrichRepoTimeout     = 90 * time.Minute
+)
 
-// enrichRepoTimeout resolves the per-repo enrichment deadline, honouring
-// the GORTEX_LSP_ENRICH_TIMEOUT env override (a Go duration such as
-// "5m"; "0" / "off" / "none" disables it). An unparseable value falls
-// back to the default.
-func enrichRepoTimeout() time.Duration {
+// enrichCancelGrace bounds how long the manager waits, after the
+// deadline cancels a ContextEnricher's context, for the provider to
+// flush its completed work and return the partial result. Generous —
+// it only has to cover one in-flight LSP call (individually bounded)
+// plus the final flush; a provider still silent after it is wedged in
+// an uncancellable call and gets abandoned like a legacy provider.
+// Var (not const) so tests can shrink it.
+var enrichCancelGrace = 2 * time.Minute
+
+// scaleEnrichTimeout returns the size-scaled per-repo enrichment
+// deadline for a repo with nodeCount enrichable nodes: floor + per-node
+// cost, capped at the ceiling. A fixed 10-minute bound was tuned for
+// small repos — a medium repo (tens of thousands of symbol nodes) pays
+// 15-25 minutes of legitimate gopls work and was being cut mid-pass.
+func scaleEnrichTimeout(nodeCount int) time.Duration {
+	if nodeCount < 0 {
+		nodeCount = 0
+	}
+	d := defaultEnrichRepoTimeout + time.Duration(nodeCount)*enrichTimeoutPerNode
+	if d > maxEnrichRepoTimeout {
+		return maxEnrichRepoTimeout
+	}
+	return d
+}
+
+// enrichRepoTimeout resolves the per-repo enrichment deadline for a repo
+// with nodeCount enrichable nodes. The GORTEX_LSP_ENRICH_TIMEOUT env
+// override (a Go duration such as "5m"; "0" / "off" / "none" disables
+// it) wins verbatim; otherwise the deadline scales with repo size (see
+// scaleEnrichTimeout). An unparseable value falls back to the scaled
+// default.
+func enrichRepoTimeout(nodeCount int) time.Duration {
 	switch v := strings.TrimSpace(os.Getenv("GORTEX_LSP_ENRICH_TIMEOUT")); v {
 	case "":
-		return defaultEnrichRepoTimeout
+		return scaleEnrichTimeout(nodeCount)
 	case "0", "off", "none":
 		return 0
 	default:
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		return defaultEnrichRepoTimeout
+		return scaleEnrichTimeout(nodeCount)
 	}
+}
+
+// setEnrichStatus records the lifecycle state of one (repo, provider)
+// enrichment pass for the index_health surface. result may be nil.
+func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline time.Duration, result *EnrichResult, detail string) {
+	st := &EnrichmentStatus{
+		Repo:     repo,
+		Provider: provider,
+		Language: lang,
+		State:    state,
+		Detail:   detail,
+	}
+	if deadline > 0 {
+		st.DeadlineSeconds = deadline.Seconds()
+	}
+	if result != nil {
+		st.DurationMs = result.DurationMs
+		st.EdgesConfirmed = result.EdgesConfirmed
+		st.EdgesAdded = result.EdgesAdded
+		st.NodesEnriched = result.NodesEnriched
+	}
+	m.mu.Lock()
+	m.enrichStatus[repo+"\x00"+provider] = st
+	m.mu.Unlock()
+}
+
+// EnrichmentStatuses returns a stable-ordered snapshot of every
+// per-(repo, provider) enrichment pass the manager has run or is
+// running. Consumed by index_health so an agent can see a graph whose
+// enrichment was cut (partial) or discarded (abandoned) instead of
+// trusting a green file count.
+func (m *Manager) EnrichmentStatuses() []EnrichmentStatus {
+	m.mu.RLock()
+	out := make([]EnrichmentStatus, 0, len(m.enrichStatus))
+	for _, st := range m.enrichStatus {
+		out = append(out, *st)
+	}
+	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Repo != out[j].Repo {
+			return out[i].Repo < out[j].Repo
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	return out
 }
 
 // runEnrichOne runs one provider against one repo root and appends the
@@ -399,62 +491,121 @@ func enrichRepoTimeout() time.Duration {
 // fetch a per-repo provider instance (keyed by the repo's workspace) before
 // dispatching — distinct providers per repo are what makes concurrent
 // cross-repo enrichment safe.
-func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, results []*EnrichResult) []*EnrichResult {
+//
+// The pass is bounded by a per-repo deadline scaled to the repo's
+// enrichable node count (env-overridable — see enrichRepoTimeout).
+// Providers that implement ContextEnricher are cancelled cooperatively:
+// they land everything finished so far, mark the result Partial, and
+// return — nothing completed is discarded and no goroutine is detached.
+// Legacy providers keep the old detach-on-deadline behaviour, recorded
+// as "abandoned" in the enrichment status.
+func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, results []*EnrichResult) []*EnrichResult {
 	start := time.Now()
+	d := enrichRepoTimeout(nodeCount)
 	m.logger.Info("semantic enrichment starting",
 		zap.String("provider", provider.Name()),
 		zap.String("language", lang),
 		zap.String("repo", repoName),
+		zap.Int("repo_nodes", nodeCount),
+		zap.Duration("deadline", d),
 	)
+	m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateRunning, d, nil, "")
 
 	// repoName is the roots-map key. In multi-repo mode it carries the
 	// repo prefix (the MultiIndexer keys roots by prefix; the per-repo
 	// indexer passes its own RepoPrefix()); a repo-scoped provider uses
 	// it to scope file selection to the repo actually being enriched.
-	//
-	// Run the (possibly long) provider pass on its own goroutine and bound
-	// it with a per-repo deadline: a provider that is slow across many
-	// symbols — e.g. a server stuck behind an MSBuild/Roslyn load — must
-	// not pin the enrichment WaitGroup indefinitely. On deadline we log
-	// and move on; the detached goroutine still drains (its LSP calls are
-	// individually bounded and its graph mutations are internally
-	// synchronized) and exits on its own.
-	type enrichOutcome struct {
-		result *EnrichResult
-		err    error
-	}
-	done := make(chan enrichOutcome, 1)
-	go func() {
-		var result *EnrichResult
-		var err error
-		if rsp, ok := provider.(RepoScopedProvider); ok {
-			result, err = rsp.EnrichRepo(g, repoName, repoRoot)
-		} else {
-			result, err = provider.Enrich(g, repoRoot)
-		}
-		done <- enrichOutcome{result, err}
-	}()
-
 	var result *EnrichResult
 	var err error
-	if d := enrichRepoTimeout(); d > 0 {
-		timer := time.NewTimer(d)
-		select {
-		case oc := <-done:
-			timer.Stop()
+	if ce, ok := provider.(ContextEnricher); ok {
+		// Cooperative path: the provider checks ctx between work items,
+		// lands completed work incrementally, and returns a Partial
+		// result once ctx expires at the deadline. We still wait for it
+		// on a goroutine with a bounded grace window past the deadline:
+		// a provider wedged in an uncancellable call (e.g. an unbounded
+		// LSP initialize) must not pin the enrichment WaitGroup forever
+		// — that liveness guarantee is what the old detach provided.
+		ctx := context.Background()
+		var cancel context.CancelFunc
+		if d > 0 {
+			ctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+		type enrichOutcome struct {
+			result *EnrichResult
+			err    error
+		}
+		done := make(chan enrichOutcome, 1)
+		go func() {
+			r, e := ce.EnrichRepoContext(ctx, g, repoName, repoRoot)
+			done <- enrichOutcome{r, e}
+		}()
+		if d > 0 {
+			timer := time.NewTimer(d + enrichCancelGrace)
+			select {
+			case oc := <-done:
+				timer.Stop()
+				result, err = oc.result, oc.err
+			case <-timer.C:
+				m.logger.Warn("semantic enrichment ignored cancellation past its deadline; abandoning",
+					zap.String("provider", provider.Name()),
+					zap.String("language", lang),
+					zap.String("repo", repoName),
+					zap.Duration("deadline", d),
+					zap.Duration("grace", enrichCancelGrace),
+				)
+				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
+					"provider did not return within the post-deadline grace window; incrementally landed work is kept, the final result was discarded")
+				return results
+			}
+		} else {
+			oc := <-done
 			result, err = oc.result, oc.err
-		case <-timer.C:
-			m.logger.Warn("semantic enrichment exceeded per-repo deadline; abandoning",
-				zap.String("provider", provider.Name()),
-				zap.String("language", lang),
-				zap.String("repo", repoName),
-				zap.Duration("deadline", d),
-			)
-			return results
 		}
 	} else {
-		oc := <-done
-		result, err = oc.result, oc.err
+		// Legacy path: run the (possibly long) provider pass on its own
+		// goroutine and bound it with the deadline. On deadline we log
+		// and move on; the detached goroutine still drains (its calls
+		// are individually bounded and its graph mutations are
+		// internally synchronized) and exits on its own — but its
+		// result is discarded, so the status records "abandoned".
+		type enrichOutcome struct {
+			result *EnrichResult
+			err    error
+		}
+		done := make(chan enrichOutcome, 1)
+		go func() {
+			var result *EnrichResult
+			var err error
+			if rsp, ok := provider.(RepoScopedProvider); ok {
+				result, err = rsp.EnrichRepo(g, repoName, repoRoot)
+			} else {
+				result, err = provider.Enrich(g, repoRoot)
+			}
+			done <- enrichOutcome{result, err}
+		}()
+
+		if d > 0 {
+			timer := time.NewTimer(d)
+			select {
+			case oc := <-done:
+				timer.Stop()
+				result, err = oc.result, oc.err
+			case <-timer.C:
+				m.logger.Warn("semantic enrichment exceeded per-repo deadline; abandoning",
+					zap.String("provider", provider.Name()),
+					zap.String("language", lang),
+					zap.String("repo", repoName),
+					zap.Duration("deadline", d),
+				)
+				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
+					"per-repo deadline exceeded; provider detached and its result discarded")
+				return results
+			}
+		} else {
+			oc := <-done
+			result, err = oc.result, oc.err
+		}
 	}
 	if err != nil {
 		m.logger.Warn("semantic enrichment failed",
@@ -462,6 +613,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.String("language", lang),
 			zap.Error(err),
 		)
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateFailed, d, result, err.Error())
 		return results
 	}
 
@@ -473,9 +625,16 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		m.lastResults[provider.Name()] = result
 		m.mu.Unlock()
 
+		state := EnrichStateCompleted
+		if result.Partial {
+			state = EnrichStatePartial
+		}
+		m.setEnrichStatus(repoName, provider.Name(), lang, state, d, result, result.AbortReason)
+
 		m.logger.Info("semantic enrichment complete",
 			zap.String("provider", provider.Name()),
 			zap.String("language", lang),
+			zap.Bool("partial", result.Partial),
 			zap.Int("confirmed", result.EdgesConfirmed),
 			zap.Int("added", result.EdgesAdded),
 			zap.Int("refuted", result.EdgesRefuted),
@@ -483,6 +642,8 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Float64("coverage", result.CoveragePercent),
 			zap.Int64("duration_ms", result.DurationMs),
 		)
+	} else {
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateCompleted, d, nil, "")
 	}
 	return results
 }

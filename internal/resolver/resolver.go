@@ -123,6 +123,16 @@ type Resolver struct {
 	nodesByName     map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
 
+	// importFilesByCaller memoises, per caller file, the set of file
+	// paths that file imports (direct EdgeImports targets plus files
+	// reached through transitive EdgeReExports barrel hops). Built
+	// lazily inside the parallel resolve workers — importFilesMu guards
+	// it — and cleared with the per-pass lookup caches. Consulted by
+	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
+	// import_evidence.go for the precedence design.
+	importFilesByCaller map[string]map[string]struct{}
+	importFilesMu       sync.RWMutex
+
 	// incrementalSkip holds the source-shapes of a single re-resolved file's
 	// out-edges that were already unresolved before the edit; the forward
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
@@ -699,6 +709,9 @@ func (r *Resolver) clearLookupCache() {
 	r.nodeByID = nil
 	r.nodesByName = nil
 	r.nodesByQualName = nil
+	r.importFilesMu.Lock()
+	r.importFilesByCaller = nil
+	r.importFilesMu.Unlock()
 }
 
 // cachedGetNode returns the node for id, consulting the per-pass
@@ -1525,14 +1538,6 @@ func isStdlibLike(importPath string) bool {
 func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
 
-	// npm-alias rewrite: a JS/TS import of a package.json alias key
-	// (`"shared": "npm:@acme/shared-lib@1.4.0"`) actually targets the
-	// real package. Rewrite the specifier before any lookup so a
-	// locally-vendored `@acme/shared-lib` resolves to its real node
-	// instead of falling through to an external stub. A no-op for
-	// non-aliased specifiers and non-JS/TS callers.
-	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
-
 	// JS/TS relative + tsconfig-path-alias / baseUrl import: resolve the
 	// specifier onto the in-repo file (or exported symbol) it names. The
 	// dirIndex cascade below is package-directory-oriented and never
@@ -1541,6 +1546,13 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// buildImportClosure of reachability and letting the cross-package
 	// guard revert the callers (issue #136). A no-op for non-JS/TS callers
 	// and for genuine third-party specifiers.
+	//
+	// This runs BEFORE the npm-alias rewrite, mirroring tsserver's
+	// precedence: `compilerOptions.paths` beats node_modules. A library
+	// whose test suite imports its own published name (zustand's tests
+	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
+	// the in-repo source, not on its own installed dist inside
+	// node_modules.
 	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
 		e.To = to
 		if callerRepo != "" {
@@ -1550,6 +1562,28 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		}
 		stats.Resolved++
 		return
+	}
+
+	// npm-alias rewrite: a JS/TS import of a package.json alias key
+	// (`"shared": "npm:@acme/shared-lib@1.4.0"`) actually targets the
+	// real package. Rewrite the specifier before any further lookup so a
+	// locally-vendored `@acme/shared-lib` resolves to its real node
+	// instead of falling through to an external stub. A no-op for
+	// non-aliased specifiers and non-JS/TS callers.
+	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
+	if npmAliased {
+		// The rewritten specifier may itself be tsconfig-paths/relative
+		// resolvable (an alias onto a workspace member).
+		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+			e.To = to
+			if callerRepo != "" {
+				if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
+					e.CrossRepo = true
+				}
+			}
+			stats.Resolved++
+			return
+		}
 	}
 
 	// Look for a package node with matching qualified name.
@@ -1717,6 +1751,47 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
+	// File-local candidates outrank everything below: a symbol defined in
+	// the caller's own file is strictly more local than a same-directory
+	// neighbour in every language (in Go both are package scope, so the
+	// same-file pick is equally valid; in module-scoped languages only the
+	// same-file symbol is in scope at all). Without this tier a same-named
+	// nested helper in a NEIGHBOURING test file captures the calls the
+	// caller's own helper should receive — zustand's persistSync tests
+	// bound to persistAsync's `createStore` helper purely by candidate
+	// iteration order.
+	for _, c := range candidates {
+		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
+			c.FilePath != "" && c.FilePath == e.FilePath {
+			e.To = c.ID
+			stats.Resolved++
+			return
+		}
+	}
+
+	// Import-evidence disambiguation (JS/TS only; see import_evidence.go
+	// for the full precedence design). The ES module system has no ambient
+	// directory scope, so before the locality cascade below can bind a
+	// same-dir shadow — and before cross-dir ambiguity guesses or refuses —
+	// ask the caller file's import closure. When the caller imports exactly
+	// one candidate's file (directly or through re-export/barrel hops) that
+	// import statement is structural, AST-grade evidence of the binding:
+	// resolve to it at OriginASTResolved, the tier resolveRendersChild's
+	// import-binding path already uses. A module-local candidate blocks the
+	// pick; no import or several imported candidates fall through to the
+	// existing cascade unchanged.
+	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
+		e.To = pick.ID
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 0.9
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		e.Meta["resolution"] = "import_closure"
+		stats.Resolved++
+		return
+	}
+
 	// Prefer same-package (same directory) match.
 	callerDir := r.dirFor(e.FilePath)
 	for _, c := range candidates {
@@ -1737,7 +1812,65 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 	}
 
+	// JS/TS last resort: an exported const initialised with a callable the
+	// extractor could not classify as a function (alias-cast exports like
+	// `export const persist = persistImpl as unknown as Persist`) lands as
+	// a KindVariable/KindConstant node, which the function/method loops
+	// above can never bind. Accept a TOP-LEVEL variable/constant callee —
+	// same-directory first, then a unique same-repo match; any ambiguity
+	// refuses so a local binding cannot capture an unrelated call.
+	if isJSTSPath(e.FilePath) {
+		if pick := pickTopLevelValueCallee(candidates, funcName, callerDir, r.dirFor); pick != nil {
+			e.To = pick.ID
+			e.Origin = graph.OriginASTInferred
+			e.Confidence = 0.7
+			if e.Meta == nil {
+				e.Meta = map[string]any{}
+			}
+			e.Meta["resolution"] = "value_callee"
+			stats.Resolved++
+			return
+		}
+	}
+
 	stats.Unresolved++
+}
+
+// pickTopLevelValueCallee returns the variable/constant candidate a JS/TS
+// call edge may bind to when no function/method candidate matched: only a
+// top-level symbol (ID == <file>::<name>, i.e. not a local or an object
+// member) is eligible, same-directory candidates win, and ambiguity at
+// either tier returns nil so no false edge lands.
+func pickTopLevelValueCallee(candidates []*graph.Node, funcName, callerDir string, dirFor func(string) string) *graph.Node {
+	var sameDir, repoWide *graph.Node
+	sameDirAmbiguous, repoAmbiguous := false, false
+	for _, c := range candidates {
+		if c.Kind != graph.KindVariable && c.Kind != graph.KindConstant {
+			continue
+		}
+		if c.ID != c.FilePath+"::"+funcName {
+			continue // nested/local binding — not a top-level value
+		}
+		if dirFor(c.FilePath) == callerDir {
+			if sameDir != nil {
+				sameDirAmbiguous = true
+			} else {
+				sameDir = c
+			}
+		}
+		if repoWide != nil {
+			repoAmbiguous = true
+		} else {
+			repoWide = c
+		}
+	}
+	if sameDir != nil && !sameDirAmbiguous {
+		return sameDir
+	}
+	if repoWide != nil && !repoAmbiguous {
+		return repoWide
+	}
+	return nil
 }
 
 // resolveTypeOrFunc resolves unresolved edges that could be either a type
@@ -2060,7 +2193,13 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 			e.Meta = map[string]any{}
 		}
 		e.Meta["dispatch"] = "interface"
-		e.Origin = graph.OriginLSPDispatch
+		// The pick below is a locality heuristic over legal runtime
+		// targets — no language server verified it. Stamping the LSP
+		// dispatch tier here let a guessed winner masquerade as
+		// semantic-provider evidence and poisoned min_tier filtering;
+		// ast_inferred is what this actually is. The LSP hierarchy
+		// pass upgrades (or fans out) the truly verified sites.
+		e.Origin = graph.OriginASTInferred
 	}
 
 	if sameDirMethod != nil {
