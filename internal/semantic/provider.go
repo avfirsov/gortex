@@ -1,6 +1,8 @@
 package semantic
 
 import (
+	"context"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -45,6 +47,17 @@ type RepoScopedProvider interface {
 	EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
 }
 
+// ContextEnricher is an optional interface a Provider MAY implement to
+// receive a cancellation context for its per-repo pass. Providers that
+// implement it are cancelled *cooperatively* at the Manager's per-repo
+// deadline instead of being detached: the provider lands whatever work it
+// has completed, marks the result Partial, and returns — so a deadline
+// never discards finished enrichment and never leaks a goroutine that
+// keeps mutating the graph after the pass was "abandoned".
+type ContextEnricher interface {
+	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error)
+}
+
 // EnrichResult contains statistics from an enrichment pass.
 type EnrichResult struct {
 	Provider        string  `json:"provider"`
@@ -57,6 +70,39 @@ type EnrichResult struct {
 	SymbolsTotal    int     `json:"symbols_total"`
 	CoveragePercent float64 `json:"coverage_percent"`
 	DurationMs      int64   `json:"duration_ms"`
+	// Partial reports that the pass was cut short (per-repo deadline /
+	// context cancellation) after landing some — but not all — of its
+	// work. The counters above reflect only what actually reached the
+	// graph. AbortReason carries the cause when Partial is true.
+	Partial     bool   `json:"partial,omitempty"`
+	AbortReason string `json:"abort_reason,omitempty"`
+}
+
+// Enrichment lifecycle states surfaced per (repo, provider) via
+// Manager.EnrichmentStatuses — the health signal that lets an agent see
+// an un-enriched or partially-enriched graph instead of assuming green.
+const (
+	EnrichStateRunning   = "running"
+	EnrichStateCompleted = "completed"
+	EnrichStatePartial   = "partial"   // deadline hit; completed work landed and is counted
+	EnrichStateAbandoned = "abandoned" // legacy provider detached at deadline; result discarded
+	EnrichStateFailed    = "failed"
+)
+
+// EnrichmentStatus reports the lifecycle state of one provider's per-repo
+// enrichment pass. Exposed through index_health so consumers can tell a
+// fully-enriched graph from one whose LSP pass was cut or abandoned.
+type EnrichmentStatus struct {
+	Repo            string  `json:"repo"`
+	Provider        string  `json:"provider"`
+	Language        string  `json:"language,omitempty"`
+	State           string  `json:"state"`
+	DeadlineSeconds float64 `json:"deadline_seconds,omitempty"`
+	DurationMs      int64   `json:"duration_ms,omitempty"`
+	EdgesConfirmed  int     `json:"edges_confirmed"`
+	EdgesAdded      int     `json:"edges_added"`
+	NodesEnriched   int     `json:"nodes_enriched"`
+	Detail          string  `json:"detail,omitempty"`
 }
 
 // ProviderStatus represents the current state of a semantic provider.

@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
@@ -3043,6 +3044,31 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 		}
 	}
 
+	// Semantic-enrichment lifecycle per (repo, provider): a graph can be
+	// 100% parsed yet carry zero lsp_resolved edges when the enrichment
+	// pass was cut (partial) or discarded (abandoned) at its deadline.
+	// Surfacing the state here is what lets an agent — or a benchmark —
+	// distinguish "fully enriched" from "looks green, tiers missing".
+	var enrichStatuses []semantic.EnrichmentStatus
+	if s.semanticMgr != nil {
+		enrichStatuses = s.semanticMgr.EnrichmentStatuses()
+	}
+	enrichmentIncomplete := false
+	for _, st := range enrichStatuses {
+		if st.State == semantic.EnrichStatePartial || st.State == semantic.EnrichStateAbandoned || st.State == semantic.EnrichStateFailed {
+			enrichmentIncomplete = true
+			break
+		}
+	}
+	if enrichmentIncomplete {
+		msg := "Semantic enrichment did not complete for at least one repo/provider (see semantic_enrichment) — LSP-tier edges may be missing and tier-filtered queries (e.g. find_usages min_tier=lsp_resolved) may under-report. Re-run enrichment (reindex_repository) or raise GORTEX_LSP_ENRICH_TIMEOUT."
+		if recommendation == "" {
+			recommendation = msg
+		} else {
+			recommendation = msg + " " + recommendation
+		}
+	}
+
 	result := map[string]any{
 		"health_score":         healthScore,
 		"total_detected":       totalDetected,
@@ -3068,6 +3094,10 @@ func (s *Server) buildIndexHealthPayload() map[string]any {
 	}
 	if len(staleFiles) > 0 {
 		result["stale_files"] = staleFiles
+	}
+	if len(enrichStatuses) > 0 {
+		result["semantic_enrichment"] = enrichStatuses
+		result["semantic_enrichment_ok"] = !enrichmentIncomplete
 	}
 	if recommendation != "" {
 		result["recommendation"] = recommendation

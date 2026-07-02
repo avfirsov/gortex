@@ -235,14 +235,21 @@ func scopedPath(repoPrefix, rel string) string {
 }
 
 // Enrich runs the full LSP enrichment pass for a single-repo (un-
-// prefixed) graph. It delegates to EnrichRepo with an empty prefix.
+// prefixed) graph. It delegates to EnrichRepoContext with an empty prefix.
 func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
-	return p.EnrichRepo(g, "", repoRoot)
+	return p.EnrichRepoContext(context.Background(), g, "", repoRoot)
 }
 
-// EnrichRepo runs the full LSP enrichment pass over the nodes that belong
-// to repoPrefix (the multi-repo scope key; "" for a single-repo / in-
-// memory graph). Scoping the node/edge selection to one repo stops a
+// EnrichRepo runs the full LSP enrichment pass with no cancellation
+// bound. Kept so the provider still satisfies semantic.RepoScopedProvider
+// for callers that don't thread a context.
+func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+	return p.EnrichRepoContext(context.Background(), g, repoPrefix, repoRoot)
+}
+
+// EnrichRepoContext runs the full LSP enrichment pass over the nodes that
+// belong to repoPrefix (the multi-repo scope key; "" for a single-repo /
+// in-memory graph). Scoping the node/edge selection to one repo stops a
 // multi-repo graph from driving this repo's language server with another
 // repo's files, and lets each node's on-disk path resolve by stripping
 // its own RepoPrefix.
@@ -253,7 +260,17 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 // starting it. This is what keeps a warm restart — where the snapshot is
 // already fully resolved — from paying a full server spin-up plus a whole
 // hover / call-hierarchy sweep per language for zero enrichment.
-func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+//
+// Work is ordered by accuracy value and lands INCREMENTALLY: the
+// interface-implementation and ambiguous-edge-confirmation passes (the
+// edges that decide graph tiers) run first and commit per item; the
+// per-file sweep runs call/type hierarchy before hover within each file
+// and flushes each file's stamps + hops into the graph as soon as the
+// file completes. When ctx is cancelled (the Manager's per-repo
+// deadline) the pass stops scheduling new work, keeps everything already
+// flushed, marks the result Partial, and returns — completed work is
+// never discarded and no writer goroutine outlives the pass.
+func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -349,6 +366,121 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	// file / import nodes and is filtered to this provider's languages.
 	result.SymbolsTotal = len(langNodes)
 
+	// The graph-mutation blocks in this pass serialise on the backend
+	// resolve mutex (the same lock every other edge-mutating pass holds)
+	// so this pass can run concurrently with other repos' enrichment.
+	// Only the in-memory mutations are locked — the LSP I/O stays outside
+	// the lock so concurrent language servers still overlap.
+	rmu := g.ResolveMutex()
+
+	// Targeted edge work runs FIRST — before the whole-repo per-file
+	// sweep — because confirmed / added edges (implements, calls) decide
+	// graph tiers and find_usages accuracy, while hover only stamps type
+	// strings. Each item commits to the graph as soon as it resolves, so
+	// a deadline cut loses only the un-visited remainder.
+
+	// Query implementations for interface nodes.
+	for _, n := range langNodes {
+		if ctx.Err() != nil {
+			break
+		}
+		if n.Kind != graph.KindInterface {
+			continue
+		}
+		line, ok := lspLine(n)
+		if !ok {
+			continue
+		}
+
+		rel := nodeRelPath(n)
+		// Per-item doc lifecycle (no bulk pre-open): open this interface's
+		// file, query, close immediately so memory stays bounded.
+		if err := p.openDocument(absRoot, rel); err != nil {
+			continue
+		}
+		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		impls, err := p.findImplementations(absRoot, rel, line, col)
+		_ = p.closeDocument(filepath.Join(absRoot, rel))
+		if err != nil || len(impls) == 0 {
+			continue
+		}
+
+		rmu.Lock()
+		for _, loc := range impls {
+			implPath := uriToPath(loc.URI, absRoot)
+			if implPath == "" {
+				continue
+			}
+			implNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
+			if implNode == nil {
+				continue
+			}
+
+			existing := semantic.FindMatchingEdge(g, implNode.ID, n.ID, graph.EdgeImplements)
+			if existing != nil {
+				if existing.Confidence < 1.0 {
+					semantic.ConfirmEdge(existing, p.Name())
+					result.EdgesConfirmed++
+				}
+			} else {
+				semantic.AddSemanticEdge(g, implNode.ID, n.ID, graph.EdgeImplements,
+					implNode.FilePath, implNode.StartLine, p.Name())
+				result.EdgesAdded++
+			}
+		}
+		rmu.Unlock()
+	}
+
+	// Query references for AMBIGUOUS edges to confirm/refute.
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		toNode := g.GetNode(t.edge.To)
+		if toNode == nil {
+			continue
+		}
+		line, ok := lspLine(toNode)
+		if !ok {
+			continue
+		}
+
+		toRel := nodeRelPath(toNode)
+		// Per-item doc lifecycle (no bulk pre-open): open the referent's
+		// file, query, close immediately so memory stays bounded.
+		if err := p.openDocument(absRoot, toRel); err != nil {
+			continue
+		}
+		col := identifierColumn(p.getSource(absRoot, toRel), toNode.StartLine, toNode.Name)
+		refs, err := p.findReferences(absRoot, toRel, line, col)
+		_ = p.closeDocument(filepath.Join(absRoot, toRel))
+		if err != nil || len(refs) == 0 {
+			continue
+		}
+
+		// Check if any reference matches the caller's location. uriToPath
+		// returns a repo-relative path while the node FilePath is prefixed,
+		// so compare against the caller's stripped path.
+		callerRel := nodeRelPath(t.node)
+		confirmed := false
+		for _, ref := range refs {
+			refPath := uriToPath(ref.URI, absRoot)
+			if refPath == callerRel &&
+				ref.Range.Start.Line+1 >= t.node.StartLine &&
+				ref.Range.Start.Line+1 <= t.node.EndLine {
+				confirmed = true
+				break
+			}
+		}
+
+		if confirmed {
+			rmu.Lock()
+			semantic.ConfirmEdge(t.edge, p.Name())
+			rmu.Unlock()
+			result.EdgesConfirmed++
+		}
+	}
+
 	// Per-file document lifecycle + bounded concurrency. The original
 	// implementation bulk-opened every target file up front and closed
 	// them all in one deferred sweep after a fully sequential hover loop —
@@ -366,17 +498,12 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	// maxParallel independently, so a single many-symbol file still hovers
 	// in parallel.
 	enrichedNodes := make(map[string]bool)
-	// EnrichNodeMeta mutates Node.Meta in place; on disk backends n is a
-	// per-call AllNodes reconstruction, so collect stamped nodes and
-	// round-trip them through the store at the end or the semantic_type
-	// stamp is discarded on the disk backend. See semantic.EnrichNodeMeta.
-	var stampedNodes []*graph.Node
 
 	// Race-safe metric counters for the concurrent hover phase.
-	var diagTotalNodes, diagHoverOK, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched atomic.Int64
+	var diagTotalNodes, diagHoverOK, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched, diagNoPosition atomic.Int64
 
-	// mu guards the cross-goroutine aggregation: stampedNodes,
-	// enrichedNodes, the EnrichResult counters, and the best-effort
+	// mu guards the cross-goroutine aggregation: per-file stamp buffers,
+	// enrichedNodes, the EnrichResult node counters, and the best-effort
 	// first-sample diagnostics below.
 	var mu sync.Mutex
 	var diagFirstHoverValue, diagFirstHoverError, diagFirstNodeName, diagFirstNodeFile string
@@ -438,10 +565,10 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		ft.nodes = append(ft.nodes, n)
 	}
 
-	// Call- and type-hierarchy hops are collected during the concurrent
-	// per-file phase (while each file is open) and applied to the graph
-	// afterwards, so the graph mutations stay single-threaded like the
-	// hover stamps while each file is still opened exactly once per pass.
+	// Call- and type-hierarchy hops are collected per file (while the
+	// file is open) and applied in that file's flush below, so each
+	// file's graph mutations land as soon as the file completes while
+	// the file is still opened exactly once per pass.
 	type callHop struct {
 		n          *graph.Node
 		other      CallHierarchyItem
@@ -458,8 +585,6 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		other       TypeHierarchyItem
 		asSupertype bool
 	}
-	var callHops []callHop
-	var typeHops []typeHop
 
 	// Only interrogate the server for call / type hierarchy when it
 	// advertised the capability. Skipping otherwise avoids the
@@ -467,6 +592,35 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	// languages) that do not implement it.
 	callHierOK := p.Supports("textDocument/prepareCallHierarchy")
 	typeHierOK := p.Supports("textDocument/prepareTypeHierarchy")
+
+	// flushFile lands one completed file's work into the graph: hover
+	// stamps plus call/type-hierarchy hops. EnrichNodeMeta mutates
+	// Node.Meta in place, but on disk backends the node is a per-call
+	// reconstruction, so stamped nodes must be round-tripped through the
+	// store (AddBatch) or the semantic_type stamp is discarded — see
+	// semantic.EnrichNodeMeta. Committing per file — instead of buffering
+	// the whole repo and applying after the sweep — is what makes a
+	// deadline cut lose only unfinished files, never completed work.
+	// Graph mutations and the result edge counters inside
+	// recordHierarchyCall / linkTypeHierarchy serialise on the resolve
+	// mutex; the counters are next read after wg.Wait, so they stay
+	// race-free.
+	flushFile := func(stamped []*graph.Node, cHops []callHop, tHops []typeHop) {
+		if len(stamped) == 0 && len(cHops) == 0 && len(tHops) == 0 {
+			return
+		}
+		rmu.Lock()
+		defer rmu.Unlock()
+		if len(stamped) > 0 {
+			g.AddBatch(stamped, nil)
+		}
+		for _, h := range cHops {
+			p.recordHierarchyCall(g, repoPrefix, absRoot, h.n, h.other, h.asOutgoing, h.fromRanges, result)
+		}
+		for _, h := range tHops {
+			p.linkTypeHierarchy(g, repoPrefix, absRoot, h.n, h.other, h.asSupertype, result)
+		}
+	}
 
 	// fileSem bounds the number of simultaneously-open documents; hoverSem
 	// bounds concurrent hovers across all open files. Both at maxParallel:
@@ -478,7 +632,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	var wg sync.WaitGroup
 
 	for _, ft := range fileList {
-		if aborted.Load() {
+		if aborted.Load() || ctx.Err() != nil {
 			break
 		}
 		wg.Add(1)
@@ -488,7 +642,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 				<-fileSem
 				wg.Done()
 			}()
-			if aborted.Load() {
+			if aborted.Load() || ctx.Err() != nil {
 				return
 			}
 
@@ -541,20 +695,99 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 				return
 			}
 
+			// Per-file result buffers, flushed into the graph when this
+			// file finishes (or is cut mid-file by cancellation) —
+			// deferred so even a partially-processed file keeps what it
+			// completed.
+			var fileStamped []*graph.Node // guarded by mu during the hover fan-out
+			var cHops []callHop
+			var tHops []typeHop
+			defer func() { flushFile(fileStamped, cHops, tHops) }()
+
+			// While the file is open on the server, interrogate it for
+			// call- and type-hierarchy edges the AST extractor may have
+			// missed. This runs BEFORE the hover fan-out: hierarchy hops
+			// become lsp_resolved edges — far more accuracy-bearing than
+			// hover type strings — so a deadline cut mid-file sheds hover
+			// work, not edges. Running while the document is added also
+			// keeps prepare* from failing with "non-added document" and
+			// preserves exactly one didOpen per file.
+			if callHierOK || typeHierOK {
+				for _, n := range ft.nodes {
+					if aborted.Load() || ctx.Err() != nil {
+						break
+					}
+					line, ok := lspLine(n)
+					if !ok {
+						continue
+					}
+					col := identifierColumn(content, n.StartLine, n.Name)
+					switch n.Kind {
+					case graph.KindFunction, graph.KindMethod:
+						if !callHierOK {
+							continue
+						}
+						items, err := p.prepareCallHierarchy(absRoot, ft.rel, line, col)
+						if err != nil {
+							continue
+						}
+						for _, item := range items {
+							if outs, oerr := p.outgoingCalls(item); oerr == nil {
+								for _, oc := range outs {
+									cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
+								}
+							}
+							if ins, ierr := p.incomingCalls(item); ierr == nil {
+								for _, ic := range ins {
+									cHops = append(cHops, callHop{n: n, other: ic.From, asOutgoing: false, fromRanges: ic.FromRanges})
+								}
+							}
+						}
+					case graph.KindType, graph.KindInterface:
+						if !typeHierOK {
+							continue
+						}
+						items, err := p.prepareTypeHierarchy(absRoot, ft.rel, line, col)
+						if err != nil {
+							continue
+						}
+						for _, item := range items {
+							if sups, serr := p.supertypes(item); serr == nil {
+								for _, s := range sups {
+									tHops = append(tHops, typeHop{n: n, other: s, asSupertype: true})
+								}
+							}
+							if subs, serr := p.subtypes(item); serr == nil {
+								for _, s := range subs {
+									tHops = append(tHops, typeHop{n: n, other: s, asSupertype: false})
+								}
+							}
+						}
+					}
+				}
+			}
+
 			var nodeWg sync.WaitGroup
 			for _, n := range ft.nodes {
-				if aborted.Load() {
+				if aborted.Load() || ctx.Err() != nil {
 					break
+				}
+				line, ok := lspLine(n)
+				if !ok {
+					// No real source position — the request would carry
+					// line -1 and be rejected by the server. Skip.
+					diagNoPosition.Add(1)
+					continue
 				}
 				diagTotalNodes.Add(1)
 				nodeWg.Add(1)
 				hoverSem <- struct{}{} // acquire — bounds concurrent hovers
-				go func(n *graph.Node) {
+				go func(n *graph.Node, line int) {
 					defer func() {
 						<-hoverSem
 						nodeWg.Done()
 					}()
-					if aborted.Load() {
+					if aborted.Load() || ctx.Err() != nil {
 						return
 					}
 
@@ -566,7 +799,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 					}
 
 					col := identifierColumn(content, n.StartLine, n.Name)
-					hoverResult, err := p.hoverWith(c, absRoot, nodeRelPath(n), n.StartLine-1, col)
+					hoverResult, err := p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
 					if err != nil && isServerExitError(err) {
 						// Server died mid-flight — recover once and retry this
 						// node's hover against the fresh session. The new client
@@ -583,7 +816,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 								zap.String("file", n.FilePath), zap.Error(err))
 							return
 						}
-						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), n.StartLine-1, col)
+						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
 					}
 					if err != nil {
 						diagHoverErr.Add(1)
@@ -619,78 +852,16 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 					semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
 					diagEnriched.Add(1)
 					mu.Lock()
-					stampedNodes = append(stampedNodes, n)
+					fileStamped = append(fileStamped, n)
 					if !enrichedNodes[n.ID] {
 						result.NodesEnriched++
 						result.SymbolsCovered++
 						enrichedNodes[n.ID] = true
 					}
 					mu.Unlock()
-				}(n)
+				}(n, line)
 			}
 			nodeWg.Wait()
-
-			// While the file is still open on the server, interrogate it for
-			// call- and type-hierarchy edges the AST extractor may have missed.
-			// Running here (not in a later pass) means the document is already
-			// added — prepare* would otherwise fail with "non-added document" —
-			// while keeping exactly one didOpen per file. Raw hops are
-			// collected; the graph mutation runs single-threaded after wg.Wait.
-			if !aborted.Load() && (callHierOK || typeHierOK) {
-				var cHops []callHop
-				var tHops []typeHop
-				for _, n := range ft.nodes {
-					col := identifierColumn(content, n.StartLine, n.Name)
-					switch n.Kind {
-					case graph.KindFunction, graph.KindMethod:
-						if !callHierOK {
-							continue
-						}
-						items, err := p.prepareCallHierarchy(absRoot, ft.rel, n.StartLine-1, col)
-						if err != nil {
-							continue
-						}
-						for _, item := range items {
-							if outs, oerr := p.outgoingCalls(item); oerr == nil {
-								for _, oc := range outs {
-									cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
-								}
-							}
-							if ins, ierr := p.incomingCalls(item); ierr == nil {
-								for _, ic := range ins {
-									cHops = append(cHops, callHop{n: n, other: ic.From, asOutgoing: false, fromRanges: ic.FromRanges})
-								}
-							}
-						}
-					case graph.KindType, graph.KindInterface:
-						if !typeHierOK {
-							continue
-						}
-						items, err := p.prepareTypeHierarchy(absRoot, ft.rel, n.StartLine-1, col)
-						if err != nil {
-							continue
-						}
-						for _, item := range items {
-							if sups, serr := p.supertypes(item); serr == nil {
-								for _, s := range sups {
-									tHops = append(tHops, typeHop{n: n, other: s, asSupertype: true})
-								}
-							}
-							if subs, serr := p.subtypes(item); serr == nil {
-								for _, s := range subs {
-									tHops = append(tHops, typeHop{n: n, other: s, asSupertype: false})
-								}
-							}
-						}
-					}
-				}
-				if len(cHops) > 0 || len(tHops) > 0 {
-					mu.Lock()
-					callHops = append(callHops, cHops...)
-					typeHops = append(typeHops, tHops...)
-					mu.Unlock()
-				}
-			}
 		}(ft)
 	}
 	wg.Wait()
@@ -703,6 +874,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		zap.Int64("hover_nil", diagHoverNil.Load()),
 		zap.Int64("type_empty", diagTypeEmpty.Load()),
 		zap.Int64("enriched", diagEnriched.Load()),
+		zap.Int64("skipped_no_position", diagNoPosition.Load()),
 		zap.Int64("reconnect_attempts", p.reconnectAttempts.Load()),
 		zap.String("first_hover_value", diagFirstHoverValue),
 		zap.String("first_hover_error", diagFirstHoverError),
@@ -710,130 +882,30 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 		zap.String("first_node_file", diagFirstNodeFile),
 	)
 
-	if aborted.Load() {
-		return result, fmt.Errorf("LSP enrichment aborted: %w", abortErr)
-	}
-
-	// The graph-mutation blocks below serialise on the backend resolve mutex
-	// (the same lock every other edge-mutating pass holds) so this pass can run
-	// concurrently with other repos' enrichment. Only the in-memory mutations
-	// are locked — the per-item findImplementations / findReferences LSP I/O
-	// stays outside the lock so concurrent language servers still overlap.
-	rmu := g.ResolveMutex()
-
-	if len(stampedNodes) > 0 {
-		rmu.Lock()
-		g.AddBatch(stampedNodes, nil)
-		rmu.Unlock()
-	}
-
-	// Query implementations for interface nodes.
-	for _, n := range langNodes {
-		if n.Kind != graph.KindInterface {
-			continue
-		}
-
-		rel := nodeRelPath(n)
-		// Per-item doc lifecycle (no bulk pre-open): open this interface's
-		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, rel); err != nil {
-			continue
-		}
-		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
-		impls, err := p.findImplementations(absRoot, rel, n.StartLine-1, col)
-		_ = p.closeDocument(filepath.Join(absRoot, rel))
-		if err != nil || len(impls) == 0 {
-			continue
-		}
-
-		rmu.Lock()
-		for _, loc := range impls {
-			implPath := uriToPath(loc.URI, absRoot)
-			if implPath == "" {
-				continue
-			}
-			implNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
-			if implNode == nil {
-				continue
-			}
-
-			existing := semantic.FindMatchingEdge(g, implNode.ID, n.ID, graph.EdgeImplements)
-			if existing != nil {
-				if existing.Confidence < 1.0 {
-					semantic.ConfirmEdge(existing, p.Name())
-					result.EdgesConfirmed++
-				}
-			} else {
-				semantic.AddSemanticEdge(g, implNode.ID, n.ID, graph.EdgeImplements,
-					implNode.FilePath, implNode.StartLine, p.Name())
-				result.EdgesAdded++
-			}
-		}
-		rmu.Unlock()
-	}
-
-	// Apply the call- and type-hierarchy hops collected while each file was
-	// open. Single-threaded: recordHierarchyCall / linkTypeHierarchy mutate
-	// the graph — promoting AST-missed call edges to lsp_resolved, or adding
-	// the cross-file call / extends / implements edges the AST extractor
-	// could not follow (the single biggest non-Go win).
-	rmu.Lock()
-	for _, h := range callHops {
-		p.recordHierarchyCall(g, repoPrefix, absRoot, h.n, h.other, h.asOutgoing, h.fromRanges, result)
-	}
-	for _, h := range typeHops {
-		p.linkTypeHierarchy(g, repoPrefix, absRoot, h.n, h.other, h.asSupertype, result)
-	}
-	rmu.Unlock()
-
-	// Query references for AMBIGUOUS edges to confirm/refute.
-	for _, t := range targets {
-		toNode := g.GetNode(t.edge.To)
-		if toNode == nil {
-			continue
-		}
-
-		toRel := nodeRelPath(toNode)
-		// Per-item doc lifecycle (no bulk pre-open): open the referent's
-		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, toRel); err != nil {
-			continue
-		}
-		col := identifierColumn(p.getSource(absRoot, toRel), toNode.StartLine, toNode.Name)
-		refs, err := p.findReferences(absRoot, toRel, toNode.StartLine-1, col)
-		_ = p.closeDocument(filepath.Join(absRoot, toRel))
-		if err != nil || len(refs) == 0 {
-			continue
-		}
-
-		// Check if any reference matches the caller's location. uriToPath
-		// returns a repo-relative path while the node FilePath is prefixed,
-		// so compare against the caller's stripped path.
-		callerRel := nodeRelPath(t.node)
-		confirmed := false
-		for _, ref := range refs {
-			refPath := uriToPath(ref.URI, absRoot)
-			if refPath == callerRel &&
-				ref.Range.Start.Line+1 >= t.node.StartLine &&
-				ref.Range.Start.Line+1 <= t.node.EndLine {
-				confirmed = true
-				break
-			}
-		}
-
-		if confirmed {
-			rmu.Lock()
-			semantic.ConfirmEdge(t.edge, p.Name())
-			rmu.Unlock()
-			result.EdgesConfirmed++
-		}
-	}
-
 	if result.SymbolsTotal > 0 {
 		result.CoveragePercent = float64(result.SymbolsCovered) / float64(result.SymbolsTotal) * 100
 	}
-
 	result.DurationMs = time.Since(start).Milliseconds()
+
+	if aborted.Load() {
+		// Whatever was flushed before the abort stays in the graph; the
+		// result rides along so the caller can record its counts.
+		return result, fmt.Errorf("LSP enrichment aborted: %w", abortErr)
+	}
+
+	if ctx.Err() != nil {
+		// Deadline / cancellation: everything flushed so far is in the
+		// graph and counted; only the un-visited remainder was skipped.
+		result.Partial = true
+		result.AbortReason = ctx.Err().Error()
+		p.logger.Warn("LSP enrich: pass cancelled at deadline; completed work already landed",
+			zap.String("repo_prefix", repoPrefix),
+			zap.Int("edges_confirmed", result.EdgesConfirmed),
+			zap.Int("edges_added", result.EdgesAdded),
+			zap.Int("nodes_enriched", result.NodesEnriched),
+			zap.Error(ctx.Err()),
+		)
+	}
 	return result, nil
 }
 
@@ -2275,6 +2347,22 @@ func buildWorkspaceFolders(primary string, additional []string) []WorkspaceFolde
 // uriToPath converts a file:// URI to a repo-relative path (Windows-correct).
 func uriToPath(uri, repoRoot string) string {
 	return lspuri.URIToRepoRel(uri, repoRoot)
+}
+
+// lspLine converts a node's 1-based StartLine to the 0-based line LSP
+// positions use, reporting ok=false for nodes without a real source
+// position (StartLine < 1 — synthetic module/package nodes and extractor
+// fallbacks). Sending such a node would put position.line == -1 on the
+// wire, which servers reject per request (gopls: "cannot unmarshal
+// number -1 into ... position.line of type uint32") — a guaranteed
+// wasted round trip. Skipping beats clamping to line 0: the identifier
+// is not there, so a clamped request would at best return junk for a
+// different symbol.
+func lspLine(n *graph.Node) (int, bool) {
+	if n.StartLine < 1 {
+		return 0, false
+	}
+	return n.StartLine - 1, true
 }
 
 // identifierColumn returns the 0-based column of the first
