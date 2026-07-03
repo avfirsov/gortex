@@ -1431,6 +1431,14 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// for calls edges, resolve as a function (original behavior).
 		if e.Kind == graph.EdgeInstantiates || e.Kind == graph.EdgeReferences {
 			r.resolveTypeOrFunc(e, target, stats)
+		} else if rp, _ := e.Meta["rust_path"].(string); strings.Contains(rp, "::") {
+			// A Rust qualified path call (`MatchStrategy::new`,
+			// `crate::mod::baz`) keeps its full path in Meta["rust_path"].
+			// The generic function-call cascade only sees the trailing
+			// segment ("new"), so it would mis-bind the call to the first
+			// same-named symbol. Leave it unresolved for the SynthRustScope
+			// pass, which reads the qualifier and binds the right owner.
+			break
 		} else {
 			before := e.To
 			r.resolveFunctionCall(e, target, stats)

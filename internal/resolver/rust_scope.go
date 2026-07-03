@@ -377,6 +377,15 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 			idx.set(graph.OriginASTResolved, 0.9, "impl_owner")
 			return id
 		}
+		// Ambiguous by type name alone — the same type name is defined in
+		// more than one crate/module (e.g. grep::regex::RegexMatcherBuilder
+		// and grep::pcre2::RegexMatcherBuilder). Disambiguate with the
+		// qualified path's crate/module segments: bind to the candidate
+		// whose file lives under a directory named by a path segment.
+		if id := idx.methodByPathSegments(repo, qualifier, last, segments); id != "" {
+			idx.set(graph.OriginASTResolved, 0.9, "impl_owner_path")
+			return id
+		}
 		return ""
 
 	default:
@@ -415,6 +424,34 @@ func (idx *rustScopeIndex) uniqueMethod(repo, owner, name string) string {
 			return "" // ambiguous
 		}
 		hit = m.ID
+	}
+	return hit
+}
+
+// methodByPathSegments disambiguates a Type::method call whose type name is
+// defined in more than one crate/module by matching the qualified path's
+// crate/module segments (grep::regex::Foo::bar -> a candidate whose file
+// lives under a `regex` directory) against each candidate's file path.
+// Returns the ID only when exactly one candidate matches a path segment.
+func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segments []string) string {
+	cands := idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+	var hit string
+	for _, m := range cands {
+		if m.Name != name {
+			continue
+		}
+		for _, seg := range segments {
+			if seg == "" || seg == owner || seg == name {
+				continue
+			}
+			if strings.Contains(m.FilePath, "/"+seg+"/") {
+				if hit != "" && hit != m.ID {
+					return "" // more than one crate/module matched
+				}
+				hit = m.ID
+				break
+			}
+		}
 	}
 	return hit
 }
