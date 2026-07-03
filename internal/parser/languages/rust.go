@@ -323,7 +323,12 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
-			continue
+			// A call outside any function body — e.g. inside a const/static
+			// initialiser (`const ALIASES = [alias(...), alias(...)]`).
+			// Attribute it to the file node instead of dropping the site, so
+			// find_usages still surfaces the call. Mirrors the let-binding
+			// type-use pass's file-node fallback.
+			callerID = fileID
 		}
 		if c.isSelector {
 			edge := &graph.Edge{
