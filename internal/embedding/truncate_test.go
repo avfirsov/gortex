@@ -1,9 +1,11 @@
 package embedding
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unicode/utf8"
 )
@@ -186,6 +188,52 @@ func TestClampRunes(t *testing.T) {
 				t.Fatalf("result not valid UTF-8: %q", got)
 			}
 		})
+	}
+}
+
+// TestHugotProvider_LiveTruncatesOverBudgetInput is the end-to-end regression
+// for the shape-mismatch crash: an input well past MiniLM's 512-token window
+// used to abort the pipeline. With truncation it must embed to a real 384-dim
+// vector. Gated on a real cached model — set GORTEX_TEST_LIVE_MODELS=1.
+func TestHugotProvider_LiveTruncatesOverBudgetInput(t *testing.T) {
+	if os.Getenv("GORTEX_TEST_LIVE_MODELS") != "1" {
+		t.Skip("set GORTEX_TEST_LIVE_MODELS=1 to run against the real MiniLM model")
+	}
+	prov, err := newHugotProvider()
+	if err != nil {
+		t.Skipf("MiniLM model unavailable: %v", err)
+	}
+	defer prov.Close()
+
+	// ~120 repetitions of a 9-token sentence ≈ 1000+ tokens — comfortably past
+	// the 512-token window that used to crash the GO tokenizer path.
+	over := strings.Repeat("the quick brown fox jumps over the lazy dog ", 120)
+
+	vec, err := prov.Embed(context.Background(), over)
+	if err != nil {
+		t.Fatalf("embedding an over-budget input failed (truncation regression): %v", err)
+	}
+	if len(vec) != prov.Dimensions() {
+		t.Fatalf("got a %d-dim vector, want %d", len(vec), prov.Dimensions())
+	}
+	nonZero := false
+	for _, v := range vec {
+		if v != 0 {
+			nonZero = true
+			break
+		}
+	}
+	if !nonZero {
+		t.Fatal("embedding vector is all zeros")
+	}
+
+	// A batch mixing an over-budget input with a short one must also succeed.
+	vecs, err := prov.EmbedBatch(context.Background(), []string{over, "short input"})
+	if err != nil {
+		t.Fatalf("mixed batch failed: %v", err)
+	}
+	if len(vecs) != 2 || len(vecs[0]) != prov.Dimensions() || len(vecs[1]) != prov.Dimensions() {
+		t.Fatalf("mixed batch produced wrong shapes: %d vectors", len(vecs))
 	}
 }
 
