@@ -20,10 +20,11 @@ const gomlxModelName = "sentence-transformers/all-MiniLM-L6-v2"
 // GoMLXProvider uses Hugot with the XLA/GoMLX backend for transformer embeddings.
 // XLA/PJRT plugin auto-downloads on first use (~100MB).
 type GoMLXProvider struct {
-	session  *hugot.Session
-	pipeline *pipelines.FeatureExtractionPipeline
-	dims     int
-	mu       sync.Mutex
+	session   *hugot.Session
+	pipeline  *pipelines.FeatureExtractionPipeline
+	dims      int
+	truncator *tokenTruncator
+	mu        sync.Mutex
 }
 
 func newGoMLXProvider() (Provider, error) {
@@ -52,10 +53,19 @@ func newGoMLXProvider() (Provider, error) {
 		return nil, fmt.Errorf("gomlx pipeline: %w", err)
 	}
 
+	// Belt-and-suspenders token truncation: the XLA path's Rust tokenizer
+	// already truncates, but keeping the client-side cap here matches the
+	// pure-Go provider and covers a degraded tokenizer. See hugot.go.
+	truncator, terr := newTokenTruncator(modelPath)
+	if terr != nil {
+		fmt.Fprintf(os.Stderr, "[gortex embedding] %v\n", terr)
+	}
+
 	return &GoMLXProvider{
-		session:  session,
-		pipeline: pipeline,
-		dims:     384,
+		session:   session,
+		pipeline:  pipeline,
+		dims:      384,
+		truncator: truncator,
 	}, nil
 }
 
@@ -74,9 +84,14 @@ func (p *GoMLXProvider) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	texts = p.truncator.TruncateAll(texts)
+
 	output, err := p.pipeline.RunPipeline(ctx, texts)
 	if err != nil {
 		return nil, fmt.Errorf("gomlx run: %w", err)
+	}
+	if err := validateBatch("gomlx", texts, output.Embeddings, p.dims); err != nil {
+		return nil, err
 	}
 	return output.Embeddings, nil
 }

@@ -2,8 +2,8 @@
 
 package embedding
 
-import "errors"
+import "fmt"
 
 func newGoMLXProvider() (Provider, error) {
-	return nil, errors.New("GoMLX provider not compiled in (build with -tags embeddings_gomlx)")
+	return nil, fmt.Errorf("GoMLX provider not compiled in (build with -tags \"embeddings_gomlx XLA\"): %w", ErrBackendNotCompiled)
 }

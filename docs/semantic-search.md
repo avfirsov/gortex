@@ -20,6 +20,14 @@ embedding:
 
 Selecting a different embedding model (`variant`, or `GORTEX_EMBEDDINGS_VARIANT`) that changes vector dimensionality re-embeds the graph on next index; the persisted index guards against a dimension mismatch.
 
+### Where the config lives — and what wins
+
+The `embedding:` block can sit in more than one place; precedence, highest first:
+
+1. **`--embeddings` / `--embeddings-url` / `--embeddings-model` flags** and the **`GORTEX_EMBEDDINGS*` env vars** — one-shot overrides. A URL forces the `api` provider; `GORTEX_EMBEDDINGS=0/1` toggles the vector channel; `GORTEX_EMBEDDINGS_VARIANT` pins a local model.
+2. **Repo-local `.gortex.yaml`** — the per-project `embedding:` block (loaded by viper, so `GORTEX_EMBEDDING_*` env keys also merge here).
+3. **Global `~/.gortex/config.yaml`** — a user-level `embedding:` block layered *under* the repo-local one: every field the repo leaves unset inherits the global value (the tri-state `enabled:` too), so one block can serve every repo. An unrecognised top-level key in this file is ignored with a startup warning (`contains keys gortex does not recognize`) rather than silently dropped — the usual cause of an `embedding:` block that "does nothing" is placing it under the wrong key here.
+
 | Provider | Quality | Offline | Native deps | Notes |
 |---|---|---|---|---|
 | `static` (default) | Good for identifier-shaped queries | Yes | None | Baked GloVe-50d table, CPU-only, zero setup |
@@ -29,6 +37,10 @@ Selecting a different embedding model (`variant`, or `GORTEX_EMBEDDINGS_VARIANT`
 ## AST sub-chunking
 
 Symbols longer than `chunk_threshold_lines` are split into AST-aware windows (block statements, case clauses, field groups) before embedding; each window is vectorised independently and de-duplicated back to the parent symbol at query time, so a large function lands as one hit grounded in the specific chunk that matched — chunk IDs never leak into results.
+
+## Input truncation
+
+Every embedding input is capped at the model's positional budget — `max_position_embeddings` from the model's `config.json` minus the two special-token slots (510 for MiniLM/BERT; larger for wide-context variants) — before it reaches inference. A transformer cannot attend past that window, so trimming the tail is lossless by construction, and it is load-bearing: the pure-Go tokenizer path does not enforce the limit itself, so a single over-budget input would otherwise reach inference at full length and abort the *entire* vector-index build with a tensor shape mismatch — dropping the daemon to text-only search. AST chunking already splits long symbols into sub-budget windows, so truncation only ever trims a pathological single chunk. If the model directory lacks a readable `config.json` the budget falls back to 510; if the tokenizer itself can't load, truncation degrades to a rune clamp rather than disabling the backend.
 
 ## Persistent index
 
@@ -72,11 +84,32 @@ The combo store now keys symbol associations both on the whole query and per key
 Opt-in faster local backends via build tags:
 
 ```bash
-go build -tags embeddings_onnx ./cmd/gortex/   # needs: brew install onnxruntime
-go build -tags embeddings_gomlx ./cmd/gortex/  # auto-downloads XLA plugin
+go build -tags embeddings_onnx ./cmd/gortex/          # needs: brew install onnxruntime
+go build -tags "embeddings_gomlx XLA" ./cmd/gortex/   # needs libtokenizers.a on the linker path — use `make build-gomlx` (see below)
 ```
 
+The `embeddings_onnx` backend (GTE-small) **never auto-downloads**: place `model.onnx` and `vocab.txt` in `~/.gortex/models/gte-small/` yourself and install the ONNX Runtime native library (`brew install onnxruntime`, or the distro equivalent). Without both, the backend reports "ONNX model not found" and the local chain falls through to the pure-Go Hugot backend.
+
+The GoMLX/XLA backend requires **both** tags — `embeddings_gomlx` alone links a disabled XLA stub and always falls through to the pure-Go backend; the `XLA` tag is what compiles the real XLA session. It also statically links the rust tokenizer, so the build needs `libtokenizers.a` on the linker path (a prebuilt archive from [daulet/tokenizers](https://github.com/daulet/tokenizers) releases, at `/usr/lib` or `/usr/local/lib`); `make build-gomlx` downloads it for you. At runtime the XLA/PJRT plugin auto-downloads (~100 MB). XLA/PJRT runtime viability is platform-dependent and still experimental — if the plugin fails to load, the local chain degrades to the pure-Go Hugot backend and the startup log names the failed backend (see Troubleshooting). The default pure-Go backend needs no tags and no native libraries, and is the reliable path.
+
+| Build tag | Backend | Model | Extra dependency | Status |
+|---|---|---|---|---|
+| _(none)_ | Hugot pure-Go | MiniLM-L6-v2 (auto-download) | none | **default — reliable path** |
+| `embeddings_gomlx XLA` | Hugot + XLA/GoMLX | MiniLM-L6-v2 (auto-download) | libtokenizers.a (build) + PJRT plugin (runtime download) | experimental — XLA/PJRT runtime is platform-dependent |
+| `embeddings_onnx` | ONNX Runtime | GTE-small (manual placement) | libonnxruntime + hand-placed model | manual setup — never auto-downloads |
+
 The legacy `--embeddings` / `--embeddings-url` / `--embeddings-model` CLI flags and the `GORTEX_EMBEDDINGS*` env vars still take precedence over the config block — useful for one-shot overrides without editing `.gortex.yaml`.
+
+## Troubleshooting
+
+Semantic search degrading to text-only (BM25 / FTS5) is always logged — match the daemon log line to the cause:
+
+- **`embeddings enabled ... provider: local (hugot/fp32), dim: 384`** — working as intended: the transformer backend is active at its true width.
+- **`embeddings enabled ... provider: local → static fallback, dim: 50`** — a `local` config could not construct any transformer backend and fell back to static GloVe. The preceding `embedding backend unavailable — degraded to static fallback` warnings name each backend and why (an uncached model with downloads disabled, a missing `embeddings_onnx` model, …). Fix the named backend or accept static; the width and provider name now tell the truth rather than echoing the configured name.
+- **`vector index aborted on chunk failure`** — an embedding call failed (API timeout / auth, or an over-long input on a build without truncation) and the whole vector index was dropped to avoid a half-embedded, mis-scoring index. Text search stays live. `gortex eval embedders` reports the concrete cause as `vector build failed: …` instead of a bare "no vector data".
+- **`vector index built ... dropped: N`** (N > 0) — N malformed vectors (nil / wrong width) were skipped; the `sample_ids` warning names the first few. A non-zero `dropped` from a healthy provider is worth investigating.
+- **`vector index disabled — embedding text count exceeds threshold`** — the corpus is larger than `embedding.max_symbols`; raise it if you have the memory headroom.
+- **`~/.gortex/config.yaml contains keys gortex does not recognize`** — a top-level key (commonly an `embedding:` block nested one level too deep, or a typo) is being ignored; move it to a recognised key.
 
 ## `search_symbols` `assist:` modes
 

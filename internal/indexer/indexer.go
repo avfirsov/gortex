@@ -236,6 +236,14 @@ type Indexer struct {
 	// inference mutex.
 	embedAPIConcurrency int
 
+	// lastVectorBuildErr records why the most recent buildSearchIndex pass
+	// shipped text-only instead of a vector index (chunk-embed failure,
+	// all-vectors-invalid, or the symbol-count guard). Nil after a build that
+	// produced a vector index. Read via LastVectorBuildError once a build has
+	// finished — it lets `gortex eval embedders` report the real cause instead
+	// of a bare "no vector data".
+	lastVectorBuildErr error
+
 	// semanticMgr is the optional semantic enrichment manager.
 	semanticMgr *semantic.Manager
 
@@ -1132,6 +1140,13 @@ func (idx *Indexer) SetEmbeddingMaxSymbols(n int) { idx.embedMaxSymbols = n }
 // in parallel against an API-backed embedder. Zero keeps the built-in
 // default. Has no effect on in-process embedders.
 func (idx *Indexer) SetEmbeddingAPIConcurrency(n int) { idx.embedAPIConcurrency = n }
+
+// LastVectorBuildError returns why the most recent index build produced no
+// vector index (chunk-embed failure, all vectors invalid, or the symbol-count
+// guard), or nil when a vector index was built or the embedder was unset. Read
+// it after an index build completes; it is not safe to call concurrently with
+// one.
+func (idx *Indexer) LastVectorBuildError() error { return idx.lastVectorBuildErr }
 
 // SetSemanticManager sets the semantic enrichment manager.
 // When set, the indexer runs semantic enrichment after resolution.
@@ -3983,6 +3998,11 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 // AllNodes() path because nodes there carry an empty RepoPrefix and
 // GetRepoNodes("") would miss them.
 func (idx *Indexer) buildSearchIndex() {
+	// Start every build from a clean vector-build error: the degraded vector
+	// paths below set it, and a successful build (or a benign skip / no embedder)
+	// leaves it nil, so LastVectorBuildError always reflects the current pass.
+	idx.lastVectorBuildErr = nil
+
 	// Code-only enumeration: content (data_class=content) sections live in
 	// the content index, never the symbol search or the vector store, so the
 	// FTS loop below and collectEmbedTexts both skip them anyway. Fetching
@@ -4098,6 +4118,7 @@ func (idx *Indexer) buildSearchIndex() {
 			zap.Int("texts", len(texts)),
 			zap.Int("threshold", embedMaxSymbols),
 			zap.String("hint", "BM25 text search remains active; raise embedding.max_symbols if you have memory headroom"))
+		idx.lastVectorBuildErr = fmt.Errorf("embedding text count %d exceeds threshold %d (raise embedding.max_symbols)", len(texts), embedMaxSymbols)
 		return
 	}
 
@@ -4150,6 +4171,7 @@ func (idx *Indexer) buildSearchIndex() {
 		// text-only search rather than ship an inconsistent hybrid
 		// backend.
 		idx.logger.Warn("vector index aborted on chunk failure", zap.Error(err))
+		idx.lastVectorBuildErr = fmt.Errorf("chunk embedding failed: %w", err)
 		return
 	}
 
@@ -4186,16 +4208,37 @@ func (idx *Indexer) buildSearchIndex() {
 	if persistSink != nil {
 		backendItems = make([]graph.VectorItem, 0, len(vectors))
 	}
+	// Add only well-formed vectors. A nil or wrong-width vector would poison
+	// the index — a mis-scored or panicking query — so drop it, count it, and
+	// keep a sample of offending node IDs for the log.
+	var droppedVectors int
+	var droppedSample []string
 	for i, vec := range vectors {
-		if vec != nil {
-			vecBackend.Add(ids[i], vec)
-			if persistSink != nil {
-				backendItems = append(backendItems, graph.VectorItem{
-					NodeID: ids[i],
-					Vec:    vec,
-				})
+		if len(vec) != dims {
+			droppedVectors++
+			if len(droppedSample) < 5 {
+				droppedSample = append(droppedSample, ids[i])
 			}
+			continue
 		}
+		vecBackend.Add(ids[i], vec)
+		if persistSink != nil {
+			backendItems = append(backendItems, graph.VectorItem{
+				NodeID: ids[i],
+				Vec:    vec,
+			})
+		}
+	}
+	// If every vector was invalid there is nothing to search on. Ship text-only
+	// rather than a silently empty vector index that mis-scores every query —
+	// the same all-or-nothing contract as the chunk-failure abort above.
+	if len(vectors) > 0 && vecBackend.Count() == 0 {
+		idx.logger.Warn("vector index aborted — all embeddings invalid",
+			zap.Int("dropped", droppedVectors),
+			zap.Int("dimensions", dims),
+			zap.Strings("sample_ids", droppedSample))
+		idx.lastVectorBuildErr = fmt.Errorf("all %d embedding vectors were invalid (want width %d)", droppedVectors, dims)
+		return
 	}
 	if persistSink != nil && len(backendItems) > 0 {
 		if err := persistSink.BulkUpsertEmbeddings(backendItems); err != nil {
@@ -4230,10 +4273,17 @@ func (idx *Indexer) buildSearchIndex() {
 		inner = hyb.TextBackend()
 	}
 	sw.Swap(search.NewHybrid(inner, vecBackend, idx.embedder))
+	if droppedVectors > 0 {
+		idx.logger.Warn("indexer: dropped invalid embedding vectors",
+			zap.Int("dropped", droppedVectors),
+			zap.Int("dimensions", dims),
+			zap.Strings("sample_ids", droppedSample))
+	}
 	fields := []zap.Field{
 		zap.Int("vectors", vecBackend.Count()),
 		zap.Int("chunk_vectors", len(chunkMap)),
 		zap.Int("dimensions", dims),
+		zap.Int("dropped", droppedVectors),
 	}
 	// Surface the actual token spend of a paid embedding pass when the
 	// backend reports usage (API providers do; in-process ones don't).

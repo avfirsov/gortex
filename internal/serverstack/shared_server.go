@@ -2,6 +2,7 @@ package serverstack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -424,9 +426,38 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			zap.Strings("lsp_auto_registered", autoRegistered))
 	}
 
+	// Layer the global ~/.gortex/config.yaml `embedding:` block under the
+	// repo-local one before resolving the embedder, so an `embedding:` block in
+	// the global file is honoured while any repo-local non-zero field still
+	// wins. Done here (not at the LLM merge below) so it precedes ResolveEmbedder
+	// and leaves its flag/env precedence untouched. Warn about any unrecognised
+	// top-level keys — most often an `embedding:` block written in the wrong file.
+	embGlobal := cfg.Global
+	if embGlobal == nil {
+		var gerr error
+		if embGlobal, gerr = config.LoadGlobal(); gerr != nil {
+			// A malformed global file is otherwise silently ignored — exactly
+			// when its embedding/llm block would have taken effect.
+			logger.Warn("serverstack: global config could not be parsed — its embedding/llm block is ignored",
+				zap.Error(gerr))
+		}
+	}
+	conf.Embedding = embGlobal.MergeEmbeddingInto(conf.Embedding)
+	// Diagnose unknown keys in the file that was actually loaded (which may be an
+	// overridden path from cfg.Global), not always the default location.
+	globalPath := ""
+	if embGlobal != nil {
+		globalPath = embGlobal.ConfigPath()
+	}
+	if unknown := config.UnknownGlobalKeys(globalPath); len(unknown) > 0 {
+		logger.Warn("serverstack: ~/.gortex/config.yaml contains keys gortex does not recognize",
+			zap.Strings("keys", unknown),
+			zap.String("hint", "see docs/semantic-search.md for embedding config placement"))
+	}
+
 	// Embeddings: explicit flag/env > `embedding:` config > default (on,
 	// static GloVe).
-	embedder, embDesc, embErr := ResolveEmbedder(cfg.Embedder, conf)
+	embedder, embDesc, embReport, embErr := ResolveEmbedder(cfg.Embedder, conf)
 	// Probe API-backed providers up front so Dimensions() is truthful before
 	// we log it and — crucially — before EmbedderDims gates snapshot-vector
 	// reload. An APIProvider reports 0 until its first embed; without this the
@@ -445,6 +476,21 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			} else {
 				logger.Info("serverstack: embedding dimension probed", zap.Int("dim", dim))
 			}
+		}
+	}
+	// Surface every backend the local auto-selection tried. Warn per backend
+	// only when the outcome was actually degraded (fell to the static fallback,
+	// or built nothing) AND the backend could really have worked — a backend
+	// that is simply not compiled into this build (the onnx/gomlx stubs) is
+	// benign noise and stays at debug even on a degradation.
+	outcomeDegraded := (embedder == nil || embReport.Chosen == "static") && len(embReport.Attempts) > 0
+	for _, a := range embReport.Attempts {
+		if outcomeDegraded && !errors.Is(a.Err, embedding.ErrBackendNotCompiled) {
+			logger.Warn("serverstack: embedding backend unavailable — degraded to static fallback",
+				zap.String("backend", a.Backend), zap.Error(a.Err))
+		} else {
+			logger.Debug("serverstack: embedding backend not available",
+				zap.String("backend", a.Backend), zap.Error(a.Err))
 		}
 	}
 	switch {

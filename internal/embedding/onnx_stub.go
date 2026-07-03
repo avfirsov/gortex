@@ -2,8 +2,8 @@
 
 package embedding
 
-import "errors"
+import "fmt"
 
 func newONNXProvider() (Provider, error) {
-	return nil, errors.New("ONNX provider not compiled in (build with -tags embeddings_onnx)")
+	return nil, fmt.Errorf("ONNX provider not compiled in (build with -tags embeddings_onnx): %w", ErrBackendNotCompiled)
 }

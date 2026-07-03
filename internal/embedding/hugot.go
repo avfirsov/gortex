@@ -23,10 +23,11 @@ const miniLMRepo = "sentence-transformers/all-MiniLM-L6-v2"
 // HugotProvider uses Hugot with the pure Go backend for offline transformer embeddings.
 // Model auto-downloads from Hugging Face on first use.
 type HugotProvider struct {
-	session  *hugot.Session
-	pipeline *pipelines.FeatureExtractionPipeline
-	dims     int
-	mu       sync.Mutex
+	session   *hugot.Session
+	pipeline  *pipelines.FeatureExtractionPipeline
+	dims      int
+	truncator *tokenTruncator
+	mu        sync.Mutex
 }
 
 // DefaultHugotVariant is the short name of the variant newHugotProvider
@@ -128,10 +129,23 @@ func newHugotProviderWithSpec(spec HugotVariant) (Provider, error) {
 	if dims == 0 {
 		dims = 384 // conservative fallback
 	}
+
+	// Cap inputs at the model's positional budget before they reach the
+	// pipeline. The pure-Go tokenizer path does not honour
+	// max_position_embeddings, so an over-long text would otherwise abort the
+	// whole vector index with a tensor shape mismatch. A degraded truncator
+	// (missing config.json / corrupt tokenizer.json) still works via a rune
+	// clamp, so we warn and continue rather than fail the provider.
+	truncator, terr := newTokenTruncator(modelPath)
+	if terr != nil {
+		fmt.Fprintf(os.Stderr, "[gortex embedding] %v\n", terr)
+	}
+
 	return &HugotProvider{
-		session:  session,
-		pipeline: pipeline,
-		dims:     dims,
+		session:   session,
+		pipeline:  pipeline,
+		dims:      dims,
+		truncator: truncator,
 	}, nil
 }
 
@@ -150,9 +164,14 @@ func (p *HugotProvider) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	texts = p.truncator.TruncateAll(texts)
+
 	output, err := p.pipeline.RunPipeline(ctx, texts)
 	if err != nil {
 		return nil, fmt.Errorf("hugot run: %w", err)
+	}
+	if err := validateBatch("hugot", texts, output.Embeddings, p.dims); err != nil {
+		return nil, err
 	}
 	return output.Embeddings, nil
 }

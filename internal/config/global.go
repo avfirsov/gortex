@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -75,6 +76,13 @@ type GlobalConfig struct {
 	// without duplicating an `llm:` block in every `.gortex.yaml`.
 	LLM llm.Config `mapstructure:"llm" yaml:"llm,omitempty"`
 
+	// Embedding is the user-level semantic-search config (`embedding.provider:`
+	// etc.). Merged into the repo-local Config.Embedding at daemon startup via
+	// MergeEmbeddingInto — local non-zero fields win, global fills the rest —
+	// so an `embedding:` block can live in ~/.gortex/config.yaml and apply
+	// across repos instead of being duplicated in every `.gortex.yaml`.
+	Embedding EmbeddingConfig `mapstructure:"embedding" yaml:"embedding,omitempty"`
+
 	// configPath stores the file path used for Save(). Set by LoadGlobal or SetConfigPath.
 	configPath string `yaml:"-"`
 }
@@ -94,6 +102,82 @@ func (gc *GlobalConfig) MergeLLMInto(local llm.Config) llm.Config {
 	}
 	local.Local.Model = expandHome(local.Local.Model)
 	return local
+}
+
+// MergeEmbeddingInto layers a repo-local EmbeddingConfig over the global user
+// config: each zero-valued field of local is filled from gc.Embedding, so an
+// `embedding:` block in ~/.gortex/config.yaml applies across repos while any
+// per-repo `.gortex.yaml` value still wins. Enabled is a tri-state pointer, so
+// a local nil (unset) inherits the global toggle. Safe on a nil receiver.
+func (gc *GlobalConfig) MergeEmbeddingInto(local EmbeddingConfig) EmbeddingConfig {
+	if gc == nil {
+		return local
+	}
+	g := gc.Embedding
+	if local.Enabled == nil {
+		local.Enabled = g.Enabled
+	}
+	if local.Provider == "" {
+		local.Provider = g.Provider
+	}
+	if local.APIURL == "" {
+		local.APIURL = g.APIURL
+	}
+	if local.APIModel == "" {
+		local.APIModel = g.APIModel
+	}
+	if local.MaxSymbols == 0 {
+		local.MaxSymbols = g.MaxSymbols
+	}
+	if local.ChunkThresholdLines == 0 {
+		local.ChunkThresholdLines = g.ChunkThresholdLines
+	}
+	if local.ChunkWindowLines == 0 {
+		local.ChunkWindowLines = g.ChunkWindowLines
+	}
+	if local.APIConcurrency == 0 {
+		local.APIConcurrency = g.APIConcurrency
+	}
+	if local.Variant == "" {
+		local.Variant = g.Variant
+	}
+	return local
+}
+
+// knownGlobalTopLevelKeys is the set of top-level keys LoadGlobal understands.
+// Anything else in ~/.gortex/config.yaml is silently dropped by yaml.Unmarshal,
+// so UnknownGlobalKeys surfaces it for a startup warning.
+var knownGlobalTopLevelKeys = map[string]bool{
+	"projects": true, "repos": true, "active_project": true,
+	"exclude": true, "llm": true, "embedding": true,
+}
+
+// UnknownGlobalKeys returns the top-level keys present in the global config file
+// that gortex does not recognise — e.g. an `embedding:` block placed under the
+// wrong nesting, or a typo. It never fails: a missing or unparseable file yields
+// no keys, so forward compatibility (an older binary reading a newer config) is
+// preserved. Pass a path to override the default ~/.gortex/config.yaml.
+func UnknownGlobalKeys(configPath ...string) []string {
+	path := DefaultGlobalConfigPath()
+	if len(configPath) > 0 && configPath[0] != "" {
+		path = configPath[0]
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var top map[string]any
+	if err := yaml.Unmarshal(data, &top); err != nil {
+		return nil
+	}
+	var unknown []string
+	for k := range top {
+		if !knownGlobalTopLevelKeys[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	sort.Strings(unknown)
+	return unknown
 }
 
 // expandHome resolves a leading `~/` in a path against $HOME so users

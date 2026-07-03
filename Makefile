@@ -26,7 +26,7 @@ build-onnx: deps-onnx
 	go build -tags embeddings_onnx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 build-gomlx: deps-gomlx
-	go build -tags embeddings_gomlx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+	go build -tags "embeddings_gomlx XLA" -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 # Hugot is bundled by default now — this target is kept as a compatibility
 # alias and also ensures the dep is explicitly recorded in go.mod.
@@ -185,7 +185,23 @@ deps-gomlx:
 	@echo "=== GoMLX dependency ==="
 	go get github.com/gomlx/gomlx@latest
 	go get github.com/gomlx/onnx-gomlx@latest
-	@echo "✓ GoMLX + ONNX converter installed"
+	@echo "=== rust tokenizers (the XLA session links libtokenizers.a statically) ==="
+	@if [ -f /usr/lib/libtokenizers.a ] || [ -f /usr/local/lib/libtokenizers.a ]; then \
+		echo "✓ libtokenizers.a already present"; \
+	else \
+		os=$$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$$(uname -m); \
+		case "$$os-$$arch" in \
+			darwin-arm64) asset=libtokenizers.darwin-arm64.tar.gz; dest=/usr/local/lib ;; \
+			darwin-x86_64) asset=libtokenizers.darwin-x86_64.tar.gz; dest=/usr/local/lib ;; \
+			linux-x86_64|linux-amd64) asset=libtokenizers.linux-amd64.tar.gz; dest=/usr/lib ;; \
+			linux-aarch64|linux-arm64) asset=libtokenizers.linux-arm64.tar.gz; dest=/usr/lib ;; \
+			*) echo "No prebuilt libtokenizers for $$os-$$arch — build it from https://github.com/daulet/tokenizers and place libtokenizers.a on the linker path"; exit 1 ;; \
+		esac; \
+		echo "  downloading $$asset -> $$dest"; \
+		curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v1.27.0/$$asset" | tar -xz -C /tmp; \
+		sudo cp /tmp/libtokenizers.a "$$dest/"; \
+	fi
+	@echo "✓ GoMLX + ONNX converter + rust tokenizers installed"
 	@echo "  Note: XLA/PJRT plugin will auto-download on first run (~100MB)"
 
 # Hugot — uses same XLA/PJRT backend as GoMLX
