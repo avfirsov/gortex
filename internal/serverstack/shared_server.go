@@ -424,6 +424,23 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			zap.Strings("lsp_auto_registered", autoRegistered))
 	}
 
+	// Layer the global ~/.gortex/config.yaml `embedding:` block under the
+	// repo-local one before resolving the embedder, so an `embedding:` block in
+	// the global file is honoured while any repo-local non-zero field still
+	// wins. Done here (not at the LLM merge below) so it precedes ResolveEmbedder
+	// and leaves its flag/env precedence untouched. Warn about any unrecognised
+	// top-level keys — most often an `embedding:` block written in the wrong file.
+	embGlobal := cfg.Global
+	if embGlobal == nil {
+		embGlobal, _ = config.LoadGlobal()
+	}
+	conf.Embedding = embGlobal.MergeEmbeddingInto(conf.Embedding)
+	if unknown := config.UnknownGlobalKeys(); len(unknown) > 0 {
+		logger.Warn("serverstack: ~/.gortex/config.yaml contains keys gortex does not recognize",
+			zap.Strings("keys", unknown),
+			zap.String("hint", "see docs/semantic-search.md for embedding config placement"))
+	}
+
 	// Embeddings: explicit flag/env > `embedding:` config > default (on,
 	// static GloVe).
 	embedder, embDesc, embReport, embErr := ResolveEmbedder(cfg.Embedder, conf)
