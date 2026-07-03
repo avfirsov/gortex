@@ -145,6 +145,33 @@ func TestResolvePHPOverrideDispatch_TraitProvidedMethod(t *testing.T) {
 	}
 }
 
+// A phpdoc @method virtual node joins the member-call binding population: a
+// unique-name call to it resolves like any other method (proving W4's virtual
+// nodes are first-class in the resolver, not just the extractor).
+func TestResolvePHP_PhpdocVirtualIsBindable(t *testing.T) {
+	var s graph.Store = graph.New()
+	f := "src/Foo.php"
+	app := "src/a.php"
+	phpType(s, f+"::Foo", "Foo", nil)
+	s.AddNode(&graph.Node{ID: f + "::Foo.magicAccessor", Kind: graph.KindMethod, Name: "magicAccessor",
+		FilePath: f, Language: "php", Meta: map[string]any{"receiver": "Foo", "virtual": "phpdoc_method"}})
+
+	caller := app + "::run"
+	s.AddNode(&graph.Node{ID: caller, Kind: graph.KindFunction, Name: "run", FilePath: app, Language: "php"})
+	s.AddEdge(&graph.Edge{From: caller, To: "unresolved::*.magicAccessor", Kind: graph.EdgeCalls, FilePath: app, Line: 2})
+
+	r := New(s)
+	r.ResolveAll()
+
+	var bound bool
+	for _, e := range s.GetOutEdges(caller) {
+		if e.Kind == graph.EdgeCalls && e.To == f+"::Foo.magicAccessor" {
+			bound = true
+		}
+	}
+	assert.True(t, bound, "a call to a unique phpdoc @method virtual must bind to it")
+}
+
 // Precision guard: same-name methods on UNRELATED types (no shared ancestor)
 // must never be sprayed together.
 func TestResolvePHPOverrideDispatch_UnrelatedNotFannedOut(t *testing.T) {

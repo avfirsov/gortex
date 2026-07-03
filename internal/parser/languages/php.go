@@ -2,6 +2,7 @@ package languages
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -210,6 +211,16 @@ func (e *PHPExtractor) extractClass(
 		return
 	}
 	methodNodes := e.extractPhpMembers(body, src, filePath, fileNode, result, seen, className, id)
+	// Magic-method surface: a class declaring __call / __callStatic can receive
+	// arbitrary member calls the extractor cannot mint nodes for; mark it so the
+	// resolver/read path knows unresolved members on it are not necessarily a gap.
+	if phpDeclaresMagicCall(methodNodes) {
+		meta["has_magic_call"] = true
+	}
+	// @method phpdoc virtuals: docblock-declared methods (magic accessors,
+	// mixins) that have no method_declaration node. Mint them so their ids
+	// resolve and member calls to them bind.
+	e.emitPHPDocMethods(node, src, filePath, fileNode, className, id, methodNodes, result, seen)
 	// Laravel-specific dispatch passes — run after methods are in the
 	// graph so action-method IDs are resolvable by name:
 	//   1. Controller middleware: `$this->middleware(X)->only([...])`
@@ -333,7 +344,11 @@ func (e *PHPExtractor) extractTrait(
 		From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
 	})
 	if body := e.findChildByType(node, "declaration_list"); body != nil {
-		e.extractPhpMembers(body, src, filePath, fileNode, result, seen, name, id)
+		methodNodes := e.extractPhpMembers(body, src, filePath, fileNode, result, seen, name, id)
+		if phpDeclaresMagicCall(methodNodes) {
+			meta["has_magic_call"] = true
+		}
+		e.emitPHPDocMethods(node, src, filePath, fileNode, name, id, methodNodes, result, seen)
 	}
 }
 
@@ -1525,6 +1540,94 @@ func phpTypeClauseNames(node *sitter.Node, src []byte, clauseType string) []stri
 		}
 	}
 	return nil
+}
+
+// phpDocMethodRe matches a phpdoc `@method` tag: an optional `static`, an
+// optional return type token, then the method name immediately before `(`.
+// Return types with `|` / `?` / `\` / `[]` are captured as one token; the
+// name is always the identifier right before the parameter list.
+var phpDocMethodRe = regexp.MustCompile(`@method\s+(?:(static)\s+)?(?:([^\s()]+)\s+)?(\w+)\s*\(`)
+
+// phpDeclaresMagicCall reports whether a class/trait body declared __call or
+// __callStatic — the PHP magic-method dispatch hooks.
+func phpDeclaresMagicCall(methodNodes map[string]*sitter.Node) bool {
+	if methodNodes == nil {
+		return false
+	}
+	_, call := methodNodes["__call"]
+	_, callStatic := methodNodes["__callStatic"]
+	return call || callStatic
+}
+
+// phpDocBlockAbove returns the raw `/** ... */` docblock immediately preceding
+// a declaration, or "" when the preceding sibling is not a doc comment. Unlike
+// ExtractDocAbove (which keeps only the first paragraph) this returns the full
+// block so @method tags below the summary survive.
+func phpDocBlockAbove(node *sitter.Node, src []byte) string {
+	sib := node.PrevNamedSibling()
+	if sib == nil || sib.Type() != "comment" {
+		return ""
+	}
+	txt := sib.Content(src)
+	if !strings.HasPrefix(strings.TrimSpace(txt), "/**") {
+		return ""
+	}
+	return txt
+}
+
+// emitPHPDocMethods mints KindMethod nodes for `@method` tags in a class/trait
+// docblock — magic accessors and mixin methods that have no method_declaration
+// and would otherwise resolve not_found. A real declaration of the same name
+// always wins (the tag is skipped). Nodes are positioned on the class
+// declaration line (a positionless decl breaks the LSP hover path) and carry
+// virtual=phpdoc_method so consumers can tell them from concrete methods.
+func (e *PHPExtractor) emitPHPDocMethods(
+	node *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	className, classID string, methodNodes map[string]*sitter.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	doc := phpDocBlockAbove(node, src)
+	if doc == "" || !strings.Contains(doc, "@method") {
+		return
+	}
+	classLine := int(node.StartPoint().Row) + 1
+	minted := map[string]bool{}
+	for _, m := range phpDocMethodRe.FindAllStringSubmatch(doc, -1) {
+		isStatic, retType, name := m[1] != "", m[2], m[3]
+		if name == "" || minted[name] {
+			continue
+		}
+		minted[name] = true
+		if _, real := methodNodes[name]; real {
+			continue // a concrete declaration wins over the docblock virtual
+		}
+		id := filePath + "::" + className + "." + name
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		meta := map[string]any{
+			"receiver":    className,
+			"scope_class": className,
+			"visibility":  VisibilityPublic,
+			"virtual":     "phpdoc_method",
+		}
+		if isStatic {
+			meta["static"] = true
+		}
+		if retType != "" {
+			meta["return_type"] = retType
+		}
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindMethod, Name: name,
+			FilePath: filePath, StartLine: classLine, EndLine: classLine,
+			Language: "php", Meta: meta,
+		})
+		result.Edges = append(result.Edges,
+			&graph.Edge{From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: classLine},
+			&graph.Edge{From: id, To: classID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: classLine},
+		)
+	}
 }
 
 // phpMemberVisibility returns the access modifier for a PHP class
