@@ -170,6 +170,9 @@ func (p *HugotProvider) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 	if err != nil {
 		return nil, fmt.Errorf("hugot run: %w", err)
 	}
+	if err := validateBatch("hugot", texts, output.Embeddings, p.dims); err != nil {
+		return nil, err
+	}
 	return output.Embeddings, nil
 }
 

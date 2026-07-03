@@ -90,6 +90,9 @@ func (p *GoMLXProvider) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 	if err != nil {
 		return nil, fmt.Errorf("gomlx run: %w", err)
 	}
+	if err := validateBatch("gomlx", texts, output.Embeddings, p.dims); err != nil {
+		return nil, err
+	}
 	return output.Embeddings, nil
 }
 

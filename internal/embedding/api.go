@@ -134,10 +134,25 @@ func (p *APIProvider) Embed(ctx context.Context, text string) ([]float32, error)
 }
 
 func (p *APIProvider) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	var (
+		vecs [][]float32
+		err  error
+	)
 	if p.format == formatOllama {
-		return p.embedOllama(ctx, texts)
+		vecs, err = p.embedOllama(ctx, texts)
+	} else {
+		vecs, err = p.embedOpenAI(ctx, texts)
 	}
-	return p.embedOpenAI(ctx, texts)
+	if err != nil {
+		return nil, err
+	}
+	// Width is learned lazily from the response (dims 0), so validate the count,
+	// reject empty vectors, and check the batch is internally consistent without
+	// asserting an absolute width.
+	if err := validateBatch("api", texts, vecs, 0); err != nil {
+		return nil, err
+	}
+	return vecs, nil
 }
 
 func (p *APIProvider) Dimensions() int { return p.dims }
