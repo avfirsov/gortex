@@ -376,7 +376,17 @@ func (s *Server) handle(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	sess, err := s.handshake(conn, reader)
 	if err != nil {
-		s.Logger.Warn("daemon: handshake failed", zap.Error(err))
+		if errors.Is(err, io.EOF) {
+			// Liveness probe (daemon.IsRunningAt and friends): the peer
+			// dialed the socket and closed it without sending a handshake
+			// frame, so the first read returns a clean EOF. This is an
+			// expected "is the socket accepting?" knock, not a fault —
+			// keep it at Debug. A partially-written frame yields
+			// io.ErrUnexpectedEOF instead and still warns below.
+			s.Logger.Debug("daemon: connection closed before handshake", zap.Error(err))
+		} else {
+			s.Logger.Warn("daemon: handshake failed", zap.Error(err))
+		}
 		return
 	}
 
