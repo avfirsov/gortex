@@ -142,9 +142,18 @@ func (m *Manager) LSPRouter() LSPRouter {
 
 // EnrichAll runs all available providers against the graph.
 // For each language, only the highest-priority available provider runs.
-func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichResult, error) {
+//
+// The second return value reports, per repo prefix, whether that repo's
+// enrichment was left incomplete — true when any provider it ran was cut
+// short (Partial), abandoned at its deadline, or failed. A repo whose every
+// provider finished cleanly (or that had no eligible provider) is absent from
+// the map. Callers gating deferred-enrichment retries key off this: a partial
+// repo keeps its pending marker so a later pass retries instead of trusting an
+// incomplete graph.
+func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichResult, map[string]bool, error) {
+	partial := make(map[string]bool)
 	if !m.config.Enabled {
-		return nil, nil
+		return nil, partial, nil
 	}
 
 	// Build a map of language → sorted providers (by priority from config).
@@ -204,7 +213,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 			continue
 		}
 
-		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, results)
+		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, results, partial)
 	}
 
 	// Router-backed LSP providers: arbitrate by priority per language
@@ -278,7 +287,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], results)
+					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], results, partial)
 				}()
 			}
 		}
@@ -298,10 +307,10 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string) ([]*EnrichRe
 		if gateOnPresence && !anyLangPresent(langs, present) {
 			continue
 		}
-		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, results)
+		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, results, partial)
 	}
 
-	return results, nil
+	return results, partial, nil
 }
 
 // repoLanguages returns the union of languages present (in symbol-bearing
@@ -425,9 +434,9 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, results []*EnrichResult) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], results)
+		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], results, partial)
 	}
 	return results
 }
@@ -582,7 +591,11 @@ func (m *Manager) EnrichmentStatuses() []EnrichmentStatus {
 // return — nothing completed is discarded and no goroutine is detached.
 // Legacy providers keep the old detach-on-deadline behaviour, recorded
 // as "abandoned" in the enrichment status.
-func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, results []*EnrichResult) []*EnrichResult {
+//
+// partial records repos left incomplete: any provider that was abandoned,
+// failed, or returned a Partial result flips partial[repoName] so the caller
+// knows the repo's enrichment must be retried.
+func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	start := time.Now()
 
 	// Readiness gate: a server whose workspace load continues past `initialize`
@@ -662,6 +675,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
 					"provider did not return within the post-deadline grace window; incrementally landed work is kept, the final result was discarded")
+				partial[repoName] = true
 				return results
 			}
 		} else {
@@ -706,6 +720,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
 					"per-repo deadline exceeded; provider detached and its result discarded")
+				partial[repoName] = true
 				return results
 			}
 		} else {
@@ -720,6 +735,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Error(err),
 		)
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateFailed, d, result, err.Error())
+		partial[repoName] = true
 		return results
 	}
 
@@ -734,6 +750,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		state := EnrichStateCompleted
 		if result.Partial {
 			state = EnrichStatePartial
+			partial[repoName] = true
 		}
 		// A degraded (compile-db-missing) pass completes normally; surface its
 		// reason as the status detail when there is no abort reason to report.

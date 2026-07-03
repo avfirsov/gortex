@@ -322,6 +322,17 @@ type Indexer struct {
 	deferResolve       bool
 	pendingContractReg *contracts.Registry
 
+	// pendingEnrich is raised by an index pass that did real work — IndexCtx
+	// that observed files (or a whole-repo re-track) and IncrementalReindex /
+	// IncrementalReindexPaths that re-indexed or evicted at least one file. It
+	// is cleared only after runDeferredEnrich completes a fully non-partial
+	// semantic enrichment for this repo. The daemon warmup enriches every
+	// indexer it collected, so this gates the (multi-minute LSP hover) pass to
+	// repos that actually changed: an unchanged repo on a warm restart would
+	// otherwise re-confirm nothing for 10+ minutes. A partial / abandoned /
+	// failed enrich leaves it set so a later deferred pass retries.
+	pendingEnrich atomic.Bool
+
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindex
 	// skip the graph-wide derivation passes (InferImplements,
 	// InferOverrides, markTestSymbolsAndEmitEdges). These passes walk the
@@ -965,10 +976,26 @@ func (idx *Indexer) runDeferredEnrich() {
 	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
 		return
 	}
+	// Gate the pass to repos that actually changed. The daemon warmup collects
+	// every indexer and enriches them all, but an unchanged repo's persisted
+	// graph already carries its enrichment edges — re-running gopls hover for
+	// it confirms nothing over many minutes. GORTEX_WARMUP_FORCE_ENRICH=1
+	// bypasses the gate for a full re-enrich.
+	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
+	if !idx.pendingEnrich.Load() {
+		if !forced {
+			idx.logger.Info("deferred enrichment skipped",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("reason", "unchanged"))
+			return
+		}
+		idx.logger.Info("deferred enrichment forced despite no pending changes",
+			zap.String("repo", idx.repoPrefix))
+	}
 	// Key by the repo prefix so a repo-scoped provider can scope file
 	// selection to this repo (empty in single-repo mode).
 	roots := map[string]string{idx.repoPrefix: idx.rootPath}
-	results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+	results, partialRepos, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
 	if err != nil {
 		idx.logger.Warn("semantic enrichment failed", zap.Error(err))
 		return
@@ -982,6 +1009,13 @@ func (idx *Indexer) runDeferredEnrich() {
 			zap.Int("refuted", r.EdgesRefuted),
 			zap.Float64("coverage", r.CoveragePercent),
 		)
+	}
+	// Clear the pending marker only when every provider that ran for this repo
+	// finished non-partial. A partial / abandoned / failed pass leaves it set
+	// so a later deferred pass (or the next restart, once the repo changes
+	// again) retries the enrichment rather than trusting an incomplete graph.
+	if !partialRepos[idx.repoPrefix] {
+		idx.pendingEnrich.Store(false)
 	}
 }
 
@@ -2871,7 +2905,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			// Key by the repo prefix so a repo-scoped provider can scope
 			// file selection to this repo (empty in single-repo mode).
 			roots := map[string]string{idx.repoPrefix: absRoot}
-			results, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
+			results, _, err := idx.semanticMgr.EnrichAll(idx.graph, roots)
 			if err != nil {
 				idx.logger.Warn("semantic enrichment failed", zap.Error(err))
 			} else if len(results) > 0 {
@@ -3052,6 +3086,12 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		Errors:           errors,
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// A whole-repo (re-)track that observed files did work: mark the repo for
+	// deferred semantic enrichment. FullRetrack is stamped by the multi-repo
+	// caller after this returns, so FileCount carries the signal here.
+	if result.FileCount > 0 || result.FullRetrack {
+		idx.pendingEnrich.Store(true)
+	}
 	return result, nil
 }
 
@@ -4769,6 +4809,12 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// An incremental pass that re-indexed or evicted at least one file did
+	// work — mark the repo for deferred semantic enrichment. A zero-change
+	// reconcile leaves the marker untouched so an unchanged repo is skipped.
+	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
+		idx.pendingEnrich.Store(true)
+	}
 	return result, nil
 }
 
@@ -5007,6 +5053,12 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
+	// An incremental pass that re-indexed or evicted at least one file did
+	// work — mark the repo for deferred semantic enrichment. A zero-change
+	// reconcile leaves the marker untouched so an unchanged repo is skipped.
+	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
+		idx.pendingEnrich.Store(true)
+	}
 	return result, nil
 }
 
