@@ -3218,8 +3218,18 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// Reuse prior resolutions for edges whose source-side shape is unchanged
 	// (the common case on a small edit), so the resolver below only handles
-	// genuinely-new references instead of re-resolving the whole file.
-	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx); reused > 0 {
+	// genuinely-new references instead of re-resolving the whole file. The
+	// about-to-be-added node IDs let the reuse recover same-file targets that
+	// eviction removed and this AddBatch re-adds under identical IDs — without
+	// them a same-file call's resolution + tier is lost to a full re-resolve on
+	// every structural save.
+	newNodeIDs := make(map[string]struct{}, len(result.Nodes))
+	for _, n := range result.Nodes {
+		if n != nil {
+			newNodeIDs[n.ID] = struct{}{}
+		}
+	}
+	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx, newNodeIDs); reused > 0 {
 		idx.logger.Debug("indexer: reused prior resolutions",
 			zap.Int("edges", reused), zap.String("file", graphPath))
 	}
@@ -3332,13 +3342,25 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			// LSP / compiler provider) instead of leaving the file's edges at
 			// their pre-enrichment tier until the next full reindex. Gated
 			// internally on Config.EnrichOnWatch; a no-op when disabled.
-			if idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() {
+			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+			reEnriched := false
+			if providersPresent {
 				if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
 					idx.logger.Debug("indexer: incremental semantic enrichment failed",
 						zap.String("file", graphPath),
 						zap.Error(err))
+				} else {
+					reEnriched = idx.semanticMgr.EnrichesOnWatch()
 				}
 			}
+			// Record whether this live re-parse left the file below the
+			// enrichment tier: providers exist (so there IS an lsp/ast tier to
+			// fall short of) but the save did not re-run enrichment. When set,
+			// find_usages / get_callers flag their default text_matched
+			// suppression as re-verification-pending so a hidden-but-real usage
+			// is diagnosable rather than silently dropped. Cleared when
+			// enrichment did re-run for the file.
+			idx.setReparsePendingEnrichment(graphPath, providersPresent && !reEnriched)
 		}
 	}
 
@@ -3510,6 +3532,40 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 	return idx.graph.EvictFile(graphPath)
 }
 
+// ReresolveFileScoped forces the scoped re-resolution + LSP re-verify a normal
+// IndexFile performs, WITHOUT re-parsing and WITHOUT the IsStale gate — used by
+// the watcher's shape-degradation self-heal, where the file's mtime is already
+// current (IndexFile just ran) yet its resolved edges came out degraded, so a
+// plain IncrementalReindexPaths would stale-gate it out. Re-runs only this
+// file's forward + incoming resolve and, when a watch-enabled provider is
+// wired, its incremental enrichment. O(file), no whole-graph pass. No-op when
+// the file has no nodes (evicted since it was enqueued).
+func (idx *Indexer) ReresolveFileScoped(filePath string) error {
+	absPath := filePath
+	if !filepath.IsAbs(absPath) {
+		absPath = filepath.Join(idx.rootPath, filePath)
+	}
+	graphPath := idx.prefixPath(idx.relKey(absPath))
+	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
+		return nil // file gone / evicted; nothing to re-resolve
+	}
+	idx.resolver.ResolveFileAndIncoming(graphPath)
+	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+	reEnriched := false
+	if providersPresent {
+		if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
+			idx.logger.Debug("indexer: forced scoped enrichment failed",
+				zap.String("file", graphPath), zap.Error(err))
+		} else {
+			reEnriched = idx.semanticMgr.EnrichesOnWatch()
+		}
+	}
+	// Keep the find_usages staleness marker consistent with the enrichment
+	// that actually ran during this forced re-resolve (mirrors indexFile).
+	idx.setReparsePendingEnrichment(graphPath, providersPresent && !reEnriched)
+	return nil
+}
+
 // restubIncomingRefs rewrites every resolved reference edge that points
 // INTO a symbol of graphPath from a surviving (other-file) source back
 // to an `unresolved::<Name>` stub, in place, BEFORE the file's nodes are
@@ -3580,6 +3636,12 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 				continue // already a pending stub
 			}
 			oldTo := e.To
+			// Stash + clear the edge's resolved provenance before restubbing:
+			// an `unresolved::` stub must not keep advertising a resolved
+			// tier. The incoming-resolve pass restores it verbatim if the stub
+			// rebinds to the same target (idempotent re-parse); a deleted or
+			// moved target leaves the stub honestly unresolved.
+			graph.StashRestubProvenance(e)
 			e.To = stub
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
