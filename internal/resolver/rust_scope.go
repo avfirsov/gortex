@@ -213,10 +213,11 @@ func parseRustOverrideTarget(to string) (trait, method string, ok bool) {
 }
 
 // rustScopeEdgeCandidate reports whether an unresolved call edge is one
-// this pass can attempt: a path call (Meta["rust_path"] set) or a
-// self/Self selector call (Meta["rust_recv"] in {self, Self}). Every
-// other selector call is left to the generic resolver's receiver-type
-// cascade.
+// this pass can attempt: a path call (Meta["rust_path"] set), a self/Self
+// selector call (Meta["rust_recv"] in {self, Self}), or a selector call on
+// a typed receiver (Meta["receiver_type"] set) that the generic resolver
+// left unresolved because it keys methods by their verbatim (generic)
+// receiver. Every other selector call is left to the generic resolver.
 func rustScopeEdgeCandidate(e *graph.Edge) bool {
 	if e.Meta == nil {
 		return false
@@ -225,6 +226,9 @@ func rustScopeEdgeCandidate(e *graph.Edge) bool {
 		return true
 	}
 	if r, _ := e.Meta["rust_recv"].(string); r == "self" || r == "Self" {
+		return true
+	}
+	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
 		return true
 	}
 	return false
@@ -343,6 +347,21 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 			return id
 		}
 		return ""
+	}
+
+	// Selector call on a typed variable/param (`mat.buffer()` where
+	// `mat: &SinkMatch<'_>`). The generic resolver keys methods by their
+	// verbatim receiver ("SinkMatch<'b>"), so a generics-stripped inferred
+	// receiver_type ("SinkMatch") misses it. The scope index carries a
+	// base-name alias, so bind here when the type owns exactly one such
+	// method.
+	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
+		if name := selectorCallName(e.To); name != "" {
+			if id := idx.uniqueMethod(repo, rustBaseTypeName(rt), name); id != "" {
+				idx.set(graph.OriginASTResolved, 0.88, "receiver_type")
+				return id
+			}
+		}
 	}
 
 	path, _ := e.Meta["rust_path"].(string)
