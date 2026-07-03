@@ -85,17 +85,17 @@ Opt-in faster local backends via build tags:
 
 ```bash
 go build -tags embeddings_onnx ./cmd/gortex/          # needs: brew install onnxruntime
-go build -tags "embeddings_gomlx XLA" ./cmd/gortex/   # activates the XLA/GoMLX backend; PJRT plugin auto-downloads at runtime
+go build -tags "embeddings_gomlx XLA" ./cmd/gortex/   # needs libtokenizers.a on the linker path — use `make build-gomlx` (see below)
 ```
 
 The `embeddings_onnx` backend (GTE-small) **never auto-downloads**: place `model.onnx` and `vocab.txt` in `~/.gortex/models/gte-small/` yourself and install the ONNX Runtime native library (`brew install onnxruntime`, or the distro equivalent). Without both, the backend reports "ONNX model not found" and the local chain falls through to the pure-Go Hugot backend.
 
-The GoMLX/XLA backend requires **both** tags — `embeddings_gomlx` alone links a disabled XLA stub and always falls through to the pure-Go backend; the `XLA` tag is what compiles the real XLA session. The tag pair is compile-verified, but XLA/PJRT runtime viability is platform-dependent and still experimental — if the plugin fails to load, the local chain degrades to the pure-Go Hugot backend and the startup log names the failed backend (see Troubleshooting). The default pure-Go backend needs no tags and is the reliable path.
+The GoMLX/XLA backend requires **both** tags — `embeddings_gomlx` alone links a disabled XLA stub and always falls through to the pure-Go backend; the `XLA` tag is what compiles the real XLA session. It also statically links the rust tokenizer, so the build needs `libtokenizers.a` on the linker path (a prebuilt archive from [daulet/tokenizers](https://github.com/daulet/tokenizers) releases, at `/usr/lib` or `/usr/local/lib`); `make build-gomlx` downloads it for you. At runtime the XLA/PJRT plugin auto-downloads (~100 MB). XLA/PJRT runtime viability is platform-dependent and still experimental — if the plugin fails to load, the local chain degrades to the pure-Go Hugot backend and the startup log names the failed backend (see Troubleshooting). The default pure-Go backend needs no tags and no native libraries, and is the reliable path.
 
 | Build tag | Backend | Model | Extra dependency | Status |
 |---|---|---|---|---|
 | _(none)_ | Hugot pure-Go | MiniLM-L6-v2 (auto-download) | none | **default — reliable path** |
-| `embeddings_gomlx XLA` | Hugot + XLA/GoMLX | MiniLM-L6-v2 (auto-download) | PJRT plugin (runtime download) | experimental — compile-verified; XLA/PJRT runtime is platform-dependent |
+| `embeddings_gomlx XLA` | Hugot + XLA/GoMLX | MiniLM-L6-v2 (auto-download) | libtokenizers.a (build) + PJRT plugin (runtime download) | experimental — XLA/PJRT runtime is platform-dependent |
 | `embeddings_onnx` | ONNX Runtime | GTE-small (manual placement) | libonnxruntime + hand-placed model | manual setup — never auto-downloads |
 
 The legacy `--embeddings` / `--embeddings-url` / `--embeddings-model` CLI flags and the `GORTEX_EMBEDDINGS*` env vars still take precedence over the config block — useful for one-shot overrides without editing `.gortex.yaml`.

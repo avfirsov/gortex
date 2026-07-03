@@ -90,6 +90,15 @@ jobs:
       - name: Build default (Hugot bundled — no tag)
         run: go build -o gortex-default ./cmd/gortex/
 
+      - name: Install rust tokenizers library
+        # hugot's XLA session uses the rust tokenizer, statically linked as
+        # -ltokenizers, so the embeddings_gomlx XLA build needs libtokenizers.a
+        # on the linker path. (The pure-Go default and the ONNX build do not.)
+        run: |
+          curl -fsSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz
+          sudo cp libtokenizers.a /usr/lib/
+          sudo cp libtokenizers.a /usr/local/lib/
+
       - name: Build with GoMLX + XLA tags
         run: go build -tags "embeddings_gomlx XLA" -o gortex-gomlx ./cmd/gortex/
 
