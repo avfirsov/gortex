@@ -2069,10 +2069,17 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	callerDir := r.dirFor(e.FilePath)
 	receiverType := edgeReceiverType(e)
 
-	// If we have a type hint, try exact type match first.
+	// If we have a type hint, try exact type match first. These passes scan
+	// the UNFILTERED candidate set: a receiver typed as T binds to T's method
+	// regardless of whether the caller's file imports T's package. Import-
+	// reachability filtering can drop the receiver's own type when it lives in
+	// a sibling Maven directory (src/main vs src/test) the caller never
+	// imports, leaving a same-named method in the caller's own class as the
+	// only survivor — so the exact-type match must see every candidate, not
+	// just the reachable ones.
 	if receiverType != "" {
 		// Pass 1: same-directory + exact type match (highest confidence).
-		for _, c := range candidates {
+		for _, c := range rawCandidates {
 			if c.Kind == graph.KindMethod &&
 				r.dirFor(c.FilePath) == callerDir &&
 				nodeReceiverType(c) == receiverType {
@@ -2083,10 +2090,10 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 			}
 		}
 		// Pass 2: exact type match, any directory.
-		for _, c := range candidates {
+		for _, c := range rawCandidates {
 			if c.Kind == graph.KindMethod && nodeReceiverType(c) == receiverType {
 				e.To = c.ID
-				e.Confidence = 0.85
+				e.Confidence = 0.9
 				stats.Resolved++
 				return
 			}

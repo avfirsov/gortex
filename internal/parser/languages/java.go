@@ -283,10 +283,18 @@ func (e *JavaExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			calls = append(calls, dc)
 
 		case m.Captures["call.expr"] != nil:
-			// Plain-call pattern fires for `bar()` AND for the inner
-			// `bar` of `foo.bar()` — the legacy extractor emitted both
-			// edges, so we mirror that here.
+			// The plain-call pattern also fires for the inner `bar` of a
+			// selector call `foo.bar()`, which the callm case already emits
+			// WITH the receiver. Emitting a second receiver-less edge for the
+			// same site collides on the edge key (which excludes Meta) and
+			// clobbers the selector edge's receiver_type — sending the call to
+			// a same-named method in the caller's own class instead of the
+			// receiver's type. Skip it; only true bare calls (no object) fall
+			// through here.
 			expr := m.Captures["call.expr"]
+			if expr.Node != nil && expr.Node.ChildByFieldName("object") != nil {
+				return
+			}
 			calls = append(calls, javaDeferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
