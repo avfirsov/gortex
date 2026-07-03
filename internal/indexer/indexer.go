@@ -4186,16 +4186,36 @@ func (idx *Indexer) buildSearchIndex() {
 	if persistSink != nil {
 		backendItems = make([]graph.VectorItem, 0, len(vectors))
 	}
+	// Add only well-formed vectors. A nil or wrong-width vector would poison
+	// the index — a mis-scored or panicking query — so drop it, count it, and
+	// keep a sample of offending node IDs for the log.
+	var droppedVectors int
+	var droppedSample []string
 	for i, vec := range vectors {
-		if vec != nil {
-			vecBackend.Add(ids[i], vec)
-			if persistSink != nil {
-				backendItems = append(backendItems, graph.VectorItem{
-					NodeID: ids[i],
-					Vec:    vec,
-				})
+		if len(vec) != dims {
+			droppedVectors++
+			if len(droppedSample) < 5 {
+				droppedSample = append(droppedSample, ids[i])
 			}
+			continue
 		}
+		vecBackend.Add(ids[i], vec)
+		if persistSink != nil {
+			backendItems = append(backendItems, graph.VectorItem{
+				NodeID: ids[i],
+				Vec:    vec,
+			})
+		}
+	}
+	// If every vector was invalid there is nothing to search on. Ship text-only
+	// rather than a silently empty vector index that mis-scores every query —
+	// the same all-or-nothing contract as the chunk-failure abort above.
+	if len(vectors) > 0 && vecBackend.Count() == 0 {
+		idx.logger.Warn("vector index aborted — all embeddings invalid",
+			zap.Int("dropped", droppedVectors),
+			zap.Int("dimensions", dims),
+			zap.Strings("sample_ids", droppedSample))
+		return
 	}
 	if persistSink != nil && len(backendItems) > 0 {
 		if err := persistSink.BulkUpsertEmbeddings(backendItems); err != nil {
@@ -4230,10 +4250,17 @@ func (idx *Indexer) buildSearchIndex() {
 		inner = hyb.TextBackend()
 	}
 	sw.Swap(search.NewHybrid(inner, vecBackend, idx.embedder))
+	if droppedVectors > 0 {
+		idx.logger.Warn("indexer: dropped invalid embedding vectors",
+			zap.Int("dropped", droppedVectors),
+			zap.Int("dimensions", dims),
+			zap.Strings("sample_ids", droppedSample))
+	}
 	fields := []zap.Field{
 		zap.Int("vectors", vecBackend.Count()),
 		zap.Int("chunk_vectors", len(chunkMap)),
 		zap.Int("dimensions", dims),
+		zap.Int("dropped", droppedVectors),
 	}
 	// Surface the actual token spend of a paid embedding pass when the
 	// backend reports usage (API providers do; in-process ones don't).
