@@ -140,7 +140,7 @@ func TestLSP_Enrich_DegradesWithoutCompileDB(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot)
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
@@ -190,7 +190,7 @@ func TestLSP_Enrich_RunsFullPipelineWithCompileDB(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot)
+	result, err := p.EnrichRepoContext(ctx, g, "", repoRoot, nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 

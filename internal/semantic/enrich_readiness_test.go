@@ -41,7 +41,7 @@ func (s *slowSolutionProvider) WaitReady(ctx context.Context, repoRoot string) e
 	return nil
 }
 
-func (s *slowSolutionProvider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string) (*EnrichResult, error) {
+func (s *slowSolutionProvider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error) {
 	res := &EnrichResult{Provider: s.name, Language: s.languages[0]}
 	// A solution-load server serves empty results until its load finishes; the
 	// readiness gate must run first for the pass to land any edges.
