@@ -39,6 +39,11 @@ type Provider struct {
 	// top of the built-in generated/vendored heuristic. Set by the router from
 	// config when the provider is spawned.
 	excludeGlobs []string
+	// sweepMode selects how much of the per-file hover / call-hierarchy sweep
+	// runs ("demand" default / "full" / "off"); see sweep.go. Set by the
+	// router from config when the provider is spawned. An empty value means
+	// the demand-gated default; the GORTEX_LSP_SWEEP env override wins over it.
+	sweepMode string
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -130,6 +135,46 @@ type Provider struct {
 	// backoff). Defaults to ensureClient. Injected in tests to swap in an
 	// in-memory piped client instead of spawning a subprocess.
 	connectOnce func(absRoot string) error
+
+	// reqStats counts the LSP request methods issued during the current
+	// enrichment pass. Reset at pass start and surfaced in the end-of-pass
+	// telemetry so the round-trip volume per method is observable.
+	reqStats requestStats
+}
+
+// requestStats holds one atomic counter per LSP request method the
+// enrichment pass issues, so the pass-complete log can report where the
+// round trips went.
+type requestStats struct {
+	references           atomic.Int64
+	implementations      atomic.Int64
+	definitions          atomic.Int64
+	hovers               atomic.Int64
+	prepareCallHierarchy atomic.Int64
+	outgoingCalls        atomic.Int64
+	incomingCalls        atomic.Int64
+	prepareTypeHierarchy atomic.Int64
+	supertypes           atomic.Int64
+	subtypes             atomic.Int64
+	// incomingSkipped counts the callHierarchy/incomingCalls round trips the
+	// sweep declined to make because the declaration's callers are already
+	// recoverable from the outgoing side — a derived saving, not a request.
+	incomingSkipped atomic.Int64
+}
+
+// reset zeroes every counter at the start of an enrichment pass.
+func (r *requestStats) reset() {
+	r.references.Store(0)
+	r.implementations.Store(0)
+	r.definitions.Store(0)
+	r.hovers.Store(0)
+	r.prepareCallHierarchy.Store(0)
+	r.outgoingCalls.Store(0)
+	r.incomingCalls.Store(0)
+	r.prepareTypeHierarchy.Store(0)
+	r.supertypes.Store(0)
+	r.subtypes.Store(0)
+	r.incomingSkipped.Store(0)
 }
 
 // Dial-retry constants for passive-attach reconnect. The window
@@ -188,17 +233,17 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		maxParallel = 10
 	}
 	p := &Provider{
-		command:          cmd,
-		args:             args,
-		env:              spec.Env,
-		languages:        spec.Languages,
-		daemon:           spec.Daemon,
-		maxParallel:      maxParallel,
-		logger:           logger,
-		spec:             spec,
-		docVersions:      map[string]int{},
-		openDocs:         map[string]bool{},
-		lastDiag:         map[string][]Diagnostic{},
+		command:            cmd,
+		args:               args,
+		env:                spec.Env,
+		languages:          spec.Languages,
+		daemon:             spec.Daemon,
+		maxParallel:        maxParallel,
+		logger:             logger,
+		spec:               spec,
+		docVersions:        map[string]int{},
+		openDocs:           map[string]bool{},
+		lastDiag:           map[string][]Diagnostic{},
 		diagWaiters:        map[string][]chan []Diagnostic{},
 		dynamicCaps:        map[string]Registration{},
 		connect:            spec.Connect,
@@ -273,6 +318,86 @@ func enrichNodeHasUnresolvedDemand(g graph.Store, n *graph.Node) bool {
 	return len(g.GetInEdges(graph.UnresolvedMarker+"*."+n.Name)) > 0
 }
 
+// enrichNodeIsDispatchRelevant reports whether a declaration's super/subtype
+// hierarchy the per-file sweep must interrogate: a type or interface whose
+// extends / supertype / subtype edges the AST extractor commonly misses (they
+// are cross-file or resolved dynamically). Such declarations never contribute
+// unresolved-call demand — enrichNodeHasUnresolvedDemand only counts callables —
+// so a file whose only enrichable work is a type hierarchy would score zero
+// demand and be skipped under the demand default. Marking it dispatch-relevant
+// keeps that file in the sweep so its hierarchy edges are still recovered.
+func enrichNodeIsDispatchRelevant(n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	return n.Kind == graph.KindType || n.Kind == graph.KindInterface
+}
+
+// enrichCallableIsDispatchRelevant reports whether a function or method takes
+// part in dynamic dispatch, so its incoming callers name concrete targets the
+// outgoing side of the sweep cannot reach. Every intra-repo static call is
+// recoverable from its caller's outgoing hop — collected for every caller by
+// the file sweep — so a declaration's incoming callers only add signal when a
+// call to it dispatches through another declaration: a call through an
+// interface / abstract member lands the caller's outgoing edge on that member,
+// leaving the concrete implementation's real call sites visible only from its
+// incoming side. A declaration qualifies when it is itself an abstract /
+// interface / virtual member, when it overrides (or is overridden by) another
+// declaration, or when its declaring type implements or extends another type.
+func enrichCallableIsDispatchRelevant(g graph.Store, n *graph.Node) bool {
+	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+		return false
+	}
+	if isAbstractMarked(n) {
+		return true
+	}
+	var parentType string
+	for _, e := range g.GetOutEdges(n.ID) {
+		switch e.Kind {
+		case graph.EdgeOverrides:
+			return true
+		case graph.EdgeMemberOf:
+			parentType = e.To
+		}
+	}
+	for _, e := range g.GetInEdges(n.ID) {
+		if e.Kind == graph.EdgeOverrides {
+			return true
+		}
+	}
+	if parentType == "" {
+		return false
+	}
+	// The declaring type implementing / extending another type makes its
+	// methods dispatch targets: a call through the interface or base type
+	// binds elsewhere, so this method's callers surface only via incoming.
+	for _, e := range g.GetOutEdges(parentType) {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	for _, e := range g.GetInEdges(parentType) {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeHasSemanticType reports whether a node already carries a non-empty
+// semantic_type stamp from an earlier enrichment. The per-file sweep skips
+// re-hovering such a node — the hover would only re-derive the identical type
+// string — which is what keeps a dispatch-relevant file (swept for its call /
+// type-hierarchy edges) from re-paying the whole-file hover cost on a warm
+// restart, where every node reloads with its prior stamp.
+func nodeHasSemanticType(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	s, ok := n.Meta["semantic_type"].(string)
+	return ok && s != ""
+}
+
 // scopedPath re-attaches repoPrefix to a repo-relative path the language
 // server handed back: uriToPath returns repo-relative, but graph node
 // FilePaths are prefixed, so node lookups must re-prefix to match in a
@@ -333,7 +458,12 @@ func edgeExistsAt(g graph.Store, from, to string, kind graph.EdgeKind, line int)
 //
 // cache memoises verdicts per (file, line, name) within one enrichment
 // pass; multiple ambiguous edges can share a call site.
-func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, siteRel string, siteLine int, name string, cache map[string]*graph.Node) (*graph.Node, bool) {
+//
+// content is the site file's bytes, already opened on the server and read
+// from disk by the caller (via the shared document session). A nil content
+// yields a no-verdict, matching the pre-session behaviour when the site
+// file could not be opened.
+func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
@@ -341,12 +471,7 @@ func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, site
 	if cached, ok := cache[key]; ok {
 		return cached, true
 	}
-	if err := p.openDocument(absRoot, siteRel); err != nil {
-		return nil, false
-	}
-	defer func() { _ = p.closeDocument(filepath.Join(absRoot, siteRel)) }()
-
-	col, found := identifierColumnStrict(p.getSource(absRoot, siteRel), siteLine, name)
+	col, found := identifierColumnStrict(content, siteLine, name)
 	if !found {
 		// The identifier is not on the recorded line — a definition
 		// request would return junk for whatever token sits there.
@@ -503,6 +628,27 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return result, nil
 	}
 
+	// Compile-database preflight: a server that needs a compilation database
+	// (clangd) but has none rebuilds a full fallback AST on every didOpen, so
+	// the hover / hierarchy sweep churns for little signal and a directly
+	// opened header becomes a standalone TU. Degrade to reference confirmation
+	// — the confirm / rebind passes work inside the fallback TU on fallback
+	// flags — and skip the sweep, the interface pass, and header files.
+	degraded := p.spec != nil && p.spec.NeedsCompileDB && !hasCompileDB(absRoot)
+	var degradedSkipFile func(rel string) bool
+	if degraded {
+		degradedSkipFile = isCXXHeaderFile
+		result.Degraded = true
+		result.DegradedReason = "no compilation database found; enrichment limited to reference confirmation (hover, hierarchy, and header translation units skipped)"
+		if p.logger != nil {
+			p.logger.Warn("LSP enrich: degrading to reference confirmation, compilation database missing",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.String("remediation", "generate compile_commands.json (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, bear -- make, or meson), then re-index"),
+			)
+		}
+	}
+
 	// Start or reuse the client now that there is work to do.
 	if err := p.ensureClient(absRoot); err != nil {
 		return nil, fmt.Errorf("start LSP server: %w", err)
@@ -515,6 +661,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Reset the cross-pass reconnect counter so the metrics log reflects
 	// only this Enrich invocation.
 	p.reconnectAttempts.Store(0)
+	// Reset the per-method request counters so the pass-complete log
+	// reports only this invocation's round trips.
+	p.reqStats.reset()
+
+	// One document session shared by every phase below: a file didOpen'd
+	// by the interface pass stays warm for the confirm pass and the sweep
+	// instead of being reopened, and every open is paired with a didClose
+	// (evicted under cap, or by closeAll here at pass end).
+	session := newDocSession(p)
+	defer session.closeAll()
 
 	// Total symbols scoped to repo + language — langNodes already excludes
 	// file / import nodes and is filtered to this provider's languages.
@@ -539,8 +695,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// targetedCtx caps the targeted-edge passes (implementations + confirm) at
 	// a fraction of the window, reserving the remainder for the sweep so both
 	// phases make progress. With no deadline (tests) it is the parent context.
+	// A degraded pass skips the sweep entirely, so there is nothing to reserve
+	// for — give the confirm pass the whole window.
 	targetedCtx := ctx
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := ctx.Deadline(); ok && !degraded {
 		window := dl.Sub(start)
 		reserve := time.Duration(float64(window) * enrichSweepReserveFraction)
 		if reserve > 0 && reserve < window {
@@ -550,8 +708,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 
-	// Query implementations for interface nodes.
+	// Query implementations for interface nodes. A degraded pass skips this:
+	// the query opens each interface's file, and a database-less clangd cannot
+	// resolve implementations across translation units regardless.
 	for _, n := range langNodes {
+		if degraded {
+			break
+		}
 		if targetedCtx.Err() != nil {
 			break
 		}
@@ -567,14 +730,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		// Per-item doc lifecycle (no bulk pre-open): open this interface's
-		// file, query, close immediately so memory stays bounded.
-		if err := p.openDocument(absRoot, rel); err != nil {
+		// Open this interface's file through the shared session: the query
+		// runs while it is pinned, and release leaves it warm in the LRU so
+		// the confirm pass and sweep reuse it instead of reopening.
+		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		if err != nil {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		col := identifierColumn(content, n.StartLine, n.Name)
 		impls, err := p.findImplementations(absRoot, rel, line, col)
-		_ = p.closeDocument(filepath.Join(absRoot, rel))
+		release()
 		if err != nil || len(impls) == 0 {
 			continue
 		}
@@ -624,7 +789,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// fallback opens arbitrary call-site files, so it runs serially afterward
 	// over the targets the sweep left unconfirmed, keeping document open/close
 	// from overlapping across goroutines.
-	confirmGroups := p.groupConfirmTargets(g, targets)
+	confirmGroups := p.groupConfirmTargets(g, targets, degradedSkipFile)
 	var confirmMu sync.Mutex
 	var fallback []enrichTarget
 	{
@@ -645,16 +810,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					return
 				}
 				absPath := filepath.Join(absRoot, grp.rel)
-				content, err := os.ReadFile(absPath)
+				// The file is unique to this group, so no two goroutines open
+				// it; the session pins it for the group and leaves it warm for
+				// a later phase that shares the file.
+				content, release, err := session.acquire(p.client, absPath)
 				if err != nil {
 					return
 				}
-				// Per-goroutine didOpen against the shared client — the file
-				// is unique to this group, so no two goroutines open it.
-				if err := p.enrichOpenDoc(p.client, absPath, content); err != nil {
-					return
-				}
-				defer func() { _ = p.enrichCloseDoc(p.client, absPath) }()
+				defer release()
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil {
 						return
@@ -703,7 +866,29 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// rebind the edge to the correct target instead of leaving a
 	// misattribution behind. Runs after the parallel sweep so arbitrary
 	// call-site document opens never overlap across goroutines.
+	//
+	// Sites are ordered by their call-site file so one session acquire
+	// serves every site in a file — a caller with many misbound sites in
+	// one file is opened once, not once per site. Stable so sites keep
+	// their relative order within a file.
+	sort.SliceStable(fallback, func(i, j int) bool {
+		return edgeSiteRelPath(fallback[i].edge, repoPrefix, nodeRelPath(fallback[i].node)) <
+			edgeSiteRelPath(fallback[j].edge, repoPrefix, nodeRelPath(fallback[j].node))
+	})
 	defSiteCache := map[string]*graph.Node{}
+	var (
+		curSiteRel string
+		curContent []byte
+		relSite    func()
+		siteOpen   bool
+	)
+	releaseSite := func() {
+		if siteOpen {
+			relSite()
+			siteOpen = false
+		}
+		curContent = nil
+	}
 	for _, t := range fallback {
 		if targetedCtx.Err() != nil {
 			break
@@ -717,8 +902,26 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(siteRel) {
 			continue // never open a call-site file this server can't compile
 		}
+		if degradedSkipFile != nil && degradedSkipFile(siteRel) {
+			continue // degraded mode: never open this call-site (e.g. a header)
+		}
+		// Hold one open document per run of same-file sites: acquire on the
+		// first site of a file, release when the file changes (and once more
+		// after the loop). A failed acquire yields nil content, which
+		// definitionNodeAtSite treats as a no-verdict — the same outcome the
+		// per-site openDocument failure produced before.
+		if siteRel != curSiteRel {
+			releaseSite()
+			curSiteRel = siteRel
+			content, release, err := session.acquire(p.client, filepath.Join(absRoot, siteRel))
+			if err == nil {
+				curContent = content
+				relSite = release
+				siteOpen = true
+			}
+		}
 		siteLine := t.edge.Line
-		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, defSiteCache)
+		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
 		switch {
 		case !ok || cand == nil:
 			// No verdict — leave the edge at its heuristic tier so
@@ -744,6 +947,39 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			result.EdgesConfirmed++
 		}
 	}
+	releaseSite()
+
+	// Degraded finalisation: the interface pass, the references-add pass, and
+	// the per-file hover / hierarchy sweep are all skipped when a needed
+	// compilation database is missing — only the reference-confirm and
+	// definition-rebind passes ran, working inside the fallback translation
+	// unit. Finalise the result here, before the sweep machinery below.
+	if degraded {
+		if result.SymbolsTotal > 0 {
+			result.CoveragePercent = float64(result.SymbolsCovered) / float64(result.SymbolsTotal) * 100
+		}
+		result.DurationMs = time.Since(start).Milliseconds()
+		if ctx.Err() != nil {
+			result.Partial = true
+			result.AbortReason = ctx.Err().Error()
+		}
+		if p.logger != nil {
+			didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
+			p.logger.Info("LSP enrich: degraded pass complete (reference confirmation only)",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Bool("degraded", true),
+				zap.Int("edges_confirmed", result.EdgesConfirmed),
+				zap.Int("did_opens", didOpens),
+				zap.Int("reopened_files", reopenedFiles),
+				zap.Int("doc_evictions", docEvictions),
+				zap.Int("peak_open_docs", peakOpenDocs),
+				zap.Int64("req_references", p.reqStats.references.Load()),
+				zap.Int64("req_definitions", p.reqStats.definitions.Load()),
+			)
+		}
+		return result, nil
+	}
 
 	// References-driven add pass: a server that enumerates references but has
 	// no call hierarchy (e.g. intelephense) never runs the per-file sweep's
@@ -752,7 +988,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// call edges. Runs under the targeted budget (before the hover sweep) so
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, result)
+		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
 
 	// Per-file document lifecycle + bounded concurrency. The original
@@ -774,7 +1010,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	enrichedNodes := make(map[string]bool)
 
 	// Race-safe metric counters for the concurrent hover phase.
-	var diagTotalNodes, diagHoverOK, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched, diagNoPosition atomic.Int64
+	var diagTotalNodes, diagHoverOK, diagHoverErr, diagHoverNil, diagTypeEmpty, diagEnriched, diagNoPosition, diagHoverSkipped atomic.Int64
 
 	// mu guards the cross-goroutine aggregation: per-file stamp buffers,
 	// enrichedNodes, the EnrichResult node counters, and the best-effort
@@ -848,9 +1084,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// spans all of its symbols. Files keep encounter order; symbols keep
 	// their order within a file.
 	type fileTargets struct {
-		rel    string
-		nodes  []*graph.Node
-		demand int // declarations still carrying unresolved same-name candidates
+		rel      string
+		nodes    []*graph.Node
+		demand   int  // declarations still carrying unresolved same-name candidates
+		dispatch bool // carries a type / interface whose hierarchy the sweep interrogates
 	}
 	var fileList []*fileTargets
 	fileIndex := map[string]*fileTargets{}
@@ -869,6 +1106,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if enrichNodeHasUnresolvedDemand(g, n) {
 			ft.demand++
 		}
+		if enrichNodeIsDispatchRelevant(n) {
+			ft.dispatch = true
+		}
 	}
 	// Demand-driven ordering: enrich the files whose declarations still carry
 	// unresolved same-name call candidates first. Under a per-repo deadline the
@@ -878,6 +1118,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	sort.SliceStable(fileList, func(i, j int) bool {
 		return fileList[i].demand > fileList[j].demand
 	})
+
+	// Sweep gate: the per-file hover / call-hierarchy sweep below is the
+	// whole-repo churn a warm restart pays to confirm zero new edges. The
+	// resolved mode (GORTEX_LSP_SWEEP env override > router-configured field
+	// > demand-gated default) decides which files it visits — sweepFile
+	// skips a file the mode excludes. "demand" (default) sweeps a file that
+	// still carries unresolved same-name candidates OR declares a type /
+	// interface whose super/subtype hierarchy only this sweep recovers,
+	// "full" sweeps every file, "off" skips the sweep entirely. The
+	// tier-deciding confirm / add / interface passes above are never gated.
+	sweepMode := p.effectiveSweepMode()
 
 	// Call- and type-hierarchy hops are collected per file (while the
 	// file is open) and applied in that file's flush below, so each
@@ -949,6 +1200,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if aborted.Load() || ctx.Err() != nil {
 			break
 		}
+		if !sweepFile(sweepMode, ft.demand, ft.dispatch) {
+			continue // mode excludes this file from the per-file sweep
+		}
 		wg.Add(1)
 		fileSem <- struct{}{} // acquire — bounds simultaneously-open docs
 		go func(ft *fileTargets) {
@@ -961,53 +1215,22 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 
 			absPath := filepath.Join(absRoot, ft.rel)
-			content, err := os.ReadFile(absPath)
+
+			// Pin the file open on the active client through the shared
+			// session for the whole span of this file's hierarchy + hover
+			// work — exactly one didOpen per file on the happy path, and the
+			// content is read from disk once. The session dedupes per
+			// (client, path), so a hover goroutine that reconnects re-opens
+			// the file on the fresh client (once) without a second open on
+			// the client this pin holds; closeAll pairs every open with a
+			// didClose at pass end.
+			content, release, err := session.acquire(activeClient.Load(), absPath)
 			if err != nil {
-				p.logger.Debug("LSP enrich: read source failed",
-					zap.String("file", ft.rel), zap.Error(err))
-				return
-			}
-
-			// ensureOpen opens the file on client c at most once per client.
-			// Tracking per client makes reconnection strict: the fresh client
-			// from a mid-flight reconnect starts with an empty open-set, so the
-			// file is re-opened on the new session (once, under openStateMu)
-			// rather than hovered against a document the dead session held.
-			// Every client we opened on is closed exactly once when the file
-			// is done, so didOpen / didClose stay paired on every session.
-			var openStateMu sync.Mutex
-			openedClients := map[*Client]bool{}
-			ensureOpen := func(c *Client) error {
-				openStateMu.Lock()
-				defer openStateMu.Unlock()
-				if openedClients[c] {
-					return nil
-				}
-				if err := p.enrichOpenDoc(c, absPath, content); err != nil {
-					return err
-				}
-				openedClients[c] = true
-				return nil
-			}
-			defer func() {
-				openStateMu.Lock()
-				clients := make([]*Client, 0, len(openedClients))
-				for c := range openedClients {
-					clients = append(clients, c)
-				}
-				openStateMu.Unlock()
-				for _, c := range clients {
-					_ = p.enrichCloseDoc(c, absPath)
-				}
-			}()
-
-			// Open once up front so the file is held open for the whole hover
-			// fan-out below — exactly one didOpen per file on the happy path.
-			if err := ensureOpen(activeClient.Load()); err != nil {
 				p.logger.Debug("LSP enrich: didOpen failed",
 					zap.String("file", ft.rel), zap.Error(err))
 				return
 			}
+			defer release()
 
 			// Per-file result buffers, flushed into the graph when this
 			// file finishes (or is cut mid-file by cancellation) —
@@ -1045,11 +1268,28 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						if err != nil {
 							continue
 						}
+						// Outgoing always: the file sweep visits every caller,
+						// so a declaration's outgoing hops alone reconstruct
+						// every intra-repo static call edge. Incoming only adds
+						// what the outgoing side is blind to — the concrete
+						// callers of a dynamic-dispatch target, and names the
+						// resolver still could not bind — so it is fetched only
+						// for a dispatch-relevant or demand-bearing declaration
+						// (or under a full sweep). Demand-first file ordering
+						// sweeps the demand-bearing callers before any deadline
+						// cut, so a skipped incoming costs no reachable edge.
+						wantIncoming := sweepMode == sweepModeFull ||
+							enrichCallableIsDispatchRelevant(g, n) ||
+							enrichNodeHasUnresolvedDemand(g, n)
 						for _, item := range items {
 							if outs, oerr := p.outgoingCalls(item); oerr == nil {
 								for _, oc := range outs {
 									cHops = append(cHops, callHop{n: n, other: oc.To, asOutgoing: true, fromRanges: oc.FromRanges})
 								}
+							}
+							if !wantIncoming {
+								p.reqStats.incomingSkipped.Add(1)
+								continue
 							}
 							if ins, ierr := p.incomingCalls(item); ierr == nil {
 								for _, ic := range ins {
@@ -1086,6 +1326,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				if aborted.Load() || ctx.Err() != nil {
 					break
 				}
+				// Hover-skip: a node already carrying a semantic_type stamp
+				// (e.g. reloaded on a warm restart) gains nothing from another
+				// hover — the derived type string is unchanged. Skip it so a
+				// file swept for its call / type-hierarchy edges does not
+				// re-pay the whole-file hover cost; the hierarchy interrogation
+				// above already ran for every node regardless.
+				if nodeHasSemanticType(n) {
+					diagHoverSkipped.Add(1)
+					continue
+				}
 				line, ok := lspLine(n)
 				if !ok {
 					// No real source position — the request would carry
@@ -1106,11 +1356,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 
 					c := activeClient.Load()
-					if err := ensureOpen(c); err != nil {
+					// Ensure the doc is open on this goroutine's client. On
+					// the happy path this dedupes against the file goroutine's
+					// pin (no didOpen); when the active client was swapped by a
+					// concurrent reconnect it opens the file on the new client.
+					_, releaseHover, err := session.acquire(c, absPath)
+					if err != nil {
 						p.logger.Debug("LSP enrich: didOpen failed",
 							zap.String("file", n.FilePath), zap.Error(err))
 						return
 					}
+					defer releaseHover()
 
 					col := identifierColumn(content, n.StartLine, n.Name)
 					hoverResult, err := p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
@@ -1118,18 +1374,21 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// Server died mid-flight — recover once and retry this
 						// node's hover against the fresh session. The new client
 						// has no record of our document, so re-open it there
-						// (ensureOpen dedupes the re-open across this file's
+						// (the session dedupes the re-open across this file's
 						// goroutines) before retrying.
 						newC, rerr := reconnect(c)
 						if rerr != nil {
 							return // aborted; wg.Wait + abort check below handles it
 						}
 						c = newC
-						if err := ensureOpen(c); err != nil {
+						var releaseNew func()
+						_, releaseNew, err = session.acquire(c, absPath)
+						if err != nil {
 							p.logger.Debug("LSP enrich: reopen after reconnect failed",
 								zap.String("file", n.FilePath), zap.Error(err))
 							return
 						}
+						defer releaseNew()
 						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
 					}
 					if err != nil {
@@ -1180,8 +1439,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	wg.Wait()
 
-	// Enrichment metrics (acceptance criterion 6).
+	// Enrichment metrics (acceptance criterion 6): hover outcomes, the
+	// shared document session's open/reopen/eviction accounting, and the
+	// per-method request volume that drove the pass.
+	didOpens, reopenedFiles, docEvictions, peakOpenDocs := session.stats()
 	p.logger.Info("LSP enrich: hover phase complete",
+		zap.String("sweep_mode", sweepMode),
 		zap.Int64("total_nodes", diagTotalNodes.Load()),
 		zap.Int64("hover_ok", diagHoverOK.Load()),
 		zap.Int64("hover_err", diagHoverErr.Load()),
@@ -1189,7 +1452,23 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Int64("type_empty", diagTypeEmpty.Load()),
 		zap.Int64("enriched", diagEnriched.Load()),
 		zap.Int64("skipped_no_position", diagNoPosition.Load()),
+		zap.Int64("skipped_already_stamped", diagHoverSkipped.Load()),
 		zap.Int64("reconnect_attempts", p.reconnectAttempts.Load()),
+		zap.Int("did_opens", didOpens),
+		zap.Int("reopened_files", reopenedFiles),
+		zap.Int("doc_evictions", docEvictions),
+		zap.Int("peak_open_docs", peakOpenDocs),
+		zap.Int64("req_references", p.reqStats.references.Load()),
+		zap.Int64("req_implementations", p.reqStats.implementations.Load()),
+		zap.Int64("req_definitions", p.reqStats.definitions.Load()),
+		zap.Int64("req_hovers", p.reqStats.hovers.Load()),
+		zap.Int64("req_prepare_call_hierarchy", p.reqStats.prepareCallHierarchy.Load()),
+		zap.Int64("req_outgoing_calls", p.reqStats.outgoingCalls.Load()),
+		zap.Int64("req_incoming_calls", p.reqStats.incomingCalls.Load()),
+		zap.Int64("incoming_calls_skipped", p.reqStats.incomingSkipped.Load()),
+		zap.Int64("req_prepare_type_hierarchy", p.reqStats.prepareTypeHierarchy.Load()),
+		zap.Int64("req_supertypes", p.reqStats.supertypes.Load()),
+		zap.Int64("req_subtypes", p.reqStats.subtypes.Load()),
 		zap.String("first_hover_value", diagFirstHoverValue),
 		zap.String("first_hover_error", diagFirstHoverError),
 		zap.String("first_node_name", diagFirstNodeName),
@@ -2035,6 +2314,7 @@ func (p *Provider) hoverWith(c *Client, repoRoot, relPath string, line, col int)
 		},
 	}
 
+	p.reqStats.hovers.Add(1)
 	var result HoverResult
 	if err := c.Call("textDocument/hover", params, &result); err != nil {
 		return nil, err
@@ -2162,6 +2442,7 @@ func (p *Provider) findImplementations(repoRoot, relPath string, line, col int) 
 		},
 	}
 
+	p.reqStats.implementations.Add(1)
 	var locations []Location
 	if err := p.client.Call("textDocument/implementation", params, &locations); err != nil {
 		return nil, err
@@ -2258,6 +2539,7 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 		Context: ReferenceContext{IncludeDeclaration: false},
 	}
 
+	p.reqStats.references.Add(1)
 	var locations []Location
 	if err := p.client.Call("textDocument/references", params, &locations); err != nil {
 		return nil, err
@@ -2281,6 +2563,7 @@ func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeo
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 		Position:     Position{Line: line, Character: col},
 	}
+	p.reqStats.definitions.Add(1)
 
 	type result struct {
 		locations []Location
@@ -2644,6 +2927,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 			Position:     Position{Line: line, Character: col},
 		},
 	}
+	p.reqStats.prepareCallHierarchy.Add(1)
 	var items []CallHierarchyItem
 	if err := p.client.Call("textDocument/prepareCallHierarchy", params, &items); err != nil {
 		return nil, err
@@ -2653,6 +2937,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 
 // outgoingCalls queries callHierarchy/outgoingCalls for one item.
 func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoingCall, error) {
+	p.reqStats.outgoingCalls.Add(1)
 	var calls []CallHierarchyOutgoingCall
 	if err := p.client.Call("callHierarchy/outgoingCalls",
 		CallHierarchyOutgoingCallsParams{Item: item}, &calls); err != nil {
@@ -2663,6 +2948,7 @@ func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoin
 
 // incomingCalls queries callHierarchy/incomingCalls for one item.
 func (p *Provider) incomingCalls(item CallHierarchyItem) ([]CallHierarchyIncomingCall, error) {
+	p.reqStats.incomingCalls.Add(1)
 	var calls []CallHierarchyIncomingCall
 	if err := p.client.Call("callHierarchy/incomingCalls",
 		CallHierarchyIncomingCallsParams{Item: item}, &calls); err != nil {
@@ -2680,6 +2966,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 			Position:     Position{Line: line, Character: col},
 		},
 	}
+	p.reqStats.prepareTypeHierarchy.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("textDocument/prepareTypeHierarchy", params, &items); err != nil {
 		return nil, err
@@ -2689,6 +2976,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 
 // supertypes queries typeHierarchy/supertypes.
 func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	p.reqStats.supertypes.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("typeHierarchy/supertypes",
 		TypeHierarchySupertypesParams{Item: item}, &items); err != nil {
@@ -2699,6 +2987,7 @@ func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, erro
 
 // subtypes queries typeHierarchy/subtypes.
 func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
+	p.reqStats.subtypes.Add(1)
 	var items []TypeHierarchyItem
 	if err := p.client.Call("typeHierarchy/subtypes",
 		TypeHierarchySubtypesParams{Item: item}, &items); err != nil {

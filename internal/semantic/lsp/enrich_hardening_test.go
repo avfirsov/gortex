@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,14 +36,14 @@ import (
 type instrumentedServer struct {
 	handlers map[string]func(params json.RawMessage) (any, *jsonRPCError)
 
-	mu          sync.Mutex
-	openDocs    map[string]int  // uri → currently-open count
-	everOpened  map[string]bool // uri → ever received a didOpen
-	maxOpen     int             // peak simultaneous open docs
-	totalOpen   int
-	totalClose  int
-	notifLog    []string
-	outMu       sync.Mutex // serialises concurrent response writes
+	mu         sync.Mutex
+	openDocs   map[string]int  // uri → currently-open count
+	everOpened map[string]bool // uri → ever received a didOpen
+	maxOpen    int             // peak simultaneous open docs
+	totalOpen  int
+	totalClose int
+	notifLog   []string
+	outMu      sync.Mutex // serialises concurrent response writes
 }
 
 func newInstrumentedServer() *instrumentedServer {
@@ -242,6 +243,7 @@ func runEnrich(t *testing.T, p *Provider, g graph.Store, repoRoot string, timeou
 // ---------------------------------------------------------------------------
 
 func TestLSP_Enrich_ConcurrencyBounded(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot, g := seedRepo(t, 50)
 
 	var inFlight atomic.Int64
@@ -277,6 +279,7 @@ func TestLSP_Enrich_ConcurrencyBounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLSP_Enrich_DocLifecyclePairedAndBounded(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot := t.TempDir()
 	// Many distinct files so each node opens its own document.
 	g := graph.New()
@@ -316,12 +319,17 @@ func TestLSP_Enrich_DocLifecyclePairedAndBounded(t *testing.T) {
 	peak, opens, closes := server.stats()
 	assert.Equal(t, opens, closes, "every didOpen must be matched by a didClose (opens=%d closes=%d)", opens, closes)
 	assert.Equal(t, nFiles, opens, "expected one didOpen per distinct file")
-	assert.LessOrEqual(t, peak, maxParallel,
-		"peak simultaneously-open docs (%d) must not exceed maxParallel (%d)", peak, maxParallel)
+	// The shared document session keeps a warm LRU tail of recently-released
+	// files across phases, so up to 2*maxParallel docs can be open at once:
+	// maxParallel pinned by the in-flight file goroutines plus the tail. The
+	// session evicts (didCloses) down to that ceiling before each new open.
+	assert.LessOrEqual(t, peak, 2*maxParallel,
+		"peak simultaneously-open docs (%d) must not exceed the session cap 2*maxParallel (%d)", peak, 2*maxParallel)
 }
 
 // didClose must happen even when hover fails.
 func TestLSP_Enrich_DocClosedEvenOnHoverError(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot := t.TempDir()
 	g := graph.New()
 	const nFiles = 8
@@ -368,6 +376,7 @@ func TestLSP_Enrich_DocClosedEvenOnHoverError(t *testing.T) {
 // "LSP server exited" error, then verifies the provider reconnects (via the
 // connectOnce seam) and the enrichment completes without error.
 func TestLSP_Enrich_ReconnectsOnServerExit(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot, g := seedRepo(t, 12)
 
 	// First server: after the 3rd hover, it "dies" (we close its client's
@@ -423,10 +432,87 @@ func TestLSP_Enrich_ReconnectsOnServerExit(t *testing.T) {
 	assert.GreaterOrEqual(t, int(reconnects.Load()), 1, "expected at least one reconnect on server exit")
 }
 
+// TestLSP_Enrich_UsesRetriedHoverResult forces the single hover down the
+// recover-and-retry path and asserts the retried hover's payload is actually
+// recorded. The first (and only) hover kills its client and then parks, so the
+// goroutine observes "LSP server exited" — never a response — which makes the
+// reconnect-and-retry the ONLY path by which this node can be stamped. The
+// second server serves a real type payload; the node must end the pass carrying
+// that type.
+func TestLSP_Enrich_UsesRetriedHoverResult(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
+	repoRoot, g := seedRepo(t, 1)
+
+	server1 := newInstrumentedServer()
+	p, cleanup := providerWithInstrumentedServer(t, server1, []string{"go"}, 1)
+	defer cleanup()
+	deadClient := p.client
+
+	// The parked handler never answers; releasing it at cleanup lets the
+	// leaked server goroutine unwind.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var killOnce sync.Once
+	server1.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		killOnce.Do(func() {
+			deadClient.mu.Lock()
+			if !deadClient.closed {
+				deadClient.closed = true
+				close(deadClient.done)
+			}
+			deadClient.mu.Unlock()
+		})
+		<-release // never reply: the goroutine must observe the server exit, not a response
+		return nil, &jsonRPCError{Code: -32603, Message: "dead"}
+	})
+
+	// Second server: healthy, serves a type payload extractTypeFromHover parses.
+	server2 := newInstrumentedServer()
+	server2.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		return map[string]any{"contents": map[string]any{"kind": "plaintext", "value": "func F0() string"}}, nil
+	})
+	var reconnects atomic.Int64
+	p.connectOnce = func(absRoot string) error {
+		reconnects.Add(1)
+		c2, in2, out2, cl2 := newPipedClient(t)
+		go server2.run(in2, out2)
+		t.Cleanup(cl2)
+		p.client = c2
+		return nil
+	}
+	p.dialBackoffStart = 1 * time.Millisecond
+	p.maxDialBackoff = 5 * time.Millisecond
+
+	var result *semantic.EnrichResult
+	var enrichErr error
+	done := make(chan struct{})
+	go func() {
+		result, enrichErr = p.Enrich(g, repoRoot)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Enrich timed out")
+	}
+
+	require.NoError(t, enrichErr)
+	require.GreaterOrEqual(t, int(reconnects.Load()), 1, "the dead server must have forced a reconnect")
+	require.NotNil(t, result)
+	assert.Equal(t, 1, result.NodesEnriched, "the retried hover's result must be recorded, not discarded")
+
+	node := g.GetNode("main.go::F0")
+	require.NotNil(t, node)
+	require.NotNil(t, node.Meta)
+	assert.Equal(t, "func F0() string", node.Meta["semantic_type"],
+		"the node must carry the type from the retried hover")
+}
+
 // TestLSP_Enrich_SingleReconnectUnderConcurrency verifies that when many
 // goroutines observe server-exit simultaneously, only ONE reconnection is
 // performed (others wait and retry).
 func TestLSP_Enrich_SingleReconnectUnderConcurrency(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot, g := seedRepo(t, 40)
 
 	server1 := newInstrumentedServer()
@@ -478,6 +564,7 @@ func TestLSP_Enrich_SingleReconnectUnderConcurrency(t *testing.T) {
 // TestLSP_Enrich_AbortsWhenReconnectFails verifies that a permanently-dead
 // server causes Enrich to return an error after exhausting retries.
 func TestLSP_Enrich_AbortsWhenReconnectFails(t *testing.T) {
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
 	repoRoot, g := seedRepo(t, 6)
 
 	server1 := newInstrumentedServer()
@@ -517,7 +604,8 @@ func TestLSP_Enrich_AbortsWhenReconnectFails(t *testing.T) {
 // of the dead session's opens) rather than hovered against an assumed-open
 // doc. The new server must therefore receive a paired didOpen/didClose.
 func TestLSP_Enrich_ReopensDocsOnNewServerAfterReconnect(t *testing.T) {
-	repoRoot, g := seedRepo(t, 8) // 8 nodes, all in main.go
+	t.Setenv("GORTEX_LSP_SWEEP", "full") // exercise the full per-file sweep, not the demand-gated default
+	repoRoot, g := seedRepo(t, 8)        // 8 nodes, all in main.go
 
 	server1 := newInstrumentedServer()
 	p, cleanup := providerWithInstrumentedServer(t, server1, []string{"go"}, 8)

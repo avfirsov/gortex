@@ -28,7 +28,7 @@ import (
 // rmu as soon as its references land, so a deadline cut loses only the
 // unvisited remainder. Runs under the caller's targeted context (the same
 // budget the confirm pass uses), before the per-file hover sweep.
-func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, result *semantic.EnrichResult) {
+func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, session *docSession, result *semantic.EnrichResult) {
 	targets := selectReferencesAddTargets(g, langNodes)
 	if len(targets) == 0 {
 		return
@@ -60,12 +60,16 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		if err := p.openDocument(absRoot, rel); err != nil {
+		// Open the declaration file through the shared session so sibling
+		// declarations in the same file reuse one open document (the LRU
+		// absorbs the same-file repeats) instead of reopening per node.
+		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		if err != nil {
 			continue
 		}
-		col := identifierColumn(p.getSource(absRoot, rel), n.StartLine, n.Name)
+		col := identifierColumn(content, n.StartLine, n.Name)
 		refs, err := p.findReferences(absRoot, rel, line, col)
-		_ = p.closeDocument(filepath.Join(absRoot, rel))
+		release()
 		if err != nil || len(refs) == 0 {
 			continue
 		}
