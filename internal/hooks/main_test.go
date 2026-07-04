@@ -15,10 +15,11 @@ func TestMain(m *testing.M) {
 		_ = os.Setenv("GORTEX_HOOK_LOG", filepath.Join(dir, "hook-decisions.jsonl"))
 		defer func() { _ = os.RemoveAll(dir) }()
 	}
-	// Default the file-indexed probe to "not indexed" so no test dials a
-	// real daemon. Tests needing an indexed verdict stub fileIndexedFn
-	// (fakeIndexedBridge / newIndexedBridge / stubBridge) and restore this
-	// default on cleanup.
+	// Default the file-indexed / file-summary probes to "not indexed" so no
+	// test dials a real daemon. Tests needing an indexed verdict stub
+	// fileIndexedFn / fileSummaryFn (fakeIndexedBridge / newIndexedBridge /
+	// stubBridge) and restore these defaults on cleanup.
 	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
+	fileSummaryFn = func(_, _ string) (*hookFileSummary, bool) { return nil, false }
 	os.Exit(m.Run())
 }

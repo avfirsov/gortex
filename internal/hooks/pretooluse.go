@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -443,16 +442,75 @@ func enrichGrep(toolInput map[string]any, _ int) enrichResult {
 	return probeSymbolPattern("Grep", pattern, defaultGrepGuidance())
 }
 
+// maxAlternationProbes caps how many identifier-shaped alternatives of a
+// multi-keyword grep pattern (grep 'a|b|c') the hook probes, so a long
+// alternation can't fan out into an unbounded number of daemon round-trips.
+const maxAlternationProbes = 5
+
 // probeSymbolPattern is the shared body of enrichGrep and the grep-/find-like
 // branches of enrichBash. Given a pattern, it gates on symbol-shape, probes
 // the daemon, and returns deny-with-hits or soft guidance. Telemetry is
 // attributed to the `tool` label so Grep- vs Bash-sourced probes stay
 // distinguishable in `hook-decisions.jsonl`.
+//
+// Alternation patterns (grep 'a|b|c') get split first: agents that wrap grep
+// in Bash — Codex especially — routinely batch several keywords behind `|`,
+// so the whole pattern is never a bare identifier even when the individual
+// alternatives are. Each identifier-shaped alternative is probed and the hits
+// aggregated; a pure-text alternation (phrases, hyphenated words) falls
+// through to guidance that points at search_text.
 func probeSymbolPattern(tool, pattern, guidance string) enrichResult {
 	if pattern == "" {
 		return enrichResult{}
 	}
 
+	segments := splitAlternation(pattern)
+	if len(segments) == 1 {
+		return probeSinglePattern(tool, segments[0], guidance)
+	}
+
+	var symbolSegs []string
+	for _, s := range segments {
+		if classifyGrepPattern(s) == GrepPatternSymbol {
+			symbolSegs = append(symbolSegs, s)
+			if len(symbolSegs) >= maxAlternationProbes {
+				break
+			}
+		}
+	}
+	if len(symbolSegs) == 0 {
+		// Pure text search — phrases, hyphenated words, numeric literals.
+		// search_text (surfaced in the guidance) is the graph equivalent.
+		if len(pattern) > 2 {
+			logHookDecision(tool, pattern, DecisionSkippedNonSymbol, 0, 0)
+			return enrichResult{context: guidance}
+		}
+		return enrichResult{}
+	}
+
+	start := time.Now()
+	hits, reached := probeSegments(symbolSegs)
+	dur := time.Since(start)
+	if len(hits) == 0 {
+		// Only record a miss when the daemon actually answered — a fully
+		// unreachable daemon is "no signal", not a miss (matches the
+		// single-pattern path).
+		if reached {
+			logHookDecision(tool, pattern, DecisionProbedMiss, 0, dur)
+		}
+		return enrichResult{context: guidance}
+	}
+	logHookDecision(tool, pattern, DecisionProbedHit, len(hits), dur)
+	return enrichResult{
+		deny:   true,
+		reason: formatGrepDeny(pattern, hits),
+	}
+}
+
+// probeSinglePattern gates a single (non-alternation) pattern on symbol-shape
+// and probes the daemon's search_symbols endpoint, returning deny-with-hits on
+// a match or soft guidance on miss/timeout/non-symbol.
+func probeSinglePattern(tool, pattern, guidance string) enrichResult {
 	if classifyGrepPattern(pattern) != GrepPatternSymbol {
 		if len(pattern) > 2 {
 			logHookDecision(tool, pattern, DecisionSkippedNonSymbol, 0, 0)
@@ -489,6 +547,71 @@ func probeSymbolPattern(tool, pattern, guidance string) enrichResult {
 	}
 }
 
+// probeSegments probes each alternation segment and returns the deduplicated
+// union of hits plus whether the daemon answered at least once. A per-segment
+// error (timeout, decode) drops that segment silently — one bad alternative
+// shouldn't sink the whole redirect — and an unreachable daemon leaves
+// reached=false so the caller can stay quiet instead of logging a false miss.
+func probeSegments(segs []string) (hits []grepSymbolHit, reached bool) {
+	seen := make(map[string]bool)
+	for _, s := range segs {
+		found, err := grepProbe(s, grepProbeTimeout)
+		if errors.Is(err, errDaemonUnreachable) {
+			continue
+		}
+		reached = true
+		if err != nil {
+			continue
+		}
+		for _, h := range found {
+			key := fmt.Sprintf("%s:%d:%s", h.FilePath, h.Line, h.Name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			hits = append(hits, h)
+		}
+	}
+	return hits, reached
+}
+
+// splitAlternation splits a grep pattern on top-level '|' alternation so a
+// multi-keyword search like "place_edges|location_edge|normalize" can be
+// probed as individual identifiers. A backslash-escaped `\|` is kept literal
+// and does not split. Empty segments are dropped; a pattern with no usable
+// '|' returns a single-element slice (the fast path).
+func splitAlternation(pattern string) []string {
+	if !strings.Contains(pattern, "|") {
+		return []string{pattern}
+	}
+	var out []string
+	var cur strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			cur.WriteByte(c)
+			cur.WriteByte(pattern[i+1])
+			i++
+			continue
+		}
+		if c == '|' {
+			if seg := strings.TrimSpace(cur.String()); seg != "" {
+				out = append(out, seg)
+			}
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	if seg := strings.TrimSpace(cur.String()); seg != "" {
+		out = append(out, seg)
+	}
+	if len(out) == 0 {
+		return []string{pattern}
+	}
+	return out
+}
+
 func defaultGrepGuidance() string {
 	var b strings.Builder
 	b.WriteString("[Gortex] PREFER graph tools over Grep:\n")
@@ -496,6 +619,7 @@ func defaultGrepGuidance() string {
 	b.WriteString("  - To find all references: use `find_usages` (zero false positives)\n")
 	b.WriteString("  - To find callers: use `get_callers`\n")
 	b.WriteString("  - To find implementations: use `find_implementations`\n")
+	b.WriteString("  - For literal / multi-keyword text (phrases, `foo|bar|baz`, hyphenated or other non-identifier strings): use `search_text` (trigram literal / regex search)\n")
 	b.WriteString("  - For TODO / FIXME / HACK / XXX / NOTE patterns: use `analyze kind=todos` (filter by tag/assignee/ticket)\n")
 	b.WriteString("  - For HTTP route / handler patterns (e.g. `app.get`, `func.*Handler`, `@RequestMapping`): use `contracts` (action=list to enumerate, action=check to match cross-repo)\n")
 	b.WriteString(gcxTip)
@@ -558,21 +682,41 @@ var fileIndexedFn = fileIndexedViaDaemon
 // hot path — is the next optimisation. Deferred so the test seam
 // (fileIndexedFn) stays a simple per-file func; left to the maintainer.
 func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
+	resp, ok := daemonFileSummaryRaw(cwd, filePath)
+	if !ok {
+		return false, 0
+	}
+	return parseFileSummaryIndexed(resp)
+}
+
+// daemonFileSummaryRaw resolves filePath to its tracked-repo root, asks the
+// daemon's get_file_summary tool over the AF_UNIX MCP channel, and returns
+// the raw tools/call response frame. ok=false on any failure (relative path
+// with no cwd, outside every tracked repo, daemon unreachable, socket error).
+// The graph keys files by their repo-relative path, so the absolute path is
+// resolved against its tracked-repo root and the root-relative path is what
+// gets queried (with the handshake CWD set to that root for scoping).
+//
+// Shared by the PreToolUse file-indexed probe (fileIndexedViaDaemon) and the
+// PostToolUse enrichment (fileSummaryViaDaemon) so both stay on the daemon
+// socket — the HTTP :8765 /api/graph/* API they used to hit was removed when
+// the web surface migrated to the daemon (#241).
+func daemonFileSummaryRaw(cwd, filePath string) ([]byte, bool) {
 	abs := filePath
 	if !filepath.IsAbs(abs) {
 		if cwd == "" {
-			return false, 0
+			return nil, false
 		}
 		abs = filepath.Join(cwd, abs)
 	}
 
 	root := repoRootForFile(abs)
 	if root == "" {
-		return false, 0 // outside every tracked repo → not indexed
+		return nil, false // outside every tracked repo → not indexed
 	}
 	rel, err := filepath.Rel(root, abs)
 	if err != nil {
-		return false, 0
+		return nil, false
 	}
 
 	client, err := daemon.Dial(daemon.Handshake{
@@ -581,7 +725,7 @@ func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
 		CWD:        root,
 	})
 	if err != nil {
-		return false, 0
+		return nil, false
 	}
 	defer client.Close()
 	_ = client.Conn.SetDeadline(time.Now().Add(fileIndexedTimeout))
@@ -596,16 +740,16 @@ func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
 		},
 	})
 	if err != nil {
-		return false, 0
+		return nil, false
 	}
 	if err := client.WriteMCPFrame(frame); err != nil {
-		return false, 0
+		return nil, false
 	}
 	resp, err := client.ReadMCPFrame()
 	if err != nil {
-		return false, 0
+		return nil, false
 	}
-	return parseFileSummaryIndexed(resp)
+	return resp, true
 }
 
 // daemonStatusCacheTTL bounds how long a fetched tracked-repo list is reused
@@ -824,25 +968,6 @@ func isGreedySourceGlob(pattern string) bool {
 	stem := last[:dot]
 	// Bare wildcard stems indicate "all files of this extension".
 	return stem == "*" || stem == "**"
-}
-
-func queryGortex(port int, path string) (string, error) {
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://localhost:%d%s", port, path))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
 }
 
 // editBlockingEnvVar gates Edit/Write enforcement. We ship behind a

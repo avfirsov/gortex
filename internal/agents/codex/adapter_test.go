@@ -173,6 +173,45 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	}
 }
 
+func TestCodexInstallsUserPromptSubmitHook(t *testing.T) {
+	env := codexGlobalEnv(t)
+	a := New()
+
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionCreate: 1})
+
+	cfg := readCodexConfig(t, env)
+	entries := userPromptSubmitEntries(t, cfg)
+	if len(entries) != 1 {
+		t.Fatalf("UserPromptSubmit entries=%d want 1: %#v", len(entries), entries)
+	}
+	entry := entries[0].(map[string]any)
+	// UserPromptSubmit takes no matcher — Codex can't filter it by tool name.
+	if _, hasMatcher := entry["matcher"]; hasMatcher {
+		t.Fatalf("UserPromptSubmit entry should carry no matcher: %#v", entry)
+	}
+	handlers, ok := codexHookList(entry["hooks"])
+	if !ok || len(handlers) != 1 {
+		t.Fatalf("handlers=%#v", entry["hooks"])
+	}
+	handler := handlers[0].(map[string]any)
+	if handler["type"] != "command" {
+		t.Errorf("hook type=%v want command", handler["type"])
+	}
+	if handler["command"] != testCodexHookCommand {
+		t.Errorf("command=%v want %q", handler["command"], testCodexHookCommand)
+	}
+	if handler["timeout"] != int64(codexHookTimeoutSeconds) {
+		t.Errorf("timeout=%v want %d", handler["timeout"], codexHookTimeoutSeconds)
+	}
+	if count := gortexUserPromptSubmitHookCount(t, cfg); count != 1 {
+		t.Fatalf("Gortex UserPromptSubmit hooks=%d want 1", count)
+	}
+}
+
 func TestCodexInstallHooksOnlyCreatesOnlyHooks(t *testing.T) {
 	env := codexGlobalEnv(t)
 	path := codexConfigPath(env)
@@ -618,6 +657,11 @@ func postToolUseEntries(t *testing.T, cfg map[string]any) []any {
 	return hookEntries(t, cfg, "PostToolUse")
 }
 
+func userPromptSubmitEntries(t *testing.T, cfg map[string]any) []any {
+	t.Helper()
+	return hookEntries(t, cfg, "UserPromptSubmit")
+}
+
 func hookEntries(t *testing.T, cfg map[string]any, event string) []any {
 	t.Helper()
 	hooks, ok := cfg["hooks"].(map[string]any)
@@ -671,6 +715,17 @@ func gortexPostToolUseHookCount(t *testing.T, cfg map[string]any) int {
 	count := 0
 	for _, entry := range postToolUseEntries(t, cfg) {
 		if codexHookEntryIsGortexPostToolUse(entry) {
+			count++
+		}
+	}
+	return count
+}
+
+func gortexUserPromptSubmitHookCount(t *testing.T, cfg map[string]any) int {
+	t.Helper()
+	count := 0
+	for _, entry := range userPromptSubmitEntries(t, cfg) {
+		if codexHookEntryIsGortexUserPromptSubmit(entry) {
 			count++
 		}
 	}

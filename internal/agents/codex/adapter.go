@@ -156,6 +156,10 @@ func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.Appl
 	return upsertCodexHook(root, "PostToolUse", codexHookEntryIsGortexPostToolUse, codexPostToolUseHookEntry(env), opts)
 }
 
+func upsertUserPromptSubmitHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	return upsertCodexHook(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, codexUserPromptSubmitHookEntry(env), opts)
+}
+
 // InstallHooksOnly refreshes the Codex lifecycle hooks in configPath without
 // touching MCP server entries, AGENTS.md, or any other Codex adapter surface.
 func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agents.ApplyOpts) (agents.FileAction, error) {
@@ -175,7 +179,8 @@ func upsertCodexHooks(root map[string]any, env agents.Env, opts agents.ApplyOpts
 	sessionChanged := upsertSessionStartHook(root, opts)
 	preChanged := upsertPreToolUseHook(root, env, opts)
 	postChanged := upsertPostToolUseHook(root, env, opts)
-	return sessionChanged || preChanged || postChanged
+	promptChanged := upsertUserPromptSubmitHook(root, env, opts)
+	return sessionChanged || preChanged || postChanged || promptChanged
 }
 
 func upsertCodexHook(root map[string]any, event string, isGortex func(any) bool, desired map[string]any, opts agents.ApplyOpts) bool {
@@ -323,6 +328,10 @@ func codexHookEntryIsGortexPostToolUse(entry any) bool {
 	return codexHookEntryInvokesCodexHook(entry)
 }
 
+func codexHookEntryIsGortexUserPromptSubmit(entry any) bool {
+	return codexHookEntryInvokesCodexHook(entry)
+}
+
 func codexHookEntryInvokesCodexHook(entry any) bool {
 	group, ok := entry.(map[string]any)
 	if !ok {
@@ -408,6 +417,24 @@ func codexPostToolUseHookEntry(env agents.Env) map[string]any {
 				"command":       codexHookCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
 				"statusMessage": "Loading Gortex Bash output context...",
+			},
+		},
+	}
+}
+
+// codexUserPromptSubmitHookEntry fires on every user turn — Codex's
+// UserPromptSubmit event takes no matcher (it can't filter by tool name), so
+// the entry omits one. The handler probes the graph for symbols relevant to
+// the prompt and injects them as additionalContext, re-surfacing Gortex on
+// every turn instead of relying on the SessionStart orientation to persist.
+func codexUserPromptSubmitHookEntry(env agents.Env) map[string]any {
+	return map[string]any{
+		"hooks": []any{
+			map[string]any{
+				"type":          "command",
+				"command":       codexHookCommand(env),
+				"timeout":       codexHookTimeoutSeconds,
+				"statusMessage": "Surfacing Gortex graph context for your prompt...",
 			},
 		},
 	}
