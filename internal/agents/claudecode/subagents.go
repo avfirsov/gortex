@@ -53,7 +53,7 @@ func SubAgentTools(def string) []string {
 // no Grep, no Glob escape.
 const subagentSearch = `---
 name: gortex-search
-description: "Use to locate code, trace call paths, or explore architecture without polluting the parent context. The sub-agent runs gortex graph queries in a fresh context and returns a summary. Examples: \"Where is X defined?\", \"Find every implementation of Y\", \"Trace the request flow from handler to database\", \"Map the auth boundary\""
+description: "Locate code, trace call paths, or map architecture in a fresh context."
 tools: mcp__gortex__smart_context, mcp__gortex__surface_memories, mcp__gortex__search_symbols, mcp__gortex__search_text, mcp__gortex__get_symbol_source, mcp__gortex__get_editing_context, mcp__gortex__get_file_summary, mcp__gortex__find_usages, mcp__gortex__get_callers, mcp__gortex__get_call_chain, mcp__gortex__get_dependencies, mcp__gortex__get_dependents, mcp__gortex__get_repo_outline, mcp__gortex__get_architecture, mcp__gortex__graph_stats, mcp__gortex__get_symbol, mcp__gortex__read_file
 ---
 
@@ -79,7 +79,7 @@ When you reply to the parent: give the answer first (symbol IDs, file:line, the 
 // would otherwise blow up the parent's context.
 const subagentImpact = `---
 name: gortex-impact
-description: "Use to assess the blast radius of a proposed change before editing — broken callers, interface implementors, contract violations, test targets. The sub-agent runs gortex verification in a fresh context and returns a short impact report. Examples: \"What breaks if I change X's signature?\", \"Is it safe to delete Y?\", \"Who depends on this contract?\""
+description: "Assess a change's blast radius — broken callers, contracts, tests."
 tools: mcp__gortex__smart_context, mcp__gortex__surface_memories, mcp__gortex__search_symbols, mcp__gortex__get_symbol_source, mcp__gortex__find_usages, mcp__gortex__get_callers, mcp__gortex__get_call_chain, mcp__gortex__get_dependents, mcp__gortex__verify_change, mcp__gortex__explain_change_impact, mcp__gortex__analyze, mcp__gortex__simulate_chain, mcp__gortex__preview_edit, mcp__gortex__check_guards, mcp__gortex__get_test_targets, mcp__gortex__contracts, mcp__gortex__read_file
 ---
 

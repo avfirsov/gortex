@@ -99,121 +99,121 @@ var SlashCommands = map[string]string{
 var GlobalSkills = map[string]string{
 	"gortex-guide": `---
 name: gortex-guide
-description: "Use when the user asks about Gortex — available tools, graph schema, or workflow reference. Examples: \"What Gortex tools are available?\", \"How do I use Gortex?\""
+description: "Gortex reference: available tools, graph schema, and workflow."
 ---
 ` + commandGuide,
 
 	"gortex-explore": `---
 name: gortex-explore
-description: "Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: \"How does X work?\", \"What calls this function?\", \"Show me the auth flow\""
+description: "Understand how code works or trace an execution flow."
 ---
 ` + commandExplore,
 
 	"gortex-debug": `---
 name: gortex-debug
-description: "Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: \"Why is X failing?\", \"Where does this error come from?\", \"Trace this bug\""
+description: "Debug a bug, trace an error, or find why something fails."
 ---
 ` + commandDebug,
 
 	"gortex-impact": `---
 name: gortex-impact
-description: "Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \"Is it safe to change X?\", \"What depends on this?\", \"What will break?\""
+description: "Assess what breaks if you change X before editing it."
 ---
 ` + commandImpact,
 
 	"gortex-refactor": `---
 name: gortex-refactor
-description: "Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: \"Rename this function\", \"Extract this into a module\", \"Refactor this class\""
+description: "Rename, extract, split, or restructure code safely."
 ---
 ` + commandRefactor,
 
 	"gortex-safe-edit": `---
 name: gortex-safe-edit
-description: "Use when the user is about to edit source code and wants the edit to be safe — speculative preview, broken-callers / blast-radius check, then on-disk apply. Enforces preview_edit / simulate_chain before batch_edit. Examples: \"Change the signature of X safely\", \"Apply this WorkspaceEdit but verify first\", \"Speculate this edit before writing\""
+description: "Preview an edit's blast radius on the shadow graph before writing."
 ---
 ` + commandSafeEdit,
 
 	"gortex-fix-all": `---
 name: gortex-fix-all
-description: "Use when the user wants to clear LSP diagnostics — a single error, a file's worth of warnings, or the whole project's source.fixAll bundle. Enforces subscribe_diagnostics / get_code_actions / apply_code_action / fix_all_in_file in order. Examples: \"Fix the diagnostics in this file\", \"Run source.fixAll\", \"Apply quick-fixes for these errors\""
+description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
 ---
 ` + commandFixAll,
 
 	"gortex-extract-function": `---
 name: gortex-extract-function
-description: "Use when the user wants to extract code into a new function / method / variable via the language server's refactor actions (not a manual rewrite). Enforces get_editing_context / get_code_actions(kind=refactor.extract) / preview_edit / apply_code_action. Examples: \"Extract these lines into a helper\", \"Pull this into its own method\", \"Refactor this block into a function\""
+description: "Extract code into a function or method via LSP refactor."
 ---
 ` + commandExtractFunction,
 
 	"gortex-rename": `---
 name: gortex-rename
-description: "Use when the user wants to rename a symbol and have every reference (definition + callers + tests + cross-repo consumers) updated atomically. Enforces search_symbols / verify_change / rename_symbol / batch_edit / check_guards in order. Examples: \"Rename Foo to Bar everywhere\", \"Rename this method\", \"Change the package name\""
+description: "Rename a symbol and update every reference atomically."
 ---
 ` + commandRename,
 
 	"gortex-cross-repo-usage": `---
 name: gortex-cross-repo-usage
-description: "Use when the user needs to see who uses a symbol across consumer repos, not just the current one. Enforces get_active_project / track_repository / find_usages partitioned by repo / analyze cross_repo. Examples: \"Who calls this across all our repos?\", \"What other services consume this API?\", \"Cross-repo blast radius\""
+description: "Find who uses a symbol across all consumer repos."
 ---
 ` + commandCrossRepoUsage,
 
 	"gortex-dataflow-trace": `---
 name: gortex-dataflow-trace
-description: "Use when the user wants to trace where a value flows — through assignments, function args, returns, channels, or pub/sub topics. Enforces search_symbols / flow_between / taint_paths / analyze pubsub|channel_ops. Examples: \"Where does this value end up?\", \"Trace the taint from input to sink\", \"Find every flow from X to Y\""
+description: "Trace where a value flows through the code."
 ---
 ` + commandDataflowTrace,
 
 	"gortex-add-test": `---
 name: gortex-add-test
-description: "Use when the user wants to add tests for under-tested code — coverage gaps, untested symbols, regression repro. Enforces analyze coverage_gaps / get_untested_symbols / suggest_pattern / scaffold / get_test_targets. Examples: \"Add tests for X\", \"Cover the gaps in this package\", \"Write a test for this bug\""
+description: "Add tests for under-tested code and coverage gaps."
 ---
 ` + commandAddTest,
 
 	"gortex-incident-investigation": `---
 name: gortex-incident-investigation
-description: "Use when an alert fired, a deploy regressed, or production is misbehaving and the user needs to walk from symptom (log line, error, broken endpoint, failing CI) back to root cause. Enforces surface_memories / search_symbols / get_recent_changes / analyze error_surface|event_emitters / get_callers / flow_between / taint_paths / explain_change_impact / store_memory(kind:incident). Examples: \"Why did this alert fire?\", \"What broke in the last deploy?\", \"Trace this production error to its root cause\""
+description: "Walk a production symptom back to its root cause."
 ---
 ` + commandIncidentInvestigation,
 
 	"gortex-episode-replay": `---
 name: gortex-episode-replay
-description: "Use when the user wants to reconstruct what happened in a window — for a postmortem, a release-boundary diff, a 'what did Alice change last week', or a 'what did this PR actually change beyond the diff'. Enforces gortex enrich blame all / analyze releases|blame|ownership / get_recent_changes / detect_changes / diff_context / explain_change_impact per symbol / query_notes|query_memories / export_context. Examples: \"What shipped in v1.3?\", \"Walk me through last week's changes\", \"Build a postmortem from this incident window\""
+description: "Reconstruct what changed in a window (postmortem, release, PR)."
 ---
 ` + commandEpisodeReplay,
 
 	"gortex-co-change": `---
 name: gortex-co-change
-description: "Use when the user asks what tends to change together — for refactor planning, ownership decisions, ADR rationale, or to find hidden coupling the graph's static edges don't capture. Enforces gortex enrich blame all / get_recent_changes / get_symbol_history / analyze blame|ownership|hotspots / get_dependents / find_clones / detect_changes. Examples: \"What changes together with X?\", \"Find hidden coupling in this package\", \"Which files should I refactor together?\""
+description: "Find what changes together and hidden coupling."
 ---
 ` + commandCoChange,
 
 	"gortex-onboarding": `---
 name: gortex-onboarding
-description: "Use when the user is new to a repo (or returning cold) and wants a structured tour — where to read first, what the architecture is, who owns what, where to safely make a first edit. Enforces graph_stats / get_active_project / get_repo_outline / surface_memories / distill_session / get_communities / get_processes / analyze hotspots|components|routes|models|ownership / contracts list / audit_agent_config / export_context. Examples: \"Give me a tour of this repo\", \"I'm new here, where do I start?\", \"Onboard me on this codebase\""
+description: "Structured tour of an unfamiliar repo."
 ---
 ` + commandOnboarding,
 
 	"gortex-quality-audit": `---
 name: gortex-quality-audit
-description: "Use when the user wants a structured pass over a repo / directory looking for code-quality issues at scale — dead code, hotspots, cycles, churn, todos, coverage gaps, clones, anti-patterns, config drift. Enforces gortex enrich / analyze dead_code|hotspots|cycles|todos|stale_code|stale_flags|coverage_*|error_surface|field_writers|race_writes|unclosed_channels|orphan_tables / find_clones dead_only / search_ast detectors / audit_agent_config / contracts check / export_context. Examples: \"Audit this repo for quality issues\", \"Find code smells in this package\", \"Run a quality scan and rank by priority\""
+description: "Repo-scale quality scan — dead code, hotspots, clones."
 ---
 ` + commandQualityAudit,
 
 	"gortex-architecture-review": `---
 name: gortex-architecture-review
-description: "Use when the user wants a graph-grounded architectural read — what the architecture actually looks like, where the design is under stress, what to refactor before it breaks. Distinct from quality-audit (punch list) — this produces a narrative. Enforces get_repo_outline / get_communities / get_processes / analyze components|routes|models|k8s_resources|images|hotspots|cycles|cross_repo|pubsub|channel_ops|race_writes|stale_code|ownership / contracts list+check / get_class_hierarchy / get_dependencies+dependents at community level / export_context. Examples: \"Review the architecture of this repo\", \"Where is this design under stress?\", \"Map the de facto modules and processes\""
+description: "Graph-grounded architectural read of a repo."
 ---
 ` + commandArchitectureReview,
 
 	"gortex-pr-review": `---
 name: gortex-pr-review
-description: "Use when the user wants a code-review pass on a pending change — local staged diff, a branch about to merge, or a PR they're reading. Walks the diff through the graph so comments are grounded in real callers / contracts / coverage / guards, not style nitpicks. Enforces detect_changes / diff_context / explain_change_impact / verify_change / contracts check / check_guards / analyze would_create_cycle|coverage_gaps / get_test_targets / find_clones dead_only / preview_edit on high-risk changes / surface_memories on touched symbols / export_context. Examples: \"Review this PR\", \"What does this staged diff break?\", \"Do a graph-grounded review of this change\""
+description: "Graph-grounded review of a pending change or PR."
 ---
 ` + commandPRReview,
 
 	"gortex-pr-review-agent": `---
 name: gortex-pr-review-agent
-description: "Use when you are a coding agent that needs a graph-grounded review verdict on a pending change without hand-walking the review gates. Shell the review verb once — gortex review --audience agent (add --format json for structured output) — and act on the terse one-line verdict + compact file:line findings + cost. Block means fix every critical/error finding and re-run until it clears. Examples: \"Review my change and tell me if it's safe to merge\", \"Run the review verb and act on the findings\", \"Get a terse review verdict for this diff\""
+description: "Coding-agent review verdict via the gortex review verb."
 ---
 ` + commandPRReviewAgent,
 
@@ -1769,7 +1769,7 @@ When you want the full reasoning behind a verdict (per-file risk, contracts, gua
 // the sub-agents' `tools:` allowlist — scoping the skill to the gortex binary.
 const skillGortexCLI = `---
 name: gortex-cli
-description: "Use to drive Gortex from the shell via the gortex CLI without mounting the MCP tool surface — when MCP is unavailable or impractical, in a CI job, or to keep baseline context low. Examples: \"use gortex from the CLI\", \"run the gortex safety workflow without MCP\", \"query the graph with the gortex command\""
+description: "Drive Gortex from the shell via the gortex CLI, no MCP surface."
 allowed-tools: Bash(gortex:*)
 ---
 
