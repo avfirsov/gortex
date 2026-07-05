@@ -261,8 +261,8 @@ func TestRunCodexPostToolUseBashReadSourceAdditionalContext(t *testing.T) {
 			if !strings.Contains(hso.AdditionalContext, "3 indexed symbol(s)") {
 				t.Fatalf("additionalContext missing symbol count: %q", hso.AdditionalContext)
 			}
-			if !strings.Contains(hso.AdditionalContext, "2 unique external caller(s)") {
-				t.Fatalf("additionalContext missing caller count: %q", hso.AdditionalContext)
+			if !strings.Contains(hso.AdditionalContext, "2 file(s) import this one") {
+				t.Fatalf("additionalContext missing importer count: %q", hso.AdditionalContext)
 			}
 			if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 				t.Fatalf("Codex PostToolUse enrichment must not deny: %#v", hso)
@@ -434,9 +434,52 @@ func TestRunCodexPostToolUseIgnoresNonBash(t *testing.T) {
 }
 
 func TestRunCodexPostToolUseMalformedJSONNoop(t *testing.T) {
-	out := captureStdout(t, func() { runCodexPostToolUse([]byte(`{`), 0) })
+	out := captureStdout(t, func() { runCodexPostToolUse([]byte(`{`)) })
 	if out != "" {
 		t.Fatalf("malformed JSON should be silent, got %q", out)
+	}
+}
+
+func TestRunCodexUserPromptSubmitInjectsGraphContext(t *testing.T) {
+	prev := userPromptProbe
+	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+		return []grepSymbolHit{
+			{Name: "AuthMiddleware", Kind: "function", FilePath: "internal/auth.go", Line: 12},
+		}, nil
+	}
+	t.Cleanup(func() { userPromptProbe = prev })
+
+	data := []byte(`{"hook_event_name":"UserPromptSubmit","session_id":"codex-shape","prompt":"where is the auth middleware wired"}`)
+	out := captureStdout(t, func() { runCodex(data, 0) })
+	if out == "" {
+		t.Fatal("expected Codex UserPromptSubmit injection, got empty output")
+	}
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil {
+		t.Fatalf("missing hookSpecificOutput: %s", out)
+	}
+	if hso.HookEventName != "UserPromptSubmit" {
+		t.Fatalf("hookEventName=%q want UserPromptSubmit", hso.HookEventName)
+	}
+	if !strings.Contains(hso.AdditionalContext, "AuthMiddleware") {
+		t.Fatalf("additionalContext missing probed symbol: %q", hso.AdditionalContext)
+	}
+	if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
+		t.Fatalf("Codex UserPromptSubmit injection must not deny: %#v", hso)
+	}
+}
+
+func TestRunCodexUserPromptSubmitSilentWhenNoHits(t *testing.T) {
+	prev := userPromptProbe
+	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { userPromptProbe = prev })
+
+	data := []byte(`{"hook_event_name":"UserPromptSubmit","session_id":"codex-shape","prompt":"refactor the parser"}`)
+	out := captureStdout(t, func() { runCodex(data, 0) })
+	if out != "" {
+		t.Fatalf("expected silent no-op when probe returns no hits, got %q", out)
 	}
 }
 

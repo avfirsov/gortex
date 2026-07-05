@@ -113,7 +113,7 @@ func Run(port int, mode Mode) {
 		captureModelHint(data)
 		runPreToolUse(data, port, mode)
 	case "PostToolUse":
-		runPostToolUse(data, port)
+		runPostToolUse(data)
 	case "PreCompact":
 		runPreCompact(data, port)
 	case "Stop":

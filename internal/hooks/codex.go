@@ -7,8 +7,9 @@ import (
 )
 
 // RunCodex handles the Codex hook wire shape. Codex support is deliberately
-// soft-only: PreToolUse is forced through ModeEnrich, and PostToolUse only
-// emits additionalContext.
+// soft-only: PreToolUse is forced through ModeEnrich, PostToolUse only emits
+// additionalContext, and UserPromptSubmit re-surfaces prompt-relevant graph
+// symbols on every turn. No branch ever denies a tool call.
 func RunCodex(port int) {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -32,7 +33,14 @@ func runCodex(data []byte, port int) {
 	case peek.HookEventName == "PreToolUse" && codexMCPReadPreToolUseTool(peek.ToolName):
 		runCodexMCPReadPreToolUse(data)
 	case peek.HookEventName == "PostToolUse" && peek.ToolName == "Bash":
-		runCodexPostToolUse(data, port)
+		runCodexPostToolUse(data)
+	case peek.HookEventName == "UserPromptSubmit":
+		// Re-surface graph symbols relevant to the prompt on every turn.
+		// Codex forgets MCP tools as context grows, so a SessionStart
+		// orientation alone fades; this lands a fresh, prompt-specific
+		// nudge at the top of each turn (the wire shape is shared with
+		// Claude Code — hookSpecificOutput.additionalContext).
+		runUserPromptSubmit(data)
 	}
 }
 
@@ -66,7 +74,7 @@ func runCodexMCPReadPreToolUse(data []byte) {
 	})
 }
 
-func runCodexPostToolUse(data []byte, port int) {
+func runCodexPostToolUse(data []byte) {
 	var input postHookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -102,5 +110,5 @@ func runCodexPostToolUse(data []byte, port int) {
 	if err != nil {
 		return
 	}
-	runPostToolUse(normalized, port)
+	runPostToolUse(normalized)
 }
