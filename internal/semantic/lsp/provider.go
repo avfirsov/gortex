@@ -606,9 +606,20 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	//     original ambiguous-edge target scan matched any repo+language source
 	//     node (file/import edges like EdgeImports included), so the
 	//     references-confirm pass must keep matching those too.
-	repoNodes := p.repoScopedNodes(g, repoPrefix)
+	//
+	// repoNodes is fetched via repoScopedNodesLight: on a backend with the
+	// optional LightNodeReader fast path (sqlite), the meta blob is never
+	// decoded for the repo's already-stamped majority. langAllByID only
+	// ever needs structural fields (file path, kind, position) for the
+	// confirm pass below, so it's built directly from whatever repoNodes
+	// holds. langNodes' candidates, in contrast, get round-tripped through
+	// AddBatch once hovered (see flushFile), so on a light scan a candidate
+	// is never added there directly — its ID is queued and the FULL node
+	// (with any non-promoted meta intact) is re-fetched afterward.
+	repoNodes, lightScan := p.repoScopedNodesLight(g, repoPrefix)
 	langAllByID := make(map[string]*graph.Node, len(repoNodes))
 	langNodes := make([]*graph.Node, 0, len(repoNodes))
+	var candidateIDs []string
 	// Count symbol nodes a prior pass already stamped with a semantic type.
 	// Stamps persist in node Meta across restarts, so on a warm restart of an
 	// unchanged repo — or a changed repo where only a few files moved — most
@@ -635,7 +646,19 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			skippedAlreadyStamped++
 			continue
 		}
+		if lightScan {
+			candidateIDs = append(candidateIDs, n.ID)
+			continue
+		}
 		langNodes = append(langNodes, n)
+	}
+	if len(candidateIDs) > 0 {
+		full := g.GetNodesByIDs(candidateIDs)
+		for _, id := range candidateIDs {
+			if n := full[id]; n != nil {
+				langNodes = append(langNodes, n)
+			}
+		}
 	}
 
 	// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
@@ -3097,6 +3120,20 @@ func (p *Provider) repoScopedNodes(g graph.Store, repoPrefix string) []*graph.No
 		return g.AllNodes()
 	}
 	return nodes
+}
+
+// repoScopedNodesLight fetches this repo's nodes via the store's optional
+// LightNodeReader fast path when available — skipping the meta-blob decode
+// for the majority of nodes that are already fully enriched — falling back
+// to the full repoScopedNodes scan otherwise. The bool result reports
+// whether the light path was taken: when true, the returned nodes must not
+// be round-tripped back through AddBatch as-is (see graph.LightNodeReader);
+// the caller re-fetches in full whatever subset it intends to stamp.
+func (p *Provider) repoScopedNodesLight(g graph.Store, repoPrefix string) ([]*graph.Node, bool) {
+	if lr, ok := g.(graph.LightNodeReader); ok {
+		return lr.GetRepoNodesLight(repoPrefix), true
+	}
+	return p.repoScopedNodes(g, repoPrefix), false
 }
 
 // repoScopedEdges returns the edges whose source node belongs to

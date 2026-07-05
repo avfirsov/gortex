@@ -140,6 +140,57 @@ func TestPromotedColumns_NewColumns(t *testing.T) {
 	}
 }
 
+// TestPromotedColumns_SemanticType verifies semantic_type/semantic_source —
+// promoted alongside signature/visibility/etc. so enrichment can query the
+// unstamped subset by column instead of decoding every node's meta blob —
+// round-trip through their columns and out of the JSON blob.
+func TestPromotedColumns_SemanticType(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "p.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	s.AddNode(&graph.Node{
+		ID: "f.go::T", Kind: graph.KindFunction, Name: "T", FilePath: "f.go",
+		Meta: map[string]any{
+			"semantic_type":   "string",
+			"semantic_source": "lsp-gopls",
+			"complexity":      5, // non-promoted — must stay in the blob
+		},
+	})
+
+	n := s.GetNode("f.go::T")
+	if n == nil {
+		t.Fatal("GetNode returned nil")
+	}
+	assertType[string](t, n.Meta, "semantic_type", "string")
+	assertType[string](t, n.Meta, "semantic_source", "lsp-gopls")
+	assertType[int](t, n.Meta, "complexity", 5)
+
+	var st, ss sql.NullString
+	var blob []byte
+	row := s.db.QueryRow(`SELECT semantic_type, semantic_source, meta FROM nodes WHERE id=?`, "f.go::T")
+	if err := row.Scan(&st, &ss, &blob); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Valid || st.String != "string" {
+		t.Errorf("semantic_type column = %+v", st)
+	}
+	if !ss.Valid || ss.String != "lsp-gopls" {
+		t.Errorf("semantic_source column = %+v", ss)
+	}
+	blobStr := string(blob)
+	for _, k := range []string{"semantic_type", "semantic_source"} {
+		if strings.Contains(blobStr, k) {
+			t.Errorf("blob still contains promoted key %q: %s", k, blobStr)
+		}
+	}
+	if !strings.Contains(blobStr, "complexity") {
+		t.Errorf("blob missing non-promoted key complexity: %s", blobStr)
+	}
+}
+
 // TestPromotedColumns_ExternalFalse guards the NULL-vs-false distinction:
 // a stored false must round-trip as false, not vanish.
 func TestPromotedColumns_ExternalFalse(t *testing.T) {

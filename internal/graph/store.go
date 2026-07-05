@@ -1054,6 +1054,20 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// LightNodeReader is an optional store capability: a repo-scoped node scan
+// that skips decoding each row's opaque meta blob, populating only struct
+// columns and the already-promoted meta keys (signature/visibility/doc/
+// external/return_type/.../semantic_type/semantic_source) into Meta. Safe
+// for read-only structural use (file path, kind, position, the promoted
+// stamp check) — a node fetched this way must NEVER be round-tripped back
+// through AddNode/AddBatch, since any non-promoted meta content still
+// living in the row's blob would be silently discarded on write. Backends
+// with no separate blob (nothing to skip) need not implement it — callers
+// fall back to the full scan.
+type LightNodeReader interface {
+	GetRepoNodesLight(repoPrefix string) []*Node
+}
+
 // EdgePersister is an optional capability backends MAY implement to
 // durably rewrite the mutable attribute columns (Confidence,
 // ConfidenceLabel, Origin, Tier, Meta) of an edge already present in the
