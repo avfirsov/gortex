@@ -28,6 +28,8 @@ var exampleArg = map[string]string{
 	"get_repo_outline":    "path_prefix=<dir>/",
 	"edit_file":           "path=<file>",
 	"edit_symbol":         "id=<file>::<Name>",
+	"index_repository":    "path=<repo-root>",
+	"reindex_repository":  "path=<repo-root>",
 }
 
 // MCPRef renders an MCP-directed reference to a tool: "call the `read_file` MCP

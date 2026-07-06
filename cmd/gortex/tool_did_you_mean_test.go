@@ -33,6 +33,18 @@ func TestMaybeToolInvocationHint(t *testing.T) {
 			wantContains: []string{"gortex call read_file --arg path=<file>"},
 		},
 		{
+			name:         "fuzzy: reindex suggests reindex_repository",
+			args:         []string{"reindex"},
+			wantHint:     true,
+			wantContains: []string{`unknown command "reindex"`, "gortex call reindex_repository --arg path=<repo-root>"},
+		},
+		{
+			name:         "fuzzy: index suggests index_repository",
+			args:         []string{"index", "."},
+			wantHint:     true,
+			wantContains: []string{`unknown command "index"`, "gortex call index_repository --arg path=<repo-root>"},
+		},
+		{
 			name:     "real cobra command is not intercepted",
 			args:     []string{"daemon", "status"},
 			wantHint: false,

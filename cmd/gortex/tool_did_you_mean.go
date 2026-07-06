@@ -28,14 +28,69 @@ func maybeToolInvocationHint(w io.Writer, args []string) bool {
 	if isKnownRootCommand(verb) {
 		return false // a real cobra verb — let cobra route it
 	}
-	if !gortexmcp.IsRegisteredToolName(verb) {
-		return false // genuinely unknown and not a tool — let cobra's error stand
+	if gortexmcp.IsRegisteredToolName(verb) {
+		fmt.Fprintf(w, "gortex: %q is not a gortex command, but it is a Gortex MCP tool.\n", verb)
+		fmt.Fprintf(w, "Run it from a shell with:\n  %s\n", toolref.CLIFallback(verb))
+		fmt.Fprintln(w, "General form: gortex call <tool> --arg k=v  (there is no bare `gortex <tool>` verb).")
+		return true
 	}
 
-	fmt.Fprintf(w, "gortex: %q is not a gortex command, but it is a Gortex MCP tool.\n", verb)
-	fmt.Fprintf(w, "Run it from a shell with:\n  %s\n", toolref.CLIFallback(verb))
+	// Not an exact tool name — try a conservative fuzzy match. Agents invent
+	// truncations of the real tool names (`gortex index`, `gortex reindex`), so
+	// a prefix / whole-token match against the registry converts those from a
+	// dead end into recovery too. No match — let cobra's error stand.
+	candidates := fuzzyToolCandidates(verb)
+	if len(candidates) == 0 {
+		return false
+	}
+	fmt.Fprintf(w, "gortex: unknown command %q. The closest Gortex MCP tools:\n", verb)
+	for _, c := range candidates {
+		fmt.Fprintf(w, "  %s\n", toolref.CLIFallback(c))
+	}
 	fmt.Fprintln(w, "General form: gortex call <tool> --arg k=v  (there is no bare `gortex <tool>` verb).")
 	return true
+}
+
+// fuzzyMinVerbLen gates the fuzzy tool match: shorter fragments are too
+// ambiguous to suggest anything for, so they fall through to cobra.
+const fuzzyMinVerbLen = 4
+
+// fuzzyToolCandidates returns up to two registered tool names the unknown verb
+// plausibly meant, ranked prefix matches first (`reindex` → reindex_repository)
+// then whole-token matches (`usages` → find_usages), alphabetical within a
+// rank. Deliberately conservative — a prefix must land on an underscore
+// boundary and a token must match exactly, so an unrelated verb never draws a
+// suggestion and cobra's own error remains the fallback.
+func fuzzyToolCandidates(verb string) []string {
+	if len(verb) < fuzzyMinVerbLen {
+		return nil
+	}
+	v := strings.ToLower(verb)
+	var prefix, token []string
+	for _, name := range gortexmcp.RegisteredToolNames() {
+		switch {
+		case strings.HasPrefix(name, v+"_"):
+			prefix = append(prefix, name)
+		case tokenOf(name, v):
+			token = append(token, name)
+		}
+	}
+	out := prefix
+	out = append(out, token...)
+	if len(out) > 2 {
+		out = out[:2]
+	}
+	return out
+}
+
+// tokenOf reports whether v equals one of name's underscore-delimited tokens.
+func tokenOf(name, v string) bool {
+	for _, t := range strings.Split(name, "_") {
+		if t == v {
+			return true
+		}
+	}
+	return false
 }
 
 // firstPositionalArg returns the first argument that is not an option flag,
