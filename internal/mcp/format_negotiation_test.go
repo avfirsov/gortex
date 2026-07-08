@@ -33,8 +33,11 @@ func TestDefaultFormatForClient(t *testing.T) {
 		{"codex", "gcx"},
 		{"omp-coding-agent", "gcx"},
 
-		// Unknown / unset → JSON fallback.
+		// Unknown / unset → JSON fallback. "pi" is deliberately NOT in
+		// the allowlist: its bridge declares the gortex/wire capability
+		// instead (TestResolveSessionFormat_WireCapability).
 		{"", ""},
+		{"pi", ""},
 		{"some-other-client", ""},
 		{"unknown", ""},
 	}
@@ -59,6 +62,53 @@ func TestResolveSessionFormat_KnownClient(t *testing.T) {
 	srv.NoteSessionClient("session_X", "claude-code", "1.0.42")
 	ctx := WithSessionID(context.Background(), "session_X")
 	assert.Equal(t, "gcx", srv.resolveSessionFormat(ctx))
+}
+
+// TestFormatFromWireCapability pins the capability → format mapping: the
+// first declared format the server can emit wins, unknown names are
+// skipped, and an empty declaration yields the JSON fallback.
+func TestFormatFromWireCapability(t *testing.T) {
+	cases := []struct {
+		formats []string
+		want    string
+	}{
+		{[]string{"gcx"}, "gcx"},
+		{[]string{"toon"}, "toon"},
+		{[]string{" GCX "}, "gcx"},             // trimmed + case-insensitive
+		{[]string{"gcx2-draft", "gcx"}, "gcx"}, // unknown skipped, fallback honoured
+		{[]string{"toon", "gcx"}, "toon"},      // client preference order wins
+		{[]string{"bogus"}, ""},                // nothing usable → JSON
+		{nil, ""},                              // no declaration → JSON
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, formatFromWireCapability(tc.formats),
+			"formatFromWireCapability(%q)", tc.formats)
+	}
+}
+
+// TestResolveSessionFormat_WireCapability verifies the full per-session
+// capability path: NoteSessionWireFormats stores the declaration (the
+// daemon dispatcher snoops it from initialize.capabilities
+// ["gortex/wire"]), and resolveSessionFormat prefers it over the
+// client-name allowlist — this is how the Pi bridge gets gcx without an
+// allowlist entry.
+func TestResolveSessionFormat_WireCapability(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.NoteSessionClient("session_pi", "pi", "1.0.0") // NOT in the allowlist
+	srv.NoteSessionWireFormats("session_pi", []string{"gcx"})
+	ctx := WithSessionID(context.Background(), "session_pi")
+	assert.Equal(t, "gcx", srv.resolveSessionFormat(ctx))
+}
+
+// TestNoteSessionWireFormats_NilSafe mirrors TestNoteSessionClient_NilSafe
+// for the capability path.
+func TestNoteSessionWireFormats_NilSafe(t *testing.T) {
+	var srv *Server
+	srv.NoteSessionWireFormats("sess", []string{"gcx"})
+
+	srv2, _ := setupTestServer(t)
+	srv2.NoteSessionWireFormats("", []string{"gcx"}) // empty session id → no-op
+	srv2.NoteSessionWireFormats("sess", nil)         // empty declaration → no-op
 }
 
 func TestResolveSessionFormat_UnknownClient(t *testing.T) {

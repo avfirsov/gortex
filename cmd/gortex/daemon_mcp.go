@@ -97,6 +97,11 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// every query runs against the whole multi-workspace graph and a
 	// session in workspace A can see workspace B's nodes.
 	ctx = gortexmcp.WithSessionCWD(ctx, sess.CWD)
+	// Run session-aware: attaching the connected client session (wired
+	// by SessionStarted) lets mcp-go's initialize handler mark it
+	// initialized — the gate SendNotificationToAllClients applies
+	// before delivering tools/list_changed and other pushes.
+	ctx = d.srv.WithClientSession(ctx, sess.ID)
 
 	// Relay the client-forwarded tool-surface preference (GORTEX_TOOLS /
 	// --tools of the proxy) so the MCP server resolves THIS session's
@@ -224,11 +229,29 @@ func rewriteUntrackedResponse(method string, out []byte, cwd string) []byte {
 	return out
 }
 
+// SessionStarted implements daemon.SessionStartedHook: register the
+// connection as a live mcp-go client session so server-initiated
+// notifications (tools/list_changed after a tools_search promotion,
+// graph_invalidated, diagnostics pushes, ...) reach this client over
+// the socket. Best-effort — on failure the session still works
+// request/response, it just misses pushes.
+func (d *mcpDispatcher) SessionStarted(sess *daemon.Session, write func([]byte) error) {
+	if d.srv == nil || sess == nil {
+		return
+	}
+	if err := d.srv.ConnectSession(sess.ID, write); err != nil {
+		d.logger.Debug("daemon: notification session unavailable",
+			zap.String("session_id", sess.ID), zap.Error(err))
+	}
+}
+
 // SessionEnded implements daemon.SessionEndedHook. When a proxy
-// disconnects, drop its entry from the MCP server's session map so idle
-// per-session state doesn't accumulate for the daemon's lifetime.
+// disconnects, unregister its notification session and drop its entry
+// from the MCP server's session map so idle per-session state doesn't
+// accumulate for the daemon's lifetime.
 func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
 	if d.srv != nil && sess != nil {
+		d.srv.DisconnectSession(sess.ID)
 		d.srv.ReleaseSession(sess.ID)
 	}
 }
@@ -389,6 +412,9 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 				Name    string `json:"name"`
 				Version string `json:"version"`
 			} `json:"clientInfo"`
+			Capabilities struct {
+				WireFormats []string `json:"gortex/wire"`
+			} `json:"capabilities"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(frame, &peek); err != nil {
@@ -396,6 +422,12 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 	}
 	if peek.Method != "initialize" {
 		return
+	}
+	// A gortex/wire capability self-declares the client's compact-format
+	// decoders; session format resolution prefers it over the built-in
+	// client-name allowlist, so new clients need no server-side entry.
+	if formats := peek.Params.Capabilities.WireFormats; len(formats) > 0 && d.srv != nil {
+		d.srv.NoteSessionWireFormats(sess.ID, formats)
 	}
 	if peek.Params.ClientInfo.Name == "" && peek.Params.ClientInfo.Version == "" {
 		return

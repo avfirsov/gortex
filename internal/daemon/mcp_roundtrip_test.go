@@ -186,3 +186,75 @@ func TestDaemon_SessionEndedHook_FiresOnDisconnect(t *testing.T) {
 		t.Fatal("SessionEnded hook never fired after client close")
 	}
 }
+
+// pushDispatcher satisfies MCPDispatcher and SessionStartedHook so we
+// can prove a dispatcher-initiated frame (an MCP notification) reaches
+// the client over the socket, interleaved with the reply path.
+type pushDispatcher struct {
+	echoDispatcher
+	started chan func([]byte) error
+}
+
+func (p *pushDispatcher) SessionStarted(_ *Session, write func([]byte) error) {
+	p.started <- write
+}
+
+// TestDaemon_SessionStartedHook_PushesFrames pins the server-initiated
+// notification path: the daemon hands dispatchers a write callback on
+// connect, and frames written through it arrive at the client without a
+// pending request — the transport leg that lets tools/list_changed
+// (and every other MCP push) reach unix-socket proxy clients.
+func TestDaemon_SessionStartedHook_PushesFrames(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gx")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(dir) }()
+	socket := filepath.Join(dir, "s")
+	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
+	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
+
+	disp := &pushDispatcher{
+		echoDispatcher: echoDispatcher{seen: make(chan echoFrame, 4)},
+		started:        make(chan func([]byte) error, 1),
+	}
+	srv := New(socket, "test", zap.NewNop())
+	srv.MCPDispatcher = disp
+	srv.Controller = &fakeController{}
+	require.NoError(t, srv.Listen())
+	go func() { _ = srv.Serve() }()
+	defer func() { _ = srv.Shutdown() }()
+
+	require.Eventually(t, func() bool { return IsRunningAt(socket) },
+		2*time.Second, 10*time.Millisecond)
+
+	client, err := DialTo(socket, Handshake{Mode: ModeMCP, CWD: "/tmp/fake-repo"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	var write func([]byte) error
+	select {
+	case write = <-disp.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SessionStarted hook never fired after connect")
+	}
+
+	// Push an unprompted notification; the client must read it even
+	// though it never sent a request.
+	notif := `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
+	require.NoError(t, write([]byte(notif)))
+
+	frame, err := client.ReadMCPFrame()
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	assert.Equal(t, "notifications/tools/list_changed", got["method"])
+
+	// The request/reply path still works alongside the push path.
+	rpc := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	require.NoError(t, client.WriteMCPFrame([]byte(rpc)))
+	reply, err := client.ReadMCPFrame()
+	require.NoError(t, err)
+	var replyObj map[string]any
+	require.NoError(t, json.Unmarshal(reply, &replyObj))
+	_, hasResult := replyObj["result"]
+	assert.True(t, hasResult, "reply must carry a result: %s", reply)
+}
