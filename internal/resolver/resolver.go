@@ -1564,12 +1564,30 @@ func (r *Resolver) resolveFileEdgesLocked(filePath string, stats *ResolveStats) 
 // idempotent on already-rewritten edges (the `unresolved::` prefix
 // check makes a second sweep a no-op). Caller holds r.mu.
 func (r *Resolver) runFileAttributionPassesLocked() {
+	t0 := time.Now()
 	r.rebindGoMethodReceivers()
+	t1 := time.Now()
 	r.bindBareNameScopeRefs()
+	t2 := time.Now()
 	r.bindDataflowCalleeRefs()
+	t3 := time.Now()
 	r.bindGenericParamRefs()
+	t4 := time.Now()
 	r.attributeGoBuiltins()
+	t5 := time.Now()
 	r.attributeGoExternalCalls()
+	t6 := time.Now()
+	// Diagnostic sub-phase breakdown of the whole-graph attribution sweep,
+	// mirroring the framework-synthesizer per-pass timing — go_attribution
+	// was previously one opaque duration in "resolver: pass complete", so a
+	// future single-pass regression here had no per-pass breadcrumb.
+	r.logger.Info("resolver: attribution sub-passes",
+		zap.Duration("rebind_go_method_receivers", t1.Sub(t0)),
+		zap.Duration("bind_bare_name_scope_refs", t2.Sub(t1)),
+		zap.Duration("bind_dataflow_callee_refs", t3.Sub(t2)),
+		zap.Duration("bind_generic_param_refs", t4.Sub(t3)),
+		zap.Duration("attribute_go_builtins", t5.Sub(t4)),
+		zap.Duration("attribute_go_external_calls", t6.Sub(t5)))
 }
 
 // runFileAttributionPassesForFileLocked is the single-file equivalent of
