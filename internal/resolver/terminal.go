@@ -298,8 +298,8 @@ func (r *Resolver) classifyTerminalBulk(pending []*graph.Edge, counter graph.Nod
 	reasons = make([]string, len(pending))
 	terminals = make([]bool, len(pending))
 	for i, e := range pending {
-		switch {
-		case e.Kind == graph.EdgeImports:
+		switch e.Kind {
+		case graph.EdgeImports:
 			reasons[i], terminals[i] = r.classifyTerminal(e)
 		default:
 			name := identifierFromTarget(graph.UnresolvedName(e.To))
