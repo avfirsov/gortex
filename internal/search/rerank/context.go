@@ -2,6 +2,7 @@ package rerank
 
 import (
 	"math"
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -159,6 +160,13 @@ type Context struct {
 	// MinHash uses it to only count similarity edges that point to
 	// other candidates in the same batch (cluster-cohesion signal).
 	candidateIDs map[string]struct{}
+
+	// nameGroupCount maps a lowercased candidate name → how many
+	// candidates in the batch share it. OverloadProminenceSignal reads
+	// it to fire only on a genuine same-name collision (an ambiguous
+	// query where several symbols answer to the same identifier), so
+	// non-colliding candidates are never perturbed.
+	nameGroupCount map[string]int
 
 	// fileGroups maps each file path → candidates from that file in
 	// batch order. The file-coherence signal reads this to detect
@@ -344,6 +352,7 @@ func (c *Context) prepare(cands []*Candidate) {
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
 	c.candidateIDs = make(map[string]struct{}, len(cands))
+	c.nameGroupCount = make(map[string]int, len(cands))
 	c.fanInMax = 0
 	c.fanOutMax = 0
 	c.churnMax = 0
@@ -369,6 +378,10 @@ func (c *Context) prepare(cands []*Candidate) {
 		}
 		c.candidateIDs[cand.Node.ID] = struct{}{}
 		ids = append(ids, cand.Node.ID)
+
+		if nm := strings.ToLower(cand.Node.Name); nm != "" {
+			c.nameGroupCount[nm]++
+		}
 
 		if c.CommunityOf != nil {
 			com := c.CommunityOf(cand.Node.ID)
