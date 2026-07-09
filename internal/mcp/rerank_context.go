@@ -117,16 +117,16 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 		rctx.CoChangeOf = s.coChangeScores
 	}
 
-	// Semantic-cosine channel: the always-available in-process static
-	// word-vector provider (baked GloVe) re-scores the BM25 top-N
-	// against the query with no ANN index and no index-time vector
-	// build. Wired unconditionally — the per-class weight table damps
-	// it hard on identifier / path queries so it earns its keep only on
-	// natural-language intent queries, where BM25 alone cannot bridge
-	// "decode bson body" to BindBody. An empty query vector (no known
-	// words) leaves the signal at 0, so a pure-identifier query is
-	// unaffected even before the class damping.
-	if emb := embedding.SharedStatic(); emb != nil {
+	// Semantic-cosine channel: the in-process static code-embedding
+	// model (with the baked GloVe word vectors as offline fallback)
+	// re-scores the BM25 top-N against the query with no ANN index and
+	// no index-time vector build. Wired unconditionally — the per-class
+	// weight table damps it hard on identifier / path queries so it
+	// earns its keep only on natural-language intent queries, where
+	// BM25 alone cannot bridge "decode bson body" to BindBody. An empty
+	// query vector leaves the signal at 0, so a pure-identifier query
+	// is unaffected even before the class damping.
+	if emb := embedding.SharedCodeEmbedder(); emb != nil {
 		rctx.EmbedText = embedding.EmbedTextFunc(emb)
 		if qv, err := emb.Embed(ctx, query); err == nil {
 			rctx.QueryVec = qv
