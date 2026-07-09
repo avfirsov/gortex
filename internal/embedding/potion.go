@@ -244,6 +244,12 @@ func downloadPotion() (string, error) {
 	if v := strings.TrimSpace(os.Getenv("GORTEX_POTION_DOWNLOAD")); v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off") {
 		return "", fmt.Errorf("model download disabled by GORTEX_POTION_DOWNLOAD")
 	}
+	// Test binaries never reach the network: a `go test` run that
+	// exercises a search path must stay hermetic and fall back to the
+	// baked vectors instead of pulling 32MB mid-suite.
+	if strings.HasSuffix(os.Args[0], ".test") {
+		return "", fmt.Errorf("model download disabled in test binaries")
+	}
 	dir := filepath.Join(platform.ModelsDir(), potionModelName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
