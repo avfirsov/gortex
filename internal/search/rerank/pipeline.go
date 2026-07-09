@@ -305,7 +305,7 @@ func DefaultWeights() map[string]float64 {
 	return map[string]float64{
 		SignalBM25:           1.00,
 		SignalSemantic:       0.80,
-		SignalSemanticCosine: 1.30,
+		SignalSemanticCosine: 2.00,
 		SignalFanIn:          0.60,
 		SignalHITS:           0.40,
 		SignalFanOut:         0.20,
