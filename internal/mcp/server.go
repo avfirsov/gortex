@@ -1113,16 +1113,28 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 // poisoning the connection with an errored initialize, the handshake succeeds
 // and the response tells the agent exactly how to activate the server — the
 // actionable affordance codegraph's silent empty-list lacks.
-func ServerInstructionsUntracked(cwd string) string {
+func ServerInstructionsUntracked(cwd string, roots ...string) string {
 	target := cwd
 	if strings.TrimSpace(target) == "" {
 		target = "."
 	}
-	return fmt.Sprintf("Gortex is connected but INACTIVE for this directory: %q is not covered by any tracked repository, "+
+	msg := fmt.Sprintf("Gortex is connected but INACTIVE for this directory: %q is not covered by any tracked repository, "+
 		"so the graph tools have nothing to answer with yet.\n\n"+
 		"To activate: run `gortex track %s`, then reconnect — the full tool catalogue and the "+
 		"graph become available.\n\n"+
 		"Until then tools/list is intentionally empty; fall back to your own file reads and text search.", target, target)
+	// Append the tracked roots so the mismatch is self-diagnosing: a
+	// case-only or drive-letter difference between the cwd above and one
+	// of these roots is the usual cause of an INACTIVE session (#277).
+	if len(roots) > 0 {
+		quoted := make([]string, len(roots))
+		for i, r := range roots {
+			quoted[i] = fmt.Sprintf("%q", r)
+		}
+		msg += fmt.Sprintf("\n\nTracked repository roots: [%s]. If one of these is the same directory as %q "+
+			"under a different letter case, that is the mismatch.", strings.Join(quoted, ", "), target)
+	}
+	return msg
 }
 
 // afterInitializeInstructions is the server's OnAfterInitialize hook: it
@@ -1142,10 +1154,26 @@ func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, _ *mcp.
 // activation affordance (shared with the F4 handshake path); a covered cwd —
 // or a single-repo / cwd-less control client — gets the base guidance plus a
 // live-facts block describing the workspace and warmup state.
+// trackedRepoRoots returns the sorted absolute root of every tracked repo,
+// for the self-diagnosing INACTIVE instructions.
+func (s *Server) trackedRepoRoots() []string {
+	if s.multiIndexer == nil {
+		return nil
+	}
+	var roots []string
+	for _, meta := range s.multiIndexer.AllMetadata() {
+		if meta != nil && meta.RootPath != "" {
+			roots = append(roots, meta.RootPath)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
 func (s *Server) stateAwareInstructions(cwd string) string {
 	if s.multiIndexer != nil && strings.TrimSpace(cwd) != "" {
 		if _, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); !ok {
-			return ServerInstructionsUntracked(cwd)
+			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
