@@ -473,22 +473,32 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
 	// mis-mapped to a phantom pypi/pub package.
+	ldStart := time.Now()
 	r.resolveRelativeImports()
+	ld1 := time.Now()
 
 	// Lua / Luau `require(...)` binding. Same settle window as the relative
 	// imports above; resolveRelativeImports never touches Lua, so this lands
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
+	ld2 := time.Now()
 
 	// Razor / Blazor `@using` namespace-cascade binding. Same settle window;
 	// binds simple-type references reachable only via an imported namespace.
 	r.resolveRazorUsings()
+	ld3 := time.Now()
 
 	// Module attribution for ecosystems without a CGO type-checker
 	// path (Python, Dart, …). Runs serially on the post-resolution
 	// graph so it sees the final `external::*` set after the
 	// dep-module bridge has had its chance.
 	r.attributeNonGoModuleImports()
+	ld4 := time.Now()
+	r.logger.Info("resolver: lang-dispatch sub-passes",
+		zap.Duration("relative_imports", ld1.Sub(ldStart)),
+		zap.Duration("lua_requires", ld2.Sub(ld1)),
+		zap.Duration("razor_usings", ld3.Sub(ld2)),
+		zap.Duration("nongo_module_imports", ld4.Sub(ld3)))
 
 	total := &ResolveStats{}
 	for i := range perWorkerStats {
@@ -936,11 +946,23 @@ func (r *Resolver) resolveFileEdgesLocked(filePath string, stats *ResolveStats) 
 // idempotent on already-rewritten edges (the `unresolved::` prefix
 // check makes a second sweep a no-op). Caller holds r.mu.
 func (r *Resolver) runFileAttributionPassesLocked() {
+	t0 := time.Now()
 	r.rebindGoMethodReceivers()
+	t1 := time.Now()
 	r.bindBareNameScopeRefs()
+	t2 := time.Now()
 	r.bindGenericParamRefs()
+	t3 := time.Now()
 	r.attributeGoBuiltins()
+	t4 := time.Now()
 	r.attributeGoExternalCalls()
+	t5 := time.Now()
+	r.logger.Info("resolver: attribution sub-passes",
+		zap.Duration("rebind_go_method_receivers", t1.Sub(t0)),
+		zap.Duration("bind_bare_name_scope_refs", t2.Sub(t1)),
+		zap.Duration("bind_generic_param_refs", t3.Sub(t2)),
+		zap.Duration("attribute_go_builtins", t4.Sub(t3)),
+		zap.Duration("attribute_go_external_calls", t5.Sub(t4)))
 }
 
 // ResolveIncomingForFile is the reverse of ResolveFile: instead of
