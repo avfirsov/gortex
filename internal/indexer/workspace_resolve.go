@@ -2,10 +2,10 @@ package indexer
 
 import (
 	"path/filepath"
-	"strings"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
@@ -95,7 +95,7 @@ func (mi *MultiIndexer) ScopeForCWD(cwd string) (workspaceID, projectID, repoPre
 		if root == "" || root == "." {
 			continue
 		}
-		if cwd == root || strings.HasPrefix(cwd, root+string(filepath.Separator)) {
+		if pathkey.HasPathPrefix(cwd, root) {
 			if len(root) > len(bestRoot) {
 				bestRoot, bestPrefix = root, prefix
 			}
