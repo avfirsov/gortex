@@ -424,14 +424,20 @@ var (
 //     labels) are dropped;
 //   - the surviving prose is bounded so it cannot re-drown the lead.
 //
-// A short or single-line task is a focused query already and is returned
-// unchanged — the shaping only engages for report-shaped input.
+// A single-line (or short multi-line) task takes the inline path instead:
+// structural noise tokens — commit-SHA-shaped hex, bare version strings —
+// are dropped (they can never name a code symbol) and, when the query has
+// clause structure, its lead clause is repeated so the headline's tokens
+// out-weigh the trailing detail. A clean prose/identifier query with no
+// noise tokens is returned byte-for-byte unchanged.
 func shapeExploreQuery(task string) string {
 	trimmed := strings.TrimSpace(task)
-	// Focused query: single line, or short enough that there is no report
-	// body to distil. Leave it exactly as the caller wrote it.
+	// Focused / inline query: single line, or too short to carry a report
+	// body worth distilling. Token-level shaping only, gated on the
+	// presence of structural noise; a clean query passes through
+	// untouched.
 	if !strings.ContainsAny(trimmed, "\n\r") || len(trimmed) < shapeMinReportChars {
-		return task
+		return shapeInlineQuery(task)
 	}
 
 	// Lead = the first non-empty line (the report's headline).
@@ -485,6 +491,185 @@ func shapeReportBody(body string) string {
 		prose = strings.TrimSpace(string(r[:shapeBodyMaxRunes]))
 	}
 	return prose
+}
+
+// Inline (single-line) query shaping. An agent that paraphrases a report
+// into one line carries the report's noise with it — command-line flag
+// tokens, quoted pattern/regex literals, commit-SHA hex, bare version
+// strings. Those token classes are structurally detectable with no
+// vocabulary, and their presence marks the query as report-derived
+// rather than hand-focused, so it is worth shaping. Measured behavior on
+// report-derived queries drove the transform's shape:
+//
+//   - commit-SHA-shaped hex and bare version strings are DROPPED — they
+//     can never name a code symbol, so they are pure ranking noise;
+//   - the lead clause (text before the first ";", " - " or ": "
+//     separator) is REPEATED once — the same headline-weighting the
+//     report path applies to a title, since a paraphrase puts the defect
+//     statement first and trailing detail after a separator;
+//   - flag tokens and quoted literals are left VERBATIM: the FTS
+//     tokenizer already reads "--word" as the bare word, and measurement
+//     showed that removing or down-weighting them costs rank (a flag
+//     name carries the feature vocabulary; a quoted literal can carry
+//     the only discriminating token) — they serve as the trigger, not
+//     as targets.
+//
+// A query with none of these token classes is returned byte-for-byte
+// unchanged.
+const (
+	// shapeInlineMinLeadChars is the minimum length for a lead clause to
+	// be worth repeating — below it the "clause" is a sentence fragment
+	// whose repetition would over-weight one or two words.
+	shapeInlineMinLeadChars = 20
+	// shaMinHexLen / shaMaxHexLen bound a commit-SHA-shaped token: git
+	// abbreviates to >=7 hex chars; a full SHA-1 is 40.
+	shaMinHexLen = 7
+	shaMaxHexLen = 40
+)
+
+var (
+	// A command-line flag token: "--long-flag" or a lone "-x", token-
+	// initial (start or whitespace) so hyphenated prose ("case-insensitive",
+	// "re-searches") never matches.
+	reInlineFlag = regexp.MustCompile(`(?:^|\s)(?:--[A-Za-z][A-Za-z0-9_-]*|-[A-Za-z])(?:[\s,.;:]|$)`)
+	// A hex run in the SHA length band. Candidates are verified in code
+	// (must contain both a digit and a hex letter) because RE2 has no
+	// lookahead — that check keeps decimal numbers (issue ids) and
+	// letter-only words out.
+	reInlineHexRun = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
+	// A bare version string: 1.9.0, v2.14.1, 14.1 — dotted digits with an
+	// optional leading v. Never a symbol name.
+	reInlineVersion = regexp.MustCompile(`\bv?\d+\.\d+(?:\.\d+)*\b`)
+	// A double-quoted span on one line ("e.x|ex", "slice index ...").
+	reInlineQuoted = regexp.MustCompile(`"[^"\n]*"`)
+)
+
+// shapeInlineQuery is the single-line/short-query arm of
+// shapeExploreQuery: drop provably-inert tokens and weight the lead
+// clause, gated on structural noise so a clean query is untouched.
+func shapeInlineQuery(task string) string {
+	if !hasInlineNoise(task) {
+		return task
+	}
+	cleaned := dropInertTokens(task)
+	if lead := inlineLeadClause(cleaned); lead != "" {
+		cleaned += " " + lead
+	}
+	return cleaned
+}
+
+// hasInlineNoise reports whether the query carries any structurally-
+// detectable report noise: a flag token, a commit-SHA-shaped hex token,
+// a bare version string, or a quoted pattern/regex literal.
+func hasInlineNoise(task string) bool {
+	if reInlineFlag.MatchString(task) || reInlineVersion.MatchString(task) {
+		return true
+	}
+	for _, m := range reInlineHexRun.FindAllString(task, -1) {
+		if isSHAToken(m) {
+			return true
+		}
+	}
+	for _, m := range reInlineQuoted.FindAllString(task, -1) {
+		if quotedLiteralIsNoise(strings.Trim(m, `"`)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSHAToken verifies a hex-run candidate looks like a commit hash: the
+// SHA length band plus at least one digit AND one hex letter, so a
+// decimal number (an issue id) or a letter-only word never qualifies.
+func isSHAToken(s string) bool {
+	if len(s) < shaMinHexLen || len(s) > shaMaxHexLen {
+		return false
+	}
+	hasDigit, hasLetter := false, false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r >= 'a' && r <= 'f':
+			hasLetter = true
+		}
+	}
+	return hasDigit && hasLetter
+}
+
+// quotedLiteralIsNoise classifies a quoted span's content: regex/pattern
+// literals (they carry regex metacharacters, or are short non-alphabetic
+// fragments like "e-x") are noise; a quoted plain word or prose phrase
+// ("setState", an error message) is signal and never triggers shaping.
+func quotedLiteralIsNoise(content string) bool {
+	if strings.ContainsAny(content, `|\^$*+?[]{}()<>/=~`) {
+		return true
+	}
+	if len(content) <= 5 {
+		for _, r := range content {
+			if !unicodeIsLetter(r) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// unicodeIsLetter is a tiny ASCII-fast letter check (the quoted-literal
+// rubric only needs letter-vs-not).
+func unicodeIsLetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r > 127
+}
+
+// dropInertTokens removes commit-SHA-shaped hex and bare version tokens
+// and collapses the leftover whitespace. Nothing else is touched.
+func dropInertTokens(task string) string {
+	out := reInlineHexRun.ReplaceAllStringFunc(task, func(m string) string {
+		if isSHAToken(m) {
+			return ""
+		}
+		return m
+	})
+	out = reInlineVersion.ReplaceAllString(out, "")
+	return strings.TrimSpace(reWhitespace.ReplaceAllString(out, " "))
+}
+
+// inlineLeadClause returns the query's lead clause — the text before the
+// first ";", " - " or ": " separator (":" only when single, so a
+// namespaced identifier's "::" never splits) — when that lead is a
+// proper, non-trivial prefix of the query. Empty when the query has no
+// clause structure worth weighting.
+func inlineLeadClause(task string) string {
+	t := strings.TrimSpace(task)
+	end := -1
+	for i := 0; i < len(t); i++ {
+		switch t[i] {
+		case ';':
+			end = i
+		case '-':
+			// " - " — a spaced dash, not a hyphen or a flag.
+			if i > 0 && t[i-1] == ' ' && i+1 < len(t) && t[i+1] == ' ' {
+				end = i
+			}
+		case ':':
+			// ": " with a non-colon before it — "walk: a scoped" splits,
+			// "ignore::WalkBuilder" does not.
+			if i > 0 && t[i-1] != ':' && t[i-1] != ' ' && i+1 < len(t) && t[i+1] == ' ' {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return ""
+	}
+	lead := strings.TrimSpace(t[:end])
+	if len(lead) < shapeInlineMinLeadChars || len(lead) >= len(t) {
+		return ""
+	}
+	return lead
 }
 
 // exploreLexicalTerms splits free task text into the distinct word/identifier
