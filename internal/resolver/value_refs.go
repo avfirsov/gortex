@@ -35,9 +35,40 @@ const (
 // Unresolved candidates are
 // left as inert placeholders. Idempotent: re-targeting to the same constant is
 // a no-op and graph.EvictFile drops the edges on reindex.
-func ResolveValueRefs(g graph.Store) int {
+func ResolveValueRefs(g graph.Store) int { return resolveValueRefs(g, nil) }
+
+// ResolveValueRefsScoped is the incremental counterpart of ResolveValueRefs: it
+// resolves only the value-ref candidates that originate in the given changed
+// repos, leaving an unchanged repo's already-bound reads on disk (they were
+// never dropped). A nil scope resolves the whole graph, so ResolveValueRefs and
+// the whole-index path stay byte-identical. Restricting the candidate set is
+// binding-preserving: every candidate binds to a constant declared in its OWN
+// file, so which other repos are in scope can never change a resolution.
+func ResolveValueRefsScoped(g graph.Store, scope map[string]bool) int {
+	return resolveValueRefs(g, scope)
+}
+
+func resolveValueRefs(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
+	}
+	// Two-pass narrowing. A value-ref binds a captured read to a file-scope
+	// constant declared in the SAME file, so only the files that actually carry
+	// a candidate read need their declarators indexed. Gather the candidate
+	// edges first (Pass A), then build the constant/local maps for their files
+	// alone (Pass B) — instead of a whole-graph scan over every
+	// constant/variable/param/field/local node, which is the largest node
+	// population in the graph and was materialised twice (a flat slice plus the
+	// nested maps) on every whole-graph run.
+	candidates := valueRefCandidateEdges(g, scope)
+	if len(candidates) == 0 {
+		return 0
+	}
+	candidateFiles := make(map[string]struct{}, len(candidates))
+	for _, e := range candidates {
+		if e.FilePath != "" {
+			candidateFiles[e.FilePath] = struct{}{}
+		}
 	}
 	// constsByFile records every file-scope constant/variable declarator of a
 	// distinctive name (a name may have several — a try/except import, a
@@ -45,28 +76,30 @@ func ResolveValueRefs(g graph.Store) int {
 	// param/field/local declarators that may shadow a read in their own scope.
 	constsByFile := map[string]map[string][]*graph.Node{}
 	localsByFile := map[string]map[string][]*graph.Node{}
-	for _, n := range nodesByKindsOrAll(g, graph.KindConstant, graph.KindVariable, graph.KindParam, graph.KindField, graph.KindLocal) {
-		if n == nil || n.FilePath == "" {
-			continue
-		}
-		switch n.Kind {
-		case graph.KindConstant, graph.KindVariable:
-			if !isDistinctiveValueName(n.Name) {
+	for f := range candidateFiles {
+		for _, n := range g.GetFileNodes(f) {
+			if n == nil || n.FilePath == "" {
 				continue
 			}
-			m := constsByFile[n.FilePath]
-			if m == nil {
-				m = map[string][]*graph.Node{}
-				constsByFile[n.FilePath] = m
+			switch n.Kind {
+			case graph.KindConstant, graph.KindVariable:
+				if !isDistinctiveValueName(n.Name) {
+					continue
+				}
+				m := constsByFile[n.FilePath]
+				if m == nil {
+					m = map[string][]*graph.Node{}
+					constsByFile[n.FilePath] = m
+				}
+				m[n.Name] = append(m[n.Name], n)
+			case graph.KindParam, graph.KindField, graph.KindLocal:
+				m := localsByFile[n.FilePath]
+				if m == nil {
+					m = map[string][]*graph.Node{}
+					localsByFile[n.FilePath] = m
+				}
+				m[n.Name] = append(m[n.Name], n)
 			}
-			m[n.Name] = append(m[n.Name], n)
-		case graph.KindParam, graph.KindField, graph.KindLocal:
-			m := localsByFile[n.FilePath]
-			if m == nil {
-				m = map[string][]*graph.Node{}
-				localsByFile[n.FilePath] = m
-			}
-			m[n.Name] = append(m[n.Name], n)
 		}
 	}
 	if len(constsByFile) == 0 {
@@ -80,13 +113,7 @@ func ResolveValueRefs(g graph.Store) int {
 
 	resolved := 0
 	var reindex []graph.EdgeReindex
-	for e := range g.EdgesByKind(graph.EdgeReads) {
-		if e == nil || e.Meta == nil {
-			continue
-		}
-		if via, _ := e.Meta["via"].(string); via != valueRefCandidateVia {
-			continue
-		}
+	for _, e := range candidates {
 		name, _ := e.Meta["name"].(string)
 		consts := constsByFile[e.FilePath][name]
 		if name == "" || len(consts) == 0 {
@@ -136,6 +163,42 @@ func ResolveValueRefs(g graph.Store) int {
 		g.ReindexEdges(reindex)
 	}
 	return resolved
+}
+
+// valueRefCandidateEdges returns the extractor-emitted placeholder read edges
+// (Meta via == value_ref_candidate) the pass resolves. With a nil scope it
+// scans every EdgeReads edge in the graph; with a scope it walks only the
+// out-edges of the changed repos' nodes (GetRepoEdges is one backend query per
+// repo), since a candidate read always originates in the repo that declared it.
+func valueRefCandidateEdges(g graph.Store, scope map[string]bool) []*graph.Edge {
+	var out []*graph.Edge
+	keep := func(e *graph.Edge) {
+		if e == nil || e.Meta == nil {
+			return
+		}
+		if via, _ := e.Meta["via"].(string); via != valueRefCandidateVia {
+			return
+		}
+		out = append(out, e)
+	}
+	if scope == nil {
+		for e := range g.EdgesByKind(graph.EdgeReads) {
+			keep(e)
+		}
+		return out
+	}
+	for prefix := range scope {
+		if prefix == "" {
+			continue
+		}
+		for _, e := range g.GetRepoEdges(prefix) {
+			if e == nil || e.Kind != graph.EdgeReads {
+				continue
+			}
+			keep(e)
+		}
+	}
+	return out
 }
 
 // valueRefReaderShadowed reports whether any same-named declarator is scoped

@@ -3,6 +3,7 @@ package indexer
 import (
 	"errors"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"testing"
 )
@@ -500,5 +501,54 @@ func TestCPUClampEnabled(t *testing.T) {
 				t.Fatalf("cpuClampEnabled() with %q = %v, want %v", tt.val, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMemReleaseEnabled(t *testing.T) {
+	tests := []struct {
+		val  string
+		want bool
+	}{
+		{"", true}, // unset => on by default
+		{"1", true},
+		{"true", true},
+		{"anything", true},
+		{"0", false}, // kill-switch
+		{"false", false},
+		{"FALSE", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.val, func(t *testing.T) {
+			t.Setenv("GORTEX_DAEMON_MEMRELEASE", tt.val)
+			if got := memReleaseEnabled(); got != tt.want {
+				t.Fatalf("memReleaseEnabled() with %q = %v, want %v", tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFreeOSMemoryAfterColdIndex(t *testing.T) {
+	// Kill-switch: a no-op that must not panic (logger is nil-safe).
+	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "0")
+	freeOSMemoryAfterColdIndex(nil)
+
+	// Enabled: forces a scavenge; HeapReleased must not go backwards.
+	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "1")
+	sink := make([]byte, 8<<20)
+	for i := range sink {
+		sink[i] = byte(i)
+	}
+	// Force the writes to land (so the allocation is not elided), then let the
+	// reference drop here: sink is dead past this point, so the scavenge below
+	// has heap to return.
+	runtime.KeepAlive(sink)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	freeOSMemoryAfterColdIndex(nil)
+	runtime.ReadMemStats(&after)
+	if after.HeapReleased < before.HeapReleased {
+		t.Fatalf("HeapReleased went backwards: before=%d after=%d",
+			before.HeapReleased, after.HeapReleased)
 	}
 }

@@ -84,8 +84,24 @@ type GlobalConfig struct {
 	// across repos instead of being duplicated in every `.gortex.yaml`.
 	Embedding EmbeddingConfig `mapstructure:"embedding" yaml:"embedding,omitempty"`
 
+	// Daemon carries policy for the long-running daemon process itself —
+	// settings that govern the shared background service rather than any
+	// single workspace. Lives in the user-level config for that reason.
+	Daemon DaemonConfig `mapstructure:"daemon" yaml:"daemon,omitempty"`
+
 	// configPath stores the file path used for Save(). Set by LoadGlobal or SetConfigPath.
 	configPath string `yaml:"-"`
+}
+
+// DaemonConfig is the `daemon:` block in ~/.gortex/config.yaml.
+type DaemonConfig struct {
+	// MemoryLimit is the standing soft memory limit (the Go runtime's
+	// SetMemoryLimit) applied at daemon boot, written as a human size —
+	// "4GiB", "2048MiB", "2G" — or "off" / "0" to disable it. Empty
+	// applies the built-in default policy (a fraction of host RAM, clamped
+	// to a sane band). The GORTEX_DAEMON_MEMLIMIT env var overrides this,
+	// and a runtime-honored GOMEMLIMIT overrides both.
+	MemoryLimit string `mapstructure:"memory_limit" yaml:"memory_limit,omitempty"`
 }
 
 // MergeLLMInto layers a repo-local llm.Config over the global user

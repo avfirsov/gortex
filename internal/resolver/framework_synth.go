@@ -175,13 +175,30 @@ func UnstampSynthesized(e *graph.Edge) {
 // synthFunc adapts a plain pass function into a FrameworkSynthesizer so
 // the existing passes (ResolveGRPCStubCalls, …) register without a
 // wrapper type each.
+//
+// scopedFn is optional: when set, the end-of-batch driver calls it with the
+// changed-repo prefix set so the synthesizer can restrict its CANDIDATE scan to
+// those repos (resolution stays whole-graph). A synthesizer without a scopedFn
+// always runs whole-graph — correct, just not narrowed — so scoping any one
+// pass is opt-in and additive.
 type synthFunc struct {
-	name string
-	fn   func(graph.Store) int
+	name     string
+	fn       func(graph.Store) int
+	scopedFn func(graph.Store, map[string]bool) int
 }
 
 func (s synthFunc) Name() string                 { return s.name }
 func (s synthFunc) Synthesize(g graph.Store) int { return s.fn(g) }
+
+// synthesizeScoped runs the scoped variant when one is registered and a scope
+// is armed; otherwise it falls back to the whole-graph pass. A nil scope always
+// means whole-graph, so the fresh-index path is byte-identical to before.
+func (s synthFunc) synthesizeScoped(g graph.Store, scope map[string]bool) int {
+	if scope != nil && s.scopedFn != nil {
+		return s.scopedFn(g, scope)
+	}
+	return s.fn(g)
+}
 
 // defaultFrameworkSynthesizers returns the registered framework
 // synthesizers in run order. Order is load-bearing: every synthesizer
@@ -308,12 +325,12 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// value-position function identifier to its same-file definition and
 		// drops unbound candidates. The per-language capture feeds it via
 		// placeholder edges; the pass is inert until those land.
-		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks},
+		synthFunc{name: SynthFnValue, fn: ResolveFnValueCallbacks, scopedFn: ResolveFnValueCallbacksScoped},
 		// Pascal unit ↔ form (.pas/.dfm) pairing by same-dir basename.
 		synthFunc{name: SynthPascalFormName, fn: ResolvePascalForms},
 		// Same-file distinctive value references → EdgeReads to the constant,
 		// so a config constant's blast radius reaches every reader.
-		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs},
+		synthFunc{name: SynthValueRefName, fn: ResolveValueRefs, scopedFn: ResolveValueRefsScoped},
 	}
 }
 
@@ -349,17 +366,41 @@ type FrameworkSynthReport struct {
 	DemoteMillis int64 `json:"demote_ms,omitempty"`
 }
 
+// scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
+// when it can restrict its candidate scan to a changed-repo prefix set. The
+// driver consults it only when a scope is armed; a synthesizer that does not
+// implement it runs whole-graph, which is always correct.
+type scopedSynthesizer interface {
+	synthesizeScoped(g graph.Store, scope map[string]bool) int
+}
+
 // RunFrameworkSynthesizers runs every registered framework synthesizer
 // over g, in registration order, and returns the per-synthesizer and
 // total landed-edge counts. A nil graph is a no-op.
 func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
+	return RunFrameworkSynthesizersScoped(g, nil)
+}
+
+// RunFrameworkSynthesizersScoped is RunFrameworkSynthesizers with an armed
+// changed-repo scope: each synthesizer that implements scopedSynthesizer
+// narrows its candidate scan to those repos, the rest run whole-graph. A nil
+// scope runs every pass whole-graph, so the fresh-index / single-repo path is
+// byte-identical to the pre-scoping behaviour. The claiming-resolver, family-
+// gate and receiver-gate tail passes always run whole-graph — they reconcile
+// the settled cross-repo call graph, not a per-repo candidate set.
+func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
-		n := s.Synthesize(g)
+		var n int
+		if ss, ok := s.(scopedSynthesizer); ok {
+			n = ss.synthesizeScoped(g, scope)
+		} else {
+			n = s.Synthesize(g)
+		}
 		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
 		rep.Total += n
 	}

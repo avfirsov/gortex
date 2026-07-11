@@ -209,6 +209,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("build daemon state: %w", err)
 	}
 
+	// Install the standing soft memory limit now — logging and config are
+	// up and no warmup / indexing has allocated yet, so the cold-index
+	// window's temporary override restores to this value rather than to
+	// "no limit" (see applyStandingMemoryLimit).
+	var daemonMemLimit string
+	if gc := state.configManager.Global(); gc != nil {
+		daemonMemLimit = gc.Daemon.MemoryLimit
+	}
+	applyStandingMemoryLimit(logger, daemonMemLimit)
+
 	controller := &realController{
 		graph:         state.graph,
 		indexer:       state.indexer,
@@ -603,6 +613,15 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			"warmup_ms":      elapsed.Milliseconds(),
 		})
 		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
+		// Warmup is the daemon's single largest allocation burst (parse +
+		// resolve + the end_batch graph passes, then the whole-graph
+		// analysis above). This is the last point reached in every warmup
+		// shape — every early return inside warmupDaemonState still lands
+		// here — so return the burst's heap high-water to the OS now rather
+		// than letting the peak pin the idle footprint. RunAnalysis above
+		// may already have released, but the enrichment tail allocates
+		// further, so a final release at the true end still pays.
+		releaseMemoryToOS(logger, "warmup_complete")
 	}()
 
 	return srv.Serve()
@@ -657,11 +676,29 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 		for {
 			select {
 			case <-t.C:
-				if gced := mi.GCVanishedWorktrees(); len(gced) > 0 {
+				gced := mi.GCVanishedWorktrees()
+				if len(gced) > 0 {
 					logger.Info("janitor: pruned vanished worktrees",
 						zap.Int("count", len(gced)))
 				}
-				mi.ReconcileAll()
+				results := mi.ReconcileAll()
+				// Return the tick's heap to the OS only when it actually did
+				// work — a repo reindexed stale/deleted files, or a worktree
+				// was pruned. ReconcileAll fills a result for every repo, so
+				// the honest "did work" signal is the per-repo stale/deleted
+				// counts, not the map size. A quiescent tick skips the
+				// release: FreeOSMemory is a full GC, and paying it hourly
+				// for a no-op sweep is the periodic cost the release policy
+				// exists to avoid.
+				reconciled := 0
+				for _, r := range results {
+					if r != nil {
+						reconciled += r.StaleFileCount + r.DeletedFileCount
+					}
+				}
+				if reconciled > 0 || len(gced) > 0 {
+					releaseMemoryToOS(logger, "reconcile_janitor")
+				}
 			case <-stop:
 				return
 			}

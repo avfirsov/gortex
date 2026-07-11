@@ -33,6 +33,20 @@ import (
 // Returns counts for telemetry: number of nodes marked as test,
 // number of EdgeTests emitted.
 func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted int) {
+	return markTestSymbolsAndEmitEdgesScoped(g, nil)
+}
+
+// markTestSymbolsAndEmitEdgesScoped is markTestSymbolsAndEmitEdges with an armed
+// changed-repo scope for the end-of-batch pass. A nil scope emits over the whole
+// graph, so the fresh-index / single-repo path is byte-identical.
+//
+// Pass 1 (test-symbol classification) always runs whole-graph: the testNodes
+// membership set it builds must be COMPLETE, because Pass 2 skips test→test
+// calls via testNodes[e.To] and a callee can be a test in an unchanged repo
+// (a cross-repo test→test call). Only Pass 2's driving EdgeCalls scan is scoped
+// — an EdgeTests edge is FROM a test function, so a changed repo owns exactly
+// the test edges its reindex dropped; an unchanged repo's persist on disk.
+func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string]bool) (markedTests int, edgesEmitted int) {
 	if g == nil {
 		return 0, 0
 	}
@@ -44,6 +58,19 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
 
+	testNodes, markedTests := markTestSymbolsLocked(g)
+	if len(testNodes) == 0 {
+		return markedTests, 0
+	}
+	edgesEmitted = emitTestEdgesLocked(g, testNodes, changedPrefixes)
+	return markedTests, edgesEmitted
+}
+
+// markTestSymbolsLocked runs Pass 1: it stamps test Meta on every test symbol
+// and returns the complete test-node membership set plus the marked count. The
+// caller must hold g.ResolveMutex(). Always whole-graph — see the scoped
+// entry point for why the set must be complete.
+func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTests int) {
 	// Pass 1: classify file nodes, then function/method nodes. Build
 	// a local testNodes set keyed by node id so Pass 2 can probe it
 	// without re-walking the Meta. (Node.Meta mutations on returned
@@ -101,7 +128,7 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 		}
 	}
 
-	testNodes := map[string]bool{}
+	testNodes = map[string]bool{}
 	stampTestSymbol := func(n *graph.Node) {
 		inTestFile := testFiles[n.FilePath]
 		var role, runner string
@@ -147,53 +174,71 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 			stampTestSymbol(n)
 		}
 	}
+	return testNodes, markedTests
+}
 
-	// Pass 2: walk EdgeCalls; for each (test, non-test) pair, emit a
-	// parallel EdgeTests. We dedupe per (From, To) because a single
-	// test can call the same subject multiple times. The testNodes set
-	// built in Pass 1 is the authoritative source — no inline GetNode
-	// is needed because the From / To kind filter is already enforced
-	// by "From must be a test symbol" (only function/method ids land
-	// in testNodes).
+// emitTestEdgesLocked runs Pass 2: for each (test, non-test) call it emits a
+// parallel EdgeTests, deduped per (From, To) because a single test can call the
+// same subject repeatedly. The testNodes set from Pass 1 is authoritative — no
+// inline GetNode is needed because "From must be a test symbol" already enforces
+// the kind filter (only function/method ids land in testNodes). The caller must
+// hold g.ResolveMutex().
+//
+// With a nil scope it walks every EdgeCalls edge; with a scope it walks only the
+// changed repos' out-edges (GetRepoEdges — one backend query per repo). The
+// testNodes[e.To] test→test skip stays correct across repos because testNodes is
+// complete (Pass 1 is whole-graph).
+func emitTestEdgesLocked(g graph.Store, testNodes map[string]bool, changedPrefixes map[string]bool) int {
+	edgesEmitted := 0
 	seen := map[string]bool{}
-	type pair struct{ from, to string }
-	var pending []struct {
-		pair pair
-		edge *graph.Edge
+	type pending struct {
+		from, to, file string
+		line           int
 	}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil {
-			continue
+	var out []pending
+	process := func(e *graph.Edge) {
+		if e == nil || e.Kind != graph.EdgeCalls {
+			return
 		}
 		if !testNodes[e.From] {
-			continue
+			return
 		}
 		if testNodes[e.To] {
-			continue // test → test calls are infrastructure, not subject coverage
+			return // test → test calls are infrastructure, not subject coverage
 		}
 		key := e.From + "\x00" + e.To
 		if seen[key] {
-			continue
+			return
 		}
 		seen[key] = true
-		pending = append(pending, struct {
-			pair pair
-			edge *graph.Edge
-		}{pair{e.From, e.To}, e})
+		out = append(out, pending{from: e.From, to: e.To, file: e.FilePath, line: e.Line})
 	}
-	for _, p := range pending {
-		newEdge := &graph.Edge{
-			From:     p.pair.from,
-			To:       p.pair.to,
-			Kind:     graph.EdgeTests,
-			FilePath: p.edge.FilePath,
-			Line:     p.edge.Line,
-			Origin:   graph.OriginASTInferred,
+	if changedPrefixes == nil {
+		for e := range g.EdgesByKind(graph.EdgeCalls) {
+			process(e)
 		}
-		g.AddEdge(newEdge)
+	} else {
+		for prefix := range changedPrefixes {
+			if prefix == "" {
+				continue
+			}
+			for _, e := range g.GetRepoEdges(prefix) {
+				process(e)
+			}
+		}
+	}
+	for _, p := range out {
+		g.AddEdge(&graph.Edge{
+			From:     p.from,
+			To:       p.to,
+			Kind:     graph.EdgeTests,
+			FilePath: p.file,
+			Line:     p.line,
+			Origin:   graph.OriginASTInferred,
+		})
 		edgesEmitted++
 	}
-	return markedTests, edgesEmitted
+	return edgesEmitted
 }
 
 // detectTestRunnerForFile resolves the runner identifier for a test file
@@ -213,10 +258,10 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 //  3. Language-level defaults that hold regardless of imports:
 //     - Go always uses `gotest` — `go test` is the only runner.
 //     - Python defaults to `pytest` (auto-discovery picks up unittest
-//       test cases too; rare files that import only `unittest` are
-//       caught by step 2).
+//     test cases too; rare files that import only `unittest` are
+//     caught by step 2).
 //     - Ruby falls back to `rspec` for `_spec.rb` and `minitest` for
-//       `_test.rb`.
+//     `_test.rb`.
 //
 // Returns "" when no signal applies; the caller leaves test_runner
 // unset rather than guessing.

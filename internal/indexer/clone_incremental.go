@@ -101,15 +101,17 @@ func cloneFuncNodes(nodes []*graph.Node) []*graph.Node {
 // decodable clone_sig (survivors). This makes Rebuild's CMS/corpus
 // byte-match what the batch finalise produced.
 //
-// Repo-scoped: it walks AllNodes filtered to n.RepoPrefix == repoPrefix so
-// each per-repo index's corpus counts only that repo's bodies — matching
-// its repo-scoped LoadCloneShingles seed. An unfiltered AllNodes walk would
-// count every repo's bodies into a single repo's corpus and skew its
-// threshold. (GetRepoNodes can't be used here: in single-repo / in-memory
-// mode repoPrefix is "" and nodes with an empty RepoPrefix are not tracked
-// in the byRepo buckets GetRepoNodes reads, so GetRepoNodes("") is always
-// empty — the AllNodes+filter form is the one that works for both regimes,
-// since "" == "" matches every node.)
+// Repo-scoped: it walks the repo's nodes (via cloneRepoNodes) filtered to
+// n.RepoPrefix == repoPrefix so each per-repo index's corpus counts only that
+// repo's bodies — matching its repo-scoped LoadCloneShingles seed. An
+// unfiltered walk would count every repo's bodies into a single repo's corpus
+// and skew its threshold. cloneRepoNodes uses GetRepoNodes when repoPrefix is
+// non-empty (the daemon multi-repo case), so a warm restart no longer decodes
+// the whole graph's nodes to rebuild one repo's index; it falls back to
+// AllNodes only in single-repo / in-memory mode, where repoPrefix is "" and
+// those nodes are not tracked in the byRepo buckets GetRepoNodes reads (so
+// GetRepoNodes("") would be empty and the "" == n.RepoPrefix filter matches
+// every node instead).
 //
 // Tolerant of a missing/partial sidecar: a body with a clone_sig but no
 // persisted shingle row still enters the LSH index (so its edges are
@@ -134,7 +136,7 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 		}
 	}
 
-	for _, n := range g.AllNodes() {
+	for _, n := range cloneRepoNodes(g, repoPrefix) {
 		if n == nil {
 			continue
 		}

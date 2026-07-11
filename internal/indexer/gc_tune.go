@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -334,11 +335,45 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 		once.Do(func() {
 			gcTuneMu.Lock()
 			gcTuneDepth--
-			if gcTuneDepth == 0 {
+			closed := gcTuneDepth == 0
+			if closed {
 				debug.SetGCPercent(gcTunePrevPct)
 				debug.SetMemoryLimit(gcTunePrevLim)
 			}
 			gcTuneMu.Unlock()
+			// Scavenge the cold-index burst's heap high-water once the
+			// window is fully closed — outside the lock, since FreeOSMemory
+			// is a full GC cycle that must not serialise sibling index
+			// calls waiting on gcTuneMu.
+			if closed {
+				freeOSMemoryAfterColdIndex(logger)
+			}
 		})
+	}
+}
+
+// memReleaseEnabled reports whether post-burst heap release is active. On by
+// default; GORTEX_DAEMON_MEMRELEASE=0 (or "false") disables it. The check is
+// duplicated here (rather than shared) because the canonical release helper
+// lives in the cmd layer, which this package must not import.
+func memReleaseEnabled() bool {
+	v := os.Getenv("GORTEX_DAEMON_MEMRELEASE")
+	return v != "0" && !strings.EqualFold(v, "false")
+}
+
+// freeOSMemoryAfterColdIndex returns the cold-index burst's heap high-water
+// to the OS once the tuning window has fully closed. A cold index churns
+// multi-GB of parse / node / edge allocation; debug.FreeOSMemory forces a GC
+// + scavenge so that peak does not stay resident on the daemon's footprint
+// until some later collection happens to reclaim it.
+func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
+	if !memReleaseEnabled() {
+		return
+	}
+	start := time.Now()
+	debug.FreeOSMemory()
+	if logger != nil {
+		logger.Debug("indexer: released heap to OS after cold index",
+			zap.Duration("elapsed", time.Since(start)))
 	}
 }

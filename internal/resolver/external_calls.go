@@ -90,6 +90,22 @@ func SynthesizeExternalCallsForFiles(g graph.Store, enabled bool, files []string
 	return synthesizeExternalCalls(g, func() []*graph.Edge { return externalCallCandidateEdgesForFiles(g, files) })
 }
 
+// SynthesizeExternalCallsForRepos is the repo-scoped counterpart used by the
+// end-of-batch global passes when only some repos re-indexed: it materialises
+// external-call nodes for the out-edges of the changed repos' symbols only, so
+// the janitor pays O(changed-repo edges) instead of a whole-graph recompute. An
+// external terminal always originates in the repo that made the call, so an
+// unchanged repo's synthesised edges (already on disk, never dropped) need no
+// re-work. The shared per-package nodes are deterministic, so a call into an
+// already-materialised package dedups onto the existing node. A no-op when
+// disabled or when no repo is in scope.
+func SynthesizeExternalCallsForRepos(g graph.Store, enabled bool, prefixes map[string]bool) int {
+	if g == nil || !enabled || len(prefixes) == 0 {
+		return 0
+	}
+	return synthesizeExternalCalls(g, func() []*graph.Edge { return externalCallCandidateEdgesForRepos(g, prefixes) })
+}
+
 // synthesizeExternalCalls is the shared materialisation core. collect runs
 // under the resolve lock and returns the candidate call / reference edges
 // (external-package terminals plus any already-synthesised external-call::
@@ -230,6 +246,32 @@ func externalCallCandidateEdgesForFiles(g graph.Store, files []string) []*graph.
 	var out []*graph.Edge
 	for _, edges := range g.GetOutEdgesByNodeIDs(ids) {
 		for _, e := range edges {
+			if e == nil {
+				continue
+			}
+			if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
+				continue
+			}
+			if isExternalCandidateTarget(e.To) {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
+// externalCallCandidateEdgesForRepos returns the external-terminal call /
+// reference out-edges originating in the given changed repos — the O(changed
+// repo) input for the end-of-batch scoped synthesis. GetRepoEdges is one
+// backend query per repo (the out-edges of every symbol the repo defines), so
+// this never materialises the whole graph's call edges.
+func externalCallCandidateEdgesForRepos(g graph.Store, prefixes map[string]bool) []*graph.Edge {
+	var out []*graph.Edge
+	for prefix := range prefixes {
+		if prefix == "" {
+			continue
+		}
+		for _, e := range g.GetRepoEdges(prefix) {
 			if e == nil {
 				continue
 			}

@@ -1,7 +1,9 @@
 package store_sqlite
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -11,10 +13,22 @@ func mkFnNode(id, name, file string) *graph.Node {
 	return &graph.Node{ID: id, Kind: graph.KindFunction, Name: name, FilePath: file, Language: "go"}
 }
 
+// newTestBundleCache builds a cache with the default byte budget without
+// consulting the environment, so the fingerprint / invalidation unit tests
+// stay hermetic regardless of GORTEX_BUNDLE_CACHE_MAX_MB.
+func newTestBundleCache() *bundleCache {
+	return &bundleCache{
+		fingerprints: map[string]uint64{},
+		entries:      map[string]*bundleCacheEntry{},
+		maxBytes:     bundleCacheDefaultMaxBytes,
+		maxEntries:   bundleCacheMaxEntries,
+	}
+}
+
 // --- unit tests over the cache logic in isolation ---
 
 func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
-	c := &bundleCache{fingerprints: map[string]uint64{}, entries: map[string]*bundleCacheEntry{}}
+	c := newTestBundleCache()
 
 	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
 
@@ -34,7 +48,7 @@ func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
 }
 
 func TestBundleCache_InvalidatesOnFingerprintChange(t *testing.T) {
-	c := &bundleCache{fingerprints: map[string]uint64{}, entries: map[string]*bundleCacheEntry{}}
+	c := newTestBundleCache()
 	c.refresh(map[string]uint64{"pkg": 1})
 	c.store(graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
 
@@ -50,7 +64,7 @@ func TestBundleCache_InvalidatesOnFingerprintChange(t *testing.T) {
 }
 
 func TestBundleCache_CrossRepoIsolation(t *testing.T) {
-	c := &bundleCache{fingerprints: map[string]uint64{}, entries: map[string]*bundleCacheEntry{}}
+	c := newTestBundleCache()
 	// Two repos with the same inner directory name resolve to DIFFERENT
 	// package keys because the stored file paths are repo-prefixed.
 	c.refresh(map[string]uint64{
@@ -210,5 +224,167 @@ func TestSearchSymbolBundles_UncachedWithoutFingerprints(t *testing.T) {
 	}
 	if got := bundleByID(second)["pkg/x.go::A"]; len(got.OutEdges) != 2 {
 		t.Fatalf("uncached path must reflect the new edge live, got %d", len(got.OutEdges))
+	}
+}
+
+// --- byte-budget tests ---
+
+func TestBundleCache_ByteBudgetEvictionAtBoundary(t *testing.T) {
+	c := newTestBundleCache()
+	c.refresh(map[string]uint64{"pkg": 1})
+
+	// Fixed-width ids so every entry estimates to the same size.
+	mk := func(i int) graph.SymbolBundle {
+		return graph.SymbolBundle{Node: mkFnNode(fmt.Sprintf("pkg/x.go::N%03d", i), "W", "pkg/x.go")}
+	}
+	unit := bundleEntryBytes(mk(0))
+	const k = 4
+	c.maxBytes = unit * k // budget holds exactly k entries
+
+	for i := 0; i < k; i++ {
+		c.store(mk(i))
+	}
+	if len(c.entries) != k {
+		t.Fatalf("expected %d entries filling the budget, got %d", k, len(c.entries))
+	}
+	if c.curBytes != unit*k {
+		t.Fatalf("curBytes = %d, want %d", c.curBytes, unit*k)
+	}
+
+	// One more entry crosses the budget -> wholesale clear, only the newest
+	// survives and the byte total resets to a single unit.
+	c.store(mk(k))
+	if len(c.entries) != 1 {
+		t.Fatalf("crossing the budget must clear wholesale to 1 entry, got %d", len(c.entries))
+	}
+	if c.curBytes != unit {
+		t.Fatalf("curBytes after clear = %d, want %d", c.curBytes, unit)
+	}
+	if _, ok := c.lookup(fmt.Sprintf("pkg/x.go::N%03d", k)); !ok {
+		t.Fatal("the entry that triggered the clear must remain served")
+	}
+	if _, ok := c.lookup("pkg/x.go::N000"); ok {
+		t.Fatal("a pre-clear entry must be gone after the wholesale clear")
+	}
+}
+
+func TestBundleCache_RefusesEntryLargerThanBudget(t *testing.T) {
+	c := newTestBundleCache()
+	c.refresh(map[string]uint64{"pkg": 1})
+	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
+	c.maxBytes = bundleEntryBytes(b) - 1 // budget just below a single entry
+
+	c.store(b)
+	if _, ok := c.lookup("pkg/x.go::A"); ok {
+		t.Fatal("an entry larger than the whole budget must not be cached")
+	}
+	if len(c.entries) != 0 || c.curBytes != 0 {
+		t.Fatalf("oversized store must leave the cache empty, got %d entries / %d bytes",
+			len(c.entries), c.curBytes)
+	}
+}
+
+func TestBundleCacheMaxBytes_EnvOverride(t *testing.T) {
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "128")
+	if got := bundleCacheMaxBytes(); got != 128<<20 {
+		t.Fatalf("env override = %d, want %d", got, 128<<20)
+	}
+	if c := newBundleCache(); c.maxBytes != 128<<20 {
+		t.Fatalf("newBundleCache maxBytes = %d, want %d", c.maxBytes, 128<<20)
+	}
+
+	// Empty and unparseable values keep the default.
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "")
+	if got := bundleCacheMaxBytes(); got != bundleCacheDefaultMaxBytes {
+		t.Fatalf("empty override should keep the default, got %d", got)
+	}
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "not-a-number")
+	if got := bundleCacheMaxBytes(); got != bundleCacheDefaultMaxBytes {
+		t.Fatalf("unparseable override should keep the default, got %d", got)
+	}
+}
+
+func TestBundleCache_DisabledMode(t *testing.T) {
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "0")
+	c := newBundleCache()
+	if c.maxBytes != 0 {
+		t.Fatalf("expected a disabled cache (maxBytes 0), got %d", c.maxBytes)
+	}
+	c.refresh(map[string]uint64{"pkg": 1})
+	c.store(graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
+	if len(c.entries) != 0 {
+		t.Fatalf("a disabled cache must not store, got %d entries", len(c.entries))
+	}
+	if _, ok := c.lookup("pkg/x.go::A"); ok {
+		t.Fatal("a disabled cache must always miss")
+	}
+
+	// A negative budget disables too.
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "-4")
+	if got := bundleCacheMaxBytes(); got != 0 {
+		t.Fatalf("a negative override should disable the cache (0), got %d", got)
+	}
+}
+
+func TestSearchSymbolBundles_DisabledCacheStillServes(t *testing.T) {
+	t.Setenv("GORTEX_BUNDLE_CACHE_MAX_MB", "0")
+	s := newBundleTestStore(t)
+	seedBundleStore(t, s)
+	s.SetBundleFingerprints(map[string]uint64{"pkg": 1})
+
+	res, err := s.SearchSymbolBundles("widget", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbolBundles with the cache disabled: %v", err)
+	}
+	if b, ok := bundleByID(res)["pkg/x.go::A"]; !ok || len(b.OutEdges) != 1 {
+		t.Fatalf("a disabled cache must still return live bundles, got %+v", b)
+	}
+	if s.bundles.maxBytes != 0 {
+		t.Fatalf("expected the store's cache disabled, got maxBytes %d", s.bundles.maxBytes)
+	}
+	if len(s.bundles.entries) != 0 {
+		t.Fatalf("a disabled cache must stay empty, got %d entries", len(s.bundles.entries))
+	}
+}
+
+func TestBundleCache_ConcurrentReadInsert(t *testing.T) {
+	c := newTestBundleCache()
+	c.maxBytes = 8 << 10 // small budget so wholesale clears fire under contention
+	c.refresh(map[string]uint64{"pkg": 1})
+
+	const workers = 8
+	const iters = 3000
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				id := fmt.Sprintf("pkg/x.go::N%d_%d", w, i%64)
+				switch i % 3 {
+				case 0:
+					c.store(graph.SymbolBundle{Node: mkFnNode(id, "W", "pkg/x.go")})
+				case 1:
+					_, _ = c.lookup(id)
+				default:
+					c.refresh(map[string]uint64{"pkg": uint64(i)})
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// No goroutines remain: the running total must exactly equal the summed
+	// bytes of the surviving entries (the accounting invariant), which also
+	// proves it never drifted negative under contention.
+	var sum int64
+	for _, e := range c.entries {
+		sum += e.bytes
+	}
+	if c.curBytes != sum {
+		t.Fatalf("curBytes %d != sum of live entry bytes %d", c.curBytes, sum)
+	}
+	if c.curBytes > c.maxBytes {
+		t.Fatalf("curBytes %d exceeds the byte budget %d", c.curBytes, c.maxBytes)
 	}
 }

@@ -840,24 +840,79 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// low-yield pass left no breadcrumb — the source of the multi-minute
 	// "silent" span after resolve on a cold index.
 	globalStart := time.Now()
+
+	// Acquire the changed-repo scope once for the whole run and derive the two
+	// shapes the passes below consume. A nil scope means whole-graph — the
+	// fresh-index / one-off behaviour every pass keeps as its fallback — so an
+	// unscoped run is byte-identical to before. A non-nil scope (armed by the
+	// daemon warmup / hourly janitor via ArmBatchScope) narrows each pass to the
+	// repos that re-indexed this batch: an unchanged repo's derived edges are
+	// already on disk and were never dropped, so re-deriving them is skipped.
+	//   - changedPrefixes: the changed-repo prefix set, for the edge-driven passes
+	//     (capability, test edges, framework synthesis, external calls), each of
+	//     which owns an edge iff its FROM node is in a changed repo.
+	//   - scopedTypeIfaceIDs: the changed repos' type/interface node IDs, for the
+	//     implements/overrides inference. The scoped inference keeps a pair when
+	//     EITHER endpoint is in this set, so a cross-repo override whose child is
+	//     in a changed repo and whose parent is in an unchanged one (or vice
+	//     versa) is still re-derived; structural implements never crosses repos
+	//     (its same-repo gate), so scoping both its sides here is complete.
+	scope := mi.takeBatchScope()
+	var changedPrefixes map[string]bool
+	var scopedTypeIfaceIDs map[string]bool
+	if scope != nil {
+		changedPrefixes = make(map[string]bool, len(scope))
+		scopedTypeIfaceIDs = map[string]bool{}
+		for prefix := range scope {
+			changedPrefixes[prefix] = true
+			if prefix == "" {
+				continue
+			}
+			for _, n := range repoNodesLightOrFull(mi.graph, prefix) {
+				if n == nil {
+					continue
+				}
+				if n.Kind == graph.KindType || n.Kind == graph.KindInterface {
+					scopedTypeIfaceIDs[n.ID] = true
+				}
+			}
+		}
+	}
+
 	implStart := time.Now()
-	implAdded := r.InferImplements()
+	implAdded := 0
+	switch {
+	case scope == nil:
+		implAdded = r.InferImplements()
+	case len(scopedTypeIfaceIDs) > 0:
+		// Empty set => no type/interface changed in the batch => no inferred
+		// implements edge could have been dropped, so the pass is skipped.
+		implAdded = r.InferImplementsScoped(scopedTypeIfaceIDs, scopedTypeIfaceIDs)
+	}
 	mi.logger.Info("global pass: infer implements",
 		zap.Int("added", implAdded),
+		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(implStart)))
 	overStart := time.Now()
-	overAdded := r.InferOverrides()
+	overAdded := 0
+	switch {
+	case scope == nil:
+		overAdded = r.InferOverrides()
+	case len(scopedTypeIfaceIDs) > 0:
+		overAdded = r.InferOverridesScoped(scopedTypeIfaceIDs)
+	}
 	mi.logger.Info("global pass: infer overrides",
 		zap.Int("added", overAdded),
+		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(overStart)))
 	testStart := time.Now()
-	marked, emitted := markTestSymbolsAndEmitEdges(mi.graph)
+	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, changedPrefixes)
 	mi.logger.Info("global pass: test edges",
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
 	capStart := time.Now()
-	capRe, capEp, capFa := synthesizeCapabilityEdges(mi.graph)
+	capRe, capEp, capFa := synthesizeCapabilityEdgesScoped(mi.graph, changedPrefixes)
 	mi.logger.Info("global pass: capability edges",
 		zap.Int("reads_env", capRe),
 		zap.Int("executes_process", capEp),
@@ -881,8 +936,10 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// its incremental clone index is reseeded lazily on its first later edit
 	// (indexFile: if !built → Rebuild), so skipping its full-graph detect +
 	// Rebuild here is sound and cuts an N-repo warm restart from N full-graph
-	// clone walks to just the changed repos'. A nil scope runs every repo.
-	scope := mi.takeBatchScope()
+	// clone walks to just the changed repos'. A nil scope runs every repo. The
+	// scope is taken once at the top of RunGlobalGraphPasses and shared by every
+	// pass; the clone passes reuse it here (takeBatchScope must not be called
+	// twice — it clears the armed scope on the first read).
 	inCloneScope := func(prefix string) bool {
 		if scope == nil {
 			return true
@@ -950,7 +1007,7 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// edge.
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
 	fwStart := time.Now()
-	fwRep := resolver.RunFrameworkSynthesizers(mi.graph)
+	fwRep := resolver.RunFrameworkSynthesizersScoped(mi.graph, changedPrefixes)
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
 		zap.Any("per_synthesizer", fwRep.Per),
@@ -963,9 +1020,16 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 	// left to materialise into call-chain terminals.
 	reporter.Report("external-call synthesis (global)", 0, 0)
 	extStart := time.Now()
-	extCalls := resolver.SynthesizeExternalCalls(mi.graph, mi.externalCallSynthesisEnabled())
+	extEnabled := mi.externalCallSynthesisEnabled()
+	extCalls := 0
+	if scope != nil {
+		extCalls = resolver.SynthesizeExternalCallsForRepos(mi.graph, extEnabled, changedPrefixes)
+	} else {
+		extCalls = resolver.SynthesizeExternalCalls(mi.graph, extEnabled)
+	}
 	mi.logger.Info("global pass: external-call synthesis",
 		zap.Int("edges", extCalls),
+		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(extStart)))
 	// Cross-repo edge layer. Runs after InferImplements / InferOverrides
 	// so the implements / extends edges they materialise across repo
@@ -978,6 +1042,21 @@ func (mi *MultiIndexer) RunGlobalGraphPasses(ctx context.Context) {
 		zap.Duration("elapsed", time.Since(crStart)))
 	mi.logger.Info("global passes complete",
 		zap.Duration("total", time.Since(globalStart)))
+}
+
+// repoNodesLightOrFull returns a repo's nodes for read-only structural
+// inspection (id / kind / repo prefix), preferring the meta-less
+// LightNodeReader fast path when the backend implements it so the enriched meta
+// blob a scope build never reads stays server-side. The returned nodes MUST NOT
+// be written back through AddNode/AddBatch — the light projection drops any
+// non-promoted meta — which holds here because the only caller reads struct
+// fields to build an ID set and discards the nodes. Falls back to the full
+// GetRepoNodes when the backend (e.g. in-memory) has no separate blob to skip.
+func repoNodesLightOrFull(g graph.Store, prefix string) []*graph.Node {
+	if lr, ok := g.(graph.LightNodeReader); ok {
+		return lr.GetRepoNodesLight(prefix)
+	}
+	return g.GetRepoNodes(prefix)
 }
 
 // externalCallSynthesisEnabled resolves whether external-call placeholder

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -2248,6 +2249,30 @@ func (s *Server) RunAnalysis() {
 	// any cached query result a long-lived client holds may be stale.
 	if s.graphInvalidatedBroadcaster != nil && s.graph != nil {
 		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
+	}
+
+	// A full analysis pass (PageRank / Leiden / HITS / hotspots over the
+	// whole graph) is one of the daemon's largest on-demand allocation
+	// bursts. Scavenge its high-water back to the OS so a client-triggered
+	// reanalysis doesn't ratchet the idle footprint up and leave it there.
+	freeOSMemoryAfterBurst(s.logger, "mcp_analysis")
+}
+
+// freeOSMemoryAfterBurst returns a completed whole-graph burst's heap
+// high-water to the OS. debug.FreeOSMemory forces a GC + scavenge;
+// GORTEX_DAEMON_MEMRELEASE=0 (or "false") disables it. The env check is
+// duplicated here (rather than shared) because the canonical release helper
+// lives in the cmd layer, which this package must not import.
+func freeOSMemoryAfterBurst(logger *zap.Logger, reason string) {
+	if v := os.Getenv("GORTEX_DAEMON_MEMRELEASE"); v == "0" || strings.EqualFold(v, "false") {
+		return
+	}
+	start := time.Now()
+	debug.FreeOSMemory()
+	if logger != nil {
+		logger.Debug("mcp: released heap to OS",
+			zap.String("reason", reason),
+			zap.Duration("elapsed", time.Since(start)))
 	}
 }
 

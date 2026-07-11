@@ -366,10 +366,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// and SetBundleFingerprints writes then race only on the cache's
 	// own mutex-guarded maps, not on the Store field. The cache stays
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
-	s.bundles = &bundleCache{
-		fingerprints: map[string]uint64{},
-		entries:      map[string]*bundleCacheEntry{},
-	}
+	s.bundles = newBundleCache()
 	if err := s.prepare(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite prepare: %w", err)

@@ -27,6 +27,10 @@ type ConfigManager struct {
 	workspacePaths map[string]string
 	mu             sync.RWMutex
 	logger         *zap.Logger
+	// excludeCache memoizes the per-repo `.gitignore` parse and the layered
+	// exclude list so EffectiveExclude — called on every indexer walk and
+	// per-file reconcile — does not re-read and re-merge on every call.
+	excludeCache *excludeCache
 }
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
@@ -49,6 +53,7 @@ func NewConfigManager(globalPath string) (*ConfigManager, error) {
 		workspace:      make(map[string]*Config),
 		workspacePaths: make(map[string]string),
 		logger:         zap.NewNop(),
+		excludeCache:   newExcludeCache(),
 	}, nil
 }
 
@@ -196,6 +201,18 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 //  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
 //  5. Workspace .gortex.yaml top-level Exclude
 //  6. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)
+//
+// This runs on a firehose of calls (every indexer walk and per-file
+// reconcile), so the layered result is memoized per repo and returned
+// shared: a steady-state call does one os.Stat of the repo's `.gitignore`
+// and returns the cached slice without re-reading or re-merging. The cache
+// invalidates on config changes (the global and workspace configs are
+// swapped, never mutated in place, so pointer identity is the version) and
+// on a `.gitignore` mtime/size change.
+//
+// The returned slice is SHARED and IMMUTABLE: callers MUST NOT mutate its
+// elements. It is clipped (len == cap), so appending to it is safe —
+// append reallocates rather than writing through the shared backing array.
 func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	cm.mu.RLock()
 	gc := cm.global
@@ -203,16 +220,24 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	repoPath := cm.workspacePaths[repoPrefix]
 	cm.mu.RUnlock()
 
+	respect := shouldRespectGitignore(ws)
+	var st gitignoreStat
+	if respect && repoPath != "" {
+		st = statGitignore(repoPath)
+	}
+	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, st); ok {
+		return m
+	}
+
 	out := make([]string, 0, 32)
 	out = append(out, excludes.Builtin...)
 
 	// Layer 2: repo `.gitignore`, unless the workspace config explicitly
-	// opts out. Reading happens on every EffectiveExclude call — the
-	// file is tiny and the function isn't on a hot path; refreshing
-	// every read keeps mid-session edits to `.gitignore` picked up
-	// without needing to wire cache invalidation.
-	if shouldRespectGitignore(ws) && repoPath != "" {
-		out = append(out, loadRepoGitignore(repoPath)...)
+	// opts out. The parse is cached per repo path and refreshed only when
+	// the file's mtime/size changes (see excludeCache), so a mid-session
+	// edit is still picked up on the next call.
+	if respect && repoPath != "" {
+		out = append(out, cm.excludeCache.patterns(repoPath, st)...)
 	}
 
 	if gc != nil {
@@ -247,6 +272,12 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 			out = append(out, inc)
 		}
 	}
+
+	// Clip to len == cap so a caller that appends to the returned slice is
+	// forced to reallocate and can never write through the shared backing
+	// array the cache hands to every reader.
+	out = out[:len(out):len(out)]
+	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, st, out)
 	return out
 }
 

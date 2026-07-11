@@ -297,12 +297,31 @@ func computeCloneSigFromShingles(cms *clones.CMS, threshold uint32, useFilter bo
 // in-memory / single-repo store — see incrementalCloneIndex.Rebuild —
 // so the AllNodes + equality filter is the form that works for both
 // regimes, since "" == "" matches every node.)
+// cloneRepoNodes returns the nodes the per-repo clone passes must walk. In
+// daemon multi-repo mode repoPrefix is non-empty, so GetRepoNodes selects just
+// that repo's nodes (one backend query, and one meta decode per repo node)
+// instead of decoding every node in a many-repo graph only to discard the other
+// repos' — the whole-graph AllNodes scan these passes used to run per repo.
+// In single-repo / in-memory mode repoPrefix is "" and those nodes are not
+// tracked in the per-repo buckets GetRepoNodes reads, so the AllNodes fallback
+// (whose "" == n.RepoPrefix filter matches every node) is the only form that
+// works there. Callers keep their n.RepoPrefix == repoPrefix guard: a no-op on
+// the GetRepoNodes path, load-bearing on the AllNodes fallback. The clone passes
+// read blob-only Meta (clone_sig / clone_tokens / clone_shingles), so the full
+// GetRepoNodes — not the meta-less light reader — is required here.
+func cloneRepoNodes(g graph.Store, repoPrefix string) []*graph.Node {
+	if repoPrefix != "" {
+		return g.GetRepoNodes(repoPrefix)
+	}
+	return g.AllNodes()
+}
+
 func finaliseCloneSignatures(g graph.Store, repoPrefix string) {
 	// First pass: collect every body that has stashed shingles. We
 	// capture the *graph.Node pointers up front so the CMS-build pass
 	// and the signature-compute pass don't both re-walk g.AllNodes().
 	bodies := make([]*graph.Node, 0, 8192)
-	for _, n := range g.AllNodes() {
+	for _, n := range cloneRepoNodes(g, repoPrefix) {
 		if n == nil || n.Meta == nil {
 			continue
 		}
@@ -480,7 +499,7 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix 
 
 	reporter.Report("clones: gather items", 0, 0)
 	var items []clones.Item
-	for _, n := range g.AllNodes() {
+	for _, n := range cloneRepoNodes(g, repoPrefix) {
 		if n == nil || n.Meta == nil {
 			continue
 		}

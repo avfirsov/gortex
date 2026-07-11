@@ -938,6 +938,10 @@ func (w *Watcher) patchGraphNoResolve(path string, kind ChangeKind) {
 		}
 	case ChangeDeleted, ChangeRenamed:
 		w.indexer.EvictFile(path)
+		// Keep the persisted mtime in step with the eviction (see
+		// forgetDeletedFileMtime) so a warm restart after a storm-drain
+		// delete does not treat the vanished path as a phantom deletion.
+		w.forgetDeletedFileMtime(w.indexer.RelKey(path))
 	}
 }
 
@@ -968,6 +972,26 @@ func (w *Watcher) reconcileKindWithDisk(path string, kind ChangeKind) ChangeKind
 		}
 	}
 	return kind
+}
+
+// forgetDeletedFileMtime drops a just-evicted file's recorded mtime from
+// both the in-memory map and the store's FileMtime sidecar. EvictFile
+// removes the file's nodes but leaves its mtime behind, so without this the
+// persisted mtime row outlives the file: the next warm restart reads it
+// back, finds the path gone from disk, and treats it as a phantom deletion
+// — re-running a scoped reconcile for a file that is already correct on
+// every boot. Mirrors IncrementalReindex's deletion handling: prune the
+// in-memory map first (pruneDeletedFileMtimes documents that its caller has
+// already done so, and a later snapshot persist would otherwise resurrect
+// the row from the stale in-memory entry), then the store, which self-skips
+// on a backend without the FileMtimeDeleter capability. relPath must be the
+// canonical relKey the mtime map and store are keyed on — the same key
+// EvictFile evicted the file's nodes under.
+func (w *Watcher) forgetDeletedFileMtime(relPath string) {
+	w.indexer.mtimeMu.Lock()
+	delete(w.indexer.fileMtimes, relPath)
+	w.indexer.mtimeMu.Unlock()
+	w.indexer.pruneDeletedFileMtimes([]string{relPath})
 }
 
 func (w *Watcher) patchGraph(path string, kind ChangeKind) {
@@ -1084,6 +1108,13 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind) {
 		nr, er := w.indexer.EvictFile(path)
 		nodesRemoved = nr
 		edgesRemoved = er
+
+		// The file is genuinely gone from disk here — reconcileKindWithDisk
+		// already downgraded a replace/revert (path still present) to
+		// ChangeModified. Drop its now-orphaned mtime so a warm restart does
+		// not re-discover the vanished path as a phantom deletion. relPath is
+		// the canonical relKey EvictFile evicted under.
+		w.forgetDeletedFileMtime(relPath)
 
 		// Notify callback: old symbols removed, no new symbols.
 		w.symbolChangeCbMu.RLock()
