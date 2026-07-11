@@ -46,7 +46,8 @@ func TestOpenUpgradesPreDataClassStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	// 1. Create a current store and seed a row, then close. A fresh store is
-	//    stamped at the v1 baseline (currentSchemaVersion == 1).
+	//    stamped at the current schema version; step 2 knocks it back to the v1
+	//    baseline to simulate a store written before data_class existed.
 	s, err := Open(path)
 	require.NoError(t, err)
 	s.AddNode(&graph.Node{ID: "old1", Kind: graph.KindFunction, Name: "Legacy", FilePath: "f.go", RepoPrefix: "r"})
@@ -58,6 +59,12 @@ func TestOpenUpgradesPreDataClassStore(t *testing.T) {
 		_, err := db.Exec(`ALTER TABLE nodes DROP COLUMN data_class`)
 		require.NoError(t, err, "simulate a pre-data_class store")
 		require.False(t, hasNodeColumn(t, db, "data_class"), "data_class must be absent before the upgrade")
+
+		// A fresh Open stamps the current schema version; knock it back to the v1
+		// baseline so this genuinely simulates a pre-data_class store and the
+		// reopen exercises the in-place upgrade arm rather than a no-op.
+		_, err = db.Exec(`PRAGMA user_version = 1`)
+		require.NoError(t, err, "reset to the v1 baseline")
 
 		var v int
 		require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&v))

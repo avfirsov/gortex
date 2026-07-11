@@ -343,9 +343,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		return nil, fmt.Errorf("sqlite fts rowid backfill: %w", err)
 	}
 
-	// Apply any in-place migration steps (none on a fresh, baseline, or wiped
-	// DB), then stamp the current schema version. After a wipe the store is
-	// empty and the daemon's normal indexing repopulates it.
+	// Apply any in-place migration steps, then stamp the current schema version.
+	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
+	// they are idempotent and no-op on an empty or already-clean store — so the
+	// first in-place migration ships without forcing every non-daemon Open to
+	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
+	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
 		if err := applyInPlaceMigrations(db, plan.inPlace); err != nil {
 			_ = db.Close()

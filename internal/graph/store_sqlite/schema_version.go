@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -49,12 +49,41 @@ type schemaMigration struct {
 	rebuild bool
 }
 
-// schemaMigrations is the ordered, forward-only registry. It is intentionally
-// empty at version 1: a v1 store is reconciled entirely by schemaSQL's
+// schemaMigrations is the ordered, forward-only registry. Version 1 is the
+// implicit baseline (no entry): a v1 store is reconciled entirely by schemaSQL's
 // idempotent CREATE ... IF NOT EXISTS plus ensureNodeColumns, so any
 // pre-versioning database baseline-stamps to v1 without a rebuild. Append
 // entries for version 2 and up as the schema evolves.
-var schemaMigrations []schemaMigration
+var schemaMigrations = []schemaMigration{
+	{version: 2, name: "dedupe fn-value placeholder edges", inPlace: dedupeFnValuePlaceholderEdges},
+}
+
+// dedupeFnValuePlaceholderEdges collapses duplicate function-as-value gate
+// placeholder edges (graph.FnValuePlaceholderMarker, `unresolved::fnvalue::
+// <name>`) to one row per (from_id, to_id), keeping the MIN(id) survivor. The
+// capture path now dedups per (from, name) before it emits, but stores written
+// earlier accumulated one placeholder per call site — a live store held
+// millions — and EdgesWithUnresolvedTarget plus the resolver's terminal
+// reconcile materialised every one on each warm restart, the dominant warmup
+// heap transient this step drains. The keep set is small (tens of thousands of
+// distinct pairs), so the NOT IN materialisation is cheap; the ph filter rides
+// the edges_by_to(to_id) range for the bare form and the is_unresolved index for
+// the multi-repo infix form. Idempotent: a second run finds no duplicates. Freed
+// pages return to the freelist and are reused by later writes; the file itself
+// shrinks only under a manual VACUUM, deliberately out of scope for a derived
+// cache that reclaims the space on its own.
+func dedupeFnValuePlaceholderEdges(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+WITH ph AS (
+    SELECT id, from_id, to_id FROM edges
+    WHERE (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
+       OR (is_unresolved = 1 AND to_id LIKE '%::unresolved::fnvalue::%')
+), keep AS (
+    SELECT MIN(id) AS id FROM ph GROUP BY from_id, to_id
+)
+DELETE FROM edges WHERE id IN (SELECT id FROM ph) AND id NOT IN (SELECT id FROM keep)`)
+	return err
+}
 
 // schemaPlan is the decision planSchemaMigration derives from the stored
 // PRAGMA user_version. It mutates nothing on its own.
@@ -77,15 +106,25 @@ func planSchemaMigrationWith(stored, current int, migrations []schemaMigration) 
 		// have changed under us. For a cache the safe move is to rebuild.
 		return schemaPlan{wipe: true, stamp: true}
 	case stored == 0:
-		// Fresh DB, or a pre-versioning store of unknown shape. When nothing is
-		// registered above the baseline, schemaSQL + ensureNodeColumns reconcile
-		// it to the current shape, so stamp it. Once any later migration exists,
-		// a store that skipped the versioning-introduction release could be
-		// missing migration-introduced structure, so rebuild instead.
-		if len(pendingBetween(0, current, migrations)) == 0 {
+		// Fresh DB, or a pre-versioning store of unknown shape. schemaSQL's
+		// idempotent CREATE ... IF NOT EXISTS plus ensureNodeColumns /
+		// ensureEdgeColumns reconcile the base shape either way, so a stored==0
+		// store needs a wipe only when a pending step is a REBUILD whose data can
+		// only come from re-indexing source. With nothing pending, stamp; with
+		// only in-place steps pending, run them and stamp — an in-place step is
+		// idempotent and mechanically derivable, so it upgrades a pre-versioning
+		// store in place (preserving its rows) exactly as it upgrades a known
+		// prior version. Wiping a stored==0 store on any migration instead would
+		// force every non-daemon Open (tests, read-only tools) to pass WithRebuild
+		// the moment the first migration ships.
+		pending := pendingBetween(0, current, migrations)
+		if len(pending) == 0 {
 			return schemaPlan{stamp: true}
 		}
-		return schemaPlan{wipe: true, stamp: true}
+		if anyRebuild(pending) {
+			return schemaPlan{wipe: true, stamp: true}
+		}
+		return schemaPlan{inPlace: pending, stamp: true}
 	default: // 0 < stored < current: a known prior version
 		pending := pendingBetween(stored, current, migrations)
 		if anyRebuild(pending) {

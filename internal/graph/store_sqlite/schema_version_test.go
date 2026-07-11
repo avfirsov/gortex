@@ -175,7 +175,8 @@ func TestPlanSchemaMigration(t *testing.T) {
 		{"up to date", 1, 1, nil, false, false, 0},
 		{"fresh at v1 baseline-stamps", 0, 1, nil, false, true, 0},
 		{"newer DB rebuilds", 2, 1, nil, true, true, 0},
-		{"v0 skipping a later migration rebuilds", 0, 2, []schemaMigration{inPlace}, true, true, 0},
+		{"v0 with only in-place pending upgrades in place, no wipe", 0, 2, []schemaMigration{inPlace}, false, true, 1},
+		{"v0 with a pending rebuild wipes", 0, 2, []schemaMigration{rebuild}, true, true, 0},
 		{"v1->v2 in-place", 1, 2, []schemaMigration{inPlace}, false, true, 1},
 		{"v1->v2 rebuild", 1, 2, []schemaMigration{rebuild}, true, true, 0},
 	}
@@ -291,7 +292,9 @@ func TestOpenAtCurrentVersionIsNoOp(t *testing.T) {
 func TestOpenWithInPlaceMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
-	// Create a v1 store with a row, then close.
+	// Create a store with a row, then knock it back to the v1 baseline so the
+	// openWith below drives the v1->v2 in-place arm (a fresh Open now stamps the
+	// current version, which is >= 2).
 	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
@@ -302,6 +305,11 @@ func TestOpenWithInPlaceMigration(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
 
 	// An in-place v2 step that depends on the base schema (an index on a
 	// nodes column) — proving it runs after schemaSQL/ensureNodeColumns.
@@ -340,13 +348,20 @@ func TestOpenWithInPlaceMigration(t *testing.T) {
 // retries the upgrade rather than treating it as done.
 func TestOpenWithInPlaceFailureDoesNotStamp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
-	s, err := Open(path) // v1 store
+	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	// A fresh Open now stamps the current version (>= 2); knock it back to the
+	// v1 baseline so openWith drives the v1->v2 arm and the failing step runs.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
 
 	boom := schemaMigration{version: 2, name: "boom", inPlace: func(*sql.Tx) error {
 		return sql.ErrConnDone
@@ -437,5 +452,94 @@ func TestSchemaMigrationsWellFormed(t *testing.T) {
 		if err := validateSchemaMigrations(c.current, c.migs); err == nil {
 			t.Errorf("%s: expected a validation error, got nil", c.name)
 		}
+	}
+}
+
+// TestOpenDedupesFnValuePlaceholders drives the shipped v2 migration through the
+// real Open composition: a store knocked back to the v1 baseline with duplicate
+// fn-value placeholder edges is deduped in place on reopen — one survivor per
+// (from_id, to_id), the MIN(id) row kept — while a distinct placeholder, a
+// resolved edge, and an ordinary unresolved stub are untouched, and the version
+// stamps to current. Covers both the bare and the multi-repo COPY-rewrite form.
+func TestOpenDedupesFnValuePlaceholders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	// Seed edges by explicit id so the MIN(id) survivors are predictable. The
+	// is_unresolved column is generated, so it is omitted from the INSERT.
+	ins := `INSERT INTO edges (id, from_id, to_id, kind, file_path, line) VALUES (?,?,?,?,?,?)`
+	seed := []struct {
+		id       int
+		from, to string
+		kind     string
+		line     int
+	}{
+		// Duplicate bare placeholders: same (from,to), distinct lines. Keep id 1.
+		{1, "a", "unresolved::fnvalue::handler", "references", 10},
+		{2, "a", "unresolved::fnvalue::handler", "references", 20},
+		{3, "a", "unresolved::fnvalue::handler", "references", 30},
+		// A distinct placeholder (different name) — must survive untouched.
+		{4, "a", "unresolved::fnvalue::other", "references", 10},
+		// Duplicate multi-repo COPY-rewrite placeholders — exercises the
+		// is_unresolved infix branch of the migration. Keep id 5.
+		{5, "b", "r::unresolved::fnvalue::handler", "references", 10},
+		{6, "b", "r::unresolved::fnvalue::handler", "references", 20},
+		// A resolved edge and an ordinary unresolved stub — never touched.
+		{7, "a", "b", "calls", 1},
+		{8, "a", "unresolved::Foo", "calls", 1},
+	}
+	for _, r := range seed {
+		if _, err := s.db.Exec(ins, r.id, r.from, r.to, r.kind, "f.go", r.line); err != nil {
+			t.Fatalf("seed edge %d: %v", r.id, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Knock the store back to the v1 baseline so the reopen runs the v2 dedup.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			t.Fatalf("reset to v1 baseline: %v", err)
+		}
+	})
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen for dedup: %v", err)
+	}
+	defer s2.Close()
+
+	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
+		t.Fatalf("user_version after dedup = %d, want %d", v, currentSchemaVersion)
+	}
+
+	present := func(id int) bool {
+		var n int
+		if err := s2.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE id = ?`, id).Scan(&n); err != nil {
+			t.Fatalf("count id %d: %v", id, err)
+		}
+		return n == 1
+	}
+	// Bare-form dedup keeps the MIN(id) survivor and drops the rest.
+	if !present(1) || present(2) || present(3) {
+		t.Fatalf("bare dedup wrong: want keep 1 / drop 2,3; got 1=%v 2=%v 3=%v", present(1), present(2), present(3))
+	}
+	// A distinct placeholder pair survives.
+	if !present(4) {
+		t.Fatal("distinct fn-value placeholder (id 4) was wrongly deleted")
+	}
+	// Multi-repo infix dedup keeps the MIN(id) survivor and drops the rest.
+	if !present(5) || present(6) {
+		t.Fatalf("multi-repo dedup wrong: want keep 5 / drop 6; got 5=%v 6=%v", present(5), present(6))
+	}
+	// A resolved edge and an ordinary unresolved stub must be untouched.
+	if !present(7) {
+		t.Fatal("resolved edge (id 7) must survive the placeholder dedup")
+	}
+	if !present(8) {
+		t.Fatal("ordinary unresolved stub (id 8) must survive the placeholder dedup")
 	}
 }
