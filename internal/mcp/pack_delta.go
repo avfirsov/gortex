@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -255,25 +257,91 @@ func shortHash(s string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// packCacheDefaultMaxBytes bounds the total memory the pack cache may
+// retain across all cached views. A count ceiling alone is unsafe: each
+// entry is a full smart_context pack whose symbols carry their source,
+// so a handful of large packs reach hundreds of MB even under the
+// 32-entry cap. Override with GORTEX_PACK_CACHE_MAX_MB.
+const packCacheDefaultMaxBytes = 32 << 20 // 32 MiB
+
+const (
+	// packEntryOverhead is a conservative fixed charge per cached symbol
+	// (struct headers, map bucket, slice growth) added on top of its
+	// retained string bytes.
+	packEntryOverhead = 64
+	// packFieldOverhead is the same fixed charge for one non-string
+	// entry field. Deliberately generous — an over-estimate only makes
+	// the cache evict sooner, it never overshoots the budget.
+	packFieldOverhead = 16
+)
+
 // packDeltaCache is a bounded LRU of pack views keyed by pack root, so a
 // later smart_context call with delta_from=<root> can diff against the
 // pack the agent already received. Content-addressed (the key is the
 // pack root), so it is safe to share across sessions: an identical pack
 // produced by two sessions resolves to the same entry.
+//
+// Bounded on two axes — a distinct-entry ceiling (cap) and a memory
+// budget (maxBytes) — because a single pack's retained bytes vary by
+// orders of magnitude with the working set's source size.
 type packDeltaCache struct {
-	mu  sync.Mutex
-	ll  *list.List
-	m   map[string]*list.Element
-	cap int
+	mu       sync.Mutex
+	ll       *list.List
+	m        map[string]*list.Element
+	cap      int   // max distinct packs retained (secondary ceiling)
+	maxBytes int64 // memory budget across all retained views
+	curBytes int64 // running sum of entry.bytes
 }
 
 type packCacheEntry struct {
-	root string
-	view packView
+	root  string
+	view  packView
+	bytes int64 // estimated retained size, for the byte budget
 }
 
+// newPackDeltaCache builds the cache with the default budgets. The
+// memory budget is overridable with GORTEX_PACK_CACHE_MAX_MB=<n>
+// (0 or negative keeps the default).
 func newPackDeltaCache() *packDeltaCache {
-	return &packDeltaCache{ll: list.New(), m: make(map[string]*list.Element), cap: 32}
+	c := &packDeltaCache{
+		ll:       list.New(),
+		m:        make(map[string]*list.Element),
+		cap:      32,
+		maxBytes: packCacheDefaultMaxBytes,
+	}
+	if v := strings.TrimSpace(os.Getenv("GORTEX_PACK_CACHE_MAX_MB")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.maxBytes = int64(n) << 20
+		}
+	}
+	return c
+}
+
+// packViewBytes conservatively estimates a cached view's retained heap
+// footprint for the byte budget. Dominated by each symbol's full entry
+// (which carries the symbol's source); identity fields and edge / file
+// keys are counted too. Computed once at insert time so eviction is a
+// cheap scalar comparison.
+func packViewBytes(v packView) int64 {
+	var n int64
+	for _, s := range v.Symbols {
+		n += int64(len(s.ID) + len(s.SourceHash) + packEntryOverhead)
+		for k, val := range s.Entry {
+			n += int64(len(k))
+			if str, ok := val.(string); ok {
+				n += int64(len(str))
+			} else {
+				n += packFieldOverhead
+			}
+		}
+	}
+	for _, f := range v.Files {
+		n += int64(len(f))
+	}
+	for _, e := range v.Edges {
+		n += int64(len(e))
+	}
+	return n
 }
 
 func (c *packDeltaCache) get(root string) (packView, bool) {
@@ -294,21 +362,36 @@ func (c *packDeltaCache) put(root string, v packView) {
 	if c == nil || root == "" {
 		return
 	}
+	sz := packViewBytes(v)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.m[root]; ok {
-		el.Value.(*packCacheEntry).view = v
+		e := el.Value.(*packCacheEntry)
+		c.curBytes += sz - e.bytes
+		e.view = v
+		e.bytes = sz
 		c.ll.MoveToFront(el)
+		c.evictLocked()
 		return
 	}
-	el := c.ll.PushFront(&packCacheEntry{root: root, view: v})
+	el := c.ll.PushFront(&packCacheEntry{root: root, view: v, bytes: sz})
 	c.m[root] = el
-	for c.ll.Len() > c.cap {
+	c.curBytes += sz
+	c.evictLocked()
+}
+
+// evictLocked drops least-recently-used entries until the cache is
+// within both its byte budget and its entry-count ceiling. The caller
+// holds c.mu.
+func (c *packDeltaCache) evictLocked() {
+	for c.ll.Len() > 0 && (c.curBytes > c.maxBytes || c.ll.Len() > c.cap) {
 		back := c.ll.Back()
 		if back == nil {
 			break
 		}
+		e := back.Value.(*packCacheEntry)
 		c.ll.Remove(back)
-		delete(c.m, back.Value.(*packCacheEntry).root)
+		delete(c.m, e.root)
+		c.curBytes -= e.bytes
 	}
 }

@@ -1,6 +1,9 @@
 package mcp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func symEntry(id string, line int, source string) map[string]any {
 	return map[string]any{"id": id, "start_line": line, "source": source, "name": id}
@@ -93,6 +96,33 @@ func TestPackDeltaCacheLRU(t *testing.T) {
 	}
 	if _, ok := c.get("r1"); !ok {
 		t.Fatal("r1 should survive")
+	}
+}
+
+// TestPackDeltaCacheByteBudget — with a high count ceiling but a small
+// byte budget, the memory budget is the binding limit: big entries
+// evict older ones even though the entry count stays well under cap.
+func TestPackDeltaCacheByteBudget(t *testing.T) {
+	c := newPackDeltaCache()
+	c.cap = 1000        // high, so the byte budget binds instead
+	c.maxBytes = 25_000 // ~2 of the 10 KB entries below fit
+
+	big := strings.Repeat("x", 10_000) // ~10 KB of source per entry
+	for _, root := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		c.put(root, extractPackView(packResult(symEntry(root+".go::F", 1, big)), true))
+	}
+
+	if c.ll.Len() > 3 {
+		t.Fatalf("byte budget should keep the cache small; got %d entries", c.ll.Len())
+	}
+	if c.curBytes > c.maxBytes {
+		t.Fatalf("curBytes %d exceeds budget %d", c.curBytes, c.maxBytes)
+	}
+	if _, ok := c.get("r5"); !ok {
+		t.Fatal("newest entry r5 should survive")
+	}
+	if _, ok := c.get("r1"); ok {
+		t.Fatal("oldest entry r1 should have been evicted by the byte budget")
 	}
 }
 
