@@ -83,6 +83,10 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 	q := `SELECT to_id, COUNT(*) FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) GROUP BY to_id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {
@@ -105,6 +109,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) ORDER BY id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
@@ -121,6 +129,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 func (s *Store) EdgeKindCounts() map[graph.EdgeKind]int {
 	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM edges GROUP BY kind`)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[graph.EdgeKind]int)
 	for rows.Next() {
@@ -154,6 +166,10 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	q += ` ORDER BY n.id`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []graph.NodeDegreeRow
 	for rows.Next() {
@@ -227,6 +243,10 @@ func (s *Store) FileImportCounts(scope []string) []graph.FileImportCountRow {
 func aggScanImportCounts(s *Store, q string, args []any, acc map[string]int) {
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return
+	}
 	defer rows.Close()
 	for rows.Next() {
 		var path string
@@ -252,6 +272,10 @@ func (s *Store) InDegreeForNodes(ids []string) map[string]int {
 			inPlaceholders(len(chunk)) + `) GROUP BY to_id`
 		rows, err := s.db.Query(q, toAnyArgs(chunk)...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var id string
 			var n int
@@ -277,6 +301,10 @@ func (s *Store) CrossRepoEdgeCounts() []graph.CrossRepoEdgeRow {
 		GROUP BY e.kind, nf.repo_prefix, nt.repo_prefix`
 	rows, err := s.db.Query(q)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	// Aggregate keyed by the edge's OWN kind (cross_repo_*), NOT the base.
 	// BaseKindForCrossRepo is used only as the recogniser that decides
@@ -322,6 +350,10 @@ func (s *Store) FileImporters(filePath string) []graph.FileImporterRow {
 		ORDER BY nf.file_path`
 	rows, err := s.db.Query(q, string(graph.EdgeImports), filePath, filePath)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	var out []graph.FileImporterRow
 	for rows.Next() {
@@ -353,6 +385,10 @@ func (s *Store) FileSymbolNamesByPaths(paths []string, kinds []graph.NodeKind) [
 			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `)`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.FileSymbolNameRow
 			panicOnFatal(rows.Scan(&r.FilePath, &r.Name))
@@ -444,6 +480,10 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return
+		}
 		defer rows.Close()
 		for rows.Next() {
 			var from, to string
@@ -487,6 +527,10 @@ func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []gr
 		args := append(append([]any(nil), usageInline...), toAnyArgs(chunk)...)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.NodeDegreeRow
 			panicOnFatal(rows.Scan(&r.NodeID, &r.InCount, &r.OutCount, &r.UsageInCount))
@@ -537,6 +581,10 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 		args = append(args, toAnyArgs(chunk)...)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
 		for rows.Next() {
 			var r graph.NodeFanRow
 			panicOnFatal(rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
@@ -562,6 +610,10 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `)`
 	rows, err := s.db.Query(q, args...)
 	panicOnFatal(err)
+	if rows == nil {
+		// swallowed teardown-race error: read returns empty (see panicOnFatal)
+		return nil
+	}
 	defer rows.Close()
 	out := make(map[string]int)
 	for rows.Next() {

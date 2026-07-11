@@ -28,3 +28,42 @@ func TestClosedStoreReadsDoNotPanic(t *testing.T) {
 		assert.Empty(t, s.GetFileNodes("p/a.go"))
 	}, "reads after Close must degrade gracefully, not panic")
 }
+
+// TestClosedStoreAggregatorsDoNotPanic pins the aggregator teardown-race sweep:
+// each aggregator read runs its Query error through panicOnFatal, which
+// swallows the "database is closed" race — leaving rows == nil. Every such site
+// must early-return its empty value instead of dereferencing nil rows. The live
+// crash was NodeIDsByKinds (FindHotspots -> RunAnalysis at watch-start) SIGSEGV
+// on nil rows right after a long warmup. Each method is called with non-empty
+// args so it actually reaches the Query rather than an early argument guard.
+func TestClosedStoreAggregatorsDoNotPanic(t *testing.T) {
+	s := openTestStore(t)
+	s.AddNode(&graph.Node{ID: "p/a.go::Foo", Kind: graph.KindType, Name: "Foo", FilePath: "p/a.go"})
+	s.AddNode(&graph.Node{ID: "p/a.go::bar", Kind: graph.KindFunction, Name: "bar", FilePath: "p/a.go"})
+	s.AddEdge(&graph.Edge{From: "p/a.go::bar", To: "p/a.go::Foo", Kind: graph.EdgeReferences, FilePath: "p/a.go", Line: 1})
+	require.NoError(t, s.Close())
+
+	nodeKinds := []graph.NodeKind{graph.KindType, graph.KindFunction}
+	edgeKinds := []graph.EdgeKind{graph.EdgeReferences}
+	ids := []string{"p/a.go::Foo", "p/a.go::bar"}
+	assert.NotPanics(t, func() {
+		assert.Empty(t, s.InEdgeCountsByKind(edgeKinds))
+		assert.Empty(t, s.NodeIDsByKinds(nodeKinds))
+		assert.Empty(t, s.EdgeKindCounts())
+		assert.Empty(t, s.NodeDegreeByKinds(nodeKinds, ""))
+		assert.Empty(t, s.FileImportCounts(nil)) // exercises aggScanImportCounts
+		assert.Empty(t, s.InDegreeForNodes(ids))
+		assert.Empty(t, s.CrossRepoEdgeCounts())
+		assert.Empty(t, s.FileImporters("p/a.go"))
+		assert.Empty(t, s.FileSymbolNamesByPaths([]string{"p/a.go"}, nodeKinds))
+		assert.Empty(t, s.NodeDegreeCounts(ids, edgeKinds))
+		assert.Empty(t, s.NodeFanCounts(ids, edgeKinds, edgeKinds))
+		assert.Empty(t, s.CommunityCrossingsByKind(edgeKinds, map[string]string{"p/a.go::bar": "c0"}))
+		// Iterator-shaped: the Query runs inside the yield closure.
+		n := 0
+		for range s.EdgeAdjacencyForKinds(edgeKinds, nodeKinds) {
+			n++
+		}
+		assert.Zero(t, n)
+	}, "aggregator reads after Close must degrade to empty, not panic")
+}

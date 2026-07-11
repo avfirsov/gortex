@@ -1756,6 +1756,14 @@ func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 // callers stay quiet. The graph.Store interface deliberately does not
 // surface errors -- it mirrors the in-memory store's "everything
 // succeeds" contract -- so a fatal storage failure cannot be ignored.
+//
+// Caller contract: on a teardown-race error panicOnFatal RETURNS rather than
+// panicking, so a caller that keeps using the query result after it returns
+// MUST nil-check first. `rows, err := db.Query(...); panicOnFatal(err)` leaves
+// rows == nil on a swallowed error, and the subsequent rows.Close() /
+// rows.Next() would SIGSEGV — the aggregator reads early-return their empty
+// value on nil rows for exactly this reason. In one line: fatal panics; a
+// teardown-race read returns empty.
 func panicOnFatal(err error) {
 	if err == nil {
 		return
