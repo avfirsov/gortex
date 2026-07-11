@@ -48,6 +48,97 @@ func (s *Store) WipeContentFile(filePath string) error {
 	return err
 }
 
+// WipeContentFileInRepo removes ONE file's content rows scoped to a repo —
+// the crash-safe full-index sibling of WipeContentFile (which keys on
+// file_path alone and so would clobber a same-named file in another repo).
+// A full index streams content per file: delete this file's prior rows,
+// then AppendContent its fresh sections — so a mid-parse kill leaves a mix
+// of old+new content per file rather than the empty table a repo-wide
+// pre-wipe would leave behind. Empty filePath is a no-op.
+func (s *Store) WipeContentFileInRepo(repoPrefix, filePath string) error {
+	if filePath == "" {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM content_fts WHERE repo_prefix = ? AND file_path = ?`, repoPrefix, filePath)
+	return err
+}
+
+// DeleteContentFilesForRepoNotIn sweeps a repo's content rows down to keep —
+// every content row whose file_path is absent from keep is deleted. keep is
+// the set of files that actually STREAMED content sections in the walk just
+// completed (each recorded as the same file_path form AppendContent wrote),
+// NOT the set of files that merely survive on disk: a file can still exist
+// yet stop producing content (doc emptied, classification changed), and a
+// disk-based keep would protect its stale rows forever. Run once at the end
+// of a successful full index (right after the authoritative mtime replace),
+// it reaps vanished files and content->no-content transitions in one scan;
+// the per-file WipeContentFileInRepo + AppendContent streaming build
+// refreshes the files that still produce content. Together they replace the
+// old repo-wide pre-wipe: a mid-parse kill no longer empties the content
+// index, and stale rows are reaped only on the next clean completion.
+// Empty keep is a deliberate no-op safety net — never wipe a whole repo from
+// an empty set; a caller that legitimately ends a walk with zero content
+// files calls WipeContent explicitly instead.
+func (s *Store) DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error {
+	if len(keep) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Enumerate the repo's content file paths, then delete only those not in
+	// keep. Content files are a small subset (docs / PDFs / office), so the
+	// DISTINCT scan + targeted deletes stay cheap and dodge a giant NOT IN
+	// (...) bound-variable list. Rows are drained + closed before the delete
+	// tx opens (no open read cursor while writing on the same connection).
+	rows, err := s.db.Query(`SELECT DISTINCT file_path FROM content_fts WHERE repo_prefix = ?`, repoPrefix)
+	if err != nil {
+		return err
+	}
+	var vanished []string
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if _, ok := keep[fp]; !ok {
+			vanished = append(vanished, fp)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if len(vanished) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	const chunk = 900
+	for start := 0; start < len(vanished); start += chunk {
+		end := minInt(start+chunk, len(vanished))
+		batch := vanished[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, repoPrefix)
+		for _, fp := range batch {
+			args = append(args, fp)
+		}
+		if _, err := tx.Exec(`DELETE FROM content_fts WHERE repo_prefix = ? AND file_path IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // AppendContent inserts content rows for repoPrefix without wiping — the
 // streamed per-file build path. Callers wipe (whole repo or one file)
 // first. Rows with an empty NodeID are skipped.

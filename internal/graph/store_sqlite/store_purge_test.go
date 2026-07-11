@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"database/sql"
+	"github.com/zzet/gortex/internal/graph"
 	"path/filepath"
 	"testing"
 
@@ -171,4 +172,51 @@ func TestRekeyRepoPrefix_MovesProvenanceDropsNodeIDKeyed(t *testing.T) {
 	}
 
 	assert.Error(t, s.RekeyRepoPrefix("repoA", ""), "rekey INTO the empty prefix is refused")
+}
+
+// TestContentCrashWindow simulates the D4 kill-window at the store level:
+// per-file delete+append leaves a mix of old+new content instead of an empty
+// table, and the end-of-track sweep (keep = files that STREAMED content this
+// run) reaps both files that vanished from disk and files that still exist
+// but no longer yield content sections.
+func TestContentCrashWindow(t *testing.T) {
+	s := openPurgeStore(t)
+	item := func(id, file, body string) graph.ContentFTSItem {
+		return graph.ContentFTSItem{NodeID: id, FilePath: file, Ordinal: 0, Body: body}
+	}
+	// Prior full index: three content files present.
+	require.NoError(t, s.AppendContent("r", []graph.ContentFTSItem{item("r::f1", "f1.md", "old one")}))
+	require.NoError(t, s.AppendContent("r", []graph.ContentFTSItem{item("r::f2", "f2.md", "old two")}))
+	require.NoError(t, s.AppendContent("r", []graph.ContentFTSItem{item("r::f3", "f3.md", "old three")}))
+
+	// A new full index re-streams only f1 (crash before it reached the
+	// rest): delete f1's rows then re-append. The other files' OLD rows must
+	// survive — no empty-table window.
+	require.NoError(t, s.WipeContentFileInRepo("r", "f1.md"))
+	require.NoError(t, s.AppendContent("r", []graph.ContentFTSItem{item("r::f1", "f1.md", "new one")}))
+
+	countFile := func(file string) int {
+		var n int
+		require.NoError(t, s.db.QueryRow(`SELECT COUNT(*) FROM content_fts WHERE repo_prefix='r' AND file_path=?`, file).Scan(&n))
+		return n
+	}
+	assert.Equal(t, 1, countFile("f1.md"), "f1 refreshed (delete+append, not doubled)")
+	assert.Equal(t, 1, countFile("f2.md"), "f2's old rows survive the mid-parse kill (no empty table)")
+	assert.Equal(t, 1, countFile("f3.md"), "f3's old rows survive the mid-parse kill (no empty table)")
+
+	// The next SUCCESSFUL completion: f2 was deleted from the repo, and f3
+	// STILL EXISTS on disk but was emptied — it streamed no content sections
+	// this run, so it is absent from the streamed set. The sweep keeps
+	// exactly the streamed set {f1}, reaping both the vanished file and the
+	// content->no-content transition (a disk-survival keep would have
+	// protected f3's stale rows forever).
+	require.NoError(t, s.DeleteContentFilesForRepoNotIn("r", map[string]struct{}{"f1.md": {}}))
+	assert.Equal(t, 1, countFile("f1.md"), "still-streaming file kept")
+	assert.Equal(t, 0, countFile("f2.md"), "vanished file swept")
+	assert.Equal(t, 0, countFile("f3.md"), "content->no-content transition swept despite surviving on disk")
+
+	// Empty keep is a deliberate no-op (the never-wipe-from-empty safety
+	// net; a zero-content walk routes to WipeContent instead).
+	require.NoError(t, s.DeleteContentFilesForRepoNotIn("r", nil))
+	assert.Equal(t, 1, countFile("f1.md"), "empty keep never wipes")
 }

@@ -25,6 +25,16 @@ const defaultShadowMaxFileCount = 50000
 // RAM even on 8GB build agents.
 const defaultStreamingChunkSize = 5000
 
+// mtimeStreamPersistEvery is how many files' mtimes the direct-to-disk
+// full-index path buffers before flushing them to the store's FileMtime
+// sidecar (see recordStreamedMtime in IndexCtx). It makes a first-ever
+// track crash-resumable: a kill after some batches have flushed re-parses
+// only the tail on the next boot, instead of re-tracking the whole repo
+// from scratch every time it dies under memory pressure. A var, not a
+// const, so a test can lower it to observe the incremental flush without
+// staging thousands of fixture files.
+var mtimeStreamPersistEvery = 500
+
 // shadowMaxFileCount returns the active file-count ceiling for the
 // IndexCtx in-memory shadow swap. GORTEX_SHADOW_MAX_FILES overrides
 // the default; setting it to 0 disables the shadow entirely (always

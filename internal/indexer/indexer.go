@@ -2521,12 +2521,43 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		}
 	}
 
-	// Clear this repo's prior content rows before the per-file streaming
-	// appends below, so a full reindex (cold or warm) rebuilds the content
-	// index from a clean slate instead of accumulating stale sections.
-	// No-op on a cold store; cheap per-repo DELETE on a warm one.
+	// Content-index rebuild strategy. The crash-safe path (on-disk store)
+	// deletes each file's prior content rows as that file re-streams
+	// (contentWipeFile, invoked at the per-file AddBatch sites below) and
+	// sweeps every OTHER content row after the authoritative mtime replace —
+	// so a mid-parse kill leaves a mix of old+new content per file instead of
+	// the empty table a repo-wide pre-wipe would leave. contentStreamedFiles
+	// records which files actually streamed content this walk (the wipe's own
+	// argument, i.e. the node FilePath content_fts carries); the end sweep
+	// keeps exactly that set, so files that vanished from disk AND files that
+	// still exist but no longer yield content sections (doc emptied,
+	// classification changed) are both reaped in one scan — the transitions
+	// the old repo-wide pre-wipe used to cover. Backends without the per-file
+	// capability keep that old behaviour: one repo-wide wipe up front (a
+	// cold-store no-op; a cheap per-repo DELETE on a warm one).
+	var (
+		contentWipeFile      func(filePath string)
+		contentStreamedMu    sync.Mutex
+		contentStreamedFiles map[string]struct{}
+	)
 	if cs := idx.contentSearcher(); cs != nil {
-		if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+		if w, ok := cs.(interface {
+			WipeContentFileInRepo(repoPrefix, filePath string) error
+		}); ok {
+			repoPrefix := idx.RepoPrefix()
+			contentStreamedFiles = make(map[string]struct{})
+			contentWipeFile = func(filePath string) {
+				if filePath == "" {
+					return
+				}
+				contentStreamedMu.Lock()
+				contentStreamedFiles[filePath] = struct{}{}
+				contentStreamedMu.Unlock()
+				if err := w.WipeContentFileInRepo(repoPrefix, filePath); err != nil {
+					idx.logger.Warn("indexer: per-file content wipe failed", zap.Error(err))
+				}
+			}
+		} else if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
 			idx.logger.Warn("indexer: content index wipe failed", zap.Error(err))
 		}
 	}
@@ -2612,6 +2643,53 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		return os.ReadFile(wf.path)
 	}
 
+	// recordStreamedMtime persists a file's mtime incrementally, in batches,
+	// as its nodes land on disk during a full track — so a first-ever index
+	// killed mid-parse RESUMES on the next boot (the flushed files reconcile
+	// clean, the remainder re-parses) instead of re-tracking a large repo
+	// from scratch every time it dies under memory pressure.
+	//
+	// INVARIANT: an mtime row must land only AFTER its file's nodes are
+	// durably in the store, or a fresh mtime would falsely imply indexed
+	// nodes. The `idx.graph.(graph.FileMtimeWriter)` assertion is what
+	// enforces it: it succeeds ONLY on the direct-to-disk path, where
+	// idx.graph is the on-disk store and AddBatch has already made the
+	// file's nodes durable. On the whole-repo in-memory shadow and the
+	// streaming-flush per-chunk shadow, idx.graph is a plain graph.Graph
+	// (no FileMtimeWriter) whose nodes reach disk only at a later drain, so
+	// this self-skips and those paths persist at their own drain points (the
+	// final ReplaceFileMtimes / the streaming-flush per-chunk persist). The
+	// final ReplaceFileMtimes still runs and is authoritative — it also
+	// prunes deleted files — so these batches only bound the work a crash
+	// can waste; the leftover under-threshold tail rides that final replace.
+	var (
+		streamMtimeMu sync.Mutex
+		streamMtimes  = make(map[string]int64, mtimeStreamPersistEvery)
+	)
+	recordStreamedMtime := func(absPath string, mtimeNano int64) {
+		if mtimeNano <= 0 {
+			return
+		}
+		w, ok := idx.graph.(graph.FileMtimeWriter)
+		if !ok {
+			return
+		}
+		var flush map[string]int64
+		streamMtimeMu.Lock()
+		streamMtimes[idx.relKey(absPath)] = mtimeNano
+		if len(streamMtimes) >= mtimeStreamPersistEvery {
+			flush = streamMtimes
+			streamMtimes = make(map[string]int64, mtimeStreamPersistEvery)
+		}
+		streamMtimeMu.Unlock()
+		if flush != nil {
+			if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+				idx.logger.Warn("indexer: incremental mtime batch persist failed",
+					zap.String("repo", idx.repoPrefix), zap.Error(err))
+			}
+		}
+	}
+
 	// parseChunk runs the per-file worker pool over the supplied
 	// slice. Closure over outer state (errors, counters, contract
 	// registry, parsePool, quarantine) so it can be called multiple
@@ -2668,9 +2746,13 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 								continue
 							}
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
+							if contentWipeFile != nil {
+								contentWipeFile(firstContentFilePath(result.Nodes))
+							}
 							idx.streamContentSections(result.Nodes)
 							idx.graph.AddBatch(result.Nodes, result.Edges)
 							idx.persistConstValues(result)
+							recordStreamedMtime(path, wf.mtimeNano)
 							continue
 						}
 					}
@@ -2785,6 +2867,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// nodes to a snippet BEFORE AddBatch, so the bulk text
 					// never enters the graph, the symbol search, or the
 					// materialising code passes.
+					if contentWipeFile != nil {
+						contentWipeFile(firstContentFilePath(result.Nodes))
+					}
 					idx.streamContentSections(result.Nodes)
 
 					// Batch the per-file insert into one shard-grouped pass
@@ -2795,6 +2880,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					idx.graph.AddBatch(result.Nodes, result.Edges)
 					idx.persistConstValues(result)
 					idx.persistFileMeta(relPath, src, result)
+					recordStreamedMtime(path, wf.mtimeNano)
 
 					if !skipped && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
@@ -2879,6 +2965,27 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			streamingDisk.AddBatch(chunkShadow.AllNodes(), chunkShadow.AllEdges())
 			if err := bl.FlushBulk(); err != nil {
 				return nil, fmt.Errorf("indexer: streaming-flush chunk %d..%d: %w", chunkStart, chunkEnd, err)
+			}
+			// This chunk's nodes are durable on disk now, so persist its
+			// files' mtimes — a kill mid-track then resumes from this chunk
+			// boundary instead of re-tracking the whole large first index
+			// from scratch. The in-worker recordStreamedMtime is a no-op on
+			// this path (idx.graph was the throwaway per-chunk shadow, not a
+			// FileMtimeWriter); the persist happens here, after the drain,
+			// keeping the "fresh mtime implies durable nodes" invariant.
+			if w, ok := streamingDisk.(graph.FileMtimeWriter); ok {
+				batch := make(map[string]int64, chunkEnd-chunkStart)
+				for _, f := range files[chunkStart:chunkEnd] {
+					if f.mtimeNano > 0 {
+						batch[idx.relKey(f.path)] = f.mtimeNano
+					}
+				}
+				if len(batch) > 0 {
+					if err := w.BulkSetFileMtimes(idx.repoPrefix, batch); err != nil {
+						idx.logger.Warn("indexer: streaming-flush chunk mtime persist failed",
+							zap.String("repo", idx.repoPrefix), zap.Error(err))
+					}
+				}
 			}
 		}
 		// After all chunks, idx.graph points at the disk store so
@@ -2967,6 +3074,40 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 				idx.logger.Info("persisted file mtimes",
 					zap.String("repo", idx.repoPrefix),
 					zap.Int("count", len(mtimeSnapshot)))
+			}
+		}
+
+		// Crash-safe content path: reap every content row this walk did NOT
+		// re-stream. keep is contentStreamedFiles — the files that actually
+		// produced content sections this run — NOT the surviving-file mtime
+		// set: a file can survive on disk yet stop yielding content (doc
+		// emptied, classification changed), and keying keep off mtimes would
+		// protect its stale rows forever. Recorded keys are the wipe's own
+		// argument (the node FilePath content_fts carries), so the comparison
+		// matches the stored rows in single- and multi-repo form alike. A walk
+		// that streamed NO content falls back to the repo-wide wipe: the repo
+		// has zero content files now, and the sweep's empty-keep guard (a
+		// never-wipe-from-empty safety net) would otherwise no-op and leave
+		// every stale row behind. Only when the per-file wipe path is active;
+		// on the repo-wide-wipe fallback the up-front pre-wipe already cleared
+		// both transitions. Runs only under the completed-walk guard above
+		// (len(mtimeSnapshot) > 0), so a killed parse never triggers it.
+		if contentWipeFile != nil {
+			contentStreamedMu.Lock()
+			keep := contentStreamedFiles
+			contentStreamedMu.Unlock()
+			if len(keep) == 0 {
+				if cs := idx.contentSearcher(); cs != nil {
+					if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+						idx.logger.Warn("indexer: content wipe of contentless repo failed", zap.Error(err))
+					}
+				}
+			} else if sw, ok := idx.contentSearcher().(interface {
+				DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error
+			}); ok {
+				if err := sw.DeleteContentFilesForRepoNotIn(idx.repoPrefix, keep); err != nil {
+					idx.logger.Warn("indexer: content sweep of stale files failed", zap.Error(err))
+				}
 			}
 		}
 	}
