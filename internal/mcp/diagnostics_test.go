@@ -107,6 +107,51 @@ func TestDiagnosticsBroadcaster_DeltaFilter(t *testing.T) {
 	require.Len(t, fake.snapshot(), 2, "exactly two deliveries after delta filter")
 }
 
+// TestDiagnosticsBroadcaster_ClearPrunesHash — a file clearing its
+// diagnostics broadcasts the clear exactly once (only when it was
+// previously non-empty) and drops its lastHash key, so the map doesn't
+// retain an entry per file the server ever touched.
+func TestDiagnosticsBroadcaster_ClearPrunesHash(t *testing.T) {
+	fake := &fakeSpecificSender{}
+	b := newDiagnosticsBroadcaster(fake, noSnapshot, zap.NewNop())
+	b.subscribe("session-A", subscribeOptions{})
+
+	const path = "/work/main.go"
+	b.publish("gopls", path, []lsp.Diagnostic{{Message: "boom", Severity: 1}}) // non-empty
+	b.publish("gopls", path, nil)                                              // cleared
+	b.publish("gopls", path, nil)                                              // still empty — suppressed
+
+	calls := fake.snapshot()
+	require.Len(t, calls, 2, "one non-empty publish + one clear; the second clear is suppressed")
+
+	// The clear delivery carries an empty diagnostics list.
+	clear, _ := calls[1].params["diagnostics"].([]map[string]any)
+	assert.Empty(t, clear, "clear broadcast carries no diagnostics")
+
+	// The key is pruned, so lastHash doesn't grow one entry per touched file.
+	b.mu.RLock()
+	_, present := b.lastHash[path]
+	b.mu.RUnlock()
+	assert.False(t, present, "lastHash key removed after clear")
+}
+
+// TestDiagnosticsBroadcaster_ClearWithoutPriorSuppressed — an empty
+// publish for a file that never had diagnostics is not broadcast (no
+// spurious clear) and leaves no lastHash entry.
+func TestDiagnosticsBroadcaster_ClearWithoutPriorSuppressed(t *testing.T) {
+	fake := &fakeSpecificSender{}
+	b := newDiagnosticsBroadcaster(fake, noSnapshot, zap.NewNop())
+	b.subscribe("session-A", subscribeOptions{})
+
+	b.publish("gopls", "/work/clean.go", nil)
+
+	assert.Empty(t, fake.snapshot(), "no prior diagnostics — clear suppressed")
+	b.mu.RLock()
+	_, present := b.lastHash["/work/clean.go"]
+	b.mu.RUnlock()
+	assert.False(t, present)
+}
+
 // TestDiagnosticsBroadcaster_PayloadShape — payload carries the
 // expected fields and the wire-form diagnostics list.
 func TestDiagnosticsBroadcaster_PayloadShape(t *testing.T) {

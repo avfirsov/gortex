@@ -102,11 +102,26 @@ func (b *diagnosticsBroadcaster) publish(specName, absPath string, diags []lsp.D
 	hash := hashDiagnostics(diags)
 
 	b.mu.Lock()
-	if b.lastHash[absPath] == hash {
-		b.mu.Unlock()
-		return
+	prev, had := b.lastHash[absPath]
+	if len(diags) == 0 {
+		// A cleared file. Suppress unless it was previously non-empty:
+		// a file that never had (or already dropped) diagnostics must
+		// not emit a spurious clear. Drop the key on the clear so
+		// lastHash only ever holds live non-empty fingerprints — that,
+		// not an "empty" entry accumulated per file the server ever
+		// touched, is what keeps the map bounded.
+		if !had {
+			b.mu.Unlock()
+			return
+		}
+		delete(b.lastHash, absPath)
+	} else {
+		if prev == hash {
+			b.mu.Unlock()
+			return
+		}
+		b.lastHash[absPath] = hash
 	}
-	b.lastHash[absPath] = hash
 	subs := make([]*diagnosticsSubscriber, 0, len(b.subscribers))
 	for _, s := range b.subscribers {
 		subs = append(subs, s)
@@ -114,8 +129,8 @@ func (b *diagnosticsBroadcaster) publish(specName, absPath string, diags []lsp.D
 	b.mu.Unlock()
 
 	if len(subs) == 0 {
-		// Hash already updated above — late subscribers won't see a
-		// stale replay of this payload during their initial snapshot.
+		// Hash state already updated above — late subscribers won't see
+		// a stale replay of this payload during their initial snapshot.
 		return
 	}
 
