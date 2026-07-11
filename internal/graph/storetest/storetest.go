@@ -68,6 +68,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
 	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
 	t.Run("FnValuePlaceholderEdges", func(t *testing.T) { testFnValuePlaceholderEdges(t, factory) })
+	t.Run("LightEdgeScanner", func(t *testing.T) { testLightEdgeScanner(t, factory) })
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
@@ -1000,7 +1001,7 @@ func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
 		t.Skip("backend does not implement FnValuePlaceholderScanner")
 	}
 	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
-	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))          // real reference — not a placeholder
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))         // real reference — not a placeholder
 	s.AddEdge(mkEdge("a", "unresolved::Foo", graph.EdgeCalls)) // unresolved, but not fn-value
 	s.AddEdge(mkEdge("a", "resolved", graph.EdgeReferences))   // resolved
 	ph1 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
@@ -1025,6 +1026,59 @@ func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
 	}
 	if !seen["gortex::unresolved::fnvalue::handler"] {
 		t.Fatalf("FnValuePlaceholderEdges missed the multi-repo COPY-rewrite form; got %v", seen)
+	}
+}
+
+// testLightEdgeScanner pins graph.LightEdgeScanner: the kind filter must scope
+// to the requested kinds (empty means all), and every promoted field must
+// survive the meta-less scan intact and equal the values written. (The
+// backend-specific Meta-is-nil guarantee is asserted where it holds — the disk
+// backend's own test — since the in-memory backend legitimately keeps Meta.)
+func testLightEdgeScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.LightEdgeScanner)
+	if !ok {
+		t.Skip("backend does not implement LightEdgeScanner")
+	}
+	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
+	s.AddNode(mkNode("b", "B", "x.go", graph.KindFunction))
+	call := mkEdge("a", "b", graph.EdgeCalls)
+	call.Line, call.Confidence, call.Origin, call.Tier, call.CrossRepo = 11, 0.75, graph.OriginLSPResolved, "lsp", true
+	call.Meta = map[string]any{"via": "direct", "blob_only": "x"}
+	ref := mkEdge("a", "b", graph.EdgeReferences)
+	ref.Line = 22
+	imp := mkEdge("a", "b", graph.EdgeImports)
+	imp.Line = 33
+	s.AddEdge(call)
+	s.AddEdge(ref)
+	s.AddEdge(imp)
+
+	// Kind filter: calls + references, imports excluded.
+	got := sc.AllEdgesLight(graph.EdgeCalls, graph.EdgeReferences)
+	kinds := map[graph.EdgeKind]int{}
+	var lightCall *graph.Edge
+	for _, e := range got {
+		kinds[e.Kind]++
+		if e.Kind == graph.EdgeCalls {
+			lightCall = e
+		}
+	}
+	if len(got) != 2 || kinds[graph.EdgeCalls] != 1 || kinds[graph.EdgeReferences] != 1 || kinds[graph.EdgeImports] != 0 {
+		t.Fatalf("AllEdgesLight(calls,references) kind filter wrong: got %d edges %v, want {calls:1, references:1}", len(got), kinds)
+	}
+	// Empty kinds means every edge.
+	if all := sc.AllEdgesLight(); len(all) != 3 {
+		t.Fatalf("AllEdgesLight() with no kinds = %d, want 3 (all edges)", len(all))
+	}
+	// Promoted fields survive the meta-less scan.
+	if lightCall == nil {
+		t.Fatal("AllEdgesLight did not return the call edge")
+	}
+	if lightCall.Line != 11 || lightCall.Confidence != 0.75 || lightCall.Origin != graph.OriginLSPResolved ||
+		lightCall.Tier != "lsp" || !lightCall.CrossRepo {
+		t.Fatalf("AllEdgesLight dropped/altered a promoted field: line=%d conf=%v origin=%q tier=%q crossRepo=%v",
+			lightCall.Line, lightCall.Confidence, lightCall.Origin, lightCall.Tier, lightCall.CrossRepo)
 	}
 }
 

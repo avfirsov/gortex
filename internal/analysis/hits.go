@@ -85,7 +85,9 @@ func ComputeHITS(g graph.Store) *HITSResult {
 	// ranking identical to the unweighted computation.
 	outLinks := make(map[string][]weightedLink)
 	inLinks := make(map[string][]weightedLink)
-	for _, e := range g.AllEdges() {
+	// Meta-less kind-scoped scan (see LightEdgeScanner): only e.Kind, endpoints,
+	// and graph.ProvenanceWeight are read here.
+	for _, e := range graph.EdgesForKindsLight(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}

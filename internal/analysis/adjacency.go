@@ -101,7 +101,9 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 		w  float64
 	}
 	adj := make([][]link, len(ids))
-	for _, e := range g.AllEdges() {
+	// Meta-less kind-scoped scan (see LightEdgeScanner): the CSR build reads only
+	// e.Kind, endpoints, and graph.ProvenanceWeight.
+	for _, e := range graph.EdgesForKindsLight(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e == nil {
 			continue
 		}

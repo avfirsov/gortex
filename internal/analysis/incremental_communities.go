@@ -78,7 +78,11 @@ type leidenGraph struct {
 // partition.
 func buildLeidenGraph(g graph.Store) *leidenGraph {
 	nodes := g.AllNodes()
-	edges := g.AllEdges()
+	// Meta-less scan (see LightEdgeScanner): the Leiden weighting keys only off
+	// e.Kind (via edgeWeight) and endpoints. No kind argument — edgeWeight scores
+	// ~14 kinds, so the kind set is pushed down here rather than duplicated at the
+	// call, and a meta-less all-kinds scan still drops the per-edge blob decode.
+	edges := graph.EdgesForKindsLight(g)
 
 	symbolNodes := make(map[string]bool, len(nodes))
 	for _, n := range nodes {

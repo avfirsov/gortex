@@ -90,7 +90,11 @@ func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
 		kset[k] = struct{}{}
 	}
 	var out []graph.CrossRepoCandidateRow
-	for _, e := range g.AllEdges() {
+	// Meta-less kind-scoped scan (see LightEdgeScanner): this fallback only runs
+	// for a store without the CrossRepoCandidates capability, and reads just
+	// e.Kind and endpoints — the emitted row propagates e but its consumer
+	// (DetectCrossRepoEdges) touches only promoted fields, never Meta.
+	for _, e := range graph.EdgesForKindsLight(g, baseKinds...) {
 		if e == nil {
 			continue
 		}

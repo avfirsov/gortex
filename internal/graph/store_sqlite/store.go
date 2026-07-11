@@ -541,7 +541,9 @@ func (s *Store) prepare() error {
 		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	prep(&s.stmtOutEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE from_id = ?`)
-	const edgeColsLight = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo`
+	// edgeColsLight is the package-level meta-less projection (store_light_edges.go),
+	// shared with AllEdgesLight so this prepared statement and the whole-graph scan
+	// can never drift apart.
 	prep(&s.stmtOutEdgesLight,
 		`SELECT `+edgeColsLight+` FROM edges WHERE from_id = ?`)
 	prep(&s.stmtInEdges,

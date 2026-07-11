@@ -39,7 +39,9 @@ type ProcessResult struct {
 // DiscoverProcesses finds execution flows by identifying entry points and tracing forward.
 func DiscoverProcesses(g graph.Store) *ProcessResult {
 	nodes := g.AllNodes()
-	edges := g.AllEdges()
+	// Meta-less call-edge scan (see LightEdgeScanner): process discovery reads only
+	// endpoints off each call edge.
+	edges := graph.EdgesForKindsLight(g, graph.EdgeCalls)
 
 	// Build call graph adjacency (forward only)
 	callees := make(map[string][]string) // who does this function call?

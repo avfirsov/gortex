@@ -69,7 +69,10 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 	// identical to the unweighted PageRank.
 	outWeight := make(map[string]float64, n)
 	inLinks := make(map[string][]weightedLink)
-	for _, e := range g.AllEdges() {
+	// Meta-less kind-scoped scan: this pass reads only e.Kind, endpoints, and
+	// graph.ProvenanceWeight — never arbitrary Meta — so it must not pay to decode
+	// every edge's meta blob on a warm-restart whole-graph run.
+	for _, e := range graph.EdgesForKindsLight(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
