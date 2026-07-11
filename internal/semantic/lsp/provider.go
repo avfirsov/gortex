@@ -62,10 +62,17 @@ type Provider struct {
 	client *Client
 
 	// sourceCache holds file contents read by openDocument so the
-	// per-symbol column-resolution lookups don't reread the file
-	// for every hover / references / implementation query. Keyed
-	// by absolute path. Eviction is not implemented — the cache
-	// lives only for the duration of one Enrich pass.
+	// per-symbol column-resolution lookups don't reread the file for
+	// every hover / references / implementation query. Keyed by
+	// absolute path. closeDocument drops a file's entry and
+	// resetForReconnect clears the whole map, so a long-lived
+	// interactive session — where hover / definition traffic keeps the
+	// provider's lastUsed fresh and the router never reaps it — does
+	// not retain every navigated file's bytes for the daemon's
+	// lifetime. Accessed lock-free (see getSource, which tolerates a
+	// miss by falling back to col=0): the interactive
+	// open→lookup→close sequence is serialized per file, so it needs
+	// no docMu.
 	sourceCache map[string][]byte
 
 	// docMu guards docVersions / openDocs / lastDiag so concurrent
@@ -1674,6 +1681,12 @@ func (p *Provider) resetForReconnect() {
 	p.openDocs = map[string]bool{}
 	p.lastDiag = map[string][]Diagnostic{}
 	p.docMu.Unlock()
+	// sourceCache is the unsynchronised interactive-navigation cache
+	// (written lock-free by openDocument); drop it on reconnect so a
+	// long-lived provider doesn't carry the dead session's file bytes.
+	// nil is the freed state — openDocument lazily re-creates it and
+	// getSource nil-checks before reading.
+	p.sourceCache = nil
 }
 
 // dialOrSpawn builds the LSP client according to the provider's spec.
@@ -2470,6 +2483,11 @@ func (p *Provider) closeDocument(absPath string) error {
 	delete(p.openDocs, absPath)
 	delete(p.docVersions, absPath)
 	p.docMu.Unlock()
+	// Drop this file's cached bytes too. getSource tolerates a miss
+	// (falls back to col=0) and the next openDocument repopulates, so
+	// without this an interactive session that navigates thousands of
+	// files would pin every one's contents until the daemon exits.
+	delete(p.sourceCache, absPath)
 	return p.client.Notify("textDocument/didClose", DidCloseTextDocumentParams{
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 	})
