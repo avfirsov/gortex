@@ -1,12 +1,18 @@
 package languages
 
 import (
-	"strconv"
-
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
+
+// cFnAddressMaxPerFile fuses the per-file candidate count. A generated parser
+// (a tree-sitter lexer, a bytecode dispatch table) presents tens of thousands
+// of distinct value-position identifiers; unbounded, each becomes a
+// speculative placeholder edge and the set explodes. A hand-written dispatch
+// table sits far below this cap, so the fuse trips only on machine-generated
+// input. Candidates are taken in walk order, so the cut is deterministic.
+const cFnAddressMaxPerFile = 1024
 
 // C cross-file function-address references.
 //
@@ -26,10 +32,19 @@ import (
 // shared pass it attributes a file-scope reference (a command table lives
 // outside any function) to the file node, so a table entry becomes a usage.
 //
-// Flood control: value-position-only, plus dropping any name the file declares
-// (functions handled by the gated pass, variables / constants / types) or that
-// is a parameter / local. What survives is the small set of free identifiers a
-// gate lookup can turn into a real cross-TU function edge.
+// Flood control matters most on generated C (a tree-sitter lexer, a bytecode
+// dispatch table), where naive capture explodes. Bounds keep the pass to the
+// small set of free identifiers a gate lookup can turn into a real cross-TU
+// function edge:
+//
+//   - value-position-only, and never a name the file declares (functions go to
+//     the gated pass; variables / constants / types resolve locally) or a
+//     parameter / local / uninitialised declaration / in-file enum member;
+//   - one candidate per (enclosing symbol or file, name): a function address
+//     binds by name repo-wide, so the same free identifier on N lines of a
+//     generated ==/!= lexer is one reference, not N;
+//   - a per-file fuse (cFnAddressMaxPerFile) bounds a pathological generated
+//     file; a hand-written dispatch table sits far below it.
 func captureCFnAddressRefs(result *parser.ExtractionResult, root *sitter.Node, filePath, fileID string, src []byte) {
 	if root == nil || result == nil {
 		return
@@ -53,6 +68,9 @@ func captureCFnAddressRefs(result *parser.ExtractionResult, root *sitter.Node, f
 	seen := map[string]bool{}
 	var cands []FnValueCandidate
 	walkNodes(root, func(n *sitter.Node) {
+		if len(cands) >= cFnAddressMaxPerFile {
+			return // per-file fuse: bound a pathological generated file
+		}
 		if n.Type() != "identifier" {
 			return
 		}
@@ -81,7 +99,12 @@ func captureCFnAddressRefs(result *parser.ExtractionResult, root *sitter.Node, f
 		if from == "" {
 			from = fileID // file-scope reference (command / dispatch table)
 		}
-		key := from + "\x00" + name + "\x00" + strconv.Itoa(line)
+		// One candidate per (enclosing symbol or file, name): a function
+		// address binds by name repo-wide, so the same free identifier on N
+		// lines of a generated ==/!= lexer collapses to a single reference.
+		// First occurrence by walk order wins; mirrors the shared
+		// captureFnValueCandidates key shape.
+		key := from + "\x00" + name
 		if seen[key] {
 			return
 		}
@@ -149,10 +172,24 @@ func isFieldChild(p *sitter.Node, field string, n *sitter.Node) bool {
 	return c != nil && c.StartByte() == n.StartByte() && c.EndByte() == n.EndByte()
 }
 
-// cCollectLocalNames gathers parameter and initialised-local declarator names
-// across the file. A function address is never a parameter or local, so these
-// names are dropped from the cross-file candidate set — the dominant flood
-// source (every call passes locals / params by value).
+// cCollectLocalNames gathers the file's parameter, local, uninitialised-
+// declaration, and in-file enum-member names — every declared name that can
+// never denote a cross-TU function address and so must be dropped from the
+// candidate set. It spans four declaration shapes:
+//
+//   - parameters and initialised locals (`f(int x)`, `Handler h = g`) — the
+//     dominant flood source, since a call passes locals / params by value into
+//     the very positions this pass scans;
+//   - uninitialised declarations (`int32_t lookahead;`) — a generated lexer
+//     compares such a local on ==/!= across tens of thousands of lines, and the
+//     identifier is only ever that local, never a function address;
+//   - in-file enum members (`enum { sym_a, sym_b }`) — a generated parser
+//     declares its token / symbol enum in-file, then floods designated-
+//     initializer tables with the members, none of which is a function.
+//
+// A same-file function prototype is deliberately NOT collected: a declaration
+// whose declarator is (or wraps) a function_declarator names a function, left
+// bindable for the resolver gate, not shadowed here.
 func cCollectLocalNames(root *sitter.Node, src []byte) map[string]bool {
 	out := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
@@ -167,9 +204,54 @@ func cCollectLocalNames(root *sitter.Node, src []byte) map[string]bool {
 			if name := cDeclName(n.ChildByFieldName("declarator"), src); name != "" {
 				out[name] = true
 			}
+		case "declaration":
+			// An uninitialised declaration's declarators sit directly under it
+			// (an initialised one is wrapped in init_declarator, handled above).
+			// A declaration may carry several (`int a, *b, c[3];`), so every
+			// declarator-field child is unwrapped to its variable name.
+			for i := 0; i < int(n.ChildCount()); i++ {
+				if n.FieldNameForChild(i) != "declarator" {
+					continue
+				}
+				if name := cUninitDeclName(n.Child(i), src); name != "" {
+					out[name] = true
+				}
+			}
+		case "enumerator":
+			if d := n.ChildByFieldName("name"); d != nil {
+				if name := d.Content(src); name != "" {
+					out[name] = true
+				}
+			}
 		}
 	})
 	return out
+}
+
+// cUninitDeclName unwraps the pointer / array / parenthesized wrappers of an
+// uninitialised declaration's declarator to its variable name. It returns "" for
+// a function_declarator — a prototype names a function, which must stay a
+// bindable candidate rather than a shadowing local — and for any other
+// unexpected shape. Unlike cDeclName it never descends through a
+// function_declarator, so `int *foo(int);` (a pointer-returning prototype)
+// contributes no name.
+func cUninitDeclName(decl *sitter.Node, src []byte) string {
+	for decl != nil {
+		switch decl.Type() {
+		case "identifier", "field_identifier":
+			return decl.Content(src)
+		case "pointer_declarator", "array_declarator":
+			decl = decl.ChildByFieldName("declarator")
+		case "parenthesized_declarator":
+			if decl.NamedChildCount() == 0 {
+				return ""
+			}
+			decl = decl.NamedChild(0)
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // isCFnAddressNonTarget reports whether a name is a C literal / keyword /

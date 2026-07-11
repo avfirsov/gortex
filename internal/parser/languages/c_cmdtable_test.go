@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -115,4 +117,138 @@ func TestCExtractor_CommandTableErrorRecovery(t *testing.T) {
 	}
 	assert.True(t, cands["getCommand"], "the cleanly-parsed row before the error survives")
 	assert.True(t, cands["strlenCommand"], "the handler still in an arg list after the missing paren survives recovery")
+}
+
+// TestCExtractor_LexerLookaheadFilteredAndDeduped pins the generated-lexer flood
+// shape. An uninitialised local (`int32_t lookahead;`) compared on ==/!= across
+// many lines is a local, never a function address, so it yields no candidate; a
+// genuinely-undeclared free name compared the same way collapses to exactly one
+// candidate regardless of how many lines mention it (the per-name dedup).
+func TestCExtractor_LexerLookaheadFilteredAndDeduped(t *testing.T) {
+	src := "" +
+		"void lexScan(void) {\n" + // line 1
+		"  int32_t lookahead;\n" + // line 2: uninitialised local
+		"  if (lookahead == 65) return;\n" + // 3
+		"  if (lookahead != 66) return;\n" + // 4
+		"  if (lookahead == 67) return;\n" + // 5
+		"  if (externScanHook == 68) return;\n" + // 6: undeclared free name
+		"  if (externScanHook != 69) return;\n" + // 7
+		"  if (externScanHook == 70) return;\n" + // 8
+		"}\n"
+	r, err := NewCExtractor().Extract("lexer.c", []byte(src))
+	require.NoError(t, err)
+
+	counts := map[string]int{}
+	for _, e := range r.Edges {
+		if e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "callback_candidate" {
+			continue
+		}
+		if name, _ := e.Meta["fn_value_name"].(string); name != "" {
+			counts[name]++
+		}
+	}
+	assert.Zero(t, counts["lookahead"], "an uninitialised local compared on ==/!= is never a function-address candidate")
+	assert.Equal(t, 1, counts["externScanHook"], "an undeclared free name on N comparison lines collapses to one candidate")
+}
+
+// TestCExtractor_EnumMembersNotCaptured pins the generated-parser enum flood: an
+// in-file anonymous enum's members, referenced from a designated-initializer
+// action table, are compile-time constants — never function addresses — so none
+// becomes a candidate, while a genuine cross-TU handler in the same table does.
+func TestCExtractor_EnumMembersNotCaptured(t *testing.T) {
+	src := "" +
+		"enum { sym_alpha, sym_beta, sym_gamma };\n" + // line 1
+		"void *actionTable[] = {\n" + // line 2
+		"  [0] = sym_alpha,\n" + // 3
+		"  [1] = sym_beta,\n" + // 4
+		"  [2] = sym_gamma,\n" + // 5
+		"  [3] = reduceAction,\n" + // 6: a real cross-TU handler
+		"};\n"
+	cands := cValueRefCandidates(t, "parser.c", src)
+
+	assert.NotContains(t, cands, "sym_alpha", "an in-file enum member is not a function reference")
+	assert.NotContains(t, cands, "sym_beta", "an in-file enum member is not a function reference")
+	assert.NotContains(t, cands, "sym_gamma", "an in-file enum member is not a function reference")
+	assert.Contains(t, cands, "reduceAction", "a genuine handler in the same table is still captured")
+}
+
+// TestCExtractor_PerFileCandidateFuse pins the per-file fuse: a pathological
+// generated file with more distinct value-position handlers than the cap emits
+// exactly the cap — the bound that stops a generated dispatch table from
+// exploding the placeholder set.
+func TestCExtractor_PerFileCandidateFuse(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("void *bigDispatch[] = {\n")
+	for i := 0; i < cFnAddressMaxPerFile+200; i++ {
+		fmt.Fprintf(&b, "  handlerFn%05d,\n", i)
+	}
+	b.WriteString("};\n")
+
+	r, err := NewCExtractor().Extract("generated.c", []byte(b.String()))
+	require.NoError(t, err)
+
+	n := 0
+	for _, e := range r.Edges {
+		if e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v == "callback_candidate" {
+			n++
+		}
+	}
+	assert.Equal(t, cFnAddressMaxPerFile, n, "the per-file fuse caps emitted candidates at the const bound")
+}
+
+// TestCExtractor_DispatchTableCandidateFields pins the candidate metadata a
+// realistic cross-TU dispatch table produces: each handler is captured exactly
+// once (dedup), marked ungated so the resolver binds it cross-translation-unit,
+// tagged with the capturing grammar, and carries no address-of form (a plain
+// value slot).
+func TestCExtractor_DispatchTableCandidateFields(t *testing.T) {
+	src := "" +
+		"struct cmd table[] = {\n" + // line 1
+		"{ \"get\", getCommand, 2 },\n" + // 2
+		"{ \"set\", setCommand, 3 },\n" + // 3
+		"};\n"
+	r, err := NewCExtractor().Extract("dispatch.c", []byte(src))
+	require.NoError(t, err)
+
+	type capture struct {
+		count   int
+		ungated bool
+		form    string
+		lang    string
+	}
+	got := map[string]capture{}
+	for _, e := range r.Edges {
+		if e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != "callback_candidate" {
+			continue
+		}
+		name, _ := e.Meta["fn_value_name"].(string)
+		if name == "" {
+			continue
+		}
+		c := got[name]
+		c.count++
+		if u, _ := e.Meta["fn_value_ungated"].(bool); u {
+			c.ungated = true
+		}
+		c.form, _ = e.Meta["fn_ref_form"].(string)
+		c.lang, _ = e.Meta["fn_ref_lang"].(string)
+		got[name] = c
+	}
+
+	for _, name := range []string{"getCommand", "setCommand"} {
+		c := got[name]
+		assert.Equal(t, 1, c.count, "%s is captured exactly once", name)
+		assert.True(t, c.ungated, "%s is ungated for cross-TU binding", name)
+		assert.Equal(t, "", c.form, "%s sits in a plain value position (no address-of form)", name)
+		assert.Equal(t, "c", c.lang, "%s is tagged with the capturing grammar", name)
+	}
 }
