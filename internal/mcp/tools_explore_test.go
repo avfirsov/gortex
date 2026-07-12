@@ -311,6 +311,46 @@ func TestExploreHelpers(t *testing.T) {
 			t.Errorf("concept recall terms retained generic %q: %v", noise, got)
 		}
 	}
+	if hasExploreExpansionTerms("case insensitive alternation", []string{"case", "alternation"}) {
+		t.Fatal("subset concept bag should not trigger duplicate retrieval")
+	}
+	if hasExploreExpansionTerms("case insensitive alternations", []string{"case", "alternation"}) {
+		t.Fatal("FTS-equivalent concept root should not trigger duplicate retrieval")
+	}
+	if !hasExploreExpansionTerms("case insensitive alternation", []string{"case", "prefix"}) {
+		t.Fatal("genuinely new concept term should trigger expansion retrieval")
+	}
+
+	semantic := &rerank.Candidate{Node: &graph.Node{ID: "semantic"}, TextRank: -1, VectorRank: 0}
+	textDuplicate := &rerank.Candidate{Node: &graph.Node{ID: "semantic"}, TextRank: 2, VectorRank: -1}
+	textOnly := &rerank.Candidate{Node: &graph.Node{ID: "text"}, TextRank: 0, VectorRank: -1}
+	merged := mergeExploreCandidates([]*rerank.Candidate{semantic}, []*rerank.Candidate{textDuplicate, textOnly}, 80)
+	if len(merged) != 2 || merged[0].Node.ID != "semantic" || merged[0].VectorRank != 0 || merged[0].TextRank != 82 {
+		t.Fatalf("candidate merge lost hybrid ranks or expansion provenance: %#v", merged)
+	}
+	if semantic.TextRank != -1 {
+		t.Fatalf("candidate merge mutated its primary input: %#v", semantic)
+	}
+
+	primaryText := &rerank.Candidate{Node: &graph.Node{ID: "primary"}, TextRank: 0, VectorRank: -1}
+	primaryMerged := mergeExploreCandidates([]*rerank.Candidate{primaryText}, []*rerank.Candidate{{Node: primaryText.Node, TextRank: 0, VectorRank: -1}}, 80)
+	if primaryMerged[0].TextRank != 0 {
+		t.Fatalf("expansion rank displaced primary query rank: %#v", primaryMerged[0])
+	}
+
+	window := make([]*rerank.Candidate, 0, 11)
+	for i := 0; i < 10; i++ {
+		window = append(window, &rerank.Candidate{Node: &graph.Node{ID: fmt.Sprintf("text-%d", i)}, TextRank: i, VectorRank: -1})
+	}
+	window = append(window, &rerank.Candidate{Node: &graph.Node{ID: "vector-only"}, TextRank: -1, VectorRank: 0})
+	bounded := limitExploreCandidates(window, 5)
+	foundVector := false
+	for _, candidate := range bounded {
+		foundVector = foundVector || candidate.Node.ID == "vector-only"
+	}
+	if !foundVector {
+		t.Fatalf("bounded candidate union dropped top vector-only evidence: %#v", bounded)
+	}
 }
 
 // TestFacadeExploreDemotesRepeatedDataLeafNames reproduces the reported

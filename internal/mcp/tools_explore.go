@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -422,19 +423,27 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	fetch := exploreCandidateFetchLimit(maxSymbols, queryClass)
 	var ranked []*rerank.Candidate
 	if queryClass == rerank.QueryClassConcept {
-		// Whole-query retrieval can let one repeated phrase own the candidate
-		// pool. Fetch the primary query and a stopword-filtered concept bag with
-		// inner reranking disabled, then run the session-aware reranker exactly
-		// once over their union. This adds one bounded backend recall call, not a
-		// duplicate full ranked search, and uses no corpus-specific vocabulary.
-		nodes, _ := fetchAndMergeBM25Timed(eng, searchQuery, exploreConceptRecallTerms(searchQuery), fetch, opts, nil)
-		scoped := opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0
-		for i, n := range nodes {
-			if n == nil || (scoped && !opts.ScopeAllows(n)) {
-				continue
-			}
-			ranked = append(ranked, &rerank.Candidate{Node: n, TextRank: i, VectorRank: -1})
+		// Gather the hybrid primary channel without truncating away vector-only
+		// candidates, add one text-only concept bag, then run the session-aware
+		// reranker exactly once over the union. Channel ranks survive the merge,
+		// so semantic intent remains useful outside signature-rich languages.
+		primaryOpts := opts
+		primaryOpts.SkipInnerRerank = true
+		ranked = eng.GatherSymbolCandidates(searchQuery, fetch, primaryOpts, rctx)
+		terms := exploreConceptRecallTerms(searchQuery)
+		if hasExploreExpansionTerms(searchQuery, terms) {
+			expansionOpts := opts
+			expansionOpts.SkipInnerRerank = true
+			expansionOpts.SkipVectorChannel = true
+			expansionOpts.SkipExactNameSplice = true
+			expanded := eng.GatherSymbolCandidates(strings.Join(terms, " "), fetch, expansionOpts, rctx)
+			ranked = mergeExploreCandidates(ranked, expanded, fetch)
 		}
+		// Gathering deliberately over-fetches each retrieval channel so scope
+		// filtering cannot erase relevant results. Bound the union before the
+		// graph-aware reranker: its centrality and edge hydration costs scale
+		// with every candidate, not just the final response size.
+		ranked = limitExploreCandidates(ranked, fetch*2)
 		if pipeline := eng.Rerank(); pipeline != nil {
 			ranked = pipeline.Rerank(searchQuery, ranked, rctx)
 		}
@@ -1127,6 +1136,99 @@ func inlineLeadClause(task string) string {
 		return ""
 	}
 	return lead
+}
+
+// mergeExploreCandidates unions retrieval passes by symbol ID without mutating
+// either input. Expansion text ranks are offset so a reduced concept bag can
+// add recall without claiming the same authority as the original query.
+func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRankOffset int) []*rerank.Candidate {
+	if expansionRankOffset < 0 {
+		expansionRankOffset = 0
+	}
+	byID := make(map[string]*rerank.Candidate, len(primary)+len(expanded))
+	out := make([]*rerank.Candidate, 0, len(primary)+len(expanded))
+	add := func(candidate *rerank.Candidate, expansion bool) {
+		if candidate == nil || candidate.Node == nil {
+			return
+		}
+		clone := *candidate
+		if expansion && clone.TextRank >= 0 {
+			clone.TextRank += expansionRankOffset
+		}
+		if current, ok := byID[clone.Node.ID]; ok {
+			// A primary lexical rank always wins. Expansion may add a weaker
+			// lexical signal to a semantic-only primary candidate.
+			if clone.TextRank >= 0 && current.TextRank < 0 {
+				current.TextRank = clone.TextRank
+			} else if !expansion && clone.TextRank >= 0 && clone.TextRank < current.TextRank {
+				current.TextRank = clone.TextRank
+			}
+			if clone.VectorRank >= 0 && (current.VectorRank < 0 || clone.VectorRank < current.VectorRank) {
+				current.VectorRank = clone.VectorRank
+			}
+			return
+		}
+		byID[clone.Node.ID] = &clone
+		out = append(out, &clone)
+	}
+	for _, candidate := range primary {
+		add(candidate, false)
+	}
+	for _, candidate := range expanded {
+		add(candidate, true)
+	}
+	return out
+}
+
+// hasExploreExpansionTerms reports whether concept normalization introduced a
+// genuinely new discriminative term. A subset/equivalent bag would repeat the
+// same FTS and materialization work without adding a retrieval channel.
+func hasExploreExpansionTerms(query string, terms []string) bool {
+	if len(terms) == 0 {
+		return false
+	}
+	raw := rerank.Tokenize(query)
+	base := make(map[string]struct{}, len(raw)*2)
+	for _, token := range raw {
+		base[token] = struct{}{}
+		base[exploreTerminalTermRoot(token)] = struct{}{}
+	}
+	for _, token := range search.NormalizeFTSTokens(raw) {
+		base[token] = struct{}{}
+	}
+	for _, term := range search.NormalizeFTSTokens(terms) {
+		if _, ok := base[term]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// limitExploreCandidates cheaply fuses text and vector ranks before the full
+// graph-aware reranker. It keeps vector-only evidence while bounding centrality
+// and edge-hydration work to a predictable multiple of the response size.
+func limitExploreCandidates(candidates []*rerank.Candidate, limit int) []*rerank.Candidate {
+	if limit <= 0 || len(candidates) <= limit {
+		return candidates
+	}
+	bounded := append([]*rerank.Candidate(nil), candidates...)
+	rrf := func(candidate *rerank.Candidate) float64 {
+		if candidate == nil || candidate.Node == nil {
+			return -1
+		}
+		score := 0.0
+		if candidate.TextRank >= 0 {
+			score += 1 / (60 + float64(candidate.TextRank+1))
+		}
+		if candidate.VectorRank >= 0 {
+			score += 1 / (60 + float64(candidate.VectorRank+1))
+		}
+		return score
+	}
+	sort.SliceStable(bounded, func(i, j int) bool {
+		return rrf(bounded[i]) > rrf(bounded[j])
+	})
+	return bounded[:limit]
 }
 
 // exploreConceptRecallTerms preserves the query's discriminative concepts in

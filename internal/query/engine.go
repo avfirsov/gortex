@@ -472,13 +472,11 @@ func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 	return e.SearchSymbolsScoped(query, limit, QueryOptions{})
 }
 
-// SearchSymbolsRanked is SearchSymbolsScoped that returns the full
-// rerank.Candidate slice instead of just the nodes — callers can read
-// the per-signal contributions and the final score off each candidate.
-// rctx is optional session context (frecency / combo / feedback /
-// repo + project locality); pass nil to score with structural signals
-// only.
-func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+// GatherSymbolCandidates retrieves the hybrid BM25/vector candidate union with
+// channel ranks and scope preserved, but does not rerank or truncate the union.
+// Fan-out callers merge multiple retrieval channels through this method and run
+// one final session-aware rerank over the combined slice.
+func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -490,11 +488,6 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		}
 	}
 
-	// Engine-side rctx wins over the opts-piggybacked one (the explicit
-	// arg is the load-bearing path for callers that build the context
-	// inline). Callers (the MCP search_symbols handler) that build the
-	// rctx upstream and want both BM25 calls to share the same edge-
-	// cache seeding pass it through opts.RerankContext instead.
 	gatherCtx := rctx
 	if gatherCtx == nil {
 		gatherCtx = opts.RerankContext
@@ -526,12 +519,21 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		cands = kept
 	}
 
-	// Cross-repo RRF: when the candidate set spans repositories, the
-	// per-channel ranks are reassigned repo by repo so each repo's
-	// strongest hits compete on even footing. The rerank's RRF-kernel
-	// bm25 and semantic signals then fuse across repos rather than
-	// ranking within one merged corpus. No-op for a single-repo set.
 	crossRepoRerank(cands)
+	return cands
+}
+
+// SearchSymbolsRanked is SearchSymbolsScoped that returns the full
+// rerank.Candidate slice instead of just the nodes — callers can read
+// the per-signal contributions and the final score off each candidate.
+// rctx is optional session context (frecency / combo / feedback /
+// repo + project locality); pass nil to score with structural signals
+// only.
+func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	if limit <= 0 {
+		limit = 20
+	}
+	cands := e.GatherSymbolCandidates(query, limit, opts, rctx)
 
 	if e.rerank != nil && !opts.SkipInnerRerank {
 		ctx := rctx
