@@ -1,8 +1,10 @@
 package analysis
 
 import (
+	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/reach"
@@ -45,6 +47,10 @@ type ImpactResult struct {
 	// interface site the resolver could not bind: the true affected count is
 	// then a floor (">=TotalAffected, could be more"), not an exact number.
 	LowerBound bool `json:"lower_bound,omitempty"`
+	// Truncated means traversal or response fan-out hit a safety budget.
+	// ByDepth and TotalAffected are then a lower bound, never proof that the
+	// omitted portion is empty.
+	Truncated bool `json:"truncated,omitempty"`
 	// Boundaries names the unresolved/dispatch sites that make the count a
 	// floor, so an agent can act on them (e.g. find_implementations on the
 	// interface). Omitted when empty.
@@ -66,10 +72,19 @@ type ImpactResult struct {
 // semantics never diverge. Missing or interrupted symbol records are
 // recomputed and atomically published by reach.Lookup.
 func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return AnalyzeImpactContext(ctx, g, symbolIDs, communities, processes)
+}
+
+// AnalyzeImpactContext is the cancellable form used by interactive callers.
+// The compatibility wrapper above supplies a strict deadline so even callers
+// that have not yet propagated their request context cannot hang on a hub.
+func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
 	result := &ImpactResult{
 		ByDepth: make(map[int][]ImpactEntry),
 	}
-	if !fillImpactFromReach(g, result, symbolIDs) {
+	if !fillImpactFromReach(ctx, g, result, symbolIDs) {
 		fillImpactLive(g, result, symbolIDs)
 	}
 
@@ -91,6 +106,7 @@ func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResu
 	const maxPerTier = 50
 	for depth := 1; depth <= 3; depth++ {
 		if len(result.ByDepth[depth]) > maxPerTier {
+			result.Truncated = true
 			result.ByDepth[depth] = result.ByDepth[depth][:maxPerTier]
 		}
 	}
@@ -154,14 +170,23 @@ func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResu
 	// that implements/overrides an interface may be reached through dynamic
 	// dispatch the resolver could not attribute — the count is then a floor.
 	result.Boundaries = graph.CallerBoundaries(g, symbolIDs, 0)
-	result.LowerBound = graph.LowerBoundCaveat(result.Boundaries)
+	result.LowerBound = result.Truncated || graph.LowerBoundCaveat(result.Boundaries)
+	// A partial traversal is never a LOW-risk verdict. MEDIUM is the minimum
+	// conservative posture; observed direct/transitive fan-out can still raise
+	// it to HIGH or CRITICAL through assessRisk above.
+	if result.LowerBound && result.Risk == RiskLow {
+		result.Risk = RiskMedium
+	}
 
 	// Summary
 	result.Summary = fmt.Sprintf(
 		"%d direct dependents, %d transitively affected, %d test files, risk: %s",
 		d1, result.TotalAffected, len(result.TestFiles), result.Risk,
 	)
-	if result.LowerBound {
+	if result.Truncated {
+		result.Summary += " — lower bound: reach traversal or output budget was reached; more callers may exist"
+	}
+	if graph.LowerBoundCaveat(result.Boundaries) {
 		result.Summary += fmt.Sprintf(
 			" — lower bound: %d dispatch boundary(ies) may add more callers",
 			len(result.Boundaries),
@@ -252,7 +277,7 @@ func fillImpactLive(g graph.Store, result *ImpactResult, symbolIDs []string) {
 // deterministic-by-shard-iteration choice closely enough for tests
 // that compare ByDepth ID sets, which is the contract consumers rely
 // on. EdgeConfidence is set from that representative edge.
-func fillImpactFromReach(g graph.Store, result *ImpactResult, symbolIDs []string) bool {
+func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResult, symbolIDs []string) bool {
 	if len(symbolIDs) == 0 {
 		return true
 	}
@@ -265,8 +290,14 @@ func fillImpactFromReach(g graph.Store, result *ImpactResult, symbolIDs []string
 	// generic path).
 	if len(symbolIDs) == 1 {
 		seedID := symbolIDs[0]
-		d1, d2, d3, hit := reach.Lookup(g, seedID)
+		d1, d2, d3, hit, truncated := reach.LookupContext(ctx, g, seedID)
+		result.Truncated = result.Truncated || truncated
 		if !hit {
+			if truncated {
+				// Cancellation before the seed could be read is still a bounded
+				// result; do not fall into the unbounded legacy walk.
+				return true
+			}
 			return false
 		}
 		for depth, tier := range [3][]reach.Entry{d1, d2, d3} {
@@ -303,8 +334,12 @@ func fillImpactFromReach(g graph.Store, result *ImpactResult, symbolIDs []string
 
 	perSeed := make([][3][]reach.Entry, len(symbolIDs))
 	for i, id := range symbolIDs {
-		d1, d2, d3, hit := reach.Lookup(g, id)
+		d1, d2, d3, hit, truncated := reach.LookupContext(ctx, g, id)
+		result.Truncated = result.Truncated || truncated
 		if !hit {
+			if truncated {
+				continue
+			}
 			return false
 		}
 		perSeed[i] = [3][]reach.Entry{d1, d2, d3}

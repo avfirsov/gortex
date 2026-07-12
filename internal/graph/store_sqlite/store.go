@@ -264,6 +264,22 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		return nil, fmt.Errorf("sqlite read schema version: %w", err)
 	}
 	plan := planSchemaMigrationWith(stored, current, migrations)
+	// A rebuild migration applies to an existing pre-versioning database, but
+	// not to the brand-new empty file sql.Open just created. Distinguish those
+	// two user_version=0 cases before requiring destructive-rebuild authority.
+	// An existing nodes/edges schema may already contain derived topology and
+	// must take the conservative rebuild path even when its current row count is
+	// zero; absence of both tables is the only safe fresh-store proof.
+	if stored == 0 && plan.wipe && !isMemoryPath(path) {
+		existing, probeErr := hasGraphStoreTables(db)
+		if probeErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite probe existing graph schema: %w", probeErr)
+		}
+		if !existing {
+			plan = schemaPlan{stamp: true}
+		}
+	}
 	didWipe := false
 	if plan.wipe && !isMemoryPath(path) {
 		// Refuse the destructive rebuild unless the caller proved it holds
@@ -382,6 +398,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	return s, nil
 }
 
+func hasGraphStoreTables(db *sql.DB) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('nodes','edges')`).Scan(&count)
+	return count > 0, err
+}
+
 // walCheckpointInterval is how often runCheckpointLoop drains the WAL into
 // the main DB and truncates the -wal file. Five minutes keeps the file
 // bounded under steady writes without making the checkpoint itself a hot
@@ -482,8 +504,27 @@ func (s *Store) prepare() error {
 
 	const nodeCols = lookupNodeCols
 
+	// Never use INSERT OR REPLACE here. SQLite implements REPLACE as
+	// DELETE+INSERT; the DELETE fires the nodes->edges ON DELETE CASCADE and
+	// silently erases every incident edge when a caller only intends to update
+	// node metadata (reach.Lookup does exactly that when publishing its cache).
+	// A true UPSERT updates the existing row in place and therefore preserves
+	// graph topology.
 	prep(&s.stmtInsertNode,
-		`INSERT OR REPLACE INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(id) DO UPDATE SET
+		 kind=excluded.kind, name=excluded.name, qual_name=excluded.qual_name,
+		 file_path=excluded.file_path, start_line=excluded.start_line, end_line=excluded.end_line,
+		 start_column=excluded.start_column, end_column=excluded.end_column,
+		 language=excluded.language, repo_prefix=excluded.repo_prefix,
+		 workspace_id=excluded.workspace_id, project_id=excluded.project_id,
+		 signature=excluded.signature, visibility=excluded.visibility, doc=excluded.doc,
+		 external=excluded.external, return_type=excluded.return_type,
+		 is_async=excluded.is_async, is_static=excluded.is_static,
+		 is_abstract=excluded.is_abstract, is_exported=excluded.is_exported,
+		 updated_at=excluded.updated_at, data_class=excluded.data_class,
+		 semantic_type=excluded.semantic_type, semantic_source=excluded.semantic_source,
+		 meta=excluded.meta`)
 	prep(&s.stmtGetNode,
 		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
 	prep(&s.stmtGetNodeByQual,
@@ -707,9 +748,9 @@ func scanEdgeLight(scanner interface {
 
 // -- writes ---------------------------------------------------------------
 
-// AddNode inserts or replaces a node. Idempotent on the id column --
-// re-adding the same id with new content does a last-write-wins
-// update, matching the in-memory store's behaviour.
+// AddNode inserts or updates a node in place. Idempotent on the id column --
+// re-adding the same id with new content does a last-write-wins update while
+// preserving incident edge rows, matching the in-memory store's behaviour.
 func (s *Store) AddNode(n *graph.Node) {
 	if n == nil || n.ID == "" {
 		return

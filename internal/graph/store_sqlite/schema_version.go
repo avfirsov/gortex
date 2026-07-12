@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -56,6 +56,12 @@ type schemaMigration struct {
 // entries for version 2 and up as the schema evolves.
 var schemaMigrations = []schemaMigration{
 	{version: 2, name: "dedupe fn-value placeholder edges", inPlace: dedupeFnValuePlaceholderEdges},
+	// Versions through v2 wrote node updates with INSERT OR REPLACE. REPLACE
+	// has delete semantics and can invalidate incident-edge integrity when
+	// foreign-key enforcement is enabled by a host/connection. Deleted edges
+	// cannot be reconstructed from the remaining graph rows, so this is an
+	// explicit source-reindex boundary rather than a misleading in-place fix.
+	{version: 3, name: "restore topology after node replace writes", rebuild: true},
 }
 
 // dedupeFnValuePlaceholderEdges collapses duplicate function-as-value gate

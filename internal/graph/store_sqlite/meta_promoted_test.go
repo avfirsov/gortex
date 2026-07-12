@@ -234,7 +234,9 @@ func TestPromotedColumns_Migration(t *testing.T) {
 	}
 	_ = raw.Close()
 
-	s, err := Open(path)
+	// Keep this mechanical-column migration test on the historical v2 plan;
+	// shipped v3 intentionally rebuilds pre-v3 topology for integrity.
+	s, err := openWith(path, 2, schemaMigrations[:1], false)
 	if err != nil {
 		t.Fatalf("Open old-schema db: %v", err)
 	}

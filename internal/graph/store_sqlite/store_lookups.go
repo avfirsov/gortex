@@ -1,6 +1,8 @@
 package store_sqlite
 
 import (
+	"context"
+	"fmt"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -138,6 +140,68 @@ func (s *Store) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 // GetInEdgesByNodeIDs is the incoming-edge twin of GetOutEdgesByNodeIDs.
 func (s *Store) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return s.edgesByNodeIDs(ids, "to_id", func(e *graph.Edge) string { return e.To })
+}
+
+// GetInEdgesByNodeIDsContext is the bounded, cancellable incoming-edge read
+// used by reachability analysis. The ordinary Store interface intentionally
+// stays unchanged; reach detects this optional capability and falls back to
+// the in-memory batch read on backends that do not implement it.
+//
+// limit is a total row budget across every IN-list chunk. One extra row is
+// requested only to prove truncation, and QueryContext lets an expired impact
+// request interrupt SQLite instead of monopolising its single connection.
+func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+	uniq := dedupeNonEmpty(ids)
+	if len(uniq) == 0 {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		return nil, true, nil
+	}
+
+	out := make(map[string][]*graph.Edge, len(uniq))
+	total := 0
+	for i := 0; i < len(uniq); i += lookupChunkSize {
+		if err := ctx.Err(); err != nil {
+			return out, true, err
+		}
+		end := minInt(i+lookupChunkSize, len(uniq))
+		chunk := uniq[i:end]
+		remaining := limit - total
+		// remaining may be zero: fetch one proof row from later chunks so
+		// exactly-limit and greater-than-limit are distinguishable.
+		queryLimit := remaining + 1
+		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) LIMIT ?`
+		args := toAnyArgs(chunk)
+		args = append(args, queryLimit)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return out, true, err
+		}
+		for rows.Next() {
+			e, scanErr := scanEdgeLight(rows)
+			if scanErr != nil {
+				_ = rows.Close()
+				return out, true, scanErr
+			}
+			if total >= limit {
+				_ = rows.Close()
+				return out, true, nil
+			}
+			if e != nil {
+				out[e.To] = append(out[e.To], e)
+				total++
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return out, true, fmt.Errorf("bounded incoming-edge query: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return out, true, err
+		}
+	}
+	return out, false, nil
 }
 
 // edgesByNodeIDs runs the chunked IN-list edge fetch keyed on the given
