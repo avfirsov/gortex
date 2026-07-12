@@ -337,7 +337,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		targets = append(targets, t)
 	}
 
-	return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
+	answerReady := exploreAnswerReady(task, targets)
+	result := mcp.NewToolResultText(s.renderExplore(task, targets, budget))
+	control := s.armExploreLocalization(ctx, task, targets, answerReady)
+	return attachLocalizationControl(result, control, false, ""), nil
 }
 
 // renderExplore lays out the ranked neighborhood as a compact, agent-facing

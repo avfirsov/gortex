@@ -455,6 +455,10 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		return invalid, nil
 	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
+	if terminal := s.preflightLocalizationRead(ctx, spec, normalized); terminal != nil {
+		outcome = facadeOutcomeBlocked
+		return terminal, nil
+	}
 	if spec.Facade == "read" && (spec.Operation == "source" || spec.Operation == "symbols") {
 		ids := []string{strings.TrimSpace(fmt.Sprint(normalized["id"]))}
 		field := "id"
@@ -498,6 +502,11 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			ctx = WithOverlayView(ctx, view)
 		}
 	}
+	reservation, terminal := s.beginLocalizationFacade(ctx, spec, normalized)
+	if terminal != nil {
+		outcome = facadeOutcomeBlocked
+		return terminal, nil
+	}
 	forwarded := req
 	forwarded.Params.Name = spec.Legacy
 	forwarded.Params.Arguments = normalized
@@ -506,6 +515,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	if err == nil {
 		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
 	}
+	result = s.completeLocalizationFacade(ctx, reservation, result, err)
 	if result != nil {
 		if result.Meta == nil {
 			result.Meta = &mcpgo.Meta{}

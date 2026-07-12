@@ -595,6 +595,11 @@ type sessionState struct {
 	// already been shown this session, so each is emitted at most once (a
 	// repeated hint is noise). Keyed by the cue's tool name.
 	emittedCues map[string]bool
+
+	// localization enforces explore's advertised one-followup contract for
+	// this MCP session. It is intentionally scoped to explore/search/read;
+	// mutation, change analysis, tests, guards, and contracts are unaffected.
+	localization *localizationState
 }
 
 // markCueOnce records that a related_tools cue keyed by `key` has been

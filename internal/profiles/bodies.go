@@ -39,7 +39,7 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 // sectionExploreOpener positions the one-shot localization verb as
 // the opening move (standard rendering; the lean profile carries its
 // own condensed line).
-var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Honor §gortex.control§: stop localization when §answer_now§ is true, use at most §followup_budget§ listed localization calls, then answer. Never substitute shell or broad file traversal. The granular tools below are only for the permitted specific follow-up.
 
 `)
 
