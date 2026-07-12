@@ -18,9 +18,42 @@ func TestGortexReadNudge_NudgesFullSourceRead(t *testing.T) {
 	if msg == "" {
 		t.Fatal("expected a nudge for a full-body source read")
 	}
-	for _, want := range []string{"compress_bodies", "search_text", "keep", "read_file"} {
+	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "read_file"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("nudge missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestGortexReadNudge_CompactReadShape(t *testing.T) {
+	input := map[string]any{
+		"operation": "file",
+		"target":    map[string]any{"file": "internal/resolver/resolver.go"},
+	}
+	msg := gortexReadNudge(gortexCompactReadTool, input)
+	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, `read(target:{file:`, "gortex call search"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("compact read nudge missing %q:\n%s", want, msg)
+		}
+	}
+	for _, legacy := range []string{"search_text", "read_file", "get_editing_context"} {
+		if strings.Contains(msg, legacy) {
+			t.Errorf("compact read nudge leaked legacy tool %q:\n%s", legacy, msg)
+		}
+	}
+}
+
+func TestGortexReadNudge_CompactNarrowAndBoundedShapesAreSilent(t *testing.T) {
+	tests := []map[string]any{
+		{"operation": "source", "target": map[string]any{"symbol": "a.go::A"}},
+		{"operation": "summary", "target": map[string]any{"file": "a.go"}},
+		{"operation": "file", "target": map[string]any{"file": "a.go"}, "options": map[string]any{"compress_bodies": true}},
+		{"operation": "editing_context", "target": map[string]any{"file": "a.go"}, "context": map[string]any{"max_tokens": 500}},
+		{"operation": "file", "target": map[string]any{"file": "a.go"}, "output": map[string]any{"max_bytes": 4000}},
+	}
+	for _, input := range tests {
+		if msg := gortexReadNudge(gortexCompactReadTool, input); msg != "" {
+			t.Errorf("economical compact read emitted nudge:\n%s\ninput=%#v", msg, input)
 		}
 	}
 }
@@ -88,11 +121,33 @@ func TestEnrichGortexRead_EconomicalCallPassesThroughEvenWhenGated(t *testing.T)
 
 func TestEnrich_DispatchesGortexReadTools(t *testing.T) {
 	withForceCompress(t, false)
-	for _, tool := range []string{gortexReadFileTool, gortexEditingContextTool} {
-		input := HookInput{ToolName: tool, ToolInput: map[string]any{"path": "a.go"}}
+	tests := []struct {
+		tool  string
+		input map[string]any
+	}{
+		{gortexReadFileTool, map[string]any{"path": "a.go"}},
+		{gortexEditingContextTool, map[string]any{"path": "a.go"}},
+		{gortexCompactReadTool, map[string]any{"operation": "file", "target": map[string]any{"file": "a.go"}}},
+	}
+	for _, tt := range tests {
+		input := HookInput{ToolName: tt.tool, ToolInput: tt.input}
 		if result := enrich(input, 0); result.context == "" {
-			t.Errorf("enrich must route %s to enrichGortexRead", tool)
+			t.Errorf("enrich must route %s to enrichGortexRead", tt.tool)
 		}
+	}
+}
+
+func TestRunPreToolUse_CompactRead_EmitsAdditionalContext(t *testing.T) {
+	withForceCompress(t, false)
+	payload := []byte(`{"hook_event_name":"PreToolUse","tool_name":"mcp__gortex__read","tool_input":{"operation":"file","target":{"file":"internal/x.go"}}}`)
+	out := captureStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) })
+
+	var dec HookOutput
+	if err := json.Unmarshal([]byte(out), &dec); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if dec.HookSpecificOutput == nil || !strings.Contains(dec.HookSpecificOutput.AdditionalContext, "compress_bodies") {
+		t.Fatalf("expected compact read guidance, got: %s", out)
 	}
 }
 

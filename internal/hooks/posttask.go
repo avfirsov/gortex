@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // PostTaskInput is the JSON structure Claude Code sends to Stop hooks.
@@ -26,6 +27,7 @@ type PostTaskInput struct {
 // Degrades silently when: the bridge is unreachable, there are no
 // changes, or stop_hook_active is true.
 func runPostTask(data []byte, port int) {
+	started := time.Now()
 	var input PostTaskInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -33,6 +35,10 @@ func runPostTask(data []byte, port int) {
 	if input.HookEventName != "Stop" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("Stop", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
 	if input.StopHookActive {
 		return
@@ -53,6 +59,7 @@ func runPostTask(data []byte, port int) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -147,6 +154,64 @@ func buildPostTaskBriefing(port int) string {
 
 	sb.WriteString("_Run the tests above and review any flagged items before handoff._\n")
 	return sb.String()
+}
+
+// buildMutationBriefing is the focused PostToolUse pipeline for mutations that
+// happen outside Gortex, notably Codex apply_patch. It detects affected graph
+// symbols first, then asks for tests, guards, and contracts using that observed
+// change set. The hook is advisory: an unavailable daemon or an edit touching
+// no indexed symbol yields no output and never changes the completed mutation.
+func buildMutationBriefing(port int) string {
+	raw := callServerTool(port, "detect_changes", map[string]any{"scope": "unstaged"})
+	if raw == "" {
+		return ""
+	}
+	var changes struct {
+		ChangedFiles   []string `json:"changed_files"`
+		ChangedSymbols []struct {
+			ID string `json:"id"`
+		} `json:"changed_symbols"`
+		Risk string `json:"risk"`
+	}
+	if json.Unmarshal([]byte(raw), &changes) != nil || len(changes.ChangedSymbols) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(changes.ChangedSymbols))
+	for _, symbol := range changes.ChangedSymbols {
+		if strings.TrimSpace(symbol.ID) != "" {
+			ids = append(ids, symbol.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	idsCSV := strings.Join(ids, ",")
+
+	var out strings.Builder
+	out.WriteString("## Gortex mutation follow-up\n\n")
+	fmt.Fprintf(&out, "Detected %d affected symbol(s) across %d file(s); risk `%s`.\n\n", len(ids), len(changes.ChangedFiles), changes.Risk)
+	out.WriteString("Affected symbols:\n")
+	for _, id := range ids {
+		fmt.Fprintf(&out, "- `%s`\n", id)
+	}
+	out.WriteString("\n")
+	if tests := renderTestTargets(port, idsCSV); tests != "" {
+		out.WriteString("### Tests\n\n")
+		out.WriteString(tests)
+		out.WriteString("\n")
+	}
+	if guards := renderGuardViolations(port, idsCSV); guards != "" {
+		out.WriteString("### Guards\n\n")
+		out.WriteString(guards)
+		out.WriteString("\n")
+	}
+	if contracts := renderContractMismatches(port); contracts != "" {
+		out.WriteString("### Contracts\n\n")
+		out.WriteString(contracts)
+		out.WriteString("\n")
+	}
+	out.WriteString("Run the selected tests and resolve any guard or contract findings before handoff.\n")
+	return out.String()
 }
 
 // renderTestTargets asks the bridge for test files that exercise the changed symbols.

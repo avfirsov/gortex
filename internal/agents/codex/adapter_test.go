@@ -84,21 +84,15 @@ func TestCodexInstallsSessionStartHook(t *testing.T) {
 	if handler["type"] != "command" {
 		t.Errorf("hook type=%v want command", handler["type"])
 	}
-	if handler["command"] != codexSessionStartCommand {
-		t.Errorf("command=%v want %q", handler["command"], codexSessionStartCommand)
+	if handler["command"] != testCodexHookCommand {
+		t.Errorf("command=%v want %q", handler["command"], testCodexHookCommand)
 	}
-	if handler["command_windows"] != codexSessionStartWindowsCommand {
-		t.Errorf("command_windows=%v want %q", handler["command_windows"], codexSessionStartWindowsCommand)
+	if _, exists := handler["command_windows"]; exists {
+		t.Errorf("SessionStart should use the same managed hook command on every platform: %#v", handler)
 	}
 	command := handler["command"].(string)
-	if !strings.Contains(command, "IMPORTANT: Prefer Gortex MCP tools") {
-		t.Errorf("command should emit the graph-tools orientation: %v", handler["command"])
-	}
-	if !strings.Contains(command, "edit_file") {
-		t.Errorf("command should mention edit_file: %v", handler["command"])
-	}
-	if strings.Contains(command, "[Gortex]") {
-		t.Errorf("command should not duplicate the Gortex label: %v", handler["command"])
+	if !codexCommandInvokesCodexHook(command) {
+		t.Errorf("SessionStart must flow through the managed Codex hook for effectiveness telemetry: %v", handler["command"])
 	}
 }
 
@@ -156,6 +150,9 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	if entry["matcher"] != codexPostToolUseMatcher {
 		t.Fatalf("matcher=%v want %q", entry["matcher"], codexPostToolUseMatcher)
 	}
+	if !strings.Contains(codexPostToolUseMatcher, "apply_patch") {
+		t.Fatalf("PostToolUse matcher must cover mutation-aware apply_patch handling: %q", codexPostToolUseMatcher)
+	}
 	handlers, ok := codexHookList(entry["hooks"])
 	if !ok || len(handlers) != 1 {
 		t.Fatalf("handlers=%#v", entry["hooks"])
@@ -170,6 +167,40 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	}
 	if handler["timeout"] != int64(codexHookTimeoutSeconds) {
 		t.Errorf("timeout=%v want %d", handler["timeout"], codexHookTimeoutSeconds)
+	}
+}
+
+func TestCodexHookModeIsOptInAndMigratesInPlace(t *testing.T) {
+	env := codexGlobalEnv(t)
+	a := New()
+	if got := codexHookMode(); got != "enrich" {
+		t.Fatalf("default Codex posture=%q want enrich", got)
+	}
+	t.Setenv(codexHookModeEnvVar, "deny")
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := readCodexConfig(t, env)
+	if !hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("deny posture not installed: %#v", preToolUseEntries(t, cfg))
+	}
+	if !hasSessionStartCommand(t, cfg, "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("SessionStart did not migrate to deny command: %#v", sessionStartEntries(t, cfg))
+	}
+
+	t.Setenv(codexHookModeEnvVar, "rewrite")
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg = readCodexConfig(t, env)
+	if !hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=rewrite") {
+		t.Fatalf("rewrite posture not installed: %#v", preToolUseEntries(t, cfg))
+	}
+	if hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("stale deny hook survived posture migration: %#v", preToolUseEntries(t, cfg))
+	}
+	if count := gortexPreToolUseHookCount(t, cfg); count != 2 {
+		t.Fatalf("posture migration duplicated PreToolUse hooks: %d", count)
 	}
 }
 
@@ -446,6 +477,52 @@ func TestCodexSessionStartHookIdempotent(t *testing.T) {
 	}
 }
 
+func TestCodexUpgradesLegacyCompactSurfaceHooks(t *testing.T) {
+	env := codexGlobalEnv(t)
+	path := codexConfigPath(env)
+	seed := `[[hooks.SessionStart]]
+matcher = "startup|resume|clear|compact"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "` + strings.ReplaceAll(legacyCodexSessionStartCommand, `\`, `\\`) + `"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "` + testCodexHookCommand + `"
+
+[[hooks.PreToolUse]]
+matcher = "^mcp__gortex__(read_file|get_editing_context)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "` + testCodexHookCommand + `"
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	if _, err := InstallHooksOnly(env.Stderr, path, env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("upgrade hooks: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	if len(sessionStartEntries(t, cfg)) != 1 {
+		t.Fatalf("legacy SessionStart should update in place: %#v", sessionStartEntries(t, cfg))
+	}
+	if !hasSessionStartCommand(t, cfg, testCodexHookCommand) {
+		t.Fatalf("managed SessionStart hook missing after static-command migration: %#v", sessionStartEntries(t, cfg))
+	}
+	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 1 {
+		t.Fatalf("compact read matcher count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
+	}
+	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", legacyCodexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 0 {
+		t.Fatalf("legacy read matcher survived upgrade: %#v", preToolUseEntries(t, cfg))
+	}
+}
+
 func TestCodexSessionStartHookPreservesExistingConfig(t *testing.T) {
 	env := codexGlobalEnv(t)
 	path := codexConfigPath(env)
@@ -617,6 +694,7 @@ func TestCodexNoHooksSkipsSessionStartHook(t *testing.T) {
 
 func codexGlobalEnv(t *testing.T) agents.Env {
 	t.Helper()
+	t.Setenv(codexHookModeEnvVar, "")
 	env, _ := agentstest.NewEnv(t)
 	env.Mode = agents.ModeGlobal
 	if err := os.MkdirAll(filepath.Join(env.Home, ".codex"), 0o755); err != nil {

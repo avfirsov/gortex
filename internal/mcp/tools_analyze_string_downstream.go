@@ -204,27 +204,28 @@ func (s *Server) handleAnalyzeSQLRebuild(ctx context.Context, req mcp.CallToolRe
 		)), nil
 	}
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"strings_visited":      stats.StringsVisited,
-		"tables_created":       stats.TablesCreated,
-		"columns_created":      stats.ColumnsCreated,
-		"query_edges_created":  stats.QueryEdges,
-		"reads_col_edges":      stats.ReadColEdges,
-		"writes_col_edges":     stats.WriteColEdges,
-		"emitters_linked":      stats.EmittersLinked,
-		"skipped":              stats.Skipped,
+		"strings_visited":     stats.StringsVisited,
+		"tables_created":      stats.TablesCreated,
+		"columns_created":     stats.ColumnsCreated,
+		"query_edges_created": stats.QueryEdges,
+		"reads_col_edges":     stats.ReadColEdges,
+		"writes_col_edges":    stats.WriteColEdges,
+		"emitters_linked":     stats.EmittersLinked,
+		"skipped":             stats.Skipped,
 	})
 }
 
 // handleAnalyzeSQLCallSites lists the call sites that execute SQL,
 // grouped by the calling symbol, with the tables each one touches and
-// a read / write split. It re-derives the table / EdgeQueries layer
-// from the string registry first (idempotent), so the view works even
-// when sql_rebuild was not run explicitly.
+// a read / write split. Legacy calls materialise the table / EdgeQueries layer
+// first; the compact read-only adapter fixes materialize=false and requires an
+// explicit effectful sql_rebuild operation when that layer is absent.
 //
 // Filters: name (call-site symbol name, case-insensitive), limit.
 func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	gortexsql.RebuildTablesFromStringRegistry(s.graph)
-
+	if requestBoolDefault(req, "materialize", true) {
+		gortexsql.RebuildTablesFromStringRegistry(s.graph)
+	}
 	args := req.GetArguments()
 	nameFilter := strings.ToLower(strings.TrimSpace(stringArg(args, "name")))
 	limit := 20
@@ -274,8 +275,7 @@ func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallTool
 	// Scope filter: keep only call sites whose calling symbol is visible
 	// to the current request. Tables are names (not node IDs) so they need
 	// no pruning. total/truncated recompute below. No-op for an unbound
-	// request. (The RebuildTablesFromStringRegistry call above is left
-	// untouched — it is an idempotent graph mutation, not a row source.)
+	// request.
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*sqlCallSite, 0, len(rows))
 		for _, r := range rows {

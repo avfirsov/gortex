@@ -42,23 +42,20 @@ func settingsPaths(home string) []string {
 	return paths
 }
 
-// alwaysAllow is Cline's auto-approve allow-list. Matches the
-// Gortex tool surface so Cline doesn't ask the user on every query.
-var alwaysAllow = []string{
+// alwaysAllow is Cline's coarse tool-level auto-approve list. It follows the
+// compact MCP surface while leaving external review publishing unapproved.
+var alwaysAllow = agents.CompactMCPAutoApproveTools()
+
+// legacyAlwaysAllow is the exact list shipped before the compact surface. It
+// is used only as a migration fingerprint; customized lists are preserved.
+var legacyAlwaysAllow = []string{
 	"graph_stats", "search_symbols", "winnow_symbols", "get_symbol", "get_file_summary",
-	"get_editing_context", "get_dependencies", "get_dependents",
-	"get_call_chain", "get_callers", "find_implementations", "find_usages",
-	"get_cluster", "get_symbol_signature", "get_symbol_source", "batch_symbols",
-	"find_import_path", "explain_change_impact", "get_recent_changes",
-	"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
-	"get_communities", "get_community", "get_processes", "get_process",
-	"detect_changes", "index_repository", "reindex_repository",
-	"verify_change", "check_guards", "prefetch_context",
-	"find_dead_code", "find_hotspots", "find_cycles", "would_create_cycle",
-	"diff_context", "index_health", "get_symbol_history",
-	"scaffold", "batch_edit",
-	"flow_between", "taint_paths",
-	"find_clones",
+	"get_editing_context", "get_dependencies", "get_dependents", "get_call_chain", "get_callers",
+	"find_implementations", "find_usages", "get_cluster", "get_symbol_signature", "get_symbol_source", "batch_symbols",
+	"find_import_path", "explain_change_impact", "get_recent_changes", "smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
+	"get_communities", "get_community", "get_processes", "get_process", "detect_changes", "index_repository", "reindex_repository",
+	"verify_change", "check_guards", "prefetch_context", "find_dead_code", "find_hotspots", "find_cycles", "would_create_cycle",
+	"diff_context", "index_health", "get_symbol_history", "scaffold", "batch_edit", "flow_between", "taint_paths", "find_clones",
 }
 
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
@@ -114,7 +111,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		entry := agents.DefaultGortexMCPEntry()
 		entry["alwaysAllow"] = alwaysAllow
 		action, err := agents.MergeJSON(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
-			return agents.UpsertMCPServer(root, "gortex", entry, opts), nil
+			return agents.UpsertMCPServerApprovalList(root, "gortex", "alwaysAllow", alwaysAllow, entry, opts, legacyAlwaysAllow), nil
 		}, opts)
 		if err != nil {
 			internalutil.Warnf(env.Stderr, "could not configure Cline at %s: %v", path, err)

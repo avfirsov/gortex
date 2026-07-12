@@ -69,6 +69,7 @@ var ToolEffects = map[string]ToolEffect{
 	"rename_memory":    EffectFilesystemWrite,
 	"save_note":        EffectFilesystemWrite,
 	"store_memory":     EffectFilesystemWrite,
+	"surface_memories": EffectFilesystemWrite,
 	"suppress_finding": EffectConfigWrite,
 
 	// Graph/index mutation.
@@ -93,16 +94,21 @@ var ToolEffects = map[string]ToolEffect{
 	// branch to disk when to_disk=true.
 	"overlay_merge": EffectSessionWrite | EffectFilesystemWrite,
 
-	// Intentional legacy exception: analyze(kind=temporal_verify) writes a
-	// verdict cache and updates graph edges, while every other analyze kind is
-	// read-only. Marking the legacy tool at name granularity would hide all
-	// analysis in planning mode. Facade-v1 rejects that kind on analyze and
-	// routes it through the mutating workspace_admin boundary instead. Remove
-	// this exception when the legacy dispatcher is retired.
+	// Intentional legacy exception: the unified analyze tool contains durable
+	// graph enrichers (blame, coverage, sql_rebuild, and temporal_verify).
+	// Marking the legacy tool at name granularity would hide every read-only
+	// analysis in planning mode. The compact public surface rejects those kinds
+	// on analyze and routes them through workspace_admin. Remove this exception
+	// when the legacy dispatcher is retired.
+	//
+	// change_contract has a similar conditional legacy write (ack=true). The
+	// compact change.contract adapter fixes ack=false and exposes durable risk
+	// acknowledgement as remember.risk_ack.
 
 	// Volatile MCP/session controls. These are effectful for introspection but
 	// remain available in planning/read-only mode (see durableToolEffects).
 	"agent_registry":                  EffectSessionWrite,
+	"nav":                             EffectSessionWrite,
 	"overlay_delete":                  EffectSessionWrite,
 	"overlay_drop":                    EffectSessionWrite,
 	"overlay_drop_branch":             EffectSessionWrite,

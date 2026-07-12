@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ var facadeDescriptions = map[string]string{
 	"session":         "Change volatile agent, planning, workflow, or proxy state for this session.",
 	"overlay":         "Change only the current session's speculative overlay state.",
 	"response":        "Inspect, slice, grep, or export a buffered Gortex response.",
-	"capabilities":    "List facade operations or return the exact legacy schema behind one operation.",
+	"capabilities":    "List public tool operations or return the exact schema for one operation.",
 }
 
 func boolPointer(v bool) *bool { return &v }
@@ -79,25 +80,15 @@ func facadeTargetProperty() mcpgo.PropertyOption {
 	})
 }
 
-func facadeOutputProperty() mcpgo.PropertyOption {
-	return mcpgo.Properties(map[string]any{
-		"format":    map[string]any{"type": "string"},
-		"max_bytes": map[string]any{"type": "integer"},
-		"limit":     map[string]any{"type": "integer"},
-		"cursor":    map[string]any{"type": "string"},
-		"fields":    map[string]any{"type": "string"},
-	})
-}
-
 func facadeToolDefinition(name string) mcpgo.Tool {
 	desc := facadeDescriptions[name]
 	annotation := mcpgo.WithToolAnnotation(facadeAnnotation(name))
 	freeObject := func(field, description string) mcpgo.ToolOption {
 		return mcpgo.WithObject(field, mcpgo.Description(description), mcpgo.AdditionalProperties(true))
 	}
-	operation := mcpgo.WithString("operation", mcpgo.Description("Operation; see capabilities."))
+	operation := mcpgo.WithString("operation", mcpgo.Description("Operation; omit for a selector default."))
 	options := freeObject("options", "Operation-specific options validated by Gortex.")
-	output := mcpgo.WithObject("output", mcpgo.Description("Response shaping."), facadeOutputProperty(), mcpgo.AdditionalProperties(false))
+	output := freeObject("output", "Response shaping.")
 	target := mcpgo.WithObject("target", mcpgo.Description("Exactly one primary target selector."), facadeTargetProperty(), mcpgo.AdditionalProperties(false))
 
 	var opts []mcpgo.ToolOption
@@ -116,7 +107,7 @@ func facadeToolDefinition(name string) mcpgo.Tool {
 		opts = []mcpgo.ToolOption{operation, freeObject("target", "Primary file or symbol target."), freeObject("to", "Optional destination target."), options, output}
 	case "analyze":
 		opts = []mcpgo.ToolOption{
-			mcpgo.WithString("kind", mcpgo.Required(), mcpgo.Description("Analysis kind or facade operation.")),
+			mcpgo.WithString("kind", mcpgo.Description("Analysis kind or operation; omit to list supported kinds.")),
 			freeObject("target", "Optional analysis target."), options, output,
 		}
 	case "ask":
@@ -148,13 +139,17 @@ func facadeToolDefinition(name string) mcpgo.Tool {
 		}
 	case "capabilities":
 		opts = []mcpgo.ToolOption{
-			mcpgo.WithString("domain", mcpgo.Description("Facade name; omit to list all facades.")),
+			mcpgo.WithString("domain", mcpgo.Description("Public tool name; omit to list all tool domains.")),
 			mcpgo.WithString("operation", mcpgo.Description("Operation name; omit to list the domain.")),
 			mcpgo.WithString("detail", mcpgo.Description("summary or schema")),
 		}
 	default:
 		opts = []mcpgo.ToolOption{operation, target, options, output}
 	}
+	// Response shaping is universal so the shell mirror can merge --format into
+	// the same public request object for every compact tool. Common-domain cases
+	// already include output above; reapplying the same property is idempotent.
+	opts = append(opts, output)
 	opts = append([]mcpgo.ToolOption{mcpgo.WithDescription(desc), annotation}, opts...)
 	return mcpgo.NewTool(name, opts...)
 }
@@ -198,20 +193,9 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 			return raw(ctx, req)
 		}
 		if name == "analyze" {
-			kind := normalizeFacadeOperation(req.GetString("kind", ""))
-			if facadeSession && kind == "temporal_verify" {
-				return NewStructuredErrorResult(StructuredError{
-					ErrorCode: ErrCodeToolBlockedByMode,
-					Message:   "analyze(kind=temporal_verify) persists verification state; use workspace_admin(operation=temporal_verify)",
-					Data:      map[string]any{"facade": "workspace_admin", "operation": "temporal_verify"},
-				}), nil
-			}
-			if _, ok := s.facades.operation("analyze", kind); !ok {
-				// Native analyze kinds remain behind its graph dispatcher.
-				return s.invokeFacadeSpec(ctx, req, facadeOperationSpec{
-					Facade: "analyze", Operation: "graph", Legacy: "analyze", Effect: facadeEffectRead,
-				})
-			}
+			// Compact calls, including native dispatcher kinds, all pass through
+			// the same effect split and capability lookup below.
+			return s.handleFacade(ctx, name, req)
 		}
 		return s.handleFacade(ctx, name, req)
 	}
@@ -221,22 +205,47 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	started := time.Now()
 	operation := normalizeFacadeOperation(req.GetString("operation", ""))
 	if facade == "analyze" {
-		operation = normalizeFacadeOperation(req.GetString("kind", "graph"))
-		if _, ok := s.facades.operation(facade, operation); !ok {
-			operation = "graph"
+		operation = requestedAnalyzeKind(req.GetArguments())
+		if operation == "" {
+			operation = "help"
+		}
+		if analyzeKindRequiresAdmin(operation) {
+			result := blockedAnalyzeKindResult(operation)
+			s.recordFacadeTelemetry("analyze", operation, facadeOutcomeBlocked, time.Since(started))
+			return result, nil
 		}
 	}
 	if facade == "session" && (operation == "subscribe" || operation == "unsubscribe") {
 		channel := normalizeFacadeOperation(req.GetString("channel", ""))
+		if !validFacadeSessionChannel(channel) {
+			result := NewStructuredErrorResult(StructuredError{
+				ErrorCode: ErrCodeInvalidArgument,
+				Message:   fmt.Sprintf("unknown session channel %q", channel),
+				Data: map[string]any{
+					"operation": operation, "valid_channels": facadeSessionChannels,
+				},
+			})
+			s.recordFacadeTelemetry("session", operation, facadeOutcomeInvalidOperation, time.Since(started))
+			return result, nil
+		}
 		operation += "_" + channel
+	}
+	if operation == "" {
+		operation = inferFacadeOperation(facade, req.GetArguments())
 	}
 	if operation == "" {
 		operation = defaultFacadeOperation(facade)
 	}
-	spec, ok := s.facades.operation(facade, operation)
+	var spec facadeOperationSpec
+	var ok bool
+	if facade == "analyze" {
+		spec, ok = s.capabilityOperation(facade, operation)
+	} else {
+		spec, ok = s.facades.operation(facade, operation)
+	}
 	if !ok {
 		valid := make([]string, 0)
-		for _, candidate := range s.facades.operations(facade) {
+		for _, candidate := range s.capabilityOperations(facade) {
 			valid = append(valid, candidate.Operation)
 		}
 		result := NewStructuredErrorResult(StructuredError{
@@ -252,6 +261,44 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	return s.invokeFacadeSpec(ctx, req, spec)
 }
 
+func inferFacadeOperation(facade string, input map[string]any) string {
+	target, _ := input["target"].(map[string]any)
+	switch facade {
+	case "read":
+		switch {
+		case facadeSelectorPresent(target["file"]):
+			return "file"
+		case facadeSelectorPresent(target["symbol"]):
+			return "source"
+		case facadeSelectorPresent(target["symbols"]):
+			return "symbols"
+		case facadeSelectorPresent(target["artifact"]):
+			return "artifact"
+		}
+	case "edit":
+		switch {
+		case facadeSelectorPresent(input["changes"]):
+			return "batch"
+		case facadeSelectorPresent(target["symbol"]):
+			return "symbol"
+		case facadeSelectorPresent(target["file"]):
+			if facadeSelectorPresent(input["content"]) && !facadeSelectorPresent(input["match"]) {
+				return "write"
+			}
+			return "file"
+		}
+	}
+	return ""
+}
+
+var facadeSessionChannels = []string{
+	"daemon_health", "diagnostics", "graph_invalidated", "stale_refs", "workspace_readiness",
+}
+
+func validFacadeSessionChannel(channel string) bool {
+	return slices.Contains(facadeSessionChannels, channel)
+}
+
 func defaultFacadeOperation(facade string) string {
 	switch facade {
 	case "explore":
@@ -265,7 +312,7 @@ func defaultFacadeOperation(facade string) string {
 	case "trace":
 		return "call_chain"
 	case "analyze":
-		return "graph"
+		return "help"
 	case "ask":
 		return "research"
 	case "change":
@@ -316,14 +363,10 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		return invalid, nil
 	}
 	normalized := normalizeFacadeArguments(spec, req.GetArguments())
-	if spec.Facade == "analyze" && spec.Operation == "graph" &&
-		normalizeFacadeOperation(fmt.Sprint(normalized["kind"])) == "temporal_verify" {
+	if spec.Facade == "analyze" && analyzeKindRequiresAdmin(normalizeFacadeOperation(fmt.Sprint(normalized["kind"]))) {
+		kind := normalizeFacadeOperation(fmt.Sprint(normalized["kind"]))
 		outcome = facadeOutcomeBlocked
-		return NewStructuredErrorResult(StructuredError{
-			ErrorCode: ErrCodeToolBlockedByMode,
-			Message:   "analyze(kind=temporal_verify) persists verification state; use workspace_admin(operation=temporal_verify)",
-			Data:      map[string]any{"facade": "workspace_admin", "operation": "temporal_verify"},
-		}), nil
+		return blockedAnalyzeKindResult(kind), nil
 	}
 	if OverlayViewFromContext(ctx) == nil && !facadeLegacyManagesOwnOverlay(spec.Legacy) {
 		view, viewErr := s.buildOverlayViewForCtx(ctx)
@@ -358,6 +401,28 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		}
 	}
 	return result, err
+}
+
+// requestedAnalyzeKind applies the same argument-container precedence as the
+// public dispatcher before choosing an operation. This closes nested bypasses
+// such as options.kind=coverage while keeping the wire shape compact.
+func requestedAnalyzeKind(input map[string]any) string {
+	normalized := normalizeFacadeArguments(facadeOperationSpec{
+		Facade: "analyze", Legacy: "analyze", Effect: facadeEffectRead,
+	}, input)
+	raw, ok := normalized["kind"]
+	if !ok || raw == nil {
+		return ""
+	}
+	return normalizeFacadeOperation(fmt.Sprint(raw))
+}
+
+func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
+	return NewStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeToolBlockedByMode,
+		Message:   fmt.Sprintf("analyze(kind=%s) changes durable state; use workspace_admin(operation=%s)", kind, kind),
+		Data:      map[string]any{"domain": "workspace_admin", "operation": kind},
+	})
 }
 
 // decorateFacadeFreshness runs the existing legacy freshness policy after a
@@ -567,10 +632,15 @@ func (s *Server) facadeTelemetryIdentity(facade, operation string) (string, stri
 	if operation == "unknown" {
 		return facade, operation
 	}
-	if _, ok := s.facades.operation(facade, operation); !ok {
-		return facade, "unknown"
+	if _, ok := s.capabilityOperation(facade, operation); ok {
+		return facade, operation
 	}
-	return facade, operation
+	// Admin-only analyze kinds are rejected before capability dispatch, but
+	// remain a fixed low-cardinality vocabulary worth measuring directly.
+	if facade == "analyze" && analyzeKindRequiresAdmin(operation) {
+		return facade, operation
+	}
+	return facade, "unknown"
 }
 
 func (s *Server) recordFacadeTelemetry(facade, operation, outcome string, elapsed time.Duration) {
@@ -645,6 +715,53 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 			}
 		}
 	}
+	jsonString := func(key string) {
+		value, ok := out[key]
+		if !ok {
+			return
+		}
+		if _, already := value.(string); already {
+			return
+		}
+		if raw, err := json.Marshal(value); err == nil {
+			out[key] = string(raw)
+		}
+	}
+	commaString := func(from, to string) {
+		value, ok := out[from]
+		if !ok {
+			return
+		}
+		switch values := value.(type) {
+		case []any:
+			parts := make([]string, 0, len(values))
+			for _, item := range values {
+				parts = append(parts, fmt.Sprint(item))
+			}
+			out[to] = strings.Join(parts, ",")
+		case []string:
+			out[to] = strings.Join(values, ",")
+		default:
+			out[to] = value
+		}
+		if from != to {
+			delete(out, from)
+		}
+	}
+	flattenRange := func() {
+		raw, ok := out["range"]
+		if !ok {
+			return
+		}
+		if fields, ok := raw.(map[string]any); ok {
+			for _, key := range []string{"start_line", "start_char", "end_line", "end_char"} {
+				if value, exists := fields[key]; exists {
+					out[key] = value
+				}
+			}
+		}
+		delete(out, "range")
+	}
 	switch spec.Facade + "." + spec.Operation {
 	case "search.ast":
 		alias("query", "pattern")
@@ -656,6 +773,43 @@ func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any)
 		alias("changes", "edits")
 	case "refactor.move":
 		alias("destination", "target_file")
+	case "change.impact", "change.edit_plan", "change.guards", "change.tests":
+		commaString("symbols", "ids")
+	case "change.pattern":
+		// suggest_pattern accepts one anchor. Preserve an explicit id; when the
+		// public source carries a one-element symbols list, lower its first item.
+		if _, exists := out["id"]; !exists {
+			switch values := out["symbols"].(type) {
+			case []any:
+				if len(values) > 0 {
+					out["id"] = fmt.Sprint(values[0])
+				}
+			case []string:
+				if len(values) > 0 {
+					out["id"] = values[0]
+				}
+			case string:
+				out["id"] = values
+			}
+		}
+		delete(out, "symbols")
+	case "change.verify":
+		jsonString("changes")
+	case "change.diagnostics", "change.code_actions":
+		alias("file", "path")
+		flattenRange()
+	case "change.ranges":
+		alias("file", "path")
+		flattenRange()
+		jsonString("ranges")
+	case "change.preview":
+		jsonString("workspace_edit")
+	case "change.simulate":
+		jsonString("steps")
+	case "change.contract":
+		commaString("symbols", "symbols")
+		jsonString("ranges")
+		jsonString("workspace_edit")
 	case "trace.flow", "trace.path":
 		if source := facadeSelector(input["target"], "symbol", "query"); source != nil {
 			out["source_id"] = source
@@ -760,14 +914,14 @@ func (s *Server) handleCapabilities(_ context.Context, req mcpgo.CallToolRequest
 	operation := normalizeFacadeOperation(req.GetString("operation", ""))
 	detail := normalizeFacadeOperation(req.GetString("detail", "summary"))
 	if domain == "" {
-		facades := make([]map[string]any, 0, len(facadeToolNames()))
+		domains := make([]map[string]any, 0, len(facadeToolNames()))
 		for _, name := range facadeToolNames() {
-			facades = append(facades, map[string]any{
-				"name": name, "description": facadeDescriptions[name], "operations": len(s.facades.operations(name)),
+			domains = append(domains, map[string]any{
+				"name": name, "description": facadeDescriptions[name], "operations": len(s.capabilityOperations(name)),
 			})
 		}
 		return mcpgo.NewToolResultJSON(map[string]any{
-			"surface_version": FacadeSurfaceVersion, "facades": facades,
+			"surface_version": FacadeSurfaceVersion, "domains": domains,
 		})
 	}
 	telemetryOperation = "domain"
@@ -775,13 +929,13 @@ func (s *Server) handleCapabilities(_ context.Context, req mcpgo.CallToolRequest
 		telemetryOperation = "unknown"
 		outcome = facadeOutcomeInvalidOperation
 		return NewStructuredErrorResult(StructuredError{
-			ErrorCode: ErrCodeInvalidArgument, Message: fmt.Sprintf("unknown facade %q", domain),
-			Data: map[string]any{"valid_facades": facadeToolNames()},
+			ErrorCode: ErrCodeInvalidArgument, Message: fmt.Sprintf("unknown tool domain %q", domain),
+			Data: map[string]any{"valid_domains": facadeToolNames()},
 		}), nil
 	}
 	if operation != "" {
 		telemetryOperation = "operation"
-		spec, ok := s.facades.operation(domain, operation)
+		spec, ok := s.capabilityOperation(domain, operation)
 		if !ok {
 			telemetryOperation = "unknown"
 			outcome = facadeOutcomeInvalidOperation
@@ -792,30 +946,510 @@ func (s *Server) handleCapabilities(_ context.Context, req mcpgo.CallToolRequest
 		return mcpgo.NewToolResultJSON(s.facadeCapability(spec, detail == "schema"))
 	}
 	ops := make([]map[string]any, 0)
-	for _, spec := range s.facades.operations(domain) {
+	for _, spec := range s.capabilityOperations(domain) {
 		ops = append(ops, s.facadeCapability(spec, detail == "schema"))
 	}
 	return mcpgo.NewToolResultJSON(map[string]any{
-		"surface_version": FacadeSurfaceVersion, "facade": domain, "operations": ops,
+		"surface_version": FacadeSurfaceVersion, "domain": domain, "operations": ops,
 	})
+}
+
+// capabilityOperation includes the native analyze(kind=...) catalogue without
+// duplicating every kind in the legacy-to-public migration registry. Mutating
+// dispatcher kinds are available only through workspace_admin.
+func (s *Server) capabilityOperation(domain, operation string) (facadeOperationSpec, bool) {
+	if domain == "session" {
+		switch operation {
+		case "subscribe":
+			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "subscribe_diagnostics", Effect: facadeEffectSessionWrite}, true
+		case "unsubscribe":
+			return facadeOperationSpec{Facade: "session", Operation: operation, Legacy: "unsubscribe_diagnostics", Effect: facadeEffectSessionWrite}, true
+		}
+		if strings.HasPrefix(operation, "subscribe_") || strings.HasPrefix(operation, "unsubscribe_") {
+			return facadeOperationSpec{}, false
+		}
+	}
+	if spec, ok := s.facades.operation(domain, operation); ok {
+		return spec, true
+	}
+	if domain == "analyze" && !analyzeKindRequiresAdmin(operation) && AnalyzeKindDescription(operation) != "" {
+		return facadeOperationSpec{
+			Facade: "analyze", Operation: operation, Legacy: "analyze", Effect: facadeEffectRead,
+			Fixed: publicAnalyzeFixedArguments(operation),
+		}, true
+	}
+	return facadeOperationSpec{}, false
+}
+
+func (s *Server) capabilityOperations(domain string) []facadeOperationSpec {
+	ops := s.facades.operations(domain)
+	if domain == "session" {
+		public := make([]facadeOperationSpec, 0, len(ops)+2)
+		for _, spec := range ops {
+			if strings.HasPrefix(spec.Operation, "subscribe_") || strings.HasPrefix(spec.Operation, "unsubscribe_") {
+				continue
+			}
+			public = append(public, spec)
+		}
+		public = append(public,
+			facadeOperationSpec{Facade: "session", Operation: "subscribe", Legacy: "subscribe_diagnostics", Effect: facadeEffectSessionWrite},
+			facadeOperationSpec{Facade: "session", Operation: "unsubscribe", Legacy: "unsubscribe_diagnostics", Effect: facadeEffectSessionWrite},
+		)
+		sort.Slice(public, func(i, j int) bool { return public[i].Operation < public[j].Operation })
+		return public
+	}
+	if domain != "analyze" {
+		return ops
+	}
+	seen := make(map[string]bool, len(ops))
+	for _, spec := range ops {
+		seen[spec.Operation] = true
+	}
+	for _, kind := range AnalyzeKinds() {
+		if analyzeKindRequiresAdmin(kind) || seen[kind] {
+			continue
+		}
+		ops = append(ops, facadeOperationSpec{
+			Facade: "analyze", Operation: kind, Legacy: "analyze", Effect: facadeEffectRead,
+			Fixed: publicAnalyzeFixedArguments(kind),
+		})
+	}
+	sort.Slice(ops, func(i, j int) bool { return ops[i].Operation < ops[j].Operation })
+	return ops
+}
+
+// publicAnalyzeFixedArguments keeps the read-only analyze boundary free of
+// optional external effects. Explicit legacy calls retain their historical
+// behavior.
+func publicAnalyzeFixedArguments(kind string) map[string]any {
+	fixed := map[string]any{"kind": kind}
+	switch kind {
+	case "concepts":
+		fixed["use_llm"] = false
+	case "impact":
+		fixed["refresh_cochange"] = false
+	case "sql_call_sites":
+		fixed["materialize"] = false
+	}
+	return fixed
 }
 
 func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) map[string]any {
 	legacy, available := s.facades.legacy(spec.Legacy)
 	out := map[string]any{
-		"surface_version": FacadeSurfaceVersion, "operation": spec.Operation, "effect": spec.Effect, "available": available,
+		"surface_version": FacadeSurfaceVersion, "domain": spec.Facade, "operation": spec.Operation,
+		"effect": spec.Effect, "available": available,
+	}
+	if len(spec.Fixed) > 0 {
+		out["fixed_arguments"] = spec.Fixed
 	}
 	if available {
-		out["summary"] = firstSentence(legacy.tool.Description)
+		if spec.Facade == "analyze" && spec.Operation == "help" {
+			out["summary"] = "List supported analysis kinds."
+		} else if summary := AnalyzeKindDescription(spec.Operation); spec.Legacy == "analyze" && summary != "" {
+			out["summary"] = summary
+		} else {
+			out["summary"] = firstSentence(legacy.tool.Description)
+		}
 		if includeSchema {
-			out["input_schema"] = legacy.tool.InputSchema
-			if raw, err := json.Marshal(legacy.tool.InputSchema); err == nil {
+			inputSchema := any(legacy.tool.InputSchema)
+			properties := legacy.tool.InputSchema.Properties
+			required := legacy.tool.InputSchema.Required
+			if spec.Facade == "analyze" || (spec.Facade == "workspace_admin" && spec.Legacy == "analyze") {
+				inputSchema, properties, required = analyzeFacadeCapabilitySchema(spec, properties, required)
+			} else if spec.Facade == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe") {
+				inputSchema = map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"channel":   map[string]any{"type": "string", "enum": facadeSessionChannels},
+						"arguments": map[string]any{"type": "object", "additionalProperties": true},
+					},
+					"required": []string{"channel"},
+				}
+				properties = map[string]any{"channel": map[string]any{"type": "string"}}
+				required = []string{"channel"}
+			}
+			out["input_schema"] = inputSchema
+			out["request_shape"] = facadeRequestShape(spec, properties, required)
+			if raw, err := json.Marshal(inputSchema); err == nil {
 				sum := sha256.Sum256(raw)
 				out["schema_hash"] = hex.EncodeToString(sum[:])
 			}
 		}
 	}
 	return out
+}
+
+// analyzeFacadeCapabilitySchema turns the legacy unified dispatcher schema
+// into the public operation-specific contract. Agents see only fields relevant
+// to the selected kind, fixed safety arguments disappear, and conditional
+// requirements become ordinary JSON Schema requirements.
+func analyzeFacadeCapabilitySchema(spec facadeOperationSpec, legacyProperties map[string]any, legacyRequired []string) (map[string]any, map[string]any, []string) {
+	options := make(map[string]any)
+	output := make(map[string]any)
+	for field, property := range legacyProperties {
+		if field == "kind" {
+			continue
+		}
+		if _, fixed := spec.Fixed[field]; fixed {
+			continue
+		}
+		if !analyzeFieldApplies(spec.Operation, field, property) {
+			continue
+		}
+		switch field {
+		case "format", "max_bytes", "cursor", "fields", "compact", "limit":
+			output[field] = property
+		default:
+			options[field] = property
+		}
+	}
+
+	requiredFields := append([]string(nil), analyzeRequiredFields(spec.Operation)...)
+	for _, field := range legacyRequired {
+		if field == "kind" {
+			continue
+		}
+		if _, fixed := spec.Fixed[field]; fixed {
+			continue
+		}
+		if _, available := options[field]; available && !slices.Contains(requiredFields, field) {
+			requiredFields = append(requiredFields, field)
+		}
+	}
+	if spec.Facade == "workspace_admin" {
+		arguments := map[string]any{
+			"type":                 "object",
+			"properties":           options,
+			"additionalProperties": false,
+		}
+		if len(requiredFields) > 0 {
+			arguments["required"] = requiredFields
+		}
+		properties := map[string]any{
+			"operation": map[string]any{"type": "string", "const": spec.Operation},
+			"arguments": arguments,
+		}
+		if len(output) > 0 {
+			properties["output"] = map[string]any{"type": "object", "properties": output, "additionalProperties": false}
+		}
+		return map[string]any{
+			"type": "object", "properties": properties,
+			"required": []string{"operation", "arguments"}, "additionalProperties": false,
+		}, mergeAnalyzeSchemaProperties(options, output), requiredFields
+	}
+
+	properties := map[string]any{
+		"kind": map[string]any{"type": "string", "const": spec.Operation},
+		"options": map[string]any{
+			"type":                 "object",
+			"properties":           options,
+			"additionalProperties": false,
+		},
+	}
+	topRequired := []string{"kind"}
+	if len(requiredFields) > 0 {
+		properties["options"].(map[string]any)["required"] = requiredFields
+		topRequired = append(topRequired, "options")
+	}
+	if len(output) > 0 {
+		properties["output"] = map[string]any{"type": "object", "properties": output, "additionalProperties": false}
+	}
+	if spec.Operation == "def_use" || spec.Operation == "co_change" {
+		targetProperties := map[string]any{"symbol": map[string]any{"type": "string"}}
+		if spec.Operation == "co_change" {
+			targetProperties["file"] = map[string]any{"type": "string"}
+		}
+		properties["target"] = map[string]any{
+			"type": "object", "properties": targetProperties,
+			"minProperties": 1, "maxProperties": 1, "additionalProperties": false,
+		}
+		topRequired = append(topRequired, "target")
+	}
+	return map[string]any{
+		"type": "object", "properties": properties,
+		"required": topRequired, "additionalProperties": false,
+	}, mergeAnalyzeSchemaProperties(options, output), requiredFields
+}
+
+func mergeAnalyzeSchemaProperties(options, output map[string]any) map[string]any {
+	merged := make(map[string]any, len(options)+len(output))
+	for key, value := range options {
+		merged[key] = value
+	}
+	for key, value := range output {
+		merged[key] = value
+	}
+	return merged
+}
+
+func analyzeRequiredFields(kind string) []string {
+	switch kind {
+	case "coverage":
+		return []string{"profile"}
+	case "would_create_cycle":
+		return []string{"from_id", "to_id"}
+	default:
+		return nil
+	}
+}
+
+// analyzeFieldApplies filters the legacy dispatcher's annotated field list.
+// Kind-specific descriptions start with one or more parenthesized kind groups;
+// unannotated fields are shared. A few handlers predate complete annotations
+// and are covered by the explicit additions below.
+func analyzeFieldApplies(kind, field string, raw any) bool {
+	if kind == "help" {
+		return false
+	}
+	property, _ := raw.(map[string]any)
+	description, _ := property["description"].(string)
+	description = strings.TrimSpace(description)
+	if strings.HasPrefix(description, "(") {
+		matched := false
+		remaining := description
+		for {
+			start := strings.IndexByte(remaining, '(')
+			if start < 0 {
+				break
+			}
+			remaining = remaining[start+1:]
+			end := strings.IndexByte(remaining, ')')
+			if end < 0 {
+				break
+			}
+			for _, candidate := range strings.Split(remaining[:end], ",") {
+				if normalizeFacadeOperation(candidate) == kind {
+					matched = true
+				}
+			}
+			remaining = strings.TrimSpace(remaining[end+1:])
+		}
+		if !matched {
+			switch kind + "." + field {
+			case "impact.ids", "impact.path_prefix", "impact.kinds", "impact.min_score", "impact.max_score", "impact.limit",
+				"def_use.id", "def_use.ids":
+				return true
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// facadeRequestShape makes capabilities actionable without teaching callers
+// canonical handler names. input_schema describes the operation-specific
+// fields; request_shape shows where those fields belong in the stable public
+// envelope and which target selector to use.
+func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, required []string) map[string]any {
+	args := map[string]any{"operation": spec.Operation}
+	placeholder := func(key string) map[string]any { return map[string]any{key: "<" + key + ">"} }
+	hasLegacyField := func(key string) bool {
+		_, ok := properties[key]
+		return ok
+	}
+
+	switch spec.Facade {
+	case "explore":
+		switch spec.Operation {
+		case "task", "context":
+			args["task"] = "<task>"
+		case "closure":
+			args["options"] = map[string]any{"files": "<file>"}
+		default:
+			args["options"] = map[string]any{}
+		}
+	case "search":
+		args["query"] = "<query>"
+		args["options"] = map[string]any{}
+	case "read":
+		switch spec.Operation {
+		case "file", "editing_context", "summary":
+			args["target"] = placeholder("file")
+		case "symbols":
+			args["target"] = map[string]any{"symbols": []string{"<symbol>"}}
+		case "artifact":
+			args["target"] = placeholder("artifact")
+		default:
+			args["target"] = placeholder("symbol")
+		}
+		args["options"] = map[string]any{}
+	case "relations":
+		if spec.Operation == "declaration" {
+			args["target"] = placeholder("query")
+		} else {
+			args["target"] = placeholder("symbol")
+		}
+		args["options"] = map[string]any{}
+	case "trace":
+		switch spec.Operation {
+		case "flow", "path":
+			args["target"] = placeholder("symbol")
+			args["to"] = placeholder("symbol")
+		case "taint":
+			args["target"] = placeholder("query")
+			args["to"] = placeholder("query")
+		case "graph":
+			args["options"] = map[string]any{"query": "<graph query>"}
+		default:
+			args["target"] = placeholder("symbol")
+		}
+		if _, ok := args["options"]; !ok {
+			args["options"] = map[string]any{}
+		}
+	case "analyze":
+		delete(args, "operation")
+		args["kind"] = spec.Operation
+		args["options"] = map[string]any{}
+		switch spec.Operation {
+		case "citation":
+			args["options"] = map[string]any{"span": "<verbatim code>", "file_path": "<file>"}
+		case "co_change":
+			args["target"] = placeholder("symbol")
+		case "def_use":
+			args["target"] = placeholder("symbol")
+		case "would_create_cycle":
+			args["options"] = map[string]any{"from_id": "<source symbol>", "to_id": "<target symbol>"}
+		}
+	case "ask":
+		delete(args, "operation")
+		args["question"] = "<question>"
+	case "change":
+		source := map[string]any{}
+		switch spec.Operation {
+		case "api_impact":
+			source["file"] = "<file>"
+		case "impact", "edit_plan", "guards", "pattern", "tests":
+			source["symbols"] = []string{"<symbol>"}
+		case "verify":
+			source["changes"] = []map[string]any{{"symbol_id": "<symbol>", "new_signature": "<signature>"}}
+		case "diagnostics", "code_actions", "ranges":
+			source["file"] = "<file>"
+			if spec.Operation == "ranges" {
+				source["ranges"] = []map[string]any{{"file": "<file>", "start_line": 1, "end_line": 1}}
+			}
+		case "detect":
+			source["scope"] = "unstaged"
+		case "preview":
+			source["workspace_edit"] = "<WorkspaceEdit JSON>"
+		case "simulate":
+			source["steps"] = "<WorkspaceEdit JSON array>"
+		case "contract":
+			source["source"] = "symbols"
+			source["symbols"] = []string{"<symbol>"}
+		}
+		args["source"] = source
+	case "review":
+		args["source"] = map[string]any{}
+	case "edit":
+		switch spec.Operation {
+		case "file":
+			args["target"] = placeholder("file")
+			args["match"] = "<existing text>"
+			args["replacement"] = "<replacement text>"
+		case "write":
+			args["target"] = placeholder("file")
+			args["content"] = "<file content>"
+		case "symbol":
+			args["target"] = placeholder("symbol")
+			args["match"] = "<existing source>"
+			args["replacement"] = "<replacement source>"
+		case "batch":
+			args["changes"] = []map[string]any{{
+				"op": "edit_file", "path": "<file>",
+				"old_string": "<existing text>", "new_string": "<replacement text>",
+			}}
+		default:
+			args["options"] = map[string]any{}
+		}
+		if spec.Operation == "skill" {
+			args["options"] = map[string]any{"directory": "<directory>"}
+		}
+		if hasLegacyField("dry_run") {
+			args["dry_run"] = true
+		}
+	case "refactor":
+		switch spec.Operation {
+		case "fix_all", "apply_code_action":
+			args["target"] = placeholder("file")
+		case "rename":
+			args["target"] = placeholder("symbol")
+			args["new_name"] = "<new name>"
+		case "move":
+			args["target"] = placeholder("symbol")
+			args["destination"] = "<destination file>"
+		default:
+			args["target"] = placeholder("symbol")
+		}
+		args["options"] = map[string]any{}
+		if hasLegacyField("dry_run") {
+			args["dry_run"] = true
+		}
+	case "session":
+		args["arguments"] = map[string]any{}
+		if spec.Operation == "subscribe" || spec.Operation == "unsubscribe" {
+			args["channel"] = "<channel>"
+		}
+	case "capabilities":
+		delete(args, "operation")
+		args["domain"] = "<tool>"
+	case "remember":
+		args["arguments"] = map[string]any{}
+		if spec.Operation == "risk_ack" {
+			args["arguments"] = map[string]any{"source": "symbols", "symbols": "<symbol>"}
+		}
+	default:
+		args["arguments"] = map[string]any{}
+	}
+	if spec.Facade == "workspace_admin" && spec.Operation == "coverage" {
+		args["arguments"] = map[string]any{"profile": "<cover profile>"}
+	}
+
+	// Manual aliases above cover common intent-oriented and conditional fields;
+	// remaining schema-required legacy fields stay operation-specific under
+	// options/arguments. Handler data preconditions may still apply.
+	lowered := normalizeFacadeArguments(spec, args)
+	var extras map[string]any
+	for _, field := range required {
+		if _, fixedOrLowered := lowered[field]; fixedOrLowered {
+			continue
+		}
+		if extras == nil {
+			container := "options"
+			switch spec.Facade {
+			case "publish_review", "pr", "recall", "remember", "workspace", "workspace_admin", "overlay", "response", "session":
+				container = "arguments"
+			}
+			if existing, ok := args[container].(map[string]any); ok {
+				extras = existing
+			} else {
+				extras = map[string]any{}
+				args[container] = extras
+			}
+		}
+		extras[field] = facadeSchemaPlaceholder(field, properties[field])
+	}
+	return map[string]any{"tool": spec.Facade, "arguments": args}
+}
+
+func facadeSchemaPlaceholder(field string, raw any) any {
+	property, _ := raw.(map[string]any)
+	switch property["type"] {
+	case "boolean":
+		return false
+	case "integer", "number":
+		return 1
+	case "array":
+		if item, ok := property["items"]; ok {
+			return []any{facadeSchemaPlaceholder(field, item)}
+		}
+		return []any{"<" + field + ">"}
+	case "object":
+		return map[string]any{}
+	default:
+		return "<" + field + ">"
+	}
 }
 
 // applyFacadeSurface provides session-level surface negotiation. Legacy

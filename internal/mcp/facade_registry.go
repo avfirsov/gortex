@@ -115,24 +115,6 @@ func (r *facadeRegistry) operations(facade string) []facadeOperationSpec {
 	return out
 }
 
-func (r *facadeRegistry) facades() []string {
-	if r == nil {
-		return nil
-	}
-	out := make([]string, 0, len(r.byFacade)+1)
-	for name := range r.byFacade {
-		out = append(out, name)
-	}
-	// capabilities is implemented directly rather than forwarding to a
-	// legacy handler. Its legacy introspection operations are still recorded
-	// in the registry for migration completeness.
-	if _, ok := r.byFacade["capabilities"]; !ok {
-		out = append(out, "capabilities")
-	}
-	sort.Strings(out)
-	return out
-}
-
 func (r *facadeRegistry) mapsLegacy(name string) bool {
 	return r != nil && len(r.byLegacy[name]) > 0
 }
@@ -144,6 +126,36 @@ func facadeToolNames() []string {
 		"relations", "remember", "response", "review", "search", "session",
 		"trace", "workspace", "workspace_admin",
 	}
+}
+
+// FacadeToolNames returns the complete stable facade-v1 tool roster. The
+// returned slice is a fresh copy so CLI/help callers cannot mutate the server's
+// canonical surface.
+func FacadeToolNames() []string {
+	return append([]string(nil), facadeToolNames()...)
+}
+
+// IsFacadeToolName reports whether name belongs to the public facade-v1
+// surface.
+func IsFacadeToolName(name string) bool { return isFacadeToolName(name) }
+
+// IsDedicatedFacadeToolName reports whether name exists only on facade-v1.
+// Shared names such as analyze/explore/review/ask retain legacy meanings and
+// are deliberately excluded.
+func IsDedicatedFacadeToolName(name string) bool { return isDedicatedFacadeTool(name) }
+
+// PublicOperationForLegacy resolves an implementation-era tool name to the
+// compact public domain and operation used in user-facing migration guidance.
+// When one legacy handler has deliberate effect splits, the first safe public
+// mapping in the canonical registry is returned; callers should obtain its
+// exact request through capabilities rather than forwarding legacy arguments.
+func PublicOperationForLegacy(name string) (domain, operation string, ok bool) {
+	for _, spec := range facadeOperationSpecs() {
+		if spec.Legacy == name && !spec.Hidden {
+			return spec.Facade, spec.Operation, true
+		}
+	}
+	return "", "", false
 }
 
 func isFacadeToolName(name string) bool {
@@ -178,6 +190,23 @@ func addFacadeGroup(dst *[]facadeOperationSpec, facade string, effect facadeEffe
 	}
 }
 
+// adminAnalyzeKinds are legacy analyze dispatcher operations that change
+// durable graph state (and, for temporal_verify, also call an external model
+// and write a cache). The public analyze tool is strictly read-only, so these
+// operations are available only through workspace_admin with a server-fixed
+// kind argument.
+var adminAnalyzeKinds = []string{
+	"blame",
+	"coverage",
+	"sql_rebuild",
+	"temporal_verify",
+}
+
+func analyzeKindRequiresAdmin(kind string) bool {
+	i := sort.SearchStrings(adminAnalyzeKinds, kind)
+	return i < len(adminAnalyzeKinds) && adminAnalyzeKinds[i] == kind
+}
+
 // facadeOperationSpecs is the single v1 migration table. Every legacy MCP
 // tool maps to exactly one ordinary facade operation, except deliberate
 // effect splits such as analyze(kind=temporal_verify), which has a second,
@@ -193,10 +222,26 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"artifacts": "search_artifacts", "ast": "search_ast", "completion": "graph_completion_search",
 		"files": "find_files", "symbols": "search_symbols", "text": "search_text", "winnow": "winnow_symbols",
 	})
+	// search_symbols can invoke an LLM under its legacy assist=auto default.
+	// The public search boundary is deterministic and local; callers that
+	// explicitly want model-backed research use ask (or the legacy surface).
+	for i := range specs {
+		if specs[i].Facade == "search" && specs[i].Operation == "symbols" {
+			specs[i].Fixed = map[string]any{"assist": "off"}
+			break
+		}
+	}
 	addFacadeGroup(&specs, "read", facadeEffectRead, map[string]string{
 		"artifact": "get_artifact", "editing_context": "get_editing_context", "file": "read_file",
 		"history": "get_symbol_history", "source": "get_symbol_source", "summary": "get_file_summary",
-		"symbol": "get_symbol", "symbols": "batch_symbols",
+		"symbols": "batch_symbols",
+	})
+	// get_symbol returns metadata without the source body, while source already
+	// includes location and signature. Keep the legacy handler reachable only
+	// on compatibility surfaces; the public read tool has one symbol default.
+	specs = append(specs, facadeOperationSpec{
+		Facade: "read", Operation: "symbol_metadata_compat", Legacy: "get_symbol",
+		Effect: facadeEffectRead, Hidden: true,
 	})
 	addFacadeGroup(&specs, "relations", facadeEffectRead, map[string]string{
 		"callers": "get_callers", "cluster": "get_cluster", "declaration": "find_declaration",
@@ -205,18 +250,34 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"references": "check_references", "usages": "find_usages",
 	})
 	addFacadeGroup(&specs, "trace", facadeEffectRead, map[string]string{
-		"call_chain": "get_call_chain", "cfg": "get_cfg", "cursor": "nav", "flow": "flow_between",
+		"call_chain": "get_call_chain", "cfg": "get_cfg", "flow": "flow_between",
 		"graph": "graph_query", "path": "trace_path", "taint": "taint_paths", "walk": "walk_graph",
 	})
 	addFacadeGroup(&specs, "analyze", facadeEffectRead, map[string]string{
 		"agent_config": "audit_agent_config", "architecture": "get_architecture", "citation": "verify_citation",
 		"clones": "find_clones", "co_change": "find_co_changing_symbols", "communities": "get_communities",
 		"contracts": "contracts", "coupling": "get_coupling_metrics", "extraction": "get_extraction_candidates",
-		"graph": "analyze", "health": "audit_health", "inspections": "run_inspections",
+		"health": "audit_health", "inspections": "run_inspections",
 		"inspection_catalog": "list_inspections", "knowledge_gaps": "get_knowledge_gaps", "lint": "lint_file",
 		"processes": "get_processes", "recent_changes": "get_recent_changes", "replay": "replay_episode",
 		"surprising_connections": "get_surprising_connections", "untested": "get_untested_symbols", "why": "why",
 		"churn": "get_churn_rate",
+	})
+	// Co-change discovery historically starts an asynchronous git mine that
+	// persists EdgeCoChange records. Compact analysis reads only the daemon's
+	// prewarmed cache; explicit legacy calls retain lazy refresh behavior.
+	for i := range specs {
+		if specs[i].Facade == "analyze" && specs[i].Operation == "co_change" {
+			specs[i].Fixed = map[string]any{"refresh": false}
+			break
+		}
+	}
+	// The legacy dispatcher accepts kind=help even though help is not an
+	// analysis kind. Make it the safe public default and the ordinary migration
+	// mapping for the shared legacy analyze name.
+	specs = append(specs, facadeOperationSpec{
+		Facade: "analyze", Operation: "help", Legacy: "analyze",
+		Effect: facadeEffectRead, Fixed: map[string]any{"kind": "help"},
 	})
 	addFacadeGroup(&specs, "ask", facadeEffectRead, map[string]string{"research": "ask"})
 	addFacadeGroup(&specs, "change", facadeEffectRead, map[string]string{
@@ -227,6 +288,15 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"pattern": "suggest_pattern", "preview": "preview_edit", "ranges": "symbols_for_ranges",
 		"tests": "get_test_targets", "verify": "verify_change",
 	})
+	// change_contract can persist a risk acknowledgement when ack=true. Keep
+	// the advisory change boundary read-only; acknowledgement is an explicit
+	// durable-memory operation below.
+	for i := range specs {
+		if specs[i].Facade == "change" && specs[i].Operation == "contract" {
+			specs[i].Fixed = map[string]any{"ack": false}
+			break
+		}
+	}
 	// simulate_chain can persist an overlay when keep=true. The read-only
 	// change facade fixes keep=false; persistent simulations belong to overlay.
 	specs = append(specs, facadeOperationSpec{
@@ -235,7 +305,14 @@ func facadeOperationSpecs() []facadeOperationSpec {
 	})
 	addFacadeGroup(&specs, "edit", facadeEffectLocalWrite, map[string]string{
 		"batch": "batch_edit", "docs": "generate_docs", "export_graph": "export_graph", "file": "edit_file", "scaffold": "scaffold",
-		"skill": "generate_skill", "symbol": "edit_symbol", "wiki": "generate_wiki", "write": "write_file",
+		"skill": "generate_skill", "symbol": "edit_symbol", "write": "write_file",
+	})
+	// generate_wiki can call an LLM when enhance=true. Keep the ordinary edit
+	// authorization boundary local-only; enhanced generation remains available
+	// through the explicit legacy compatibility surface.
+	specs = append(specs, facadeOperationSpec{
+		Facade: "edit", Operation: "wiki", Legacy: "generate_wiki",
+		Effect: facadeEffectLocalWrite, Fixed: map[string]any{"enhance": false},
 	})
 	specs = append(specs, facadeOperationSpec{
 		Facade: "edit", Operation: "apply_overlay", Legacy: "overlay_merge",
@@ -258,12 +335,23 @@ func facadeOperationSpecs() []facadeOperationSpec {
 	addFacadeGroup(&specs, "recall", facadeEffectRead, map[string]string{
 		"distill": "distill_session", "memories": "query_memories", "notebook_find": "notebook_find",
 		"notebook_list": "notebook_list", "notebook_show": "notebook_show", "notes": "query_notes",
-		"onboarding": "check_onboarding_performed", "surface": "surface_memories",
+		"onboarding": "check_onboarding_performed",
+	})
+	// surface_memories normally updates access counters, which affect future
+	// ranking. Compact recall is a true read; explicit legacy calls retain the
+	// historical mark_accessed default.
+	specs = append(specs, facadeOperationSpec{
+		Facade: "recall", Operation: "surface", Legacy: "surface_memories",
+		Effect: facadeEffectRead, Fixed: map[string]any{"mark_accessed": false},
 	})
 	addFacadeGroup(&specs, "remember", facadeEffectLocalWrite, map[string]string{
 		"edit_memory": "edit_memory", "memory": "store_memory", "note": "save_note",
 		"notebook": "notebook_save", "notebook_used": "notebook_used", "rename_memory": "rename_memory",
 		"suppress_finding": "suppress_finding",
+	})
+	specs = append(specs, facadeOperationSpec{
+		Facade: "remember", Operation: "risk_ack", Legacy: "change_contract",
+		Effect: facadeEffectLocalWrite, Fixed: map[string]any{"ack": true},
 	})
 	addFacadeGroup(&specs, "workspace", facadeEffectRead, map[string]string{
 		"active_project": "get_active_project", "graph": "graph_stats", "index": "index_health",
@@ -277,7 +365,7 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"track": "track_repository", "untrack": "untrack_repository",
 	})
 	addFacadeGroup(&specs, "session", facadeEffectSessionWrite, map[string]string{
-		"agents": "agent_registry", "planning_mode": "set_planning_mode", "proxy_disable": "proxy_disable",
+		"agents": "agent_registry", "cursor": "nav", "planning_mode": "set_planning_mode", "proxy_disable": "proxy_disable",
 		"proxy_enable": "proxy_enable", "subscribe_daemon_health": "subscribe_daemon_health",
 		"subscribe_diagnostics": "subscribe_diagnostics", "subscribe_graph_invalidated": "subscribe_graph_invalidated",
 		"subscribe_stale_refs": "subscribe_stale_refs", "subscribe_workspace_readiness": "subscribe_workspace_readiness",
@@ -285,12 +373,15 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"unsubscribe_graph_invalidated": "unsubscribe_graph_invalidated", "unsubscribe_stale_refs": "unsubscribe_stale_refs",
 		"unsubscribe_workspace_readiness": "unsubscribe_workspace_readiness", "workflow": "workflow",
 	})
-	// temporal_verify writes a cache and persists graph verdicts. It is
-	// deliberately extracted from the otherwise read-only analyze facade.
-	specs = append(specs, facadeOperationSpec{
-		Facade: "workspace_admin", Operation: "temporal_verify", Legacy: "analyze",
-		Effect: facadeEffectControlWrite, Fixed: map[string]any{"kind": "temporal_verify"},
-	})
+	// The unified legacy analyze dispatcher mixes reads with durable graph
+	// enrichers. Keep every mutating kind behind one explicit control-write
+	// boundary and make the selected kind impossible for callers to override.
+	for _, kind := range adminAnalyzeKinds {
+		specs = append(specs, facadeOperationSpec{
+			Facade: "workspace_admin", Operation: kind, Legacy: "analyze",
+			Effect: facadeEffectControlWrite, Fixed: map[string]any{"kind": kind},
+		})
+	}
 	addFacadeGroup(&specs, "overlay", facadeEffectSessionWrite, map[string]string{
 		"delete": "overlay_delete", "drop": "overlay_drop", "drop_branch": "overlay_drop_branch",
 		"fork": "overlay_fork", "keepalive": "overlay_keepalive", "push": "overlay_push",

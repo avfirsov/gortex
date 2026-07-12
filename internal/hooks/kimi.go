@@ -102,10 +102,8 @@ func runKimiPreToolUseEvent(data []byte, port int, mode Mode) {
 
 // runKimiPreToolUse applies the graph-aware PreToolUse posture to one tool call.
 //
-//   - Gortex's own whole-file read tools (read_file / get_editing_context) keep
-//     the historical plain-stdout compress-bodies nudge, never a hard deny —
-//     matching Claude's soft posture for these and the established Kimi
-//     contract.
+//   - Gortex's compact read tool (plus legacy compatibility names) keeps the
+//     historical plain-stdout compress-bodies nudge, never a hard deny.
 //   - Native tools (Read / Grep / Glob / Bash) and Task subagent spawns run
 //     through the shared enrich + applyMode path: a deny of an indexed
 //     whole-file read becomes a Kimi permission-decision block; soft guidance
@@ -189,7 +187,7 @@ func kimiSubagentFallbackBriefing() string {
 	sb.WriteString("Subagents don't inherit project instructions, so the rules below are restated inline:\n\n")
 	sb.WriteString(gortexToolGuidance)
 	sb.WriteString(toolref.FallbackLine("smart_context"))
-	sb.WriteString("\n_First call: `smart_context` with your task. Before editing any file: `get_editing_context`. Never Read/Grep an indexed source file._\n")
+	sb.WriteString("\n_First call: `explore` with the task. Before mutation, call `change(operation:\"impact\")`; inspect with `read`; mutate only with `edit` or `refactor`. After mutation, call `change(operation:\"detect\")`, then use its symbol IDs with `change` operations `tests`, `guards`, and `contract`. Never Read/Grep indexed source._\n")
 	return sb.String()
 }
 
@@ -246,7 +244,7 @@ func emitKimiDeny(reason string) {
 
 func kimiGortexReadPreToolUseTool(toolName string) bool {
 	switch strings.TrimSpace(toolName) {
-	case gortexReadFileTool, gortexEditingContextTool, "read_file", "get_editing_context":
+	case gortexCompactReadTool, gortexReadFileTool, gortexEditingContextTool, "read", "read_file", "get_editing_context":
 		return true
 	default:
 		return false

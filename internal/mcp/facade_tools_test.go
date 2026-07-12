@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -53,18 +54,26 @@ func TestFacadeEffectBoundaryParity(t *testing.T) {
 		class := effects[0].Effect
 		for _, spec := range effects {
 			require.Equal(t, class, spec.Effect, "%s mixes effect classes", facade)
-			if spec.Effect == facadeEffectRead && daemon.IsMutating(spec.Legacy) {
+			if spec.Effect == facadeEffectRead && daemon.IsMutating(spec.Legacy) && spec.Facade+"."+spec.Operation != "recall.surface" {
 				t.Fatalf("read facade %s.%s routes durable writer %s", facade, spec.Operation, spec.Legacy)
 			}
 			if spec.Effect == facadeEffectRead && daemon.IsEffectful(spec.Legacy) {
-				require.Equal(t, "change", spec.Facade, "read facade routes effectful legacy tool without an audited fixed-safe adapter")
-				require.Equal(t, "simulate", spec.Operation, "read facade routes effectful legacy tool without an audited fixed-safe adapter")
-				require.Equal(t, false, spec.Fixed["keep"], "change.simulate must disable session persistence")
+				switch spec.Facade + "." + spec.Operation {
+				case "change.simulate":
+					require.Equal(t, false, spec.Fixed["keep"], "change.simulate must disable session persistence")
+				case "recall.surface":
+					require.Equal(t, false, spec.Fixed["mark_accessed"], "recall.surface must disable ranking mutation")
+				default:
+					t.Fatalf("read facade routes effectful legacy tool without an audited fixed-safe adapter: %s.%s -> %s", spec.Facade, spec.Operation, spec.Legacy)
+				}
 			}
 			if spec.Effect == facadeEffectSessionWrite && daemon.IsMutating(spec.Legacy) {
 				require.Equal(t, "overlay", spec.Facade, "session facade routes durable legacy writer without an audited fixed-safe adapter")
 				require.Equal(t, "merge", spec.Operation, "session facade routes durable legacy writer without an audited fixed-safe adapter")
 				require.Equal(t, false, spec.Fixed["to_disk"], "overlay.merge must disable disk application")
+			}
+			if spec.Facade == "edit" && spec.Operation == "wiki" {
+				require.Equal(t, false, spec.Fixed["enhance"], "local edit.wiki must disable LLM egress")
 			}
 		}
 		switch class {
@@ -84,10 +93,10 @@ func TestFacadeEffectBoundaryParity(t *testing.T) {
 	}
 }
 
-func TestFacadeCodexToolsListIsStaticAndBudgeted(t *testing.T) {
+func TestCompactToolsListIsStaticAndBudgeted(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "facade_budget")
-	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
+	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"generic-harness","version":"1.0"}}}`)
 	require.NotNil(t, srv.MCPServer().HandleMessage(ctx, initFrame))
 
 	listFrame := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
@@ -95,6 +104,9 @@ func TestFacadeCodexToolsListIsStaticAndBudgeted(t *testing.T) {
 	require.NotNil(t, reply)
 	raw, err := json.Marshal(reply)
 	require.NoError(t, err)
+	serialized := strings.ToLower(string(raw))
+	require.NotContains(t, serialized, "facade-v1")
+	require.NotContains(t, serialized, "facade")
 	require.LessOrEqual(t, len(raw), 15_000,
 		"facade-v1 tools/list is %d bytes; compact the facade schemas before raising the ceiling", len(raw))
 
@@ -108,6 +120,81 @@ func TestFacadeCodexToolsListIsStaticAndBudgeted(t *testing.T) {
 	for _, tool := range parsed.Result.Tools {
 		require.True(t, isFacadeToolName(tool.Name), "legacy tool leaked into facade-v1: %s", tool.Name)
 	}
+}
+
+func TestFacadeSchemasAcceptUniversalCLIOutput(t *testing.T) {
+	for _, name := range facadeToolNames() {
+		tool := facadeToolDefinition(name)
+		raw, err := json.Marshal(tool.InputSchema)
+		require.NoError(t, err)
+		var schema map[string]any
+		require.NoError(t, json.Unmarshal(raw, &schema))
+		properties, ok := schema["properties"].(map[string]any)
+		require.True(t, ok, name)
+		require.Contains(t, properties, "output", "%s must accept gortex call's universal --format shaping", name)
+	}
+}
+
+func TestIdentifiedClientsShareDefaultSurface(t *testing.T) {
+	clients := make([]string, 0, len(knownAgentClients)+3)
+	for client := range knownAgentClients {
+		clients = append(clients, client)
+	}
+	// Product aliases resolved through host context must follow the same rule.
+	clients = append(clients, "openai-codex", "Claude Code 1.4", "Visual Studio Code")
+	sort.Strings(clients)
+
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	wantTools := mapKeysAsSet(facadeToolNames())
+	require.Len(t, wantTools, 21)
+	for i, client := range clients {
+		t.Run(client, func(t *testing.T) {
+			sessionID := fmt.Sprintf("identified_client_%d", i)
+			ctx := WithSessionID(context.Background(), sessionID)
+			frame := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":%q,"version":"1.0"}}}`, i+1, client))
+			reply := srv.MCPServer().HandleMessage(ctx, frame)
+			require.NotNil(t, reply)
+			raw, err := json.Marshal(reply)
+			require.NoError(t, err)
+			var parsed struct {
+				Result struct {
+					Instructions string `json:"instructions"`
+				} `json:"result"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &parsed))
+			require.Equal(t, codingAgentInstructions, parsed.Result.Instructions)
+			require.Equal(t, wantTools, listToolNamesForSession(t, srv, sessionID))
+			policy := srv.effectiveSessionPolicy(ctx)
+			require.Equal(t, FacadeSurfaceVersion, policy.preset)
+			require.Equal(t, toolPolicyModeHide, policy.mode)
+		})
+	}
+
+	unknownCtx := WithSessionID(context.Background(), "unknown_editor")
+	unknownFrame := []byte(`{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"some-editor","version":"1.0"}}}`)
+	reply := srv.MCPServer().HandleMessage(unknownCtx, unknownFrame)
+	require.NotNil(t, reply)
+	raw, err := json.Marshal(reply)
+	require.NoError(t, err)
+	var parsed struct {
+		Result struct {
+			Instructions string `json:"instructions"`
+		} `json:"result"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &parsed))
+	require.Equal(t, codingAgentInstructions, parsed.Result.Instructions)
+	unknownTools := listToolNamesForSession(t, srv, "unknown_editor")
+	require.Equal(t, wantTools, unknownTools)
+	require.Equal(t, "", srv.resolveSessionFormat(unknownCtx),
+		"unknown clients keep the JSON-safe wire format")
+
+	// Until initialize provides a non-empty clientInfo.name, preserve the
+	// server's global compatibility policy and instructions.
+	anonymousTools := listToolNamesForSession(t, srv, "anonymous_client")
+	require.True(t, anonymousTools["read_file"])
+	require.False(t, anonymousTools["read"])
+	require.Equal(t, serverInstructions, srv.stateAwareInstructionsForClient("", ""))
+	require.Equal(t, serverInstructions, srv.stateAwareInstructionsForClient("", " \t "))
 }
 
 func TestFacadeDispatchReachesColdLegacyHandlerWithoutPromotion(t *testing.T) {
@@ -133,17 +220,30 @@ func TestFacadeDispatchReachesColdLegacyHandlerWithoutPromotion(t *testing.T) {
 	require.True(t, srv.lazy.IsDeferred("get_architecture"), "facade dispatch must not promote the legacy schema")
 	require.Equal(t, listToolNamesForSession(t, srv, "facade_cold_dispatch"),
 		mapKeysAsSet(facadeToolNames()), "facade dispatch must not change the static tools/list")
+
+	helpFrame := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analyze","arguments":{}}}`)
+	raw, err = json.Marshal(srv.MCPServer().HandleMessage(ctx, helpFrame))
+	require.NoError(t, err)
+	parsed = struct {
+		Error  any                   `json:"error"`
+		Result *mcpgo.CallToolResult `json:"result"`
+	}{}
+	require.NoError(t, json.Unmarshal(raw, &parsed))
+	require.Nil(t, parsed.Error)
+	require.NotNil(t, parsed.Result)
+	require.False(t, parsed.Result.IsError, "omitted public analyze kind must return help")
 }
 
 func TestFacadeLegacyClientKeepsLegacySurfaceAndSchema(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "legacy_client")
+	srv.NoteSessionToolPolicy("legacy_client", "core", "defer")
 	before := listToolNamesForSession(t, srv, "legacy_client")
 
 	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"some-editor","version":"1.0"}}}`)
 	require.NotNil(t, srv.MCPServer().HandleMessage(ctx, initFrame))
 	after := listToolNamesForSession(t, srv, "legacy_client")
-	require.Equal(t, before, after, "an unknown legacy client must retain the global core surface")
+	require.Equal(t, before, after, "an explicitly selected legacy preset must retain the core surface")
 	require.True(t, after["read_file"])
 	require.True(t, after["analyze"])
 	for _, name := range facadeToolNames() {
@@ -191,6 +291,7 @@ func TestFacadeLegacyClientKeepsLegacySurfaceAndSchema(t *testing.T) {
 func TestDedicatedFacadeNamesRequireFacadeNegotiation(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "legacy_facade_gate")
+	srv.NoteSessionToolPolicy("legacy_facade_gate", "core", "defer")
 	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"some-editor","version":"1.0"}}}`)
 	require.NotNil(t, srv.MCPServer().HandleMessage(ctx, initFrame))
 
@@ -350,6 +451,7 @@ func TestFacadeGateRecoveryGuidanceUsesCallableSurface(t *testing.T) {
 	require.Contains(t, toolResultText(workflow), `session(operation=\"workflow\"`)
 
 	// Legacy sessions retain the established recovery vocabulary.
+	srv.NoteSessionToolPolicy("legacy_guidance", "core", "defer")
 	srv.NoteSessionClient("legacy_guidance", "some-editor", "1")
 	legacyCtx := WithSessionID(context.Background(), "legacy_guidance")
 	legacySess := srv.sessionFor(legacyCtx)
@@ -369,12 +471,17 @@ func mapKeysAsSet(names []string) map[string]bool {
 	return out
 }
 
-func TestFacadeCodexInstructionsStayTerse(t *testing.T) {
+func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	srv := &Server{}
-	got := srv.stateAwareInstructionsForClient("", "openai-codex")
-	require.Equal(t, facadeServerInstructions, got)
+	got := srv.stateAwareInstructionsForClient("", "generic-harness")
+	require.Equal(t, codingAgentInstructions, got)
 	require.Less(t, len(got), 500)
-	require.NotContains(t, got, "tools_search")
+	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
+		require.NotContains(t, strings.ToLower(got), implementationTerm)
+	}
+	for _, directive := range []string{"MUST use Gortex MCP", "Start every task with explore", `change(operation:"impact")`, "Mutate only with edit or refactor", `change(operation:"detect")`, "Call capabilities only for unknown fields"} {
+		require.Contains(t, got, directive)
+	}
 }
 
 func TestFacadeInitializeInstructionsFollowEffectivePolicy(t *testing.T) {
@@ -408,7 +515,7 @@ func TestFacadeInitializeInstructionsFollowEffectivePolicy(t *testing.T) {
 		srv.NoteSessionToolPolicy("editor_facade", FacadeSurfaceVersion, "hide")
 		ctx := WithSessionID(context.Background(), "editor_facade")
 		instructions := initialize(t, srv, ctx, "some-editor")
-		require.Equal(t, facadeServerInstructions, instructions)
+		require.Equal(t, codingAgentInstructions, instructions)
 		names := listToolNamesForSession(t, srv, "editor_facade")
 		require.True(t, names["read"])
 		require.False(t, names["read_file"])
@@ -437,7 +544,7 @@ func TestFacadePolicyResolutionPrecedence(t *testing.T) {
 
 	t.Run("codex_host_alias_uses_facade", func(t *testing.T) {
 		srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
-		require.Equal(t, facadeServerInstructions, initialize(t, srv, "codex_alias", "openai-codex"))
+		require.Equal(t, codingAgentInstructions, initialize(t, srv, "codex_alias", "openai-codex"))
 		require.Equal(t, mapKeysAsSet(facadeToolNames()), listToolNamesForSession(t, srv, "codex_alias"))
 	})
 
@@ -458,7 +565,7 @@ func TestFacadePolicyResolutionPrecedence(t *testing.T) {
 	t.Run("bare_forwarded_facade_defaults_hide", func(t *testing.T) {
 		srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 		srv.NoteSessionToolPolicy("forwarded_facade", FacadeSurfaceVersion, "")
-		require.Equal(t, facadeServerInstructions, initialize(t, srv, "forwarded_facade", "some-editor"))
+		require.Equal(t, codingAgentInstructions, initialize(t, srv, "forwarded_facade", "some-editor"))
 		ctx := WithSessionID(context.Background(), "forwarded_facade")
 		policy := srv.effectiveSessionPolicy(ctx)
 		require.Equal(t, FacadeSurfaceVersion, policy.preset)
@@ -536,6 +643,21 @@ func TestFacadeDispatchNormalizesTargetAndEditAliases(t *testing.T) {
 	require.Equal(t, "old", editArgs["old_source"])
 	require.Equal(t, "new", editArgs["new_source"])
 	require.Equal(t, "abc", editArgs["base_sha"])
+
+	inferredRead := mcpgo.CallToolRequest{}
+	inferredRead.Params.Arguments = map[string]any{"target": map[string]any{"file": "internal/mcp/server.go"}}
+	readResult, err = srv.handleFacade(context.Background(), "read", inferredRead)
+	require.NoError(t, err)
+	require.Equal(t, "internal/mcp/server.go", unmarshalResult(t, readResult)["path"])
+
+	inferredEdit := mcpgo.CallToolRequest{}
+	inferredEdit.Params.Arguments = map[string]any{
+		"target": map[string]any{"symbol": "internal/mcp/server.go::Server.addTool"},
+		"match":  "old", "replacement": "new",
+	}
+	editResult, err = srv.handleFacade(context.Background(), "edit", inferredEdit)
+	require.NoError(t, err)
+	require.Equal(t, "internal/mcp/server.go::Server.addTool", unmarshalResult(t, editResult)["id"])
 }
 
 func TestFacadeOperationAliasesMatchLegacyContracts(t *testing.T) {
@@ -543,7 +665,13 @@ func TestFacadeOperationAliasesMatchLegacyContracts(t *testing.T) {
 	captureArguments := func(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		return mcpgo.NewToolResultJSON(req.GetArguments())
 	}
-	for _, legacy := range []string{"search_ast", "winnow_symbols", "find_files", "search_symbols", "find_declaration", "flow_between", "trace_path", "taint_paths", "move_symbol", "batch_edit", "subscribe_diagnostics"} {
+	for _, legacy := range []string{
+		"search_ast", "winnow_symbols", "find_files", "search_symbols", "find_declaration",
+		"flow_between", "trace_path", "taint_paths", "move_symbol", "batch_edit", "subscribe_diagnostics",
+		"explain_change_impact", "get_test_targets", "check_guards", "get_edit_plan", "suggest_pattern",
+		"verify_change", "get_diagnostics", "get_code_actions", "symbols_for_ranges", "preview_edit",
+		"simulate_chain", "change_contract",
+	} {
 		srv.facades.capture(mcpgo.NewTool(legacy), captureArguments)
 	}
 	tests := []struct {
@@ -559,6 +687,18 @@ func TestFacadeOperationAliasesMatchLegacyContracts(t *testing.T) {
 		{"trace", map[string]any{"operation": "taint", "target": map[string]any{"query": "user.*"}, "to": map[string]any{"query": "exec.*"}}, map[string]any{"source_pattern": "user.*", "sink_pattern": "exec.*"}},
 		{"refactor", map[string]any{"operation": "move", "target": map[string]any{"symbol": "pkg/a.go::A"}, "destination": "pkg/b.go"}, map[string]any{"id": "pkg/a.go::A", "target_file": "pkg/b.go"}},
 		{"edit", map[string]any{"operation": "batch", "changes": []any{map[string]any{"op": "edit_file"}}}, map[string]any{"edits": []any{map[string]any{"op": "edit_file"}}}},
+		{"change", map[string]any{"operation": "impact", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "tests", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "guards", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "edit_plan", "source": map[string]any{"symbols": []any{"a", "b"}}}, map[string]any{"ids": "a,b"}},
+		{"change", map[string]any{"operation": "pattern", "source": map[string]any{"symbols": []any{"a"}}}, map[string]any{"id": "a"}},
+		{"change", map[string]any{"operation": "verify", "source": map[string]any{"changes": []any{map[string]any{"symbol_id": "a", "new_signature": "A()"}}}}, map[string]any{"changes": `[{"new_signature":"A()","symbol_id":"a"}]`}},
+		{"change", map[string]any{"operation": "diagnostics", "source": map[string]any{"file": "a.go"}}, map[string]any{"path": "a.go"}},
+		{"change", map[string]any{"operation": "code_actions", "source": map[string]any{"file": "a.go", "range": map[string]any{"start_line": 2, "end_line": 4}}}, map[string]any{"path": "a.go", "start_line": float64(2), "end_line": float64(4)}},
+		{"change", map[string]any{"operation": "ranges", "source": map[string]any{"file": "a.go", "range": map[string]any{"start_line": 2, "end_line": 4}}}, map[string]any{"path": "a.go", "start_line": float64(2), "end_line": float64(4)}},
+		{"change", map[string]any{"operation": "preview", "source": map[string]any{"workspace_edit": map[string]any{"changes": map[string]any{}}}}, map[string]any{"workspace_edit": `{"changes":{}}`}},
+		{"change", map[string]any{"operation": "simulate", "source": map[string]any{"steps": []any{map[string]any{"changes": map[string]any{}}}}}, map[string]any{"steps": `[{"changes":{}}]`, "keep": false}},
+		{"change", map[string]any{"operation": "contract", "source": map[string]any{"symbols": []any{"a", "b"}, "ranges": []any{map[string]any{"file": "a.go", "start_line": 2}}}}, map[string]any{"symbols": "a,b", "ranges": `[{"file":"a.go","start_line":2}]`}},
 	}
 	for _, test := range tests {
 		req := mcpgo.CallToolRequest{}
@@ -686,6 +826,11 @@ func TestFacadeReadOnlyOperationsCannotEnablePersistence(t *testing.T) {
 	srv.facades.capture(mcpgo.NewTool("simulate_chain"), captureArguments)
 	srv.facades.capture(mcpgo.NewTool("analyze"), captureArguments)
 	srv.facades.capture(mcpgo.NewTool("overlay_merge"), captureArguments)
+	srv.facades.capture(mcpgo.NewTool("generate_wiki"), captureArguments)
+	srv.facades.capture(mcpgo.NewTool("surface_memories"), captureArguments)
+	srv.facades.capture(mcpgo.NewTool("search_symbols"), captureArguments)
+	srv.facades.capture(mcpgo.NewTool("change_contract"), captureArguments)
+	srv.facades.capture(mcpgo.NewTool("find_co_changing_symbols"), captureArguments)
 
 	simulate := mcpgo.CallToolRequest{}
 	simulate.Params.Arguments = map[string]any{
@@ -711,25 +856,107 @@ func TestFacadeReadOnlyOperationsCannotEnablePersistence(t *testing.T) {
 	args = unmarshalResult(t, result)
 	require.Equal(t, true, args["to_disk"], "edit.apply_overlay must always cross the disk-write boundary")
 
-	admin := mcpgo.CallToolRequest{}
-	admin.Params.Arguments = map[string]any{
-		"operation": "temporal_verify",
-		"options":   map[string]any{"kind": "hotspots"},
-	}
-	result, err = srv.handleFacade(context.Background(), "workspace_admin", admin)
+	wiki := mcpgo.CallToolRequest{}
+	wiki.Params.Arguments = map[string]any{"operation": "wiki", "options": map[string]any{"enhance": true}}
+	result, err = srv.handleFacade(context.Background(), "edit", wiki)
 	require.NoError(t, err)
 	args = unmarshalResult(t, result)
-	require.Equal(t, "temporal_verify", args["kind"], "effect-safe routing must fix the mutating analyze kind")
+	require.Equal(t, false, args["enhance"], "compact edit.wiki must not cross the LLM/open-world boundary")
 
-	analyzeCalled = false
-	nestedBypass := mcpgo.CallToolRequest{}
-	nestedBypass.Params.Arguments = map[string]any{
-		"options": map[string]any{"kind": "temporal_verify"},
-	}
-	result, err = srv.handleFacade(context.Background(), "analyze", nestedBypass)
+	recall := mcpgo.CallToolRequest{}
+	recall.Params.Arguments = map[string]any{"operation": "surface", "arguments": map[string]any{"mark_accessed": true}}
+	result, err = srv.handleFacade(context.Background(), "recall", recall)
 	require.NoError(t, err)
-	require.True(t, result.IsError)
-	require.False(t, analyzeCalled, "nested temporal_verify must be rejected before the read-only analyze handler runs")
+	args = unmarshalResult(t, result)
+	require.Equal(t, false, args["mark_accessed"], "read-only recall must not mutate future memory ranking")
+
+	search := mcpgo.CallToolRequest{}
+	search.Params.Arguments = map[string]any{
+		"operation": "symbols", "query": "where is authentication handled",
+		"options": map[string]any{"assist": "deep"},
+	}
+	result, err = srv.handleFacade(context.Background(), "search", search)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, "off", args["assist"], "local search must not invoke an LLM")
+
+	contract := mcpgo.CallToolRequest{}
+	contract.Params.Arguments = map[string]any{
+		"operation": "contract",
+		"source":    map[string]any{"source": "symbols", "symbols": []any{"a.go::A"}},
+		"options":   map[string]any{"ack": true},
+	}
+	result, err = srv.handleFacade(context.Background(), "change", contract)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, false, args["ack"], "read-only change.contract must not persist a risk acknowledgement")
+
+	riskAck := mcpgo.CallToolRequest{}
+	riskAck.Params.Arguments = map[string]any{
+		"operation": "risk_ack",
+		"arguments": map[string]any{"source": "symbols", "symbols": "a.go::A", "ack": false},
+	}
+	result, err = srv.handleFacade(context.Background(), "remember", riskAck)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, true, args["ack"], "remember.risk_ack must always take the durable acknowledgement path")
+
+	coChange := mcpgo.CallToolRequest{}
+	coChange.Params.Arguments = map[string]any{
+		"kind": "co_change", "target": map[string]any{"symbol": "a.go::A"},
+		"options": map[string]any{"refresh": true},
+	}
+	result, err = srv.handleFacade(context.Background(), "analyze", coChange)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, false, args["refresh"], "compact co-change lookup must not start a durable mine")
+
+	for kind, flag := range map[string]string{"concepts": "use_llm", "impact": "refresh_cochange", "sql_call_sites": "materialize"} {
+		req := mcpgo.CallToolRequest{}
+		req.Params.Arguments = map[string]any{"kind": kind, "options": map[string]any{flag: true}}
+		result, err = srv.handleFacade(context.Background(), "analyze", req)
+		require.NoError(t, err)
+		args = unmarshalResult(t, result)
+		require.Equal(t, kind, args["kind"])
+		require.Equal(t, false, args[flag], "analyze.%s must keep its public read-only posture", kind)
+	}
+
+	normalizedKind := mcpgo.CallToolRequest{}
+	normalizedKind.Params.Arguments = map[string]any{"kind": "dead-code"}
+	result, err = srv.handleFacade(context.Background(), "analyze", normalizedKind)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, "dead_code", args["kind"], "the normalized public kind must be fixed before legacy dispatch")
+
+	defaultHelp := mcpgo.CallToolRequest{}
+	result, err = srv.handleFacade(context.Background(), "analyze", defaultHelp)
+	require.NoError(t, err)
+	args = unmarshalResult(t, result)
+	require.Equal(t, "help", args["kind"], "omitted kind must select the safe help operation")
+
+	for _, kind := range adminAnalyzeKinds {
+		admin := mcpgo.CallToolRequest{}
+		admin.Params.Arguments = map[string]any{
+			"operation": kind,
+			"arguments": map[string]any{"kind": "hotspots"},
+		}
+		result, err = srv.handleFacade(context.Background(), "workspace_admin", admin)
+		require.NoError(t, err)
+		args = unmarshalResult(t, result)
+		require.Equal(t, kind, args["kind"], "effect-safe admin routing must fix kind=%s", kind)
+	}
+
+	for _, kind := range adminAnalyzeKinds {
+		analyzeCalled = false
+		nestedBypass := mcpgo.CallToolRequest{}
+		nestedBypass.Params.Arguments = map[string]any{
+			"options": map[string]any{"kind": kind},
+		}
+		result, err = srv.handleFacade(context.Background(), "analyze", nestedBypass)
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+		require.False(t, analyzeCalled, "nested %s must be rejected before the read-only analyze handler runs", kind)
+	}
 
 	ambiguous := mcpgo.CallToolRequest{}
 	ambiguous.Params.Arguments = map[string]any{
@@ -755,10 +982,265 @@ func TestFacadeCapabilitiesReturnsOperationSchema(t *testing.T) {
 	require.NoError(t, err)
 	out := unmarshalResult(t, result)
 	require.Equal(t, FacadeSurfaceVersion, out["surface_version"])
+	require.Equal(t, "read", out["domain"])
 	require.Equal(t, "file", out["operation"])
 	require.Equal(t, true, out["available"])
 	require.NotEmpty(t, out["schema_hash"])
 	require.NotNil(t, out["input_schema"])
+	shape, ok := out["request_shape"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "read", shape["tool"])
+	arguments, ok := shape["arguments"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "file", arguments["operation"])
+	require.Equal(t, map[string]any{"file": "<file>"}, arguments["target"])
+}
+
+func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	handler := func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText("ok"), nil
+	}
+	srv.facades.capture(mcpgo.NewTool("edit_file",
+		mcpgo.WithString("path", mcpgo.Required()),
+		mcpgo.WithString("old_string", mcpgo.Required()),
+		mcpgo.WithString("new_string", mcpgo.Required()),
+		mcpgo.WithBoolean("dry_run"),
+	), handler)
+	srv.facades.capture(mcpgo.NewTool("rename_symbol",
+		mcpgo.WithString("id", mcpgo.Required()),
+		mcpgo.WithString("new_name", mcpgo.Required()),
+		mcpgo.WithBoolean("dry_run"),
+	), handler)
+	srv.facades.capture(mcpgo.NewTool("find_files"), handler)
+	srv.facades.capture(mcpgo.NewTool("api_impact"), handler)
+	srv.facades.capture(mcpgo.NewTool("symbols_for_ranges"), handler)
+	srv.facades.capture(mcpgo.NewTool("batch_edit",
+		mcpgo.WithArray("edits", mcpgo.Required()),
+	), handler)
+	srv.facades.capture(mcpgo.NewTool("context_closure"), handler)
+	srv.facades.capture(mcpgo.NewTool("verify_citation"), handler)
+	srv.facades.capture(mcpgo.NewTool("find_co_changing_symbols"), handler)
+	srv.facades.capture(mcpgo.NewTool("generate_skill"), handler)
+
+	requestShape := func(domain, operation string) map[string]any {
+		t.Helper()
+		req := mcpgo.CallToolRequest{}
+		req.Params.Arguments = map[string]any{"domain": domain, "operation": operation, "detail": "schema"}
+		result, err := srv.handleCapabilities(context.Background(), req)
+		require.NoError(t, err)
+		out := unmarshalResult(t, result)
+		shape, ok := out["request_shape"].(map[string]any)
+		require.True(t, ok)
+		arguments, ok := shape["arguments"].(map[string]any)
+		require.True(t, ok)
+		return arguments
+	}
+
+	edit := requestShape("edit", "file")
+	require.Equal(t, map[string]any{"file": "<file>"}, edit["target"])
+	require.Equal(t, "<existing text>", edit["match"])
+	require.Equal(t, "<replacement text>", edit["replacement"])
+	require.Equal(t, true, edit["dry_run"])
+	require.NotContains(t, edit, "old_string")
+	require.NotContains(t, edit, "new_string")
+
+	rename := requestShape("refactor", "rename")
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, rename["target"])
+	require.Equal(t, "<new name>", rename["new_name"])
+	require.Equal(t, true, rename["dry_run"])
+
+	files := requestShape("search", "files")
+	require.Equal(t, "<query>", files["query"])
+	apiImpact := requestShape("change", "api_impact")
+	require.Equal(t, "<file>", apiImpact["source"].(map[string]any)["file"])
+	ranges := requestShape("change", "ranges")
+	require.NotEmpty(t, ranges["source"].(map[string]any)["ranges"])
+	batch := requestShape("edit", "batch")
+	require.NotEmpty(t, batch["changes"])
+	closure := requestShape("explore", "closure")
+	require.NotEmpty(t, closure["options"].(map[string]any)["files"])
+	citation := requestShape("analyze", "citation")
+	require.NotEmpty(t, citation["options"].(map[string]any)["span"])
+	require.NotEmpty(t, citation["options"].(map[string]any)["file_path"])
+	coChange := requestShape("analyze", "co_change")
+	require.Equal(t, map[string]any{"symbol": "<symbol>"}, coChange["target"])
+	skill := requestShape("edit", "skill")
+	require.Equal(t, "<directory>", skill["options"].(map[string]any)["directory"])
+}
+
+func TestFacadeCapabilitiesDiscoversNativeAnalyzeKinds(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	srv.facades.capture(mcpgo.NewTool("analyze",
+		mcpgo.WithString("kind", mcpgo.Required()),
+		mcpgo.WithString("tag", mcpgo.Description("(todos) TODO tag; also accepted by (releases)")),
+		mcpgo.WithNumber("limit", mcpgo.Description("Maximum rows")),
+		mcpgo.WithString("profile", mcpgo.Description("(coverage) Cover profile")),
+		mcpgo.WithString("from_id", mcpgo.Description("(would_create_cycle) Source symbol")),
+		mcpgo.WithString("to_id", mcpgo.Description("(would_create_cycle) Target symbol")),
+		mcpgo.WithString("id", mcpgo.Description("(def_use) Symbol")),
+		mcpgo.WithString("ids", mcpgo.Description("(def_use, impact) Symbols")),
+		mcpgo.WithBoolean("use_llm", mcpgo.Description("(concepts) Use a model")),
+		mcpgo.WithBoolean("refresh_cochange", mcpgo.Description("(impact) Refresh co-change")),
+		mcpgo.WithBoolean("materialize", mcpgo.Description("(sql_call_sites) Rebuild SQL edges")),
+	), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText("ok"), nil
+	})
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"domain": "analyze", "operation": "todos", "detail": "schema"}
+	result, err := srv.handleCapabilities(context.Background(), req)
+	require.NoError(t, err)
+	out := unmarshalResult(t, result)
+	require.Equal(t, true, out["available"])
+	require.Equal(t, AnalyzeKindDescription("todos"), out["summary"])
+	shape := out["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	require.Equal(t, "todos", shape["kind"])
+	schema := out["input_schema"].(map[string]any)
+	schemaProperties := schema["properties"].(map[string]any)
+	optionsProperties := schemaProperties["options"].(map[string]any)["properties"].(map[string]any)
+	require.Contains(t, optionsProperties, "tag")
+	require.NotContains(t, optionsProperties, "profile")
+	require.NotContains(t, optionsProperties, "from_id")
+	require.Contains(t, schemaProperties["output"].(map[string]any)["properties"], "limit")
+
+	capability := func(domain, operation string) map[string]any {
+		t.Helper()
+		call := mcpgo.CallToolRequest{}
+		call.Params.Arguments = map[string]any{"domain": domain, "operation": operation, "detail": "schema"}
+		got, callErr := srv.handleCapabilities(context.Background(), call)
+		require.NoError(t, callErr)
+		return unmarshalResult(t, got)
+	}
+
+	would := capability("analyze", "would_create_cycle")
+	wouldSchema := would["input_schema"].(map[string]any)
+	require.ElementsMatch(t, []any{"kind", "options"}, wouldSchema["required"].([]any))
+	wouldOptions := wouldSchema["properties"].(map[string]any)["options"].(map[string]any)
+	require.ElementsMatch(t, []any{"from_id", "to_id"}, wouldOptions["required"].([]any))
+
+	defUse := capability("analyze", "def_use")
+	defSchema := defUse["input_schema"].(map[string]any)
+	require.Contains(t, defSchema["required"].([]any), "target")
+	defTarget := defSchema["properties"].(map[string]any)["target"].(map[string]any)
+	require.Contains(t, defTarget["properties"].(map[string]any), "symbol")
+
+	coverage := capability("workspace_admin", "coverage")
+	require.Equal(t, AnalyzeKindDescription("coverage"), coverage["summary"])
+	coverageSchema := coverage["input_schema"].(map[string]any)
+	coverageArgs := coverageSchema["properties"].(map[string]any)["arguments"].(map[string]any)
+	require.Contains(t, coverageArgs["properties"].(map[string]any), "profile")
+	require.Contains(t, coverageArgs["required"].([]any), "profile")
+	require.Equal(t, "coverage", coverage["fixed_arguments"].(map[string]any)["kind"])
+
+	concepts := capability("analyze", "concepts")
+	require.Equal(t, false, concepts["fixed_arguments"].(map[string]any)["use_llm"])
+	require.Equal(t, "concepts", concepts["fixed_arguments"].(map[string]any)["kind"])
+
+	releases := capability("analyze", "releases")
+	releasesOptions := releases["input_schema"].(map[string]any)["properties"].(map[string]any)["options"].(map[string]any)["properties"].(map[string]any)
+	require.Contains(t, releasesOptions, "tag")
+
+	listReq := mcpgo.CallToolRequest{}
+	listReq.Params.Arguments = map[string]any{"domain": "analyze"}
+	listResult, err := srv.handleCapabilities(context.Background(), listReq)
+	require.NoError(t, err)
+	list := unmarshalResult(t, listResult)
+	operations := list["operations"].([]any)
+	foundTodos := false
+	foundHelp := false
+	for _, raw := range operations {
+		operation := raw.(map[string]any)["operation"]
+		foundTodos = foundTodos || operation == "todos"
+		foundHelp = foundHelp || operation == "help"
+		require.NotEqual(t, "graph", operation)
+		for _, adminKind := range adminAnalyzeKinds {
+			require.NotEqual(t, adminKind, operation)
+		}
+	}
+	require.True(t, foundTodos)
+	require.True(t, foundHelp)
+}
+
+func TestFacadeCapabilitiesCollapseSessionSubscriptionChannels(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+	handler := func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText("ok"), nil
+	}
+	srv.facades.capture(mcpgo.NewTool("subscribe_diagnostics"), handler)
+	srv.facades.capture(mcpgo.NewTool("unsubscribe_diagnostics"), handler)
+	srv.facades.capture(mcpgo.NewTool("nav", mcpgo.WithString("action", mcpgo.Required()), mcpgo.WithString("id")), handler)
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"domain": "session"}
+	result, err := srv.handleCapabilities(context.Background(), req)
+	require.NoError(t, err)
+	operations := unmarshalResult(t, result)["operations"].([]any)
+	seen := map[string]bool{}
+	for _, raw := range operations {
+		name := raw.(map[string]any)["operation"].(string)
+		seen[name] = true
+		require.NotContains(t, name, "diagnostics")
+		require.NotContains(t, name, "daemon_health")
+	}
+	require.True(t, seen["subscribe"])
+	require.True(t, seen["unsubscribe"])
+	require.True(t, seen["cursor"])
+
+	schemaReq := mcpgo.CallToolRequest{}
+	schemaReq.Params.Arguments = map[string]any{"domain": "session", "operation": "subscribe", "detail": "schema"}
+	schemaResult, err := srv.handleCapabilities(context.Background(), schemaReq)
+	require.NoError(t, err)
+	shape := unmarshalResult(t, schemaResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	require.Equal(t, "subscribe", shape["operation"])
+	require.Equal(t, "<channel>", shape["channel"])
+
+	cursorReq := mcpgo.CallToolRequest{}
+	cursorReq.Params.Arguments = map[string]any{"domain": "session", "operation": "cursor", "detail": "schema"}
+	cursorResult, err := srv.handleCapabilities(context.Background(), cursorReq)
+	require.NoError(t, err)
+	cursorShape := unmarshalResult(t, cursorResult)["request_shape"].(map[string]any)["arguments"].(map[string]any)
+	require.Equal(t, "cursor", cursorShape["operation"])
+	require.Equal(t, "<action>", cursorShape["arguments"].(map[string]any)["action"])
+
+	invalid := mcpgo.CallToolRequest{}
+	invalid.Params.Arguments = map[string]any{"operation": "subscribe", "channel": "private_channel"}
+	invalidResult, err := srv.handleFacade(context.Background(), "session", invalid)
+	require.NoError(t, err)
+	require.True(t, invalidResult.IsError)
+	invalidText := toolResultText(invalidResult)
+	require.Contains(t, invalidText, "valid_channels")
+	require.NotContains(t, invalidText, "subscribe_diagnostics")
+	require.NotContains(t, invalidText, "unsubscribe_daemon_health")
+}
+
+func TestFacadeCapabilitiesUsesPublicDomainVocabulary(t *testing.T) {
+	srv := &Server{facades: newFacadeRegistry()}
+
+	listReq := mcpgo.CallToolRequest{}
+	listResult, err := srv.handleCapabilities(context.Background(), listReq)
+	require.NoError(t, err)
+	list := unmarshalResult(t, listResult)
+	require.NotNil(t, list["domains"])
+	require.NotContains(t, list, "facades")
+
+	domainReq := mcpgo.CallToolRequest{}
+	domainReq.Params.Arguments = map[string]any{"domain": "read"}
+	domainResult, err := srv.handleCapabilities(context.Background(), domainReq)
+	require.NoError(t, err)
+	domain := unmarshalResult(t, domainResult)
+	require.Equal(t, "read", domain["domain"])
+	require.NotContains(t, domain, "facade")
+
+	unknownReq := mcpgo.CallToolRequest{}
+	unknownReq.Params.Arguments = map[string]any{"domain": "missing"}
+	unknownResult, err := srv.handleCapabilities(context.Background(), unknownReq)
+	require.NoError(t, err)
+	require.True(t, unknownResult.IsError)
+	unknownText := unknownResult.Content[0].(mcpgo.TextContent).Text
+	require.Contains(t, unknownText, "unknown tool domain")
+	require.Contains(t, unknownText, "valid_domains")
+	require.NotContains(t, unknownText, "valid_facades")
 }
 
 func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
@@ -797,6 +1279,10 @@ func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.IsError)
 
+	srv.recordFacadeTelemetry("analyze", "todos", facadeOutcomeSuccess, time.Millisecond)
+	srv.recordFacadeTelemetry("analyze", "coverage", facadeOutcomeBlocked, time.Millisecond)
+	srv.recordFacadeTelemetry("analyze", sensitiveOperation, facadeOutcomeSuccess, time.Millisecond)
+
 	srv.FlushTelemetry()
 	days, err := store.Days()
 	require.NoError(t, err)
@@ -818,7 +1304,15 @@ func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
 		boundedFacadeTelemetryDimension("capabilities", "unknown", facadeOutcomeInvalidOperation)])
 	require.Equal(t, 1, rollup.Counts["mcp_facade_invalid:"+
 		boundedFacadeTelemetryDimension("capabilities", "unknown", string(ErrCodeInvalidArgument))])
-	latencyCounts := map[string]int{"read.file": 0, "read.unknown": 0, "capabilities.unknown": 0}
+	require.Equal(t, 1, rollup.Counts["mcp_facade_call:analyze.todos"])
+	require.Equal(t, 1, rollup.Counts["mcp_facade_outcome:analyze.todos.success"])
+	require.Equal(t, 1, rollup.Counts["mcp_facade_call:analyze.coverage"])
+	require.Equal(t, 1, rollup.Counts["mcp_facade_outcome:analyze.coverage.blocked"])
+	require.Equal(t, 1, rollup.Counts["mcp_facade_call:analyze.unknown"])
+	latencyCounts := map[string]int{
+		"read.file": 0, "read.unknown": 0, "capabilities.unknown": 0,
+		"analyze.todos": 0, "analyze.coverage": 0, "analyze.unknown": 0,
+	}
 	for key := range rollup.Counts {
 		require.LessOrEqual(t, len(strings.TrimPrefix(key, strings.SplitN(key, ":", 2)[0]+":")), 32)
 		require.NotContains(t, key, "alice")
@@ -834,6 +1328,9 @@ func TestFacadeDispatchRecordsOperationTelemetry(t *testing.T) {
 	require.Equal(t, 2, latencyCounts["read.file"])
 	require.Equal(t, 1, latencyCounts["read.unknown"])
 	require.Equal(t, 1, latencyCounts["capabilities.unknown"])
+	require.Equal(t, 1, latencyCounts["analyze.todos"])
+	require.Equal(t, 1, latencyCounts["analyze.coverage"])
+	require.Equal(t, 1, latencyCounts["analyze.unknown"])
 
 	long := facadeTelemetryDimension(facadeOperationSpec{Facade: "session", Operation: "unsubscribe_workspace_readiness"})
 	require.LessOrEqual(t, len(long), 32)

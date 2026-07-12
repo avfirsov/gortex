@@ -46,6 +46,32 @@ func TestBuildToolCallFrame_NilArgs(t *testing.T) {
 	}
 }
 
+func TestBuildToolCallFrame_CompactKeepsPublicOutputShape(t *testing.T) {
+	args := map[string]any{
+		"operation": "symbols",
+		"output":    map[string]any{"format": "json", "limit": 5},
+	}
+	frame, err := buildToolCallFrameWithDefault(3, "search", args, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Params struct {
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := m.Params.Arguments["format"]; leaked {
+		t.Fatalf("compact frame leaked legacy top-level format: %v", m.Params.Arguments)
+	}
+	output, ok := m.Params.Arguments["output"].(map[string]any)
+	if !ok || output["format"] != "json" || output["limit"] != float64(5) {
+		t.Fatalf("compact output shaping was not preserved: %v", m.Params.Arguments)
+	}
+}
+
 func contains(b []byte, sub string) bool {
 	return len(b) >= len(sub) && (string(b) == sub || indexOf(string(b), sub) >= 0)
 }

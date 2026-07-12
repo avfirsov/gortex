@@ -138,29 +138,29 @@ const (
 	formatDeepDiveMarker = "compact tabular text, lossy"
 )
 
-// TestInstructionsBody_PolicyCoreAndSingleHome smoke-tests the slim project
-// rule block: it keeps the mandatory graph-tools mapping + the memory-workflow
-// pointers, and it does NOT re-carry the relocated reference content.
+// TestInstructionsBody_PolicyCoreAndSingleHome locks the compact public
+// workflow and its Bash mirror. Agent-facing rules must not leak transport
+// versions, legacy implementation aliases, or the relocated long reference.
 func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	for _, token := range []string{
-		// Graph-tools policy core.
-		"search_symbols", "find_usages", "get_callers",
-		"get_symbol_source", "get_editing_context", "get_file_summary",
-		"read_file", "smart_context", "edit_file", "compress_bodies",
-		// Memory workflow (pointer form).
-		"distill_session", "surface_memories", "save_note", "store_memory",
-		"query_notes", "query_memories",
-		// Discovery pointers.
-		"tools_search", "gortex://guide",
+		"explore", "search", "read", "relations", "trace", "change",
+		"edit", "refactor", "capabilities", "recall", "remember",
+		"gortex call read", `operation:"verify"`,
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — policy core regression", token)
 		}
 	}
-	for _, banned := range []string{providerMatrixMarker, analyzeCatalogMarker, formatDeepDiveMarker} {
+	for _, banned := range []string{
+		providerMatrixMarker, analyzeCatalogMarker, formatDeepDiveMarker,
+		"facade-v1", "search_symbols", "get_symbol_source", "tools_search",
+	} {
 		if strings.Contains(InstructionsBody, banned) {
 			t.Errorf("InstructionsBody re-carries relocated content %q — single-home violation", banned)
 		}
+	}
+	if len(InstructionsBody) > 2_500 {
+		t.Fatalf("InstructionsBody grew to %d bytes; keep ambient agent guidance lean", len(InstructionsBody))
 	}
 }
 

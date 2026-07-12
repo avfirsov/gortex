@@ -890,10 +890,8 @@ func (s *Server) NoteSessionToolPolicy(sessionID, spec, mode string) {
 // named MCP client is known to decode. Resolution order is gcx >
 // toon > json:
 //
-//   - GCX-capable: claude-code, cursor, vscode (via the @gortex/wire
-//     extension that ships with the IDE plugin), zed (gortex-zed
-//     plugin links gcx-go), aider, kilocode, opencode, openclaw,
-//     codex (Anthropic CLI bundles the gcx decoder).
+//   - GCX-capable: the canonical coding clients and product aliases in
+//     knownAgentClients / knownAgentHosts.
 //   - TOON-capable but no GCX: kept for forward compat; today there
 //     is no client we know to be in this bucket. Listed for the
 //     mapping shape and as a placeholder — clients can be promoted
@@ -909,11 +907,9 @@ func defaultFormatForClient(name string) string {
 	return ""
 }
 
-// knownAgentClients is the set of MCP clients recognised as coding agents:
-// they ship a GCX decoder (so they default to the gcx wire format) AND they
-// get the lean `agent` tool preset by default. One list drives both
-// defaults so the two stay in lock-step. Matched case-insensitively on the
-// exact clientInfo.name.
+// knownAgentClients is the set of canonical MCP client identifiers known to
+// ship a GCX decoder. It controls wire-format negotiation only; every non-empty
+// clientInfo.name receives the compact coding surface independently.
 var knownAgentClients = map[string]bool{
 	"claude-code":      true,
 	"cursor":           true,
@@ -927,10 +923,26 @@ var knownAgentClients = map[string]bool{
 	"omp-coding-agent": true,
 }
 
+// knownAgentHosts are host-context families whose aliases name the same
+// GCX-capable coding client (for example "Claude Code 1.4", "Visual Studio
+// Code", or "openai-codex"). Editor-only hosts without the decoder remain on
+// JSON, while still receiving the compact coding surface.
+var knownAgentHosts = map[string]bool{
+	"claude-code": true,
+	"cursor":      true,
+	"vscode":      true,
+	"zed":         true,
+	"codex":       true,
+}
+
 // isKnownAgentClient reports whether the named MCP client is a recognised
 // coding agent (see knownAgentClients).
 func isKnownAgentClient(name string) bool {
-	return knownAgentClients[strings.ToLower(strings.TrimSpace(name))]
+	name = strings.ToLower(strings.TrimSpace(name))
+	if knownAgentClients[name] {
+		return true
+	}
+	return knownAgentHosts[resolveHostContext(name).name]
 }
 
 // resolveSessionFormat returns the format the current session prefers
@@ -1132,11 +1144,10 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 
 ` + sharedParamLegend
 
-// facadeServerInstructions is intentionally terse because some MCP hosts
-// repeat initialize instructions beside every rendered tool. Operation detail
-// lives behind capabilities; repeating the legacy shared-parameter legend
-// would erase most of facade-v1's context savings.
-const facadeServerInstructions = `Gortex facade-v1 is a compact code-intelligence surface. Start task-shaped work with explore. Use search/read/relations/trace for source intelligence, change for impact and verification, and edit/refactor for mutations. Call capabilities for an operation's exact schema. Prefer these MCP tools over shell file reads and text search.`
+// codingAgentInstructions is intentionally terse because some MCP hosts repeat
+// initialize instructions beside every rendered tool. It describes what to do,
+// not how the server versions or implements its tool surface.
+const codingAgentInstructions = `You MUST use Gortex MCP—not shell, Read, or Grep—for code. Start every task with explore; inspect with search, read, relations, or trace. Before edits call change(operation:"impact"); for signatures also call change(operation:"verify") with the proposal. Mutate only with edit or refactor. Afterward call change(operation:"detect"), then change operations tests, guards, and contract with its IDs. Call capabilities only for unknown fields.`
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1212,17 +1223,13 @@ func (s *Server) stateAwareInstructions(cwd string) string {
 }
 
 func (s *Server) stateAwareInstructionsForClient(cwd, client string) string {
-	preset := ""
-	if resolveHostContext(client).name == "codex" {
-		preset = FacadeSurfaceVersion
-	}
-	return s.stateAwareInstructionsForPolicy(cwd, &toolPolicy{preset: preset})
+	return s.stateAwareInstructionsForPolicy(cwd, s.clientDefaultPolicy(client))
 }
 
 func (s *Server) stateAwareInstructionsForPolicy(cwd string, policy *toolPolicy) string {
 	base := serverInstructions
 	if policy != nil && policy.preset == FacadeSurfaceVersion {
-		base = facadeServerInstructions
+		base = codingAgentInstructions
 	}
 	return s.stateAwareInstructionsWithBase(cwd, base)
 }

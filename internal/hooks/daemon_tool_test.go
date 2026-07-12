@@ -1,6 +1,10 @@
 package hooks
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zzet/gortex/internal/daemon"
+)
 
 // The daemon-socket fallback must only fire when a hook CWD has been recorded,
 // so the pure-HTTP unit tests (which never set one) keep their "no bridge"
@@ -33,5 +37,20 @@ func TestCallServerToolDaemonFallbackGatedOnHookCWD(t *testing.T) {
 	}
 	if called != 1 {
 		t.Fatalf("daemon fallback should fire exactly once, fired %d times", called)
+	}
+}
+
+func TestHookMCPHandshakePinsInternalCompatibilitySurface(t *testing.T) {
+	t.Parallel()
+
+	hs := hookMCPHandshake("/repo")
+	if hs.Mode != daemon.ModeMCP || hs.ClientName != "gortex-hook" || hs.CWD != "/repo" {
+		t.Fatalf("unexpected hook handshake identity: %#v", hs)
+	}
+	if hookInternalToolSurface != "core" {
+		t.Fatalf("internal hook surface = %q, want core", hookInternalToolSurface)
+	}
+	if hs.Tools != hookInternalToolSurface || hs.ToolsMode != "defer" {
+		t.Fatalf("hook handshake surface = %q/%q, want core/defer", hs.Tools, hs.ToolsMode)
 	}
 }

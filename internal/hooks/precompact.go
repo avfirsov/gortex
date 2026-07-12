@@ -31,6 +31,7 @@ type PreCompactInput struct {
 // Graceful degradation: if the bridge is unreachable (port wrong, server down),
 // the hook returns silently with no output. It never blocks compaction.
 func runPreCompact(data []byte, port int) {
+	started := time.Now()
 	var input PreCompactInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -38,6 +39,10 @@ func runPreCompact(data []byte, port int) {
 	if input.HookEventName != "PreCompact" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PreCompact", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 
 	briefing := buildPreCompactBriefing(port)
 	if briefing == "" {
@@ -54,6 +59,7 @@ func runPreCompact(data []byte, port int) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -68,7 +74,7 @@ func buildPreCompactBriefing(port int) string {
 
 	var sb strings.Builder
 	sb.WriteString("## Gortex PreCompact Snapshot\n\n")
-	sb.WriteString("Use this orientation to avoid re-exploring after compaction. Prefer graph tools (`smart_context`, `get_symbol_source`, `get_editing_context`) over re-reading files.\n\n")
+	sb.WriteString("Continue with Gortex after compaction: call `explore` for the task, then inspect with `search`, `read`, `relations`, or `trace`; do not re-read indexed files.\n\n")
 
 	if summary := renderStatsSummary(stats); summary != "" {
 		sb.WriteString("**Index:** ")
@@ -177,25 +183,24 @@ func cappedLines(s string, max int) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// callServerTool resolves a Gortex tool call for a hook handler. It first
-// tries the HTTP REST surface (POST /v1/tools/{name} on the given port, served
-// only when the daemon runs with --http-addr); when that yields nothing it
-// falls back to the daemon's AF_UNIX socket, scoped to the current hook's
-// working directory. Returns "" on any error so callers degrade silently.
+// callServerTool resolves a Gortex tool call for a hook handler. Live hook
+// invocations carry a CWD and use the daemon's default AF_UNIX socket first;
+// the optional HTTP REST surface is a compatibility fallback for older
+// integrations and focused tests. Returns "" on any error so callers degrade
+// silently.
 //
 // The socket fallback is gated on a set hookCWD (see setHookCWD): the pure-HTTP
 // unit tests never set it, so they keep their existing "no bridge" semantics,
 // while a live hook process — which sets hookCWD from the payload — reaches a
 // normally-running daemon that only listens on the socket.
 func callServerTool(port int, name string, args map[string]any) string {
-	if raw := callServerToolHTTP(port, name, args); raw != "" {
-		return raw
-	}
 	cwd := loadHookCWD()
-	if cwd == "" {
-		return ""
+	if cwd != "" {
+		if raw := callServerToolDaemonFn(cwd, name, args); raw != "" {
+			return raw
+		}
 	}
-	return callServerToolDaemonFn(cwd, name, args)
+	return callServerToolHTTP(port, name, args)
 }
 
 // callServerToolHTTP issues a POST /v1/tools/{name} against the server and

@@ -1,53 +1,36 @@
 === home/.gemini/antigravity/knowledge/gortex-workflow/artifacts/gortex-instructions.md ===
 ---
 type: "Knowledge Item"
-description: "Gortex Workflow and Tools for Antigravity"
+description: "Mandatory Gortex public-tool workflow"
 ---
 
-# Gortex Engine Usage
+## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
-This codebase is indexed by Gortex, an in-memory knowledge graph code intelligence engine.
+For every coding task:
 
-**MANDATORY:** You MUST prioritize using the Gortex CLI via `run_command` instead of using standard text searches (`grep_search`) or full file reads (`view_file`). This drastically improves token efficiency and prevents hallucination.
+1. Call `explore` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
+2. Inspect indexed code only with `search`, `read`, `relations`, and `trace`. Do not use Read/Grep/Glob or shell equivalents while these tools are available.
+3. Before mutation, call `change(operation:"impact")`; for a signature change, also call `change(operation:"verify")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation, call `change(operation:"detect")`, then use its symbol IDs with `change(operation:"tests")`, `change(operation:"guards")`, and `change(operation:"contract")`.
+4. Call `capabilities` only when you need the exact fields for an operation.
 
-## Setup
-If the daemon is not tracking your target repos, register the current repo so the graph tools activate:
-```bash
-gortex track .
-```
+Common calls:
 
-## Standard Workflow Translation
+- `search({operation:"symbols", query:"<name or concept>"})`
+- `read({target:{symbol:"<file>::<Name|Recv.Name>"}})`
+- `relations({operation:"usages", target:{symbol:"<id>"}})`
+- `edit({target:{file:"<path>"}, match:"<old>", replacement:"<new>"})`
 
-| Instead of... | You MUST use... (via `run_command`) |
-|---|---|
-| `grep_search` to find a class or function | `./gortex query symbol <name> --format text` (AST-aware search) |
-| `grep_search` to find all references | `./gortex query usages <id>` (zero false positives) |
-| `view_file` to read a whole file to find a method | `./gortex query symbol <name>` or `./gortex query callers <func_id>` |
-| Guessing what breaks during a refactor | `./gortex query dependents <id>` (impact analysis) |
-| Creating circular dependencies | Evaluate `./gortex query deps <id>` first |
+If MCP tools are unavailable but Bash is available, use the same tool names and arguments through `gortex call`:
 
-## Example Usage
+- `gortex call explore --arg task="<task>"`
+- `gortex call search --arg operation=symbols --arg query="<name>"`
+- `gortex call read --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'`
+- `gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema`
 
-### 1. View Architecture and Communities
-```bash
-./gortex query stats
-```
-
-### 2. Find specific symbol definition
-```bash
-./gortex query symbol MyController
-```
-
-### 3. Trace blast radius
-If you are modifying `core/parser.go::Parse`, check what will break:
-```bash
-./gortex query dependents core/parser.go::Parse --depth 2
-```
-
-This gives you perfectly accurate AST-level analysis, guaranteeing safe edits.
+Use `recall` before revisiting prior work and `remember` immediately for durable decisions, invariants, or gotchas.
 === home/.gemini/antigravity/knowledge/gortex-workflow/metadata.json ===
 {
-  "summary": "MANDATORY: Instructions on how to use the local gortex engine CLI to significantly improve codebase intelligence. Antigravity must use run_command with gortex query over standard file read commands.",
+  "summary": "MANDATORY: Use Gortex MCP tools first for indexed code. Use gortex call only when MCP is unavailable and Bash is the only transport.",
   "references": ["artifacts/gortex-instructions.md"]
 }
 === home/.gemini/antigravity/mcp_config.json ===

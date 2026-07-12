@@ -45,8 +45,8 @@ func TestEnrichBash_GrepMiss_SoftGuidance(t *testing.T) {
 	if r.deny {
 		t.Fatal("miss should not deny")
 	}
-	if !strings.Contains(r.context, "search_symbols") {
-		t.Error("miss should return soft guidance mentioning search_symbols")
+	if !strings.Contains(r.context, `search(operation:"symbols"`) || !strings.Contains(r.context, "operation `text`") {
+		t.Error("miss should return soft guidance mentioning public search operations")
 	}
 }
 
@@ -122,8 +122,8 @@ func TestEnrichBash_CatIndexedSource_Denies(t *testing.T) {
 	if !strings.Contains(r.reason, "17 symbols") {
 		t.Error("deny reason should include the symbol count")
 	}
-	if !strings.Contains(r.reason, "get_file_summary") {
-		t.Error("deny reason should point to get_file_summary")
+	if !strings.Contains(r.reason, `read(operation:"summary"`) {
+		t.Error("deny reason should point to read(operation=summary)")
 	}
 }
 
@@ -133,8 +133,8 @@ func TestEnrichBash_CatUnindexedSource_SoftGuidance(t *testing.T) {
 	if r.deny {
 		t.Fatal("unindexed source should not deny")
 	}
-	if !strings.Contains(r.context, "get_symbol_source") {
-		t.Error("soft guidance should mention get_symbol_source")
+	if !strings.Contains(r.context, "Use `read` instead") || !strings.Contains(r.context, `read(target:{symbol:`) {
+		t.Error("soft guidance should show the selector-driven public symbol read")
 	}
 }
 

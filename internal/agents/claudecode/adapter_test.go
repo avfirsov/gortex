@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,43 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
 )
+
+func TestInstallPermissionsMigratesWildcardButPreservesCustomPolicy(t *testing.T) {
+	t.Run("legacy wildcard", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "settings.json")
+		if err := os.WriteFile(path, []byte(`{"permissions":{"allow":["mcp__gortex__*"]}}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := installPermissions(io.Discard, path, agents.ApplyOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		if strings.Contains(text, "mcp__gortex__*") || !strings.Contains(text, "mcp__gortex__read") || strings.Contains(text, "mcp__gortex__edit") {
+			t.Fatalf("unsafe wildcard migration: %s", text)
+		}
+	})
+
+	t.Run("custom narrow list", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "settings.json")
+		if err := os.WriteFile(path, []byte(`{"permissions":{"allow":["mcp__gortex__read"]}}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := installPermissions(io.Discard, path, agents.ApplyOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(string(body), "mcp__gortex__") != 1 || strings.Contains(string(body), "mcp__gortex__search") {
+			t.Fatalf("custom permission list was widened: %s", body)
+		}
+	})
+}
 
 // TestClaudeCodeProjectModeCreatesCanonicalArtifacts is the
 // acceptance test for the most important adapter. It asserts that
@@ -142,15 +180,15 @@ func TestClaudeCodeGlobalModeWritesUserFiles(t *testing.T) {
 		}
 	}
 
-	// settings.json must contain the mcp__gortex__* permission rule
-	// so MCP tool calls don't prompt for approval each session.
+	// settings.json auto-approves only the safe compact read surface; mutation,
+	// session control, and external writes still require host approval.
 	settingsPath := filepath.Join(env.Home, ".claude", "settings.json")
 	body, err := os.ReadFile(settingsPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", settingsPath, err)
 	}
-	if !strings.Contains(string(body), "mcp__gortex__*") {
-		t.Errorf("expected mcp__gortex__* in %s, got:\n%s", settingsPath, body)
+	if !strings.Contains(string(body), "mcp__gortex__read") || strings.Contains(string(body), "mcp__gortex__*") || strings.Contains(string(body), "mcp__gortex__edit") {
+		t.Errorf("expected the safe compact permission set in %s, got:\n%s", settingsPath, body)
 	}
 
 	// CLAUDE.md must contain the marker-fenced rule block when

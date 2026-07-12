@@ -28,10 +28,22 @@ func TestSubAgentToolPropagation(t *testing.T) {
 				require.Falsef(t, seen[tool], "%s lists duplicate tool %q", name, tool)
 				seen[tool] = true
 			}
-			// smart_context is the shared entry point every sub-agent should hold.
-			require.Truef(t, seen["mcp__gortex__smart_context"],
-				"%s should grant smart_context (the one-call working-set entry point)", name)
+			for _, required := range []string{"mcp__gortex__capabilities", "mcp__gortex__explore"} {
+				require.Truef(t, seen[required], "%s should grant compact entry point %s", name, required)
+			}
+			for _, legacy := range []string{"mcp__gortex__smart_context", "mcp__gortex__search_symbols", "mcp__gortex__read_file"} {
+				require.Falsef(t, seen[legacy], "%s should not grant legacy tool %s", name, legacy)
+			}
 		})
+	}
+}
+
+func TestSubAgentBodiesUseOnlyCompactVocabulary(t *testing.T) {
+	for name, def := range SubAgents {
+		for _, legacy := range []string{"smart_context", "search_symbols", "get_symbol_source", "find_usages", "get_callers", "verify_change", "read_file"} {
+			require.NotContainsf(t, def, legacy, "%s contains legacy MCP tool %q", name, legacy)
+		}
+		require.NotContains(t, def, "facade-v1")
 	}
 }
 

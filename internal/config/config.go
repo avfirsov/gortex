@@ -1649,6 +1649,11 @@ type MCPToolsConfig struct {
 	Mode   string   `mapstructure:"mode"   yaml:"mode,omitempty"`
 	Allow  []string `mapstructure:"allow"  yaml:"allow,omitempty"`
 	Deny   []string `mapstructure:"deny"   yaml:"deny,omitempty"`
+	// Explicit records whether the operator supplied any mcp.tools field.
+	// It is runtime provenance, not serialized configuration, and lets an
+	// explicit core/defer rollback outrank named-client defaults even though it
+	// has the same values as the shipped compatibility fallback.
+	Explicit bool `mapstructure:"-" yaml:"-"`
 }
 
 // defaultMaxParseBytesInFlight caps concurrent raw source bytes in
@@ -1774,6 +1779,9 @@ func Load(configPath string) (*Config, error) {
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, err
 	}
+	cfg.MCP.Tools.Explicit = v.IsSet("mcp.tools") ||
+		v.IsSet("mcp.tools.preset") || v.IsSet("mcp.tools.mode") ||
+		v.IsSet("mcp.tools.allow") || v.IsSet("mcp.tools.deny")
 	cfg.Scope = cfg.Scope.MergeEnv()
 
 	if err := cfg.validateWorkspaceSchema(); err != nil {

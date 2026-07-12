@@ -113,6 +113,8 @@ func TestDaemon_EndToEnd_GraphStatsOverMCPProxy(t *testing.T) {
 		Mode:       daemon.ModeMCP,
 		CWD:        trackedRoot,
 		ClientName: "integration-test",
+		Tools:      cliLegacyToolSurface,
+		ToolsMode:  cliLegacyToolMode,
 	})
 	require.NoError(t, err)
 	defer client.Close()

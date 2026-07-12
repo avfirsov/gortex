@@ -47,7 +47,14 @@ func init() {
 // does not track the repo, this returns an actionable error rather than
 // silently building a second-class in-process index.
 func requireDaemonTool(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
-	exec, err := resolveExecutor(repoPath)
+	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode)
+}
+
+// requireDaemonToolWithSurface runs one tool through a per-connection MCP
+// surface without changing daemon-global configuration. It shares the normal
+// daemon-required and repo-not-tracked error behavior.
+func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string) (json.RawMessage, error) {
+	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode)
 	if err != nil {
 		if errors.Is(err, ErrNoExecutor) {
 			return nil, daemonRequiredErr(repoPath)

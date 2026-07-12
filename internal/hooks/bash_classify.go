@@ -1,6 +1,10 @@
 package hooks
 
-import "strings"
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
 
 // BashAction describes what an enrichBash caller should do with a Bash command.
 type BashAction int
@@ -17,13 +21,20 @@ const (
 	// BashActionReadSource means the command reads an indexed-looking source
 	// file (cat/head/tail of .go/.ts/…). Path holds the file path.
 	BashActionReadSource
+	// BashActionFileList is a read-only, line-oriented file listing whose
+	// stdout can be normalized to the existing Glob post-processing path.
+	// Ambiguous or execution-capable variants remain passthrough.
+	BashActionFileList
+	// BashActionReadRange is a bounded sed/awk source read. It is never denied
+	// or rewritten; PostToolUse may add graph context for the referenced file.
+	BashActionReadRange
 )
 
 // BashClassification is the result of classifyBashCommand.
 type BashClassification struct {
 	Action  BashAction
 	Pattern string // for GrepLike / FindName
-	Path    string // for ReadSource
+	Path    string // for ReadSource / ReadRange
 	Primary string // the primary command token (grep, rg, cat, …) — for messages
 }
 
@@ -71,6 +82,22 @@ func classifyBashCommand(cmd string) BashClassification {
 		case "cat", "head", "tail":
 			if path, ok := extractReadFile(tokens); ok {
 				return BashClassification{Action: BashActionReadSource, Path: path, Primary: tokens[0]}
+			}
+		case "fd", "fdfind", "ls", "tree":
+			if safeFileList(tokens) {
+				return BashClassification{Action: BashActionFileList, Primary: tokens[0]}
+			}
+		case "git":
+			if safeGitFileList(tokens) {
+				return BashClassification{Action: BashActionFileList, Primary: "git ls-files"}
+			}
+		case "sed":
+			if path, ok := extractSedReadFile(tokens); ok {
+				return BashClassification{Action: BashActionReadRange, Path: path, Primary: "sed"}
+			}
+		case "awk":
+			if path, ok := extractAwkReadFile(tokens); ok {
+				return BashClassification{Action: BashActionReadRange, Path: path, Primary: "awk"}
 			}
 		}
 	}
@@ -201,6 +228,11 @@ var grepFlagsTakingArg = map[string]bool{
 // or the first non-flag positional. Returns ok=false if no pattern is
 // present (e.g. `grep -h` help invocation).
 func extractGrepPattern(tokens []string) (string, bool) {
+	pattern, _, ok := extractGrepPatternAt(tokens)
+	return pattern, ok
+}
+
+func extractGrepPatternAt(tokens []string) (string, int, bool) {
 	// tokens[0] is the command itself.
 	i := 1
 	for i < len(tokens) {
@@ -210,9 +242,9 @@ func extractGrepPattern(tokens []string) (string, bool) {
 		// purposes — it'll be gated by classifyGrepPattern anyway).
 		if t == "-e" || t == "--regexp" {
 			if i+1 < len(tokens) {
-				return tokens[i+1], true
+				return tokens[i+1], i + 1, true
 			}
-			return "", false
+			return "", -1, false
 		}
 		// --flag=value: one token, skip.
 		if strings.HasPrefix(t, "--") && strings.Contains(t, "=") {
@@ -227,9 +259,9 @@ func extractGrepPattern(tokens []string) (string, bool) {
 			i++
 			continue
 		}
-		return t, true
+		return t, i, true
 	}
-	return "", false
+	return "", -1, false
 }
 
 // extractFindName walks tokens looking for `-name`/`-iname` and returns the
@@ -263,4 +295,219 @@ func extractReadFile(tokens []string) (string, bool) {
 		return "", false
 	}
 	return "", false
+}
+
+func safeFileList(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	switch tokens[0] {
+	case "fd", "fdfind":
+		for _, token := range tokens[1:] {
+			if token == "-x" || token == "-X" || token == "-0" || token == "-l" ||
+				strings.HasPrefix(token, "--exec") || strings.HasPrefix(token, "--print0") ||
+				token == "--list-details" || strings.HasPrefix(token, "--format") {
+				return false
+			}
+		}
+		return true
+	case "ls":
+		for _, token := range tokens[1:] {
+			if !safeLSOption(token) {
+				return false
+			}
+		}
+		return true
+	case "tree":
+		hasFullPath, hasNoIndent := false, false
+		for _, token := range tokens[1:] {
+			if !strings.HasPrefix(token, "-") {
+				continue
+			}
+			if token == "--noreport" {
+				continue
+			}
+			if strings.HasPrefix(token, "--") {
+				return false
+			}
+			for _, flag := range strings.TrimPrefix(token, "-") {
+				switch flag {
+				case 'f':
+					hasFullPath = true
+				case 'i':
+					hasNoIndent = true
+				case 'a', 'd', 'n':
+					// These filter entries or disable color without decorating paths.
+				default:
+					return false
+				}
+			}
+		}
+		return hasFullPath && hasNoIndent
+	default:
+		return false
+	}
+}
+
+func safeGitFileList(tokens []string) bool {
+	if len(tokens) < 2 || tokens[0] != "git" || tokens[1] != "ls-files" {
+		return false
+	}
+	for _, token := range tokens[2:] {
+		if token == "--stage" || token == "--debug" || token == "--eol" ||
+			token == "--unmerged" || token == "--resolve-undo" ||
+			strings.HasPrefix(token, "--format") || strings.HasPrefix(token, "--abbrev") {
+			return false
+		}
+		if strings.HasPrefix(token, "-") && !strings.HasPrefix(token, "--") {
+			for _, flag := range strings.TrimPrefix(token, "-") {
+				if strings.ContainsRune("zstvfuh", flag) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// safeLSOption permits only flags that keep stdout one-path-per-line. The
+// default non-TTY shape and -1 are line-oriented; metadata, quoting,
+// classification suffixes, columns, commas, and recursion are deliberately
+// ignored because PostToolUse would otherwise parse decorations as paths.
+func safeLSOption(token string) bool {
+	if !strings.HasPrefix(token, "-") || token == "-" {
+		return true
+	}
+	if token == "--" {
+		return true
+	}
+	if strings.HasPrefix(token, "--") {
+		switch token {
+		case "--all", "--almost-all", "--directory", "--hide-control-chars", "--literal":
+			return true
+		default:
+			return false
+		}
+	}
+	for _, flag := range strings.TrimPrefix(token, "-") {
+		if !strings.ContainsRune("aA1d", flag) {
+			return false
+		}
+	}
+	return true
+}
+
+const maxHookReadRangeLines = 2000
+
+var (
+	sedSinglePrintRE = regexp.MustCompile(`^\s*(\d+|\$)\s*p\s*$`)
+	sedRangePrintRE  = regexp.MustCompile(`^\s*(\d+)\s*,\s*(\d+)\s*p\s*$`)
+	awkRangePrintRE  = regexp.MustCompile(`(?i)^\s*NR\s*>=?\s*(\d+)\s*&&\s*NR\s*<=\s*(\d+)\s*\{\s*print(?:\s+\$0)?\s*\}\s*$`)
+)
+
+func extractSedReadFile(tokens []string) (string, bool) {
+	if len(tokens) < 3 {
+		return "", false
+	}
+	quiet := false
+	for _, token := range tokens[1:] {
+		if token == "-i" || strings.HasPrefix(token, "-i") || token == "--in-place" || strings.HasPrefix(token, "--in-place=") {
+			return "", false
+		}
+		if token == "-n" || token == "--quiet" || token == "--silent" {
+			quiet = true
+		}
+	}
+	if !quiet {
+		return "", false
+	}
+	path, ok := lastSourceToken(tokens)
+	if !ok {
+		return "", false
+	}
+	program := ""
+	for i := 1; i < len(tokens); i++ {
+		if tokens[i] == "-n" || tokens[i] == "--quiet" || tokens[i] == "--silent" || tokens[i] == path {
+			continue
+		}
+		if strings.HasPrefix(tokens[i], "-") {
+			return "", false
+		}
+		program = tokens[i]
+		break
+	}
+	if !safeSedPrintProgram(program) {
+		return "", false
+	}
+	return path, true
+}
+
+func safeSedPrintProgram(program string) bool {
+	if sedSinglePrintRE.MatchString(program) {
+		return true
+	}
+	match := sedRangePrintRE.FindStringSubmatch(program)
+	return boundedLineRange(match)
+}
+
+func extractAwkReadFile(tokens []string) (string, bool) {
+	if len(tokens) < 3 {
+		return "", false
+	}
+	path, ok := lastSourceToken(tokens)
+	if !ok {
+		return "", false
+	}
+	if !boundedLineRange(awkRangePrintRE.FindStringSubmatch(tokens[1])) {
+		return "", false
+	}
+	return path, true
+}
+
+func boundedLineRange(match []string) bool {
+	if len(match) != 3 {
+		return false
+	}
+	start, startErr := strconv.Atoi(match[1])
+	end, endErr := strconv.Atoi(match[2])
+	return startErr == nil && endErr == nil && start > 0 && end >= start && end-start+1 <= maxHookReadRangeLines
+}
+
+func lastSourceToken(tokens []string) (string, bool) {
+	for i := len(tokens) - 1; i >= 1; i-- {
+		if strings.HasPrefix(tokens[i], "-") {
+			continue
+		}
+		if looksLikeSourceFile(tokens[i]) {
+			return tokens[i], true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// simpleBashCommand accepts exactly one unpiped, unredirected command. It is
+// used only by rewrite mode; ambiguity always falls back to advisory context.
+func simpleBashCommand(command string) bool {
+	if strings.Contains(command, "$(") || strings.Contains(command, "`") || strings.Contains(command, "\n") {
+		return false
+	}
+	inSingle, inDouble := false, false
+	for i := 0; i < len(command); i++ {
+		switch command[i] {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case ';', '|', '&', '>', '<':
+			if !inSingle && !inDouble {
+				return false
+			}
+		}
+	}
+	return !inSingle && !inDouble && len(primarySegments(command)) == 1
 }

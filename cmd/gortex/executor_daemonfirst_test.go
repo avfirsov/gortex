@@ -26,11 +26,12 @@ type stubDaemonServer struct {
 	ln           net.Listener
 	trackedRepos []string
 
-	mu        sync.Mutex
-	lastTool  string
-	lastArgs  map[string]any
-	mcpResult json.RawMessage // raw result payload echoed in the content block
-	mcpError  *stubRPCError   // when set, the MCP reply is a JSON-RPC error
+	mu               sync.Mutex
+	lastTool         string
+	lastArgs         map[string]any
+	lastMCPHandshake daemon.Handshake
+	mcpResult        json.RawMessage // raw result payload echoed in the content block
+	mcpError         *stubRPCError   // when set, the MCP reply is a JSON-RPC error
 }
 
 type stubRPCError struct {
@@ -88,6 +89,11 @@ func (s *stubDaemonServer) handleConn(conn net.Conn) {
 	var hs daemon.Handshake
 	if err := json.Unmarshal(hsLine, &hs); err != nil {
 		return
+	}
+	if hs.Mode == daemon.ModeMCP {
+		s.mu.Lock()
+		s.lastMCPHandshake = hs
+		s.mu.Unlock()
 	}
 	if err := daemon.WriteJSONLine(conn, daemon.HandshakeAck{OK: true, DaemonVersion: "stub"}); err != nil {
 		return
@@ -181,6 +187,12 @@ func (s *stubDaemonServer) seenTool() (string, map[string]any) {
 	return s.lastTool, s.lastArgs
 }
 
+func (s *stubDaemonServer) seenMCPHandshake() daemon.Handshake {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastMCPHandshake
+}
+
 // TestResolveExecutor_DaemonFirst asserts resolveExecutor is daemon-first:
 // when a warm daemon owns the repo it returns a daemonExecutor that relays
 // the tool call over the daemon's MCP channel (the same warm graph the
@@ -224,6 +236,11 @@ func TestResolveExecutor_DaemonFirst(t *testing.T) {
 		if args["x"] != "y" {
 			t.Fatalf("caller args must be relayed, daemon saw %v", args)
 		}
+		hs := stub.seenMCPHandshake()
+		if hs.Tools != cliLegacyToolSurface || hs.ToolsMode != cliLegacyToolMode {
+			t.Fatalf("legacy CLI handshake = tools:%q mode:%q, want %q/%q",
+				hs.Tools, hs.ToolsMode, cliLegacyToolSurface, cliLegacyToolMode)
+		}
 	})
 
 	t.Run("no daemon reachable -> ErrNoExecutor", func(t *testing.T) {
@@ -243,6 +260,27 @@ func TestResolveExecutor_DaemonFirst(t *testing.T) {
 			t.Fatalf("an untracked repo must yield ErrNoExecutor, got %v", err)
 		}
 	})
+}
+
+func TestCallFacadeDaemonTool_SurfaceIsConnectionScoped(t *testing.T) {
+	repo := t.TempDir()
+	stub := startStubDaemon(t, []string{repo})
+
+	if _, err := callFacadeDaemonTool(repo, "read", map[string]any{
+		"operation": "file",
+		"target":    map[string]any{"file": "main.go"},
+	}); err != nil {
+		t.Fatalf("facade relay: %v", err)
+	}
+
+	hs := stub.seenMCPHandshake()
+	if hs.ClientName != "cli" || hs.Tools != "facade-v1" || hs.ToolsMode != "hide" {
+		t.Fatalf("facade handshake = client:%q tools:%q mode:%q", hs.ClientName, hs.Tools, hs.ToolsMode)
+	}
+	tool, _ := stub.seenTool()
+	if tool != "read" {
+		t.Fatalf("daemon saw tool %q, want read", tool)
+	}
 }
 
 // TestDaemonExecutor_ErrDistinct asserts the daemonExecutor relay

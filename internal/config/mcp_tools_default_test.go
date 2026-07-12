@@ -28,6 +28,7 @@ func TestLoad_MCPToolsDefaultAndOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "core", cfg.MCP.Tools.Preset, "omitted mcp.tools keeps the core default")
 	require.Equal(t, "defer", cfg.MCP.Tools.Mode)
+	require.False(t, cfg.MCP.Tools.Explicit)
 
 	// An explicit preset overrides the default — the documented opt-out
 	// back to the full eager surface.
@@ -35,6 +36,17 @@ func TestLoad_MCPToolsDefaultAndOverride(t *testing.T) {
 	require.NoError(t, os.WriteFile(full, []byte("mcp:\n  tools:\n    preset: full\n    mode: hide\n"), 0o644))
 	cfg2, err := Load(full)
 	require.NoError(t, err)
+	require.True(t, cfg2.MCP.Tools.Explicit)
 	require.Equal(t, "full", cfg2.MCP.Tools.Preset)
 	require.Equal(t, "hide", cfg2.MCP.Tools.Mode)
+}
+
+func TestLoad_MCPToolsExplicitCoreDeferKeepsProvenance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".gortex.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("mcp:\n  tools:\n    preset: core\n    mode: defer\n"), 0o644))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "core", cfg.MCP.Tools.Preset)
+	require.Equal(t, "defer", cfg.MCP.Tools.Mode)
+	require.True(t, cfg.MCP.Tools.Explicit, "explicit rollback must remain distinguishable from defaults")
 }

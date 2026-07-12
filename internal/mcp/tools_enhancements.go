@@ -202,6 +202,8 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithNumber("min_axes", mcp.Description("(health_score) Require at least this many populated axes per row (default 1; raise to demand multi-signal confidence)")),
 			mcp.WithString("roll_up", mcp.Description("(health_score) Aggregate per-symbol scores up to a coarser scope — 'file' (per-file average + per-grade counts) or 'repo' (per-repo). Omit for per-symbol rows.")),
 			mcp.WithString("ids", mcp.Description("(impact) Comma-separated symbol IDs — score only these, the blast radius of changing specific symbols.")),
+			mcp.WithBoolean("refresh_cochange", mcp.Description("(impact) Start legacy lazy co-change mining when cold (default true). The compact public operation fixes this false.")),
+			mcp.WithBoolean("materialize", mcp.Description("(sql_call_sites) Rebuild SQL table/query edges before reading (legacy default true). The compact public operation fixes this false.")),
 			mcp.WithString("name", mcp.Description("(named) The query bundle to run. Omit to list every available bundle.")),
 			mcp.WithString("group_by", mcp.Description("(tests_as_edges) symbol (default — tested symbol → its tests) or test (test → symbols it exercises).")),
 			mcp.WithString("algorithm", mcp.Description("(clusters) Community-detection algorithm — leiden (default), louvain, or spectral (recursive Fiedler-vector bisection).")),

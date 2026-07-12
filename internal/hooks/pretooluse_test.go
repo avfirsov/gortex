@@ -21,8 +21,8 @@ func TestEnrichGlob_GreedySourcePattern_DaemonUp_Denies(t *testing.T) {
 	if !strings.Contains(result.reason, "BLOCKED") {
 		t.Errorf("expected BLOCKED in reason, got: %s", result.reason)
 	}
-	if !strings.Contains(result.reason, "get_repo_outline") {
-		t.Errorf("expected get_repo_outline in reason, got: %s", result.reason)
+	if !strings.Contains(result.reason, `explore(operation:"outline")`) {
+		t.Errorf("expected explore(operation=outline) in reason, got: %s", result.reason)
 	}
 }
 
@@ -35,8 +35,8 @@ func TestEnrichGlob_GreedySourcePattern_DaemonDown_Soft(t *testing.T) {
 	if result.context == "" {
 		t.Fatal("expected soft guidance text, got empty")
 	}
-	if !strings.Contains(result.context, "search_symbols") {
-		t.Error("expected guidance to mention search_symbols")
+	if !strings.Contains(result.context, `search(operation:"symbols")`) {
+		t.Error("expected guidance to mention search(operation=symbols)")
 	}
 }
 
@@ -107,11 +107,11 @@ func TestEnrichRead_NonIndexed_Guidance(t *testing.T) {
 	if result.deny {
 		t.Error("should not deny when file is not indexed")
 	}
-	if !strings.Contains(result.context, "get_symbol_source") {
-		t.Error("expected guidance to mention get_symbol_source")
+	if !strings.Contains(result.context, `read(target:{symbol:`) {
+		t.Error("expected guidance to mention the selector-driven symbol read")
 	}
-	if !strings.Contains(result.context, "get_editing_context") {
-		t.Error("expected guidance to mention get_editing_context")
+	if !strings.Contains(result.context, `read(operation:"editing_context"`) {
+		t.Error("expected guidance to mention read(operation=editing_context)")
 	}
 }
 
@@ -182,11 +182,11 @@ func TestEnrichGrep_Guidance(t *testing.T) {
 	if result.deny {
 		t.Error("grep should never be denied")
 	}
-	if !strings.Contains(result.context, "search_symbols") {
-		t.Error("expected guidance to mention search_symbols")
+	if !strings.Contains(result.context, `search(operation:"symbols"`) || !strings.Contains(result.context, "operation `text`") {
+		t.Error("expected guidance to mention public search operations")
 	}
-	if !strings.Contains(result.context, "find_usages") {
-		t.Error("expected guidance to mention find_usages")
+	if !strings.Contains(result.context, `relations(operation:"usages"`) || !strings.Contains(result.context, "choose `callers` or `implementations`") {
+		t.Error("expected guidance to mention public relations operations")
 	}
 }
 

@@ -11,15 +11,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestFacadeProtocolReadAndGuardedEdit exercises the user-facing Codex path
-// through real MCP frames and the real file handlers. It guards the two core
-// promises behind facade-v1: read.file can return an uncompressed source file
+// TestFacadeProtocolReadAndGuardedEdit exercises the user-facing named-client
+// path through real MCP frames and the real file handlers. It guards two core
+// compact-surface promises: read.file can return an uncompressed source file
 // immediately, and edit.file preserves the legacy dry-run/cardinality guards.
 func TestFacadeProtocolReadAndGuardedEdit(t *testing.T) {
 	srv, root := setupTestServer(t)
 	ctx := WithSessionID(context.Background(), "facade_real_file_ops")
 
-	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"1.0"}}}`)
+	initFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"integration-harness","version":"1.0"}}}`)
 	require.NotNil(t, srv.MCPServer().HandleMessage(ctx, initFrame))
 
 	call := func(id int, name string, arguments map[string]any) *mcpgo.CallToolResult {

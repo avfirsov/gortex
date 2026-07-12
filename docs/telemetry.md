@@ -1,6 +1,6 @@
 # Telemetry & privacy
 
-Gortex can collect **anonymous usage statistics** — coarse, bucketed counts of *which* tools and commands run. It is **opt-in and OFF by default**: nothing is recorded, buffered, or sent until you explicitly enable it, and even when enabled nothing is transmitted unless an ingest endpoint is configured. Telemetry never sees your code, file paths, file names, symbol names, or repository names.
+Gortex can collect **anonymous usage statistics** — coarse, bucketed counts of *which* tools and commands run. That anonymous rollup is **opt-in and OFF by default**: nothing is buffered or sent until you explicitly enable it, and even when enabled nothing is transmitted unless an ingest endpoint is configured. Separate, non-transmitted hook diagnostics may be written locally as described below. Neither path records code, file paths, file names, symbol names, or repository names.
 
 ## Quick control
 
@@ -36,7 +36,7 @@ Only the following metric keys can ever be recorded — a hard allow-list; the a
 | Key | Meaning | Dimension |
 | --- | --- | --- |
 | `mcp_tool_call` | an MCP tool was invoked | tool name (e.g. `search_symbols`) |
-| `mcp_facade_call` | a facade-v1 operation was attempted | registered `facade.operation` or a fixed `unknown` sentinel |
+| `mcp_facade_call` | a compact-surface operation was attempted | registered `facade.operation` or a fixed `unknown` sentinel |
 | `mcp_facade_status` | coarse facade result status | registered `facade.operation.ok|error` |
 | `mcp_facade_outcome` | bounded facade result class | registered `facade.operation` plus `success`, `invalid_operation`, `invalid_argument`, `blocked`, `unavailable`, `tool_error`, `handler_error`, or `empty_result` |
 | `mcp_facade_invalid` | facade validation failed | registered `facade.operation.invalid_argument` |
@@ -55,6 +55,27 @@ A recorded counter is `key` or `key:dimension` (e.g. `mcp_tool_call:search_symbo
 - Facade latencies → `<1ms`, `1-10ms`, `10-100ms`, `100ms-1s`, `1-10s`, `10s+`
 
 Facade dimensions are admitted only from the canonical operation registry (or fixed sentinels). Caller-provided operation/domain values never become a metric dimension, even in hashed form.
+
+### Local hook-effectiveness diagnostics
+
+Hooks also keep a local, non-transmitted JSONL diagnostic at
+`~/.gortex/cache/hook-effectiveness.jsonl` (override with
+`GORTEX_HOOK_EFFECTIVENESS_LOG`). One bounded record is written for every
+Claude-compatible or Codex event handled by the shared hook dispatcher,
+including no-op events, so the denominator cannot disappear.
+Each record contains only:
+
+- an allow-listed event name;
+- whether the hook emitted model-visible context or a decision reason;
+- whether the local daemon was reachable;
+- a capped alternation-segment count (`0` when not applicable); and
+- hook latency in milliseconds.
+
+Commands, grep patterns, prompts, source, paths, symbols, repositories, and
+tool output are never written to this log. This diagnostic is separate from
+the opt-in anonymous rollup above and is never uploaded. Together with the
+existing local `hook-decisions.jsonl`, it directly exposes emitted-context
+rate and makes another high-skip regression visible.
 
 A dimension guard (`^[A-Za-z0-9_.<>+-]{1,32}$`) drops any token containing a path separator, whitespace, or over 32 characters, so even a caller that mistakenly passed a path or symbol name as a dimension cannot leak it — only the bare metric key is recorded.
 

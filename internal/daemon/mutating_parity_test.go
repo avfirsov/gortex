@@ -122,6 +122,7 @@ func TestToolEffects_DurableAudit(t *testing.T) {
 func TestToolEffects_SessionOnlyAudit(t *testing.T) {
 	names := []string{
 		"agent_registry",
+		"nav",
 		"overlay_delete", "overlay_drop", "overlay_drop_branch", "overlay_fork",
 		"overlay_keepalive", "overlay_push", "overlay_register", "overlay_switch",
 		"proxy_disable", "proxy_enable", "set_planning_mode", "simulate_chain",

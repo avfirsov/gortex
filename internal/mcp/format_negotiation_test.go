@@ -31,12 +31,18 @@ func TestDefaultFormatForClient(t *testing.T) {
 		{"opencode", "gcx"},
 		{"openclaw", "gcx"},
 		{"codex", "gcx"},
+		{"openai-codex", "gcx"},
+		{"Claude Code 1.4", "gcx"},
+		{"Visual Studio Code", "gcx"},
 		{"omp-coding-agent", "gcx"},
 
 		// Unknown / unset → JSON fallback.
 		{"", ""},
 		{"some-other-client", ""},
+		{"windsurf", ""},
 		{"unknown", ""},
+		{"Claude Desktop", ""},
+		{"not-codex", ""},
 	}
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, defaultFormatForClient(tc.client),

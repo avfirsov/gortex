@@ -28,13 +28,18 @@ const Name = "codex"
 const DocsURL = "https://developers.openai.com/codex/mcp"
 
 const codexSessionStartMatcher = "startup|resume|clear|compact"
-const codexSessionStartMessage = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
-const codexSessionStartCommand = "printf '%s\\n' '" + codexSessionStartMessage + "'"
-const codexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + codexSessionStartMessage + "'\""
+const codexStaticSessionStartMessage = "IMPORTANT: You MUST use Gortex MCP tools for indexed code: start with explore; inspect with search, read, relations, and trace; before mutation call change impact and, for signatures, verify; mutate only with edit or refactor; afterward call change detect, then tests, guards, and contract with its symbol IDs. You MUST NOT substitute Read, Grep, Glob, or shell source reads and searches."
+const codexStaticSessionStartCommand = "printf '%s\\n' '" + codexStaticSessionStartMessage + "'"
+const codexStaticSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + codexStaticSessionStartMessage + "'\""
+const legacyCodexSessionStartMessage = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
+const legacyCodexSessionStartCommand = "printf '%s\\n' '" + legacyCodexSessionStartMessage + "'"
+const legacyCodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + legacyCodexSessionStartMessage + "'\""
 const codexPreToolUseMatcher = "^Bash$"
-const codexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
-const codexPostToolUseMatcher = "^Bash$"
+const codexMCPReadPreToolUseMatcher = "^mcp__gortex__read$"
+const legacyCodexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
+const codexPostToolUseMatcher = "^(Bash|apply_patch)$"
 const codexHookTimeoutSeconds = 5
+const codexHookModeEnvVar = "GORTEX_CODEX_HOOK_MODE"
 
 type Adapter struct{}
 
@@ -140,8 +145,8 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	return res, nil
 }
 
-func upsertSessionStartHook(root map[string]any, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "SessionStart", codexHookEntryIsGortexSessionStart, codexSessionStartHookEntry(), opts)
+func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	return upsertCodexHookSet(root, "SessionStart", codexHookEntryIsGortexSessionStart, []map[string]any{codexSessionStartHookEntry(env)}, opts)
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
@@ -153,11 +158,11 @@ func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.Apply
 }
 
 func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "PostToolUse", codexHookEntryIsGortexPostToolUse, codexPostToolUseHookEntry(env), opts)
+	return upsertCodexHookSet(root, "PostToolUse", codexHookEntryIsGortexPostToolUse, []map[string]any{codexPostToolUseHookEntry(env)}, opts)
 }
 
 func upsertUserPromptSubmitHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, codexUserPromptSubmitHookEntry(env), opts)
+	return upsertCodexHookSet(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, []map[string]any{codexUserPromptSubmitHookEntry(env)}, opts)
 }
 
 // InstallHooksOnly refreshes the Codex lifecycle hooks in configPath without
@@ -176,45 +181,11 @@ func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agent
 }
 
 func upsertCodexHooks(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	sessionChanged := upsertSessionStartHook(root, opts)
+	sessionChanged := upsertSessionStartHook(root, env, opts)
 	preChanged := upsertPreToolUseHook(root, env, opts)
 	postChanged := upsertPostToolUseHook(root, env, opts)
 	promptChanged := upsertUserPromptSubmitHook(root, env, opts)
 	return sessionChanged || preChanged || postChanged || promptChanged
-}
-
-func upsertCodexHook(root map[string]any, event string, isGortex func(any) bool, desired map[string]any, opts agents.ApplyOpts) bool {
-	hooks, ok := root["hooks"].(map[string]any)
-	if !ok {
-		if _, exists := root["hooks"]; exists {
-			return false
-		}
-		hooks = make(map[string]any)
-	}
-
-	entries, ok := codexHookList(hooks[event])
-	if !ok {
-		return false
-	}
-
-	found := false
-	kept := make([]any, 0, len(entries)+1)
-	for _, entry := range entries {
-		if isGortex(entry) {
-			found = true
-			if opts.Force {
-				continue
-			}
-		}
-		kept = append(kept, entry)
-	}
-	if found && !opts.Force {
-		return false
-	}
-
-	hooks[event] = append(kept, desired)
-	root["hooks"] = hooks
-	return true
 }
 
 func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bool, desired []map[string]any, opts agents.ApplyOpts) bool {
@@ -233,22 +204,30 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 
 	found := make([]bool, len(desired))
 	kept := make([]any, 0, len(entries)+len(desired))
+	changed := false
 	for _, entry := range entries {
 		if isGortex(entry) {
 			if opts.Force {
 				continue
 			}
+			matched := false
 			for i, want := range desired {
 				if !found[i] && codexHookEntryMatchesDesired(entry, want) {
 					found[i] = true
+					matched = true
 					break
 				}
+			}
+			if !matched {
+				// This is a Gortex-authored hook with a stale matcher, command,
+				// or posture. Replace it instead of accumulating duplicate hooks.
+				changed = true
+				continue
 			}
 		}
 		kept = append(kept, entry)
 	}
 
-	changed := false
 	for i, want := range desired {
 		if opts.Force || !found[i] {
 			kept = append(kept, want)
@@ -266,7 +245,30 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 
 func codexHookEntryMatchesDesired(entry any, desired map[string]any) bool {
 	matcher, _ := desired["matcher"].(string)
-	return codexHookEntryHasMatcher(entry, matcher) && codexHookEntryInvokesCodexHook(entry)
+	if !codexHookEntryHasMatcher(entry, matcher) {
+		return false
+	}
+	want := codexHookEntryCommand(desired)
+	return want != "" && codexHookEntryCommand(entry) == want
+}
+
+func codexHookEntryCommand(entry any) string {
+	group, ok := entry.(map[string]any)
+	if !ok {
+		return ""
+	}
+	handlers, ok := codexHookList(group["hooks"])
+	if !ok {
+		return ""
+	}
+	for _, handler := range handlers {
+		if fields, ok := handler.(map[string]any); ok {
+			if command, _ := fields["command"].(string); strings.TrimSpace(command) != "" {
+				return command
+			}
+		}
+	}
+	return ""
 }
 
 func codexHookEntryHasMatcher(entry any, matcher string) bool {
@@ -310,10 +312,10 @@ func codexHookEntryIsGortexSessionStart(entry any) bool {
 		if !ok {
 			continue
 		}
-		if cmd, _ := hm["command"].(string); cmd == codexSessionStartCommand {
+		if cmd, _ := hm["command"].(string); cmd == codexStaticSessionStartCommand || cmd == legacyCodexSessionStartCommand || codexCommandInvokesCodexHook(cmd) {
 			return true
 		}
-		if cmd, _ := hm["command_windows"].(string); cmd == codexSessionStartWindowsCommand {
+		if cmd, _ := hm["command_windows"].(string); cmd == codexStaticSessionStartWindowsCommand || cmd == legacyCodexSessionStartWindowsCommand {
 			return true
 		}
 	}
@@ -365,16 +367,15 @@ func codexCommandInvokesCodexHook(cmd string) bool {
 	return strings.Contains(cmd, "--agent=codex") || strings.Contains(cmd, "--agent codex")
 }
 
-func codexSessionStartHookEntry() map[string]any {
+func codexSessionStartHookEntry(env agents.Env) map[string]any {
 	return map[string]any{
 		"matcher": codexSessionStartMatcher,
 		"hooks": []any{
 			map[string]any{
-				"type":            "command",
-				"command":         codexSessionStartCommand,
-				"command_windows": codexSessionStartWindowsCommand,
-				"timeout":         codexHookTimeoutSeconds,
-				"statusMessage":   "Loading Gortex graph orientation...",
+				"type":          "command",
+				"command":       codexHookCommand(env),
+				"timeout":       codexHookTimeoutSeconds,
+				"statusMessage": "Loading Gortex graph orientation...",
 			},
 		},
 	}
@@ -416,7 +417,7 @@ func codexPostToolUseHookEntry(env agents.Env) map[string]any {
 				"type":          "command",
 				"command":       codexHookCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex Bash output context...",
+				"statusMessage": "Loading Gortex post-tool context...",
 			},
 		},
 	}
@@ -449,5 +450,23 @@ func codexHookCommand(env agents.Env) string {
 	if base == "" {
 		base = "gortex hook"
 	}
-	return base + " --agent=codex --mode=enrich"
+	return base + " --agent=codex --mode=" + codexHookMode()
+}
+
+// codexHookMode keeps the shipped posture advisory while allowing a team to
+// opt into current Codex capabilities without changing the generic Claude hook
+// posture. Supported values: enrich, deny, rewrite, suppress. Suppress uses
+// PostToolUse result replacement because Codex does not yet implement the
+// suppressOutput field itself.
+func codexHookMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(codexHookModeEnvVar))) {
+	case "deny", "hard-deny":
+		return "deny"
+	case "rewrite", "input-rewrite":
+		return "rewrite"
+	case "suppress", "replace-output", "output-suppression":
+		return "suppress"
+	default:
+		return "enrich"
+	}
 }

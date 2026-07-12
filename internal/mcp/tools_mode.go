@@ -40,14 +40,7 @@ func (s *Server) editingToolsHidden(ctx context.Context) bool {
 
 func (s *Server) toolSurfaceFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
 	if s.editingToolsHidden(ctx) {
-		kept := make([]mcp.Tool, 0, len(tools))
-		for _, t := range tools {
-			if daemon.MutatingTools[t.Name] {
-				continue
-			}
-			kept = append(kept, t)
-		}
-		tools = kept
+		tools = withoutMutatingTools(tools)
 	}
 	// Per-session tool-surface preset: narrow (and, for a client asking for
 	// a wider surface than the daemon's eager set, widen) the list to the
@@ -58,9 +51,26 @@ func (s *Server) toolSurfaceFilter(ctx context.Context, tools []mcp.Tool) []mcp.
 	// new dispatcher names; facade-v1 sessions receive exactly the compact,
 	// static definitions and never depend on lazy promotion.
 	tools = s.applyFacadeSurface(ctx, tools)
+	// Session preset shaping can widen from the lazy catalogue. Re-apply the
+	// planning/workflow boundary after widening so tools/list never advertises
+	// an edit that the hard call gate will refuse.
+	if s.editingToolsHidden(ctx) {
+		tools = withoutMutatingTools(tools)
+	}
 	// Per-host adaptation: drop tools the host duplicates and apply any
 	// host-specific description overrides (see host_context.go).
 	return s.sessionHostContext(ctx).apply(tools)
+}
+
+func withoutMutatingTools(tools []mcp.Tool) []mcp.Tool {
+	kept := make([]mcp.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if daemon.MutatingTools[tool.Name] {
+			continue
+		}
+		kept = append(kept, tool)
+	}
+	return kept
 }
 
 // applySessionPreset shapes the tool list to the surface in force for this
@@ -238,8 +248,13 @@ func (s *Server) checkToolPresetGate(ctx context.Context, toolName string) *mcp.
 	guidance := "Call tool_profile to see the available tools."
 	recovery := "tool_profile"
 	if p.preset == FacadeSurfaceVersion {
-		guidance = "Call capabilities to see the available facade operations and their schemas."
+		guidance = "Call capabilities to see the available public operations and their schemas."
 		recovery = "capabilities"
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeToolBlockedByMode,
+			Message:   fmt.Sprintf("%q is not part of the active public Gortex tool surface. %s", toolName, guidance),
+			Data:      map[string]any{"tool": toolName, "preset": p.preset, "recovery_tool": recovery},
+		})
 	}
 	return NewStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeToolBlockedByMode,

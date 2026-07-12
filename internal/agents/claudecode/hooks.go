@@ -20,12 +20,11 @@ import (
 // upgradeGortexMatcher rewrites those in place. Edit and Write are
 // included so the hook can redirect whole-file rewrites of indexed
 // source to the Gortex MCP edit tools (gated by GORTEX_HOOK_BLOCK_EDIT
-// in the hook itself). The two mcp__gortex__ read tools are included so
-// the hook can also nudge a full-body read_file / get_editing_context
-// toward compress_bodies / search_text — the one gap that fires once
-// the agent is already inside a Gortex tool (gated by
-// GORTEX_HOOK_FORCE_COMPRESS for the hard-deny posture).
-const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
+// in the hook itself). The compact mcp__gortex__read tool is included so the
+// hook can also enforce read shaping after the client has entered Gortex.
+const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read"
+
+const previousPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
 
 // CurrentPostToolUseMatcher names the tools whose response the
 // PostToolUse hook augments. Only the read-shaped tools have an obvious
@@ -208,6 +207,7 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 		"Read|Grep|Glob|Task":                 true,
 		"Read|Grep|Glob|Task|Bash":            true,
 		"Read|Grep|Glob|Task|Bash|Edit|Write": true,
+		previousPreToolUseMatcher:             true,
 	}
 	upgraded := false
 	for _, h := range pre {

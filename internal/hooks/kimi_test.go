@@ -54,32 +54,41 @@ func TestRunKimiPreToolUseGortexReadPlainStdout(t *testing.T) {
 	withForceCompress(t, true)
 	cwd := writeGortexProjectMarker(t, t.TempDir())
 	tests := []struct {
-		name string
-		tool string
+		name  string
+		tool  string
+		input string
 	}{
 		{
-			name: "kimi plain read_file",
-			tool: "read_file",
+			name:  "compact read",
+			tool:  gortexCompactReadTool,
+			input: `{"operation":"file","target":{"file":"internal/a.go"}}`,
 		},
 		{
-			name: "kimi plain get_editing_context",
-			tool: "get_editing_context",
+			name:  "kimi plain read_file",
+			tool:  "read_file",
+			input: `{"path":"internal/a.go"}`,
 		},
 		{
-			name: "prefixed read_file",
-			tool: gortexReadFileTool,
+			name:  "kimi plain get_editing_context",
+			tool:  "get_editing_context",
+			input: `{"path":"internal/a.go"}`,
+		},
+		{
+			name:  "prefixed read_file",
+			tool:  gortexReadFileTool,
+			input: `{"path":"internal/a.go"}`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			out := captureStdout(t, func() {
-				runKimi(kimiPreToolPayload(cwd, tt.tool, `{"path":"internal/a.go"}`), 0, ModeDeny)
+				runKimi(kimiPreToolPayload(cwd, tt.tool, tt.input), 0, ModeDeny)
 			})
 			if out == "" {
 				t.Fatal("expected Kimi MCP read PreToolUse guidance, got empty output")
 			}
-			for _, want := range []string{"compress_bodies", "search_text", "keep"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "gortex call search"} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout guidance missing %q: %q", want, out)
 				}

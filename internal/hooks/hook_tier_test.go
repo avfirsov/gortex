@@ -40,7 +40,7 @@ func TestSessionStart_LeanTier_TrackedCwd(t *testing.T) {
 	if !strings.Contains(briefing, "enforcement active") {
 		t.Errorf("lean briefing lost the enforcement signal:\n%s", briefing)
 	}
-	if !strings.Contains(briefing, "Rule:") || !strings.Contains(briefing, "search_symbols") {
+	if !strings.Contains(briefing, "Rule:") || !strings.Contains(briefing, "`explore`") || !strings.Contains(briefing, "`search`") {
 		t.Errorf("lean briefing lost the rule preamble cues:\n%s", briefing)
 	}
 	// The standard-tier status prose must be gone.
@@ -88,7 +88,7 @@ func TestPromptInjection_LeanTier(t *testing.T) {
 	if !strings.Contains(lean, "Alpha") {
 		t.Errorf("lean tier dropped the top hit:\n%s", lean)
 	}
-	if !strings.Contains(lean, "get_symbol_source") || !strings.Contains(lean, "explore") {
+	if !strings.Contains(lean, `read(operation:"source")`) || !strings.Contains(lean, "explore") {
 		t.Errorf("lean tier lost the tool cues:\n%s", lean)
 	}
 

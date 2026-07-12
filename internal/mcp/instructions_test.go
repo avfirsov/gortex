@@ -47,11 +47,7 @@ func TestInitialize_ReturnsInstructions(t *testing.T) {
 	if strings.TrimSpace(parsed.Result.Instructions) == "" {
 		t.Fatalf("initialize response carried no instructions field; got: %s", out)
 	}
-	for _, want := range []string{"explore", "search_symbols", "tools_search"} {
-		if !strings.Contains(parsed.Result.Instructions, want) {
-			t.Errorf("instructions should mention %q; got: %q", want, parsed.Result.Instructions)
-		}
-	}
+	require.Equal(t, codingAgentInstructions, parsed.Result.Instructions)
 }
 
 func TestServerInstructions_NonEmpty(t *testing.T) {

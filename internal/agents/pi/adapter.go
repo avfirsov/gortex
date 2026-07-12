@@ -49,18 +49,11 @@ var extensionSource string
 // Templated sentinels in extension/index.ts. Each is replaced with a JSON
 // literal so values containing spaces or backslashes survive intact.
 const (
-	sentinelBin         = "{{GORTEX_BIN}}"
-	sentinelArgv        = "{{GORTEX_HOOK_ARGV}}"
-	sentinelEnforce     = "{{GORTEX_ENFORCE}}"
-	sentinelToolsPreset = "{{GORTEX_TOOLS_PRESET}}"
+	sentinelBin          = "{{GORTEX_BIN}}"
+	sentinelArgv         = "{{GORTEX_HOOK_ARGV}}"
+	sentinelEnforce      = "{{GORTEX_ENFORCE}}"
+	sentinelInstructions = "{{GORTEX_INSTRUCTIONS}}"
 )
-
-// defaultToolsPreset is the eager tool preset baked into the extension. It
-// mirrors the daemon's own default surface (corePresetTools, in defer
-// mode); GORTEX_TOOLS in the environment overrides it at runtime, the same
-// override the daemon honours. Kept a constant (not read from the
-// environment at render time) so the rendered extension is deterministic.
-const defaultToolsPreset = "core"
 
 type Adapter struct{}
 
@@ -164,7 +157,7 @@ func renderExtension(env agents.Env) string {
 	src = substituteSentinel(src, sentinelBin, jsonString(bin))
 	src = substituteSentinel(src, sentinelArgv, jsonValue(argv))
 	src = substituteSentinel(src, sentinelEnforce, jsonValue(env.InstallHooks))
-	src = substituteSentinel(src, sentinelToolsPreset, jsonString(defaultToolsPreset))
+	src = substituteSentinel(src, sentinelInstructions, jsonString(agents.InstructionsBody))
 	return src
 }
 

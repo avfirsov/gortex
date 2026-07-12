@@ -55,10 +55,10 @@ func TestRunPreToolUse_EnrichModeDowngradesDeny(t *testing.T) {
 		if dec.HookSpecificOutput.AdditionalContext == "" {
 			t.Error("enrich mode should surface the deny rationale as additionalContext")
 		}
-		// The downgraded message should still reference the graph
-		// alternative (edit_symbol/edit_file/etc) so the agent learns
+		// The downgraded message should still reference the public graph
+		// mutation alternative so the agent learns
 		// without being blocked.
-		if !strings.Contains(dec.HookSpecificOutput.AdditionalContext, "edit_symbol") {
+		if !strings.Contains(dec.HookSpecificOutput.AdditionalContext, "choose `edit` operation `symbol`, `file`, or `batch`") {
 			t.Errorf("downgraded context should retain graph alternative hints, got:\n%s",
 				dec.HookSpecificOutput.AdditionalContext)
 		}
@@ -284,7 +284,7 @@ func TestRunPreToolUse_AdaptiveNudge_FiresOncePerBurst(t *testing.T) {
 	if !strings.Contains(reason, "fires once") {
 		t.Errorf("nudge reason should note it fires once, got:\n%s", reason)
 	}
-	if !strings.Contains(reason, "search_symbols") {
+	if !strings.Contains(reason, "`search`") || !strings.Contains(reason, "`relations`") {
 		t.Errorf("nudge reason should point at Gortex graph tools, got:\n%s", reason)
 	}
 

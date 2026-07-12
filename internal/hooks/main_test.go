@@ -19,6 +19,7 @@ func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "gortex-hooks-test")
 	if err == nil {
 		_ = os.Setenv("GORTEX_HOOK_LOG", filepath.Join(dir, "hook-decisions.jsonl"))
+		_ = os.Setenv("GORTEX_HOOK_EFFECTIVENESS_LOG", filepath.Join(dir, "hook-effectiveness.jsonl"))
 		defer func() { _ = os.RemoveAll(dir) }()
 	}
 	// Default the file-indexed / file-summary probes to "not indexed" so no
@@ -27,5 +28,6 @@ func TestMain(m *testing.M) {
 	// stubBridge) and restore these defaults on cleanup.
 	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
 	fileSummaryFn = func(_, _ string) (*hookFileSummary, bool) { return nil, false }
+	callServerToolDaemonFn = func(string, string, map[string]any) string { return "" }
 	os.Exit(m.Run())
 }

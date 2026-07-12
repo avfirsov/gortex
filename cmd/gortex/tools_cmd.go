@@ -59,7 +59,7 @@ func init() {
 
 	toolsListCmd.Flags().StringVar(&toolsListCategory, "category", "", "show only tools in this functional category")
 	toolsListCmd.Flags().BoolVar(&toolsListMutating, "mutating", false, "show only tools that write to the working tree / graph")
-	toolsListCmd.Flags().StringVar(&toolsListPreset, "preset", "", "show only tools published by this builtin preset (core|edit|nav|readonly)")
+	toolsListCmd.Flags().StringVar(&toolsListPreset, "preset", "", "show only tools published by this builtin preset (compact|core|edit|nav|readonly)")
 	toolsListCmd.Flags().StringVar(&toolsListFormat, "format", "text", "output format: text or json")
 
 	toolsSearchCmd.Flags().IntVar(&toolsSearchLimit, "limit", 10, "max number of tools to return")
@@ -122,6 +122,9 @@ func runToolsList(cmd *cobra.Command, _ []string) error {
 // descriptorHasPreset reports whether the descriptor lists the given preset
 // (case-insensitive).
 func descriptorHasPreset(d toolDescriptorCLI, preset string) bool {
+	if strings.EqualFold(strings.TrimSpace(preset), "compact") {
+		preset = "facade-v1"
+	}
 	for _, p := range d.Presets {
 		if strings.EqualFold(p, preset) {
 			return true

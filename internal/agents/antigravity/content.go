@@ -1,23 +1,41 @@
 // Package antigravity implements the Gortex init integration for
-// Google's Antigravity. Today we write a Knowledge Item at
+// Google's Antigravity. We register native MCP and write a Knowledge Item at
 // ~/.gemini/antigravity/knowledge/gortex-workflow/ — the official
-// documented mechanism for teaching Antigravity about project-
-// specific tooling. The Step 3 audit will add true MCP registration
-// alongside the KI once Antigravity's MCP config path is verified.
+// mechanism for teaching Antigravity the mandatory public-tool workflow.
 package antigravity
 
-// Metadata is the KI manifest. Antigravity reads it to show the KI
-// in its UI and to locate the artifact files it references.
+import "github.com/zzet/gortex/internal/agents"
+
+// Metadata is the KI manifest. Antigravity reads it to show the KI in its UI
+// and locate the public-tool workflow. The summary is deliberately transport
+// specific: native MCP first, with Bash only as an availability fallback.
 const Metadata = `{
+  "summary": "MANDATORY: Use Gortex MCP tools first for indexed code. Use gortex call only when MCP is unavailable and Bash is the only transport.",
+  "references": ["artifacts/gortex-instructions.md"]
+}
+`
+
+// Instructions reuses the same compact, agent-neutral workflow installed by
+// every other adapter. Antigravity's native MCP registration makes the direct
+// tool calls primary; the shared body names gortex call only as a Bash fallback.
+const Instructions = `---
+type: "Knowledge Item"
+description: "Mandatory Gortex public-tool workflow"
+---
+
+` + agents.InstructionsBody
+
+// These exact artifacts shipped before the compact public-tool surface. They
+// remain here solely as byte-for-byte migration fingerprints; customized KI
+// files never match them and are therefore preserved.
+const legacyMetadata = `{
   "summary": "MANDATORY: Instructions on how to use the local gortex engine CLI to significantly improve codebase intelligence. Antigravity must use run_command with gortex query over standard file read commands.",
   "references": ["artifacts/gortex-instructions.md"]
 }
 `
 
-// Instructions is the KI body — a Knowledge Item in Antigravity's
-// frontmatter-first markdown format. Lists the run_command
-// invocations Antigravity should prefer over grep_search / view_file.
-const Instructions = `---
+// legacyInstructions is the former CLI-first KI body.
+const legacyInstructions = `---
 type: "Knowledge Item"
 description: "Gortex Workflow and Tools for Antigravity"
 ---

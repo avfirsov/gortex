@@ -103,10 +103,13 @@ func Run(port int, mode Mode) {
 
 	var peek struct {
 		HookEventName string `json:"hook_event_name"`
+		CWD           string `json:"cwd"`
 	}
 	if err := json.Unmarshal(data, &peek); err != nil {
 		return
 	}
+	setHookCWD(peek.CWD)
+	defer setHookCWD("")
 
 	switch peek.HookEventName {
 	case "PreToolUse":

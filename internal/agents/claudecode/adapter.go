@@ -564,16 +564,6 @@ func pathExists(path string) bool {
 // present.
 func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	return agents.MergeJSON(w, settingsPath, func(settings map[string]any, _ bool) (bool, error) {
-		// Bail early if a gortex rule is already present.
-		if perms, ok := settings["permissions"].(map[string]any); ok {
-			if allow, ok := perms["allow"].([]any); ok {
-				for _, entry := range allow {
-					if s, ok := entry.(string); ok && strings.Contains(s, "mcp__gortex__") {
-						return false, nil
-					}
-				}
-			}
-		}
 		if _, ok := settings["permissions"]; !ok {
 			settings["permissions"] = make(map[string]any)
 		}
@@ -582,7 +572,43 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 			perms["allow"] = []any{}
 		}
 		allow := perms["allow"].([]any)
-		perms["allow"] = append(allow, "mcp__gortex__*")
+		hasGortexRule := false
+		hasLegacyWildcard := false
+		for _, entry := range allow {
+			s, ok := entry.(string)
+			if !ok || !strings.HasPrefix(s, "mcp__gortex__") {
+				continue
+			}
+			hasGortexRule = true
+			hasLegacyWildcard = hasLegacyWildcard || s == "mcp__gortex__*"
+		}
+		// Exact existing entries are user policy. Do not widen them. The one
+		// legacy wildcard is Gortex's old shipped rule and is safe to migrate.
+		if hasGortexRule && !hasLegacyWildcard {
+			return false, nil
+		}
+		if hasLegacyWildcard {
+			filtered := allow[:0]
+			for _, entry := range allow {
+				if entry != "mcp__gortex__*" {
+					filtered = append(filtered, entry)
+				}
+			}
+			allow = filtered
+		}
+		seen := make(map[string]bool, len(allow))
+		for _, entry := range allow {
+			if value, ok := entry.(string); ok {
+				seen[value] = true
+			}
+		}
+		for _, tool := range agents.CompactMCPAutoApproveTools() {
+			permission := "mcp__gortex__" + tool
+			if !seen[permission] {
+				allow = append(allow, permission)
+			}
+		}
+		perms["allow"] = allow
 		return true, nil
 	}, opts)
 }
@@ -629,7 +655,7 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "outside-profile"})
 				continue
 			}
-			if string(existing) != content {
+			if !isShippedAgentArtifact(existing, content, legacyGlobalSkillHashes[name]) {
 				logWarn(w, "keeping customised skill %s (outside the active profile)", path)
 				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"})
 				continue
@@ -645,7 +671,7 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 			out = append(out, agents.FileAction{Path: path, Action: agents.ActionDelete, Keys: []string{"skill"}})
 			continue
 		}
-		action, err := agents.WriteIfNotExists(w, path, content, opts)
+		action, err := writeAgentArtifact(w, path, content, legacyGlobalSkillHashes[name], opts)
 		if err != nil {
 			return out, err
 		}
@@ -664,7 +690,7 @@ func installGlobalSlashCommands(w io.Writer, home string, opts agents.ApplyOpts)
 	dir := filepath.Join(userClaudeConfigDir(home), "commands")
 	for name, content := range SlashCommands {
 		path := filepath.Join(dir, name)
-		action, err := agents.WriteIfNotExists(w, path, content, opts)
+		action, err := writeAgentArtifact(w, path, content, legacySlashCommandHashes[name], opts)
 		if err != nil {
 			return out, err
 		}
@@ -682,7 +708,7 @@ func installGlobalSubAgents(w io.Writer, home string, opts agents.ApplyOpts) ([]
 	dir := filepath.Join(userClaudeConfigDir(home), "agents")
 	for name, content := range SubAgents {
 		path := filepath.Join(dir, name)
-		action, err := agents.WriteIfNotExists(w, path, content, opts)
+		action, err := writeAgentArtifact(w, path, content, legacySubAgentHashes[name], opts)
 		if err != nil {
 			return out, err
 		}

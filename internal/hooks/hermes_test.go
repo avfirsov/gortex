@@ -51,7 +51,7 @@ func TestHermesPreToolCall_ReadFileIndexed_Blocks(t *testing.T) {
 	if !strings.Contains(d.Message, "/repo/handler.go") {
 		t.Errorf("message should name the file: %q", d.Message)
 	}
-	if !strings.Contains(d.Message, "get_symbol_source") {
+	if !strings.Contains(d.Message, `read(target:{symbol:`) {
 		t.Errorf("message should redirect to graph tools: %q", d.Message)
 	}
 	// Canonical Hermes shape — never Claude's envelope.

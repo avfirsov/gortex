@@ -10,12 +10,12 @@ import (
 // hostContext is a runtime, per-host adaptation of the served tool
 // surface, resolved from the MCP initialize clientInfo.name. It is the
 // serve-time counterpart of the install-time agent adapters: it can hide
-// tools the host duplicates, override individual tool descriptions, and
-// carry a host-specific guidance fragment surfaced via tool_profile.
+// tools the host duplicates and override individual tool descriptions.
+// Workflow guidance is surface-dependent and comes from MCP initialize, not
+// from host labels: a legacy tool_profile must never recommend compact names.
 type hostContext struct {
 	name         string            // canonical host name ("" = no context)
 	matches      []string          // lowercase substrings of clientInfo.name that select this context
-	instruction  string            // host-specific guidance fragment
 	excluded     map[string]bool   // tools removed from this host's tools/list
 	descOverride map[string]string // per-tool description replacements
 }
@@ -45,33 +45,22 @@ func (h hostContext) apply(tools []mcp.Tool) []mcp.Tool {
 	return out
 }
 
-// editorHostInstruction is shared by the IDE-extension hosts.
-const editorHostInstruction = "You are driving Gortex from an editor extension. Push unsaved buffers " +
-	"with overlay_push so graph queries see your in-progress edits before they reach disk, and use " +
-	"preview_edit / simulate_chain to evaluate a change without writing it."
-
 // hostContexts is the runtime registry of per-host adaptations, matched
 // against the MCP initialize clientInfo.name. Order matters — the first
 // matching entry wins, so more specific hosts come first.
 var hostContexts = []hostContext{
 	{
 		name:    "claude-code",
-		matches: []string{"claude"},
-		instruction: "Gortex runs here with PreToolUse hooks that redirect Read / Grep / Glob to graph " +
-			"tools. Begin every task with smart_context, prefer get_symbol_source over reading whole " +
-			"files, and edit through edit_file / edit_symbol.",
+		matches: []string{"claude-code", "claude code"},
 	},
-	{name: "cursor", matches: []string{"cursor"}, instruction: editorHostInstruction},
-	{name: "vscode", matches: []string{"vscode", "visual studio"}, instruction: editorHostInstruction},
-	{name: "zed", matches: []string{"zed"}, instruction: editorHostInstruction},
-	{name: "windsurf", matches: []string{"windsurf"}, instruction: editorHostInstruction},
-	{name: "jetbrains", matches: []string{"jetbrains", "intellij"}, instruction: editorHostInstruction},
+	{name: "cursor", matches: []string{"cursor"}},
+	{name: "vscode", matches: []string{"vscode", "visual studio"}},
+	{name: "zed", matches: []string{"zed"}},
+	{name: "windsurf", matches: []string{"windsurf"}},
+	{name: "jetbrains", matches: []string{"jetbrains", "intellij"}},
 	{
 		name:    "codex",
-		matches: []string{"codex"},
-		instruction: "Gortex facade-v1 is available directly through MCP. Start with explore, then use " +
-			"search/read/relations instead of shell source inspection; mutate through edit/refactor and " +
-			"verify the result with change. Use capabilities for operation-specific schemas.",
+		matches: []string{"codex", "openai-codex"},
 	},
 }
 
@@ -84,12 +73,27 @@ func resolveHostContext(clientName string) hostContext {
 	}
 	for _, hc := range hostContexts {
 		for _, m := range hc.matches {
-			if strings.Contains(name, m) {
+			if matchesClientAlias(name, m) {
 				return hc
 			}
 		}
 	}
 	return hostContext{}
+}
+
+// matchesClientAlias accepts an exact client family or an anchored versioned
+// spelling. Substring matching is unsafe here: names such as "not-codex" and
+// "Claude Desktop" must remain unknown and therefore JSON-only.
+func matchesClientAlias(name, alias string) bool {
+	if name == alias {
+		return true
+	}
+	for _, separator := range []string{" ", "/", "@"} {
+		if strings.HasPrefix(name, alias+separator) {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionHostContext resolves the per-host context for the request's

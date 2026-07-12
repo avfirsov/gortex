@@ -71,7 +71,7 @@ func TestEnrichGrep_Alternation_MixedProbesOnlySymbolSegments(t *testing.T) {
 
 // TestEnrichGrep_Alternation_PureTextSkips covers a multi-keyword pattern with
 // no identifier-shaped alternative: it must not probe and must steer the agent
-// toward search_text.
+// toward the public text-search operation.
 func TestEnrichGrep_Alternation_PureTextSkips(t *testing.T) {
 	logPath := redirectTelemetry(t)
 	rec := stubProbe(t, nil, nil)
@@ -80,8 +80,8 @@ func TestEnrichGrep_Alternation_PureTextSkips(t *testing.T) {
 	if result.deny {
 		t.Fatal("pure-text alternation should not deny")
 	}
-	if !strings.Contains(result.context, "search_text") {
-		t.Errorf("guidance should point at search_text: %q", result.context)
+	if !strings.Contains(result.context, `search(operation:"symbols"`) || !strings.Contains(result.context, "literal text: use operation `text`") {
+		t.Errorf("guidance should point at search(operation=text): %q", result.context)
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("pure-text alternation should not probe, got %v", rec.calls)

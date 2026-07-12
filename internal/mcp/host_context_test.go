@@ -15,6 +15,8 @@ func TestResolveHostContext(t *testing.T) {
 	require.Equal(t, "cursor", resolveHostContext("Cursor").name)
 	require.Equal(t, "vscode", resolveHostContext("Visual Studio Code").name)
 	require.Equal(t, "", resolveHostContext("some-unknown-agent").name)
+	require.Equal(t, "", resolveHostContext("Claude Desktop").name)
+	require.Equal(t, "", resolveHostContext("not-codex").name)
 	require.True(t, resolveHostContext("").empty(), "an unidentified host applies no adaptation")
 }
 
@@ -57,5 +59,5 @@ func TestToolProfile_ReportsHostContext(t *testing.T) {
 	var profile map[string]any
 	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &profile))
 	require.Equal(t, "cursor", profile["host"], "tool_profile must report the resolved host")
-	require.NotEmpty(t, profile["host_instruction"], "an editor host carries a guidance fragment")
+	require.NotContains(t, profile, "host_instruction", "legacy tool_profile must not recommend compact-only names")
 }

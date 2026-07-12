@@ -10,32 +10,32 @@ package toolref
 
 import "strings"
 
-// exampleArg maps a Gortex MCP tool to a realistic `--arg` for its shell
-// fallback, so the rendered hint reads `gortex call read_file --arg path=<file>`
-// rather than a shapeless `key=value`. A tool absent here falls back to the
-// generic `key=value`, which is still a valid invocation shape.
+// cliExample maps internal/compatibility tool names used by hooks to the
+// compact public call an agent should execute from Bash. Hooks may still use
+// the internal handler name for their daemon probe; emitted guidance must not
+// make an agent learn that implementation vocabulary.
 //
 // Symbol-ID placeholders render both forms — `<file>::<Name|Recv.Name>` — so
 // an agent targeting a method knows the ID carries the receiver
 // (`pkg/s.go::Server.Handle`), not the bare method name; the bare form only
 // resolves functions and types.
-var exampleArg = map[string]string{
-	"read_file":           "path=<file>",
-	"get_symbol_source":   "symbol=<file>::<Name|Recv.Name>",
-	"get_editing_context": "path=<file>",
-	"get_file_summary":    "path=<file>",
-	"get_symbol":          "id=<file>::<Name|Recv.Name>",
-	"search_symbols":      "query=<name>",
-	"search_text":         "query=<text>",
-	"find_usages":         "symbol=<file>::<Name|Recv.Name>",
-	"get_callers":         "symbol=<file>::<Name|Recv.Name>",
-	"smart_context":       "task=<what you want to do>",
-	"explore":             "task=<the request / bug report text>",
-	"get_repo_outline":    "path_prefix=<dir>/",
-	"edit_file":           "path=<file>",
-	"edit_symbol":         "id=<file>::<Name|Recv.Name>",
-	"index_repository":    "path=<repo-root>",
-	"reindex_repository":  "path=<repo-root>",
+var cliExample = map[string]string{
+	"read_file":           `gortex call read --arg target='{"file":"<file>"}'`,
+	"get_symbol_source":   `gortex call read --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'`,
+	"get_editing_context": `gortex call read --arg operation=editing_context --arg target='{"file":"<file>"}'`,
+	"get_file_summary":    `gortex call read --arg operation=summary --arg target='{"file":"<file>"}'`,
+	"get_symbol":          `gortex call read --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'`,
+	"search_symbols":      `gortex call search --arg operation=symbols --arg query='<name>'`,
+	"search_text":         `gortex call search --arg operation=text --arg query='<text>'`,
+	"find_usages":         `gortex call relations --arg operation=usages --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'`,
+	"get_callers":         `gortex call relations --arg operation=callers --arg target='{"symbol":"<file>::<Name|Recv.Name>"}'`,
+	"smart_context":       `gortex call explore --arg operation=context --arg task='<task>'`,
+	"explore":             `gortex call explore --arg task='<task>'`,
+	"get_repo_outline":    `gortex call explore --arg operation=outline --arg options='{"path_prefix":"<dir>/"}'`,
+	"edit_file":           `gortex call edit --arg target='{"file":"<file>"}' --arg match='<old>' --arg replacement='<new>'`,
+	"edit_symbol":         `gortex call edit --arg target='{"symbol":"<id>"}' --arg match='<old>' --arg replacement='<new>'`,
+	"index_repository":    `gortex call workspace_admin --arg operation=index --arg arguments='{"path":"<repo-root>"}'`,
+	"reindex_repository":  `gortex call workspace_admin --arg operation=reindex --arg arguments='{"path":"<repo-root>"}'`,
 }
 
 // MCPRef renders an MCP-directed reference to a tool: "call the `read_file` MCP
@@ -45,16 +45,23 @@ func MCPRef(tool string) string {
 	return "call the `" + tool + "` MCP tool"
 }
 
-// CLIFallback renders the shell-fallback invocation for one tool:
-// `gortex call read_file --arg path=<file>`. This is the single place a tool
-// name becomes a shell command — nothing else should hand-assemble a
-// `gortex …` shape, so the bare-verb mistake can never be re-minted piecemeal.
+// CLIFallback renders the compact shell invocation for one operation, for
+// example `gortex call read --arg target='{"file":"..."}'`. This is the single
+// place an internal tool reference becomes agent-facing Bash — nothing else
+// should hand-assemble a `gortex …` shape, so the bare-verb mistake can never
+// be re-minted piecemeal.
 func CLIFallback(tool string) string {
-	arg := exampleArg[tool]
-	if arg == "" {
-		arg = "key=value"
+	if example := cliExample[tool]; example != "" {
+		return example
 	}
-	return "gortex call " + tool + " --arg " + arg
+	return "gortex call " + tool + " --arg key=value"
+}
+
+// ConcreteCLIFallback reports whether tool has a reviewed, shell-safe compact
+// invocation rather than the generic compatibility fallback.
+func ConcreteCLIFallback(tool string) (string, bool) {
+	example, ok := cliExample[tool]
+	return example, ok
 }
 
 // FallbackLine is the standard one-line advisory appended to graph-tool

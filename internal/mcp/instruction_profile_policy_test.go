@@ -72,6 +72,7 @@ func TestOperatorPinnedToolPolicy(t *testing.T) {
 	}{
 		{"zero config", ToolPolicyConfig{}, false},
 		{"shipped default", ToolPolicyConfig{Preset: "core", Mode: "defer"}, false},
+		{"explicit shipped values", ToolPolicyConfig{Preset: "core", Mode: "defer", OperatorPinned: true}, true},
 		{"default alias", ToolPolicyConfig{Preset: "default", Mode: "defer"}, false},
 		{"core in hide mode", ToolPolicyConfig{Preset: "core", Mode: "hide"}, true},
 		{"named preset", ToolPolicyConfig{Preset: "agent", Mode: "defer"}, true},

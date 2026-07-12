@@ -123,8 +123,12 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		allowedKinds = parseAnalyzeKindsFilter(k)
 	}
 
-	// Co-change feeds one axis — make sure the git mine has run.
-	s.ensureCoChange()
+	// Legacy analyze historically starts the co-change mine lazily. The compact
+	// read-only adapter fixes refresh_cochange=false, so it consumes only the
+	// daemon-prewarmed cache and cannot cause durable EdgeCoChange writes.
+	if requestBoolDefault(req, "refresh_cochange", true) {
+		s.ensureCoChange()
+	}
 
 	pr := s.getPageRank()
 	maxPR := 0.0

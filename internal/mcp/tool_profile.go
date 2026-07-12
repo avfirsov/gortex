@@ -231,13 +231,11 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 		profile["preset"] = p.preset
 		profile["preset_mode"] = p.mode
 	}
-	// Per-host runtime context — the resolved host name and its guidance
-	// fragment, when the MCP client identified itself (host_context.go).
+	// Per-host runtime context. Guidance is emitted at initialize time from the
+	// effective tool policy; tool_profile may describe a legacy surface and
+	// therefore must not inject compact-only names.
 	if hc := s.sessionHostContext(ctx); hc.name != "" {
 		profile["host"] = hc.name
-		if hc.instruction != "" {
-			profile["host_instruction"] = hc.instruction
-		}
 	}
 	return s.respondJSONOrTOON(ctx, req, profile)
 }

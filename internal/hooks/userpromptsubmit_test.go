@@ -49,7 +49,7 @@ func TestBuildPromptInjection(t *testing.T) {
 	// The follow-up routing points at the one-shot localization verb first,
 	// with the granular readers as the single-symbol fallback.
 	require.Contains(t, block, "`explore`")
-	require.Contains(t, block, "batch_symbols")
+	require.Contains(t, block, `read(operation:"source")`)
 }
 
 func TestBuildPromptInjectionCapsHits(t *testing.T) {
