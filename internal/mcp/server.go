@@ -1147,7 +1147,7 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 // codingAgentInstructions is intentionally terse because some MCP hosts repeat
 // initialize instructions beside every rendered tool. It describes what to do,
 // not how the server versions or implements its tool surface.
-const codingAgentInstructions = `You MUST use Gortex MCP—not shell, Read, or Grep—for code. Start every task with explore; inspect with search, read, relations, or trace. Before edits call change(operation:"impact"); for signatures also call change(operation:"verify") with the proposal. Mutate only with edit or refactor. Afterward call change(operation:"detect"), then change operations tests, guards, and contract with its IDs. Call capabilities only for unknown fields.`
+const codingAgentInstructions = `You MUST use Gortex MCP—not shell, Read, or Grep—for code. Start every task with explore. For localization, answer from it; no cross-check. For changes, follow up only on one unresolved symbol with search/read/relations/trace. Before edits call change(operation:"impact"); for signatures also change(operation:"verify"). Mutate only with edit or refactor. Afterward call change(operation:"detect"), then change tests, guards, and contract with its IDs. Call capabilities only for unknown fields.`
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
