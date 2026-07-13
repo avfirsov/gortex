@@ -12,7 +12,7 @@ import (
 )
 
 // TestIncrementalReindex_NestedFileNoDuplicate guards the
-// "斜杠路径重复索引" (slash-path duplicate indexing) regression on Windows.
+// slash-path duplicate indexing regression on Windows.
 //
 // The cold bulk walk keys a nested file's graph nodes under OS-native
 // separators — "myrepo/pkg\sub\thing.go" on Windows. The incremental

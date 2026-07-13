@@ -331,7 +331,7 @@ func TestRenameWithRetryReturnsNonRetryableErr(t *testing.T) {
 }
 
 // TestAtomicWriteFileReapsStaleTempOrphans guards the cleanup of temp
-// files a crashed write orphaned ("历史临时文件未清理"): a *.gortex.tmp-*
+// files a crashed write orphaned ("not cleared"): a *.gortex.tmp-*
 // stranded when a process died between CreateTemp and the rename must be
 // reaped by a later AtomicWriteFile — but a temp still in flight (fresh
 // mtime) and any unrelated file must be left untouched.
