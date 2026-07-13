@@ -128,13 +128,76 @@ func TestRenderExploreAnswerDraftIncludesQueryAlignedGraphNeighbor(t *testing.T)
 		t.Fatalf("invalid draft/detail ordering:\n%s", out)
 	}
 	draft := out[draftStart:detailsStart]
-	for _, want := range []string{"SYMBOL: RetryCoordinator", "retry/coordinator.go:20-30", "caller of ranked #1"} {
+	for _, want := range []string{"SYMBOL: RetryCoordinator", "ID: retry/coordinator.go::RetryCoordinator", "retry/coordinator.go:20-30", "caller of ranked #1"} {
 		if !strings.Contains(draft, want) {
 			t.Fatalf("query-aligned neighbor missing %q from answer draft:\n%s", want, draft)
 		}
 	}
 	if strings.Contains(draft, "log.go::Logger") {
 		t.Fatalf("unrelated graph neighbor must not be promoted into answer draft:\n%s", draft)
+	}
+}
+
+func TestRenderExploreAnswerDraftPromotesBoundedStructuralNeighbors(t *testing.T) {
+	node := func(id, name, file string) *graph.Node {
+		return &graph.Node{ID: id, Name: name, Kind: graph.KindMethod, FilePath: file, StartLine: 20}
+	}
+	genericHidden := node("crates/ignore/src/walk.rs::WalkBuilder.hidden", "hidden", "crates/ignore/src/walk.rs")
+	standardFilters := node("crates/ignore/src/walk.rs::WalkBuilder.standard_filters", "standard_filters", "crates/ignore/src/walk.rs")
+	isHidden := node("crates/ignore/src/walk.rs::Ignore.is_hidden", "is_hidden", "crates/ignore/src/walk.rs")
+	matched := node("crates/ignore/src/dir.rs::Ignore.matched_dir_entry", "matched_dir_entry", "crates/ignore/src/dir.rs")
+	testCaller := &graph.Node{ID: "crates/ignore/tests/gitignore_tests.rs::hidden_test", Name: "hidden_test", Kind: graph.KindFunction, FilePath: "crates/ignore/tests/gitignore_tests.rs"}
+	callers := []*graph.Node{testCaller, node("crates/core/src/log.rs::trace_event", "trace_event", "crates/core/src/log.rs"), matched}
+	targets := []exploreTarget{
+		{node: genericHidden, callees: []*graph.Node{standardFilters}},
+		{node: node("rank2", "ignore_rules", "crates/ignore/src/dir.rs")},
+		{node: node("rank3", "walk_entries", "crates/ignore/src/walk.rs")},
+		{node: node("rank4", "ignore", "crates/ignore/src/dir.rs")},
+		{node: node("rank5", "hidden", "crates/ignore/src/dir.rs")},
+		{node: node("rank6", "filter_entry", "crates/ignore/src/walk.rs")},
+		{node: isHidden, callers: callers},
+		{node: node("rank8", "walk_state", "crates/ignore/src/walk.rs")},
+		{node: node("rank9", "path_filter", "crates/ignore/src/dir.rs")},
+		{node: node("rank10", "ignore_match", "crates/ignore/src/dir.rs")},
+	}
+	out := (&Server{}).renderExplore("locate is_hidden scoped ignore behavior", targets, 1600)
+	draft := out[strings.Index(out, "## Answer draft"):strings.Index(out, "## Likely targets")]
+	for _, want := range []string{"SYMBOL: matched_dir_entry", "ID: crates/ignore/src/dir.rs::Ignore.matched_dir_entry", "caller of ranked #7"} {
+		if !strings.Contains(draft, want) {
+			t.Fatalf("rank-7 structural caller missing %q from answer draft:\n%s", want, draft)
+		}
+	}
+	for _, forbidden := range []string{"hidden_test", "trace_event", "standard_filters"} {
+		if strings.Contains(draft, forbidden) {
+			t.Fatalf("generic or ineligible caller %q was promoted:\n%s", forbidden, draft)
+		}
+	}
+
+	buildParallel := node("crates/ignore/src/walk.rs::WalkBuilder.build_parallel", "build_parallel", "crates/ignore/src/walk.rs")
+	buildWithCWD := node("crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", "build_with_cwd", "crates/ignore/src/dir.rs")
+	getCurrentDir := node("crates/ignore/src/walk.rs::get_or_set_current_dir", "get_or_set_current_dir", "crates/ignore/src/walk.rs")
+	build := node("crates/ignore/src/walk.rs::WalkBuilder.build", "build", "crates/ignore/src/walk.rs")
+	targets = []exploreTarget{
+		{node: node("parallel-rank1", "parallel_walk", "crates/ignore/src/walk.rs")},
+		{node: buildParallel, callees: []*graph.Node{build, getCurrentDir, buildWithCWD}},
+		{node: node("parallel-rank3", "multi_root", "crates/ignore/src/walk.rs")},
+		{node: node("parallel-rank4", "current_dir", "crates/ignore/src/walk.rs")},
+		{node: node("parallel-rank5", "standard_filters", "crates/ignore/src/walk.rs")},
+		{node: node("parallel-rank6", "add_root", "crates/ignore/src/walk.rs")},
+		{node: node("parallel-rank7", "ignore_rule", "crates/ignore/src/dir.rs")},
+		{node: node("parallel-rank8", "walk_state", "crates/ignore/src/walk.rs")},
+		{node: node("parallel-rank9", "root_path", "crates/ignore/src/dir.rs")},
+		{node: node("parallel-rank10", "ignore_match", "crates/ignore/src/dir.rs")},
+	}
+	out = (&Server{}).renderExplore("nondeterminism WalkBuilder parallel multi-root walk current_dir standard_filters add build_parallel", targets, 1600)
+	draft = out[strings.Index(out, "## Answer draft"):strings.Index(out, "## Likely targets")]
+	for _, want := range []string{"SYMBOL: build_with_cwd", "ID: crates/ignore/src/dir.rs::IgnoreBuilder.build_with_cwd", "callee of ranked #2"} {
+		if !strings.Contains(draft, want) {
+			t.Fatalf("cross-file structural callee missing %q from answer draft:\n%s", want, draft)
+		}
+	}
+	if strings.Contains(draft, "get_or_set_current_dir") {
+		t.Fatalf("query-overlapping but parent-unrelated callee displaced structural implementation:\n%s", draft)
 	}
 }
 
@@ -182,6 +245,25 @@ func TestExploreDraftExactAnchorUsesTokenBoundaries(t *testing.T) {
 	}
 	if !exploreDraftExactAnchor("inspect get.go", n) {
 		t.Fatal("path basename should be an exact anchor")
+	}
+	generic := &graph.Node{Name: "write", QualName: "Writer.write", FilePath: "runtime/output.go"}
+	if exploreDraftExactAnchor("fix write behavior", generic) {
+		t.Fatal("unqualified generic method must not become an exact anchor")
+	}
+	if !exploreDraftExactAnchor("fix Writer.write behavior", generic) {
+		t.Fatal("qualified generic method should remain an exact anchor")
+	}
+	plainGeneric := &graph.Node{Name: "write", QualName: "write", FilePath: "runtime/output.go"}
+	if exploreDraftExactAnchor("fix write behavior", plainGeneric) {
+		t.Fatal("duplicated unqualified qualname must not bypass the generic-name guard")
+	}
+	convert := &graph.Node{Name: "Convert", QualName: "Convert", FilePath: "runtime/value.cs"}
+	if exploreDraftExactAnchor("review Convert behavior", convert) {
+		t.Fatal("unqualified cross-language generic method must not become an exact anchor")
+	}
+	convert.QualName = "Thing.Convert"
+	if !exploreDraftExactAnchor("review Thing.Convert behavior", convert) {
+		t.Fatal("qualified cross-language generic method should remain an exact anchor")
 	}
 }
 

@@ -86,12 +86,17 @@ const (
 )
 
 type exploreDraftEntry struct {
-	node       *graph.Node
-	evidence   string
-	exact      bool
-	overlap    int
-	direct     bool
-	parentRank int
+	node             *graph.Node
+	evidence         string
+	exact            bool
+	overlap          int
+	direct           bool
+	structural       bool
+	structuralShared int
+	structuralLocal  bool
+	parentExact      bool
+	parentOverlap    int
+	parentRank       int
 }
 
 // exploreAnswerDraft puts a small, ready-to-use evidence set before the full
@@ -131,21 +136,20 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		return true
 	}
 
-	// Preserve recall by reserving the retrieval head in the five-row draft;
-	// the final sort below orders those rows by visible query alignment.
+	// Preserve the retrieval head, then reserve at most one structural caller
+	// and one structural callee. The global quotas keep graph expansion useful
+	// without allowing a generic call neighborhood to consume the whole draft.
 	for i := 0; i < len(targets) && i < exploreDraftPrimaryLimit; i++ {
 		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
 		appendEntry(entry)
 	}
 
-	var aligned []exploreDraftEntry
+	var aligned, structuralCallers, structuralCallees []exploreDraftEntry
 	consider := func(n *graph.Node, evidence string, direct bool, parentRank int) {
-		if n == nil {
+		if n == nil || (!direct && exploreDraftIsTestNode(n)) {
 			return
 		}
 		entry, longest := makeEntry(n, evidence, direct, parentRank)
-		// One long discriminative term is useful for graph neighbors; short
-		// generic collisions need either an exact anchor or two query terms.
 		if !entry.exact && entry.overlap < 2 && !(entry.overlap == 1 && longest >= 5) {
 			return
 		}
@@ -161,19 +165,63 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 		for _, n := range target.callees {
 			consider(n, fmt.Sprintf("callee of ranked #%d", i+1), false, i)
 		}
+
+		if target.node == nil {
+			continue
+		}
+		parent, longest := makeEntry(target.node, "", true, i)
+		strongParent := parent.exact || parent.overlap >= 2 || (parent.overlap == 1 && longest >= 5)
+		if !strongParent || exploreIdentifierSegmentCount(target.node.Name) < 2 {
+			continue
+		}
+		collectStructural := func(n *graph.Node, evidence string, dst *[]exploreDraftEntry) {
+			if n == nil || exploreDraftIsTestNode(n) || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreIdentifierSegmentCount(n.Name) < 2 {
+				return
+			}
+			entry, _ := makeEntry(n, evidence, false, i)
+			shared, local := exploreStructuralSignals(target.node, n)
+			if shared == 0 && !entry.exact && entry.overlap == 0 && !local {
+				return
+			}
+			entry.structural = true
+			entry.structuralShared = shared
+			entry.structuralLocal = local
+			entry.parentExact = parent.exact
+			entry.parentOverlap = parent.overlap
+			*dst = append(*dst, entry)
+		}
+		for _, n := range target.callers {
+			collectStructural(n, fmt.Sprintf("caller of ranked #%d", i+1), &structuralCallers)
+		}
+		for _, n := range target.callees {
+			collectStructural(n, fmt.Sprintf("callee of ranked #%d", i+1), &structuralCallees)
+		}
 	}
+
 	sort.SliceStable(aligned, func(i, j int) bool {
 		return exploreDraftEntryLess(aligned[i], aligned[j])
 	})
+	sort.SliceStable(structuralCallers, func(i, j int) bool {
+		return exploreStructuralEntryLess(structuralCallers[i], structuralCallers[j])
+	})
+	sort.SliceStable(structuralCallees, func(i, j int) bool {
+		return exploreStructuralEntryLess(structuralCallees[i], structuralCallees[j])
+	})
+	appendFirst := func(candidates []exploreDraftEntry) {
+		for _, entry := range candidates {
+			if appendEntry(entry) {
+				return
+			}
+		}
+	}
+	appendFirst(structuralCallers)
+	appendFirst(structuralCallees)
 	for _, entry := range aligned {
 		if len(entries) >= exploreDraftTotalLimit {
 			break
 		}
 		appendEntry(entry)
 	}
-	// Weakly aligned neighborhoods still provide a compact best-supported
-	// answer: fill unused slots from the original ranking, never by broadening
-	// retrieval or inventing another search step.
 	for i := exploreDraftPrimaryLimit; i < len(targets) && len(entries) < exploreDraftTotalLimit; i++ {
 		entry, _ := makeEntry(targets[i].node, fmt.Sprintf("ranked #%d", i+1), true, i)
 		appendEntry(entry)
@@ -185,11 +233,32 @@ func exploreAnswerDraft(task string, targets []exploreTarget) []exploreDraftEntr
 }
 
 func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
-	if a.exact != b.exact {
-		return a.exact
+	priority := func(entry exploreDraftEntry) int {
+		switch {
+		case entry.exact && entry.direct:
+			return 0
+		case entry.exact:
+			return 1
+		case entry.overlap > 0 && entry.direct:
+			return 2
+		case entry.overlap > 0:
+			return 3
+		case entry.structural:
+			return 4
+		case entry.direct:
+			return 5
+		default:
+			return 6
+		}
+	}
+	if ap, bp := priority(a), priority(b); ap != bp {
+		return ap < bp
 	}
 	if a.overlap != b.overlap {
 		return a.overlap > b.overlap
+	}
+	if a.parentOverlap != b.parentOverlap {
+		return a.parentOverlap > b.parentOverlap
 	}
 	if a.direct != b.direct {
 		return a.direct
@@ -198,6 +267,94 @@ func exploreDraftEntryLess(a, b exploreDraftEntry) bool {
 		return a.parentRank < b.parentRank
 	}
 	return exploreDraftNodeKey(a.node) < exploreDraftNodeKey(b.node)
+}
+
+func exploreStructuralEntryLess(a, b exploreDraftEntry) bool {
+	if a.structuralShared != b.structuralShared {
+		return a.structuralShared > b.structuralShared
+	}
+	if a.exact != b.exact {
+		return a.exact
+	}
+	if a.overlap != b.overlap {
+		return a.overlap > b.overlap
+	}
+	if a.structuralLocal != b.structuralLocal {
+		return a.structuralLocal
+	}
+	if a.parentExact != b.parentExact {
+		return a.parentExact
+	}
+	if a.parentOverlap != b.parentOverlap {
+		return a.parentOverlap > b.parentOverlap
+	}
+	if a.parentRank != b.parentRank {
+		return a.parentRank < b.parentRank
+	}
+	return exploreDraftNodeKey(a.node) < exploreDraftNodeKey(b.node)
+}
+
+func exploreIdentifierSegmentCount(name string) int {
+	return len(rerank.Tokenize(name))
+}
+
+func exploreIdentifierTerms(name string) map[string]struct{} {
+	generic := map[string]struct{}{
+		"and": {}, "for": {}, "from": {}, "get": {}, "has": {}, "into": {},
+		"is": {}, "new": {}, "of": {}, "or": {}, "set": {}, "the": {},
+		"to": {}, "with": {}, "without": {},
+	}
+	terms := make(map[string]struct{})
+	for _, term := range rerank.Tokenize(name) {
+		term = strings.ToLower(term)
+		if len(term) < 3 {
+			continue
+		}
+		if _, skip := generic[term]; skip {
+			continue
+		}
+		terms[term] = struct{}{}
+	}
+	return terms
+}
+
+func exploreStructuralSignals(parent, child *graph.Node) (shared int, local bool) {
+	parentTerms := exploreIdentifierTerms(parent.Name)
+	for term := range exploreIdentifierTerms(child.Name) {
+		if _, ok := parentTerms[term]; ok {
+			shared++
+		}
+	}
+	parentPath := nodeDisplayPath(parent)
+	childPath := nodeDisplayPath(child)
+	parentSlash := strings.LastIndex(parentPath, "/")
+	childSlash := strings.LastIndex(childPath, "/")
+	if parentSlash >= 0 && childSlash >= 0 && parentPath != childPath {
+		local = parentPath[:parentSlash] == childPath[:childSlash]
+	}
+	return shared, local
+}
+
+func exploreDraftIsTestNode(n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	if auditIsTestNode(n) {
+		return true
+	}
+	path := strings.ToLower(strings.ReplaceAll(nodeDisplayPath(n), "\\", "/"))
+	segmented := "/" + strings.Trim(path, "/") + "/"
+	for _, dir := range []string{"/__tests__/", "/spec/", "/specs/", "/test/", "/tests/"} {
+		if strings.Contains(segmented, dir) {
+			return true
+		}
+	}
+	base := path
+	if slash := strings.LastIndex(base, "/"); slash >= 0 {
+		base = base[slash+1:]
+	}
+	return strings.HasPrefix(base, "test_") || strings.Contains(base, "_test.") ||
+		strings.Contains(base, ".spec.") || strings.Contains(base, ".test.")
 }
 
 func exploreDraftTermOverlap(queryTerms map[string]struct{}, n *graph.Node) (count, longest int) {
@@ -227,9 +384,15 @@ func exploreDraftExactAnchor(query string, n *graph.Node) bool {
 	normalize := func(text string) string {
 		return strings.ToLower(strings.Join(rerank.Tokenize(text), " "))
 	}
+	genericName := map[string]struct{}{
+		"clear": {}, "convert": {}, "get": {}, "set": {}, "write": {},
+	}
 	query = " " + normalize(query) + " "
 	for _, anchor := range []string{n.Name, n.QualName} {
 		anchor = normalize(anchor)
+		if _, generic := genericName[anchor]; generic {
+			continue
+		}
 		if len(anchor) >= 3 && strings.Contains(query, " "+anchor+" ") {
 			return true
 		}
@@ -574,6 +737,11 @@ func (s *Server) renderExplore(task string, targets []exploreTarget, budget int)
 	draft := exploreAnswerDraft(task, targets)
 	b.WriteString("## Answer draft\n")
 	for _, entry := range draft {
+		if !entry.direct && entry.node.ID != "" {
+			fmt.Fprintf(&b, "- FILE: %s  ·  SYMBOL: %s  ·  ID: %s  ·  EVIDENCE: %s\n",
+				nodeLoc(entry.node), exploreDraftSymbol(entry.node), entry.node.ID, entry.evidence)
+			continue
+		}
 		fmt.Fprintf(&b, "- FILE: %s  ·  SYMBOL: %s  ·  EVIDENCE: %s\n",
 			nodeLoc(entry.node), exploreDraftSymbol(entry.node), entry.evidence)
 	}
