@@ -37,6 +37,9 @@ type Server struct {
 	// tests and for early integration before the MCP passthrough lands.
 	MCPDispatcher MCPDispatcher
 
+	// MCPToolCallTimeout bounds individual tools/call dispatches. Zero uses DefaultMCPToolCallTimeout.
+	MCPToolCallTimeout time.Duration
+
 	// Controller handles control-mode RPCs (track/untrack/reload/status/shutdown).
 	Controller Controller
 
@@ -483,43 +486,33 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		})
 		return
 	}
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.Logger.Debug("daemon: mcp read closed",
+
+	serveMCPConnection(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
+		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
+			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return reply, err
+		})
+		if err != nil && s.Logger != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				outcome := "cancelled"
+				if errors.Is(ctxErr, context.DeadlineExceeded) {
+					outcome = "deadline"
+				}
+				s.Logger.Warn("daemon: mcp request lifetime ended",
+					zap.String("session_id", sess.ID),
+					zap.String("outcome", outcome),
+					zap.Duration("deadline", s.mcpToolCallTimeout()),
+					zap.Error(ctxErr))
+			} else {
+				s.Logger.Warn("daemon: dispatch error",
 					zap.String("session_id", sess.ID), zap.Error(err))
 			}
-			return
 		}
-		// Scanner-style: trim trailing newline but keep the payload as-is
-		// so the dispatcher sees valid JSON.
-		if n := len(line); n > 0 && line[n-1] == '\n' {
-			line = line[:n-1]
-		}
-		if len(line) == 0 {
-			continue
-		}
-
-		ctx := context.Background()
-		reply, _, err := sess.dispatchMCPOnce(line, func() ([]byte, error) {
-			return s.MCPDispatcher.Dispatch(ctx, sess, line)
-		})
-		if err != nil {
-			s.Logger.Warn("daemon: dispatch error",
-				zap.String("session_id", sess.ID), zap.Error(err))
-			continue
-		}
-		if len(reply) == 0 {
-			continue
-		}
-		// The dispatcher returns a full JSON-RPC frame; re-append newline.
-		if _, werr := conn.Write(append(reply, '\n')); werr != nil {
-			s.Logger.Debug("daemon: mcp write failed",
-				zap.String("session_id", sess.ID), zap.Error(werr))
-			return
-		}
-	}
+		return reply, err
+	})
 }
 
 // serveControl drains ControlRequest messages, invokes the Controller,

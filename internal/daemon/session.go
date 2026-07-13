@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -119,27 +120,50 @@ type mcpResponseFlight struct {
 // in the same logical session. Identical concurrent requests share one dispatch,
 // while unrelated requests remain independent even if one handler blocks.
 func (s *Session) dispatchMCPOnce(request []byte, dispatch func() ([]byte, error)) ([]byte, bool, error) {
+	return s.dispatchMCPOnceContext(context.Background(), request, dispatch)
+}
+
+func (s *Session) dispatchMCPOnceContext(ctx context.Context, request []byte, dispatch func() ([]byte, error)) ([]byte, bool, error) {
 	if s == nil || s.LogicalSessionID == "" {
-		reply, err := dispatch()
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
 		return reply, false, err
 	}
-	key, digest, cacheable := mcpResponseCacheIdentity(request)
-	if !cacheable || len(key) > MCPResponseCacheMaxIDBytes {
-		reply, err := dispatch()
+	identity, cacheable := parseMCPReplayIdentity(request)
+	if !cacheable {
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
+		return reply, false, err
+	}
+	key, digest := identity.key, identity.digest
+	if len(key) > MCPResponseCacheMaxIDBytes {
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
 		return reply, false, err
 	}
 
 	flightKey := mcpResponseFlightKey{id: key, digest: digest}
+
+retryFlight:
 	s.responseMu.Lock()
 	if cached, ok := s.responseCache[key]; ok && cached.requestDigest == digest {
 		reply := append([]byte(nil), cached.response...)
 		s.responseMu.Unlock()
+		signalMCPDispatchAdmission(ctx)
 		return reply, true, nil
 	}
 	if existing, ok := s.responseInFlight[flightKey]; ok {
 		s.responseMu.Unlock()
-		<-existing.done
-		return append([]byte(nil), existing.response...), true, existing.err
+		signalMCPDispatchAdmission(ctx)
+		select {
+		case <-existing.done:
+			if existing.err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, false, ctxErr
+				}
+				goto retryFlight
+			}
+			return append([]byte(nil), existing.response...), true, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 	}
 	if s.responseInFlight == nil {
 		s.responseInFlight = make(map[mcpResponseFlightKey]*mcpResponseFlight)
@@ -148,10 +172,15 @@ func (s *Session) dispatchMCPOnce(request []byte, dispatch func() ([]byte, error
 	s.responseInFlight[flightKey] = flight
 	s.responseMu.Unlock()
 
-	reply, err := dispatch()
+	reply, err := dispatchMCPWithContext(ctx, dispatch)
 	copyReply := append([]byte(nil), reply...)
 
 	s.responseMu.Lock()
+	current, ownsFlight := s.responseInFlight[flightKey]
+	if !ownsFlight || current != flight {
+		s.responseMu.Unlock()
+		return reply, false, err
+	}
 	flight.response = copyReply
 	flight.err = err
 	if err == nil && len(copyReply) > 0 {
@@ -194,26 +223,52 @@ func (s *Session) dispatchMCPOnce(request []byte, dispatch func() ([]byte, error
 	return reply, false, err
 }
 
-func mcpResponseCacheIdentity(request []byte) (string, [sha256.Size]byte, bool) {
-	var zero [sha256.Size]byte
+type mcpReplayIdentity struct {
+	key    string
+	digest [sha256.Size]byte
+}
+
+func parseMCPReplayIdentity(request []byte) (mcpReplayIdentity, bool) {
 	trimmed := bytes.TrimSpace(request)
 	var envelope map[string]json.RawMessage
 	if json.Unmarshal(trimmed, &envelope) != nil {
-		return "", zero, false
+		return mcpReplayIdentity{}, false
 	}
 	var method string
 	if raw, ok := envelope["method"]; !ok || json.Unmarshal(raw, &method) != nil || method == "" {
-		return "", zero, false
+		return mcpReplayIdentity{}, false
 	}
 	rawID, present := envelope["id"]
 	if !present {
-		return "", zero, false // notification
+		return mcpReplayIdentity{}, false // notification
 	}
 	rawID = bytes.TrimSpace(rawID)
-	if len(rawID) == 0 || !json.Valid(rawID) {
-		return "", zero, false
+	canonicalID, valid := canonicalMCPRequestID(rawID)
+	if !valid {
+		return mcpReplayIdentity{}, false
 	}
-	return string(rawID), sha256.Sum256(trimmed), true
+
+	// Normalize only the request ID representation before hashing. The digest
+	// still distinguishes different methods, params, and extension fields, while
+	// equivalent JSON string escapes share replay and singleflight state.
+	normalizedID, err := json.Marshal(canonicalID)
+	if err != nil {
+		return mcpReplayIdentity{}, false
+	}
+	envelope["id"] = normalizedID
+	normalizedRequest, err := json.Marshal(envelope)
+	if err != nil {
+		return mcpReplayIdentity{}, false
+	}
+	return mcpReplayIdentity{
+		key:    canonicalID,
+		digest: sha256.Sum256(normalizedRequest),
+	}, true
+}
+
+func mcpResponseCacheIdentity(request []byte) (string, [sha256.Size]byte, bool) {
+	identity, ok := parseMCPReplayIdentity(request)
+	return identity.key, identity.digest, ok
 }
 
 // SetClientInfo updates the session's client metadata from the MCP

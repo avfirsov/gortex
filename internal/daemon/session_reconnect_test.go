@@ -215,7 +215,7 @@ func TestDaemonRebindsLogicalMCPStateAcrossRealSocketReconnect(t *testing.T) {
 	}
 }
 
-func TestDaemonReturnsCachedResponseAfterRealSocketLoss(t *testing.T) {
+func TestDaemonReplaysCanonicalIDAfterRealSocketLoss(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix socket reconnect test")
 	}
@@ -254,8 +254,8 @@ func TestDaemonReturnsCachedResponseAfterRealSocketLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := []byte(`{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"read","arguments":{"operation":"source"}}}`)
-	if err := first.WriteMCPFrame(request); err != nil {
+	firstRequest := []byte(`{"jsonrpc":"2.0","id":"\u003c","method":"tools/call","params":{"name":"read","arguments":{"operation":"source"}}}`)
+	if err := first.WriteMCPFrame(firstRequest); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -284,7 +284,8 @@ func TestDaemonReturnsCachedResponseAfterRealSocketLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	if err := second.WriteMCPFrame(request); err != nil {
+	secondRequest := []byte(`{"jsonrpc":"2.0","id":"<","method":"tools/call","params":{"name":"read","arguments":{"operation":"source"}}}`)
+	if err := second.WriteMCPFrame(secondRequest); err != nil {
 		t.Fatal(err)
 	}
 	response, err := second.ReadMCPFrame()
@@ -292,17 +293,17 @@ func TestDaemonReturnsCachedResponseAfterRealSocketLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	var envelope struct {
-		ID json.RawMessage `json:"id"`
+		ID string `json:"id"`
 	}
-	if json.Unmarshal(response, &envelope) != nil || string(envelope.ID) != "null" {
-		t.Fatalf("cached response lost null ID: %s", response)
+	if json.Unmarshal(response, &envelope) != nil || envelope.ID != "<" {
+		t.Fatalf("cached response changed reconnect request ID value: %s", response)
 	}
 	sessions, ended := dispatcher.snapshot()
 	if len(sessions) != 1 || ended != 0 {
 		t.Fatalf("identical replay redispatched: calls=%d ended=%d", len(sessions), ended)
 	}
 
-	different := []byte(`{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"read","arguments":{"operation":"source","symbol":"other"}}}`)
+	different := []byte(`{"jsonrpc":"2.0","id":"<","method":"tools/call","params":{"name":"read","arguments":{"operation":"source","symbol":"other"}}}`)
 	if err := second.WriteMCPFrame(different); err != nil {
 		t.Fatal(err)
 	}

@@ -724,6 +724,29 @@ func hasEventType(types []fswatcher.EventType, want fswatcher.EventType) bool {
 	return false
 }
 
+func isGortexAtomicTemp(path string) bool {
+	// filepath.Base only recognizes the host separator. Watcher tests and
+	// forwarded events can contain either slash, so split both explicitly.
+	if idx := strings.LastIndexAny(path, `/\\`); idx >= 0 {
+		path = path[idx+1:]
+	}
+	const marker = ".gortex.tmp-"
+	idx := strings.LastIndex(path, marker)
+	if idx < 0 {
+		return false
+	}
+	suffix := path[idx+len(marker):]
+	if suffix == "" {
+		return false
+	}
+	for _, ch := range suffix {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 	// Kernel queue overflow arrives as a pathless EventOverflow on the
 	// Events channel: the Linux inotify and Windows backends emit it when
@@ -741,6 +764,12 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 	}
 
 	path := normalizeEventPath(event.Path, w.indexer.rootPath)
+	// Guarded edits use atomic temp files in the watched directory. They are
+	// implementation artifacts, not source changes; indexing them duplicates
+	// the subsequent target-file patch and can monopolize the serialized queue.
+	if isGortexAtomicTemp(path) {
+		return
+	}
 
 	// Probe artifacts: sentinel files Start writes to confirm the
 	// OS-level watch is actually active. Their create event signals
