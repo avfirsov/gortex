@@ -1152,6 +1152,24 @@ func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string,
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	bounds := def.Node.ChildByFieldName("bounds")
+	if bounds == nil {
+		for child := range def.Node.NamedChildren() {
+			if child.Type() == "trait_bounds" {
+				bounds = child
+				break
+			}
+		}
+	}
+	if bounds != nil {
+		for _, parentPath := range rustPositiveTraitBounds(bounds.Content(src)) {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: id, To: "unresolved::extends::" + parentPath,
+				Kind: graph.EdgeExtends, FilePath: filePath, Line: def.StartLine + 1,
+				Meta: map[string]any{"rust_trait_path": parentPath},
+			})
+		}
+	}
 	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 	emitRustGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 }

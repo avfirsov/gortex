@@ -78,6 +78,18 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 ) string {
+	if isRustFile(srcFile) {
+		src := mi.cachedSource(srcFile, srcCache)
+		if len(src) == 0 {
+			return ""
+		}
+		rustFacts, ok := rustImportFactsForName(string(src), srcFile, name)
+		if !ok {
+			return ""
+		}
+		return mi.resolveRustUseFactsTarget(rustFacts, g, srcCache)
+	}
+
 	candidates := g.FindNodesByName(name)
 	if len(candidates) == 0 {
 		return ""
@@ -89,9 +101,8 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 		}
 	}
 	if len(typed) < 2 {
-		// 0 candidates → nothing to do; 1 candidate would already have
-		// been caught by UpgradeBareTypeRefs, so we don't try to redo
-		// its work here.
+		// A single TS candidate would already have been caught by
+		// UpgradeBareTypeRefs, so this pass handles ambiguous candidates only.
 		return ""
 	}
 
@@ -108,21 +119,61 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	if len(imports) == 0 {
 		return ""
 	}
-	wantFile, ok := imports[name]
-	if !ok {
+	wantFile, found := imports[name]
+	if !found {
 		return ""
 	}
-	// Follow re-export chains: a symbol imported from a barrel that
-	// only `export { X } from './x'`s — or a Rust module that only
-	// `pub use`s X — is defined in the terminal module, not the
-	// re-exporting one.
-	reachable := mi.followReExportChain(wantFile, name, srcCache)
+
+	// Follow re-export chains while retaining the source leaf through every
+	// alias. The follower is depth-bounded and cycle-safe.
+	reachable, unsafe := mi.followReExportChainChecked(wantFile, name, srcCache)
+	if unsafe {
+		return ""
+	}
+	var hit string
 	for _, n := range typed {
-		if reachable[n.FilePath] {
-			return n.ID
+		if !reachable[n.FilePath] {
+			continue
+		}
+		if hit != "" && hit != n.ID {
+			return ""
+		}
+		hit = n.ID
+	}
+	return hit
+}
+
+func (mi *MultiIndexer) resolveRustUseFactTarget(fact rustUseFact, g graph.Store, srcCache map[string][]byte) string {
+	return mi.resolveRustUseFactsTarget([]rustUseFact{fact}, g, srcCache)
+}
+
+func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.Store, srcCache map[string][]byte) string {
+	seen := map[string]bool{}
+	var hit string
+	for _, fact := range facts {
+		chain := mi.followReExportChainDetailed(fact.fromFile, fact.sourceName, srcCache)
+		if chain.unsafe {
+			return ""
+		}
+		for file, names := range chain.names {
+			for name := range names {
+				for _, node := range g.FindNodesByName(name) {
+					if node == nil || node.FilePath != file || seen[node.ID] {
+						continue
+					}
+					if node.Kind != graph.KindType && node.Kind != graph.KindInterface {
+						continue
+					}
+					seen[node.ID] = true
+					if hit != "" && hit != node.ID {
+						return ""
+					}
+					hit = node.ID
+				}
+			}
 		}
 	}
-	return ""
+	return hit
 }
 
 // tsAliasCache caches the per-repo Collection of tsconfig/jsconfig
@@ -499,21 +550,29 @@ type reExportEdge struct {
 	star     bool
 	names    map[string]string
 	fromFile string
+	// Rust-only provenance retained from the source use-tree. TypeScript
+	// re-exports leave these empty.
+	sourceModule  string
+	visibility    string
+	ambiguousName map[string]bool
 }
 
-// rustReExportRe matches a `pub use` (or `pub(crate) use`) re-export
-// statement. A plain `use` carries no visibility modifier and is a
-// private import — never a re-export — so the leading `pub` is
-// mandatory. Capture groups:
-//
-//	1: the use path, up to but excluding a trailing `::*` glob,
-//	   `::{...}` list, or `::Symbol` final segment
-//	2: `*` when the statement is a glob re-export (`pub use mod::*`)
-//	3: the brace body of a list re-export (`pub use mod::{A, B}`)
-//	4: the final path segment of a single-symbol re-export
-//	   (`pub use mod::Symbol`) — possibly `Orig as Public`
-var rustReExportRe = regexp.MustCompile(
-	`(?m)\bpub(?:\s*\([^)]*\))?\s+use\s+([\w:]+?)\s*::\s*(?:(\*)|\{([^}]*)\}|(\w+(?:\s+as\s+\w+)?))\s*;`)
+// rustUseRe matches both private imports and visible re-exports. Capture
+// groups retain visibility, the source module, glob/list shape, and the full
+// symbol entry so aliases can be followed without degrading to a basename.
+// The regex deliberately accepts a conservative ASCII identifier subset;
+// Unicode identifiers remain unresolved instead of being guessed.
+var rustUseRe = regexp.MustCompile(
+	`(?m)\b(pub(?:\s*\([^)]*\))?\s+)?use\s+([\w#:]+?)\s*::\s*(?:(\*)|\{([^}]*)\}|([\w#]+(?:\s+as\s+[\w#]+)?))\s*;`)
+
+type rustUseFact struct {
+	fromFile     string
+	sourceModule string
+	sourceName   string
+	localName    string
+	visibility   string
+	glob         bool
+}
 
 // rustFileCandidates expands a resolved Rust module path into the
 // concrete files it might be on disk. A module `foo` lives either in
@@ -521,7 +580,17 @@ var rustReExportRe = regexp.MustCompile(
 // turning a logical module reference into matchable file paths. The
 // input is the `.rs`-suffixed module path resolveRustModulePath
 // produces; the suffix is stripped to recover the stem.
+const rustLogicalCrateRootFile = ".gortex-crate-root.rs"
+
+func rustLogicalCrateRoot(crateRoot string) string {
+	return path.Join(crateRoot, rustLogicalCrateRootFile)
+}
+
 func rustFileCandidates(modulePath string) []string {
+	if path.Base(modulePath) == rustLogicalCrateRootFile {
+		root := path.Dir(modulePath)
+		return []string{path.Join(root, "lib.rs"), path.Join(root, "main.rs")}
+	}
 	if modulePath == "" {
 		return nil
 	}
@@ -552,108 +621,324 @@ func rustCrateRoot(srcFile string) string {
 // `.rs`-suffixed module path, anchored against the re-exporting file.
 // `crate::` is anchored at the crate src root; `self::` at the current
 // module directory; `super::` at the parent. A leading bare segment is
-// treated as a submodule of the current file's directory — the
-// best-effort local candidate; genuine external-crate paths simply
-// fail to match a graph file, which leaves the bare name in place. The
+// conservatively left unresolved because Rust 2018 may interpret it as an
+// external crate and Cargo dependency identity is not available here. The
 // `.rs` suffix lets downstream language dispatch recognise the result
 // as Rust even though a logical module name carries no extension;
 // rustFileCandidates strips it back to a stem.
 func resolveRustModulePath(modPath, srcFile string) string {
-	segs := strings.Split(modPath, "::")
+	segs := strings.Split(strings.TrimSpace(modPath), "::")
 	for len(segs) > 0 && segs[0] == "" {
 		segs = segs[1:]
 	}
 	if len(segs) == 0 {
 		return ""
 	}
-	dir := path.Dir(srcFile)
+	crateRoot := rustCrateRoot(srcFile)
+	var dir string
 	switch segs[0] {
 	case "crate":
-		dir = rustCrateRoot(srcFile)
+		dir = crateRoot
 		segs = segs[1:]
+		if len(segs) == 0 {
+			return rustCrateModuleFile(srcFile)
+		}
 	case "self":
+		dir = rustModuleDirectory(srcFile)
 		segs = segs[1:]
+		if len(segs) == 0 {
+			return path.Clean(srcFile)
+		}
 	case "super":
+		dir = rustModuleDirectory(srcFile)
 		for len(segs) > 0 && segs[0] == "super" {
+			if dir == crateRoot || !strings.HasPrefix(dir, crateRoot+"/") {
+				return ""
+			}
 			dir = path.Dir(dir)
 			segs = segs[1:]
 		}
+	default:
+		// In Rust 2018 a leading bare segment may name an external crate.
+		// Without Cargo dependency facts it is unsafe to reinterpret it as
+		// a same-named local module; callers must use crate/self/super for
+		// conservative local resolution.
+		return ""
 	}
 	if len(segs) == 0 {
-		// `pub use crate::*` / `pub use self::*` — re-exporting the
-		// module's own directory; nothing more specific to anchor.
+		if dir == crateRoot {
+			return rustCrateModuleFile(srcFile)
+		}
 		return path.Clean(dir) + ".rs"
 	}
 	return path.Clean(path.Join(dir, path.Join(segs...))) + ".rs"
 }
 
+func rustCrateModuleFile(srcFile string) string {
+	clean := path.Clean(srcFile)
+	root := rustCrateRoot(clean)
+	if path.Dir(clean) == root {
+		switch path.Base(clean) {
+		case "lib.rs", "main.rs":
+			return clean
+		}
+	}
+	// Nested modules do not encode whether their crate root is a library or
+	// binary. Keep a logical root so both lib.rs and main.rs remain candidates;
+	// exact graph identity later selects one or rejects ambiguity.
+	return rustLogicalCrateRoot(root)
+}
+
+func rustModuleDirectory(srcFile string) string {
+	dir := path.Dir(srcFile)
+	base := path.Base(srcFile)
+	switch base {
+	case "lib.rs", "main.rs", "mod.rs":
+		return dir
+	}
+	return strings.TrimSuffix(srcFile, path.Ext(srcFile))
+}
+
+// maskRustNonCode blanks comments and string literals while preserving byte
+// positions and newlines. The use parser remains intentionally shallow (it
+// does not parse recursive use trees), but apparent `use` text in comments,
+// normal strings, byte strings, and raw strings cannot become import facts.
+func maskRustNonCode(src string) string {
+	masked := []byte(src)
+	mask := func(start, end int) {
+		for i := start; i < end; i++ {
+			if masked[i] != '\n' && masked[i] != '\r' {
+				masked[i] = ' '
+			}
+		}
+	}
+	isIdentContinue := func(b byte) bool {
+		return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= 0x80
+	}
+	rawStart := func(start int) (quote, hashes int, ok bool) {
+		if start > 0 && isIdentContinue(src[start-1]) {
+			return 0, 0, false
+		}
+		i := start
+		if src[i] == 'b' {
+			i++
+			if i >= len(src) || src[i] != 'r' {
+				return 0, 0, false
+			}
+		}
+		if src[i] != 'r' {
+			return 0, 0, false
+		}
+		i++
+		for i < len(src) && src[i] == '#' {
+			hashes++
+			i++
+		}
+		if i >= len(src) || src[i] != '"' {
+			return 0, 0, false
+		}
+		return i, hashes, true
+	}
+
+	for i := 0; i < len(src); {
+		switch {
+		case i+1 < len(src) && src[i] == '/' && src[i+1] == '/':
+			start := i
+			i += 2
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			mask(start, i)
+		case i+1 < len(src) && src[i] == '/' && src[i+1] == '*':
+			start, depth := i, 1
+			i += 2
+			for i < len(src) && depth > 0 {
+				switch {
+				case i+1 < len(src) && src[i] == '/' && src[i+1] == '*':
+					depth++
+					i += 2
+				case i+1 < len(src) && src[i] == '*' && src[i+1] == '/':
+					depth--
+					i += 2
+				default:
+					i++
+				}
+			}
+			mask(start, i)
+		case src[i] == 'r' || src[i] == 'b':
+			quote, hashes, ok := rawStart(i)
+			if !ok {
+				i++
+				continue
+			}
+			start := i
+			i = quote + 1
+			for i < len(src) {
+				if src[i] != '"' {
+					i++
+					continue
+				}
+				end := i + 1
+				for end < len(src) && end-i-1 < hashes && src[end] == '#' {
+					end++
+				}
+				if end-i-1 == hashes {
+					i = end
+					break
+				}
+				i++
+			}
+			mask(start, i)
+		case src[i] == '"':
+			start := i
+			i++
+			for i < len(src) {
+				if src[i] == '\\' {
+					i += 2
+					if i > len(src) {
+						i = len(src)
+					}
+					continue
+				}
+				i++
+				if src[i-1] == '"' {
+					break
+				}
+			}
+			mask(start, i)
+		default:
+			i++
+		}
+	}
+	return string(masked)
+}
+
 // parseRustReExports extracts `pub use` re-export statements from a
 // Rust source file, resolving each module path to a repo-prefixed
 // module stem the same way parseTSReExports resolves an `export ...
-// from` specifier.
-func parseRustReExports(src, srcFile string) []reExportEdge {
-	matches := rustReExportRe.FindAllStringSubmatch(src, -1)
+// from` specifier. Restricted visibility is retained as source text; this
+// resolver does not interpret the restriction's access scope.
+func parseRustUseFacts(src, srcFile string) []rustUseFact {
+	matches := rustUseRe.FindAllStringSubmatch(maskRustNonCode(src), -1)
 	if len(matches) == 0 {
 		return nil
 	}
-	var out []reExportEdge
-	for _, m := range matches {
-		fromMod := resolveRustModulePath(m[1], srcFile)
-		if fromMod == "" {
+	var out []rustUseFact
+	for _, match := range matches {
+		visibility := strings.TrimSpace(match[1])
+		baseModule := strings.TrimSpace(match[2])
+		if match[3] == "*" {
+			fromFile := resolveRustModulePath(baseModule, srcFile)
+			if fromFile != "" {
+				out = append(out, rustUseFact{
+					fromFile: fromFile, sourceModule: baseModule,
+					visibility: visibility, glob: true,
+				})
+			}
 			continue
 		}
-		re := reExportEdge{fromFile: fromMod}
-		if m[2] == "*" {
-			re.star = true
-			out = append(out, re)
-			continue
+		entries := []string{match[5]}
+		if match[4] != "" {
+			entries = strings.Split(match[4], ",")
 		}
-		re.names = map[string]string{}
-		switch {
-		case m[3] != "":
-			// `pub use mod::{Orig, Other as Public}` — a list.
-			for _, raw := range strings.Split(m[3], ",") {
-				orig, exported := splitRustUseEntry(raw)
-				if orig != "" && exported != "" {
-					re.names[exported] = orig
-				}
+		for _, raw := range entries {
+			if fact, ok := rustUseFactForEntry(baseModule, raw, srcFile, visibility); ok {
+				out = append(out, fact)
 			}
-		case m[4] != "":
-			// `pub use mod::Symbol` / `pub use mod::Orig as Public`.
-			orig, exported := splitRustUseEntry(m[4])
-			if orig != "" && exported != "" {
-				re.names[exported] = orig
-			}
-		}
-		if len(re.names) > 0 {
-			out = append(out, re)
 		}
 	}
 	return out
 }
 
+func rustUseFactForEntry(baseModule, raw, srcFile, visibility string) (rustUseFact, bool) {
+	orig, local := splitRustUseEntry(raw)
+	orig = strings.Trim(strings.TrimSpace(orig), ":")
+	if orig == "" || local == "" || orig == "self" {
+		return rustUseFact{}, false
+	}
+	parts := strings.Split(orig, "::")
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return rustUseFact{}, false
+		}
+	}
+	sourceName := parts[len(parts)-1]
+	sourceModule := strings.Trim(strings.TrimSpace(baseModule), ":")
+	if len(parts) > 1 {
+		sourceModule += "::" + strings.Join(parts[:len(parts)-1], "::")
+	}
+	fromFile := resolveRustModulePath(sourceModule, srcFile)
+	if fromFile == "" {
+		return rustUseFact{}, false
+	}
+	return rustUseFact{
+		fromFile: fromFile, sourceModule: sourceModule,
+		sourceName: sourceName, localName: local, visibility: visibility,
+	}, true
+}
+
+func parseRustReExports(src, srcFile string) []reExportEdge {
+	type groupKey struct {
+		fromFile, sourceModule, visibility string
+	}
+	var out []reExportEdge
+	groups := map[groupKey]int{}
+	for _, fact := range parseRustUseFacts(src, srcFile) {
+		if fact.visibility == "" {
+			continue
+		}
+		key := groupKey{fact.fromFile, fact.sourceModule, fact.visibility}
+		if fact.glob {
+			out = append(out, reExportEdge{
+				star: true, fromFile: fact.fromFile,
+				sourceModule: fact.sourceModule, visibility: fact.visibility,
+			})
+			continue
+		}
+		if index, ok := groups[key]; ok {
+			edge := &out[index]
+			if edge.ambiguousName[fact.localName] {
+				continue
+			}
+			if _, duplicate := edge.names[fact.localName]; duplicate {
+				if edge.ambiguousName == nil {
+					edge.ambiguousName = map[string]bool{}
+				}
+				edge.ambiguousName[fact.localName] = true
+				delete(edge.names, fact.localName)
+				continue
+			}
+			edge.names[fact.localName] = fact.sourceName
+			continue
+		}
+		groups[key] = len(out)
+		out = append(out, reExportEdge{
+			names:    map[string]string{fact.localName: fact.sourceName},
+			fromFile: fact.fromFile, sourceModule: fact.sourceModule,
+			visibility: fact.visibility,
+		})
+	}
+	return out
+}
+
 // splitRustUseEntry normalises a single `use`-list entry, resolving an
-// `Orig as Public` rebind to (sourceName, exportedName). A plain entry
-// returns the same name twice.
+// `Orig as Public` rebind to (sourceName, exportedName). A qualified plain
+// entry retains its full source path while exporting only its target leaf.
 func splitRustUseEntry(raw string) (orig, exported string) {
 	entry := strings.TrimSpace(raw)
 	if entry == "" {
 		return "", ""
 	}
-	orig, exported = entry, entry
+	orig = entry
 	if i := strings.Index(entry, " as "); i >= 0 {
 		orig = strings.TrimSpace(entry[:i])
 		exported = strings.TrimSpace(entry[i+4:])
+	} else {
+		parts := strings.Split(strings.Trim(orig, ":"), "::")
+		exported = strings.TrimSpace(parts[len(parts)-1])
 	}
 	return orig, exported
 }
-
-// rustImportRe matches any `use` statement (re-export or private
-// import) — the consumer side, where a private `use` is a legitimate
-// import to resolve. Capture groups mirror rustReExportRe groups 1-4
-// minus the leading visibility modifier.
-var rustImportRe = regexp.MustCompile(
-	`(?m)\buse\s+([\w:]+?)\s*::\s*(?:(\*)|\{([^}]*)\}|(\w+(?:\s+as\s+\w+)?))\s*;`)
 
 // parseRustImports walks the `use` statements of a Rust source file
 // and returns local-binding-name → the repo-prefixed module stem the
@@ -662,33 +947,70 @@ var rustImportRe = regexp.MustCompile(
 // reach the symbol's real definition. Glob imports (`use mod::*`) are
 // skipped — they bind no specific name to follow.
 func parseRustImports(src, srcFile string) map[string]string {
-	matches := rustImportRe.FindAllStringSubmatch(src, -1)
-	if len(matches) == 0 {
+	out := map[string]string{}
+	ambiguous := map[string]bool{}
+	for _, fact := range parseRustUseFacts(src, srcFile) {
+		if fact.glob || fact.localName == "" {
+			continue
+		}
+		if _, exists := out[fact.localName]; exists {
+			ambiguous[fact.localName] = true
+			continue
+		}
+		if !ambiguous[fact.localName] {
+			out[fact.localName] = fact.fromFile
+		}
+	}
+	for name := range ambiguous {
+		delete(out, name)
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	out := map[string]string{}
-	for _, m := range matches {
-		if m[2] == "*" {
-			continue
-		}
-		fromMod := resolveRustModulePath(m[1], srcFile)
-		if fromMod == "" {
-			continue
-		}
-		switch {
-		case m[3] != "":
-			for _, raw := range strings.Split(m[3], ",") {
-				if _, exported := splitRustUseEntry(raw); exported != "" {
-					out[exported] = fromMod
-				}
-			}
-		case m[4] != "":
-			if _, exported := splitRustUseEntry(m[4]); exported != "" {
-				out[exported] = fromMod
-			}
+	return out
+}
+
+func rustImportFactsForName(src, srcFile, name string) ([]rustUseFact, bool) {
+	facts := parseRustUseFacts(src, srcFile)
+	var explicit []rustUseFact
+	for _, fact := range facts {
+		if !fact.glob && fact.localName == name {
+			explicit = append(explicit, fact)
 		}
 	}
-	return out
+	if len(explicit) > 0 {
+		// Rust rejects duplicate local bindings even when they happen to point
+		// at the same source. Never let source order choose a winner.
+		if len(explicit) != 1 {
+			return nil, false
+		}
+		return explicit, true
+	}
+
+	var globs []rustUseFact
+	seen := map[string]bool{}
+	for _, fact := range facts {
+		if !fact.glob {
+			continue
+		}
+		fact.sourceName = name
+		fact.localName = name
+		key := fact.fromFile + "\x00" + fact.sourceName
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		globs = append(globs, fact)
+	}
+	return globs, len(globs) > 0
+}
+
+func rustImportFactForName(src, srcFile, name string) (rustUseFact, bool) {
+	facts, ok := rustImportFactsForName(src, srcFile, name)
+	if !ok || len(facts) != 1 {
+		return rustUseFact{}, false
+	}
+	return facts[0], true
 }
 
 // isRustFile reports whether a repo-prefixed path is a Rust source
@@ -733,7 +1055,7 @@ func (mi *MultiIndexer) reExportsFor(src, srcPath string) []reExportEdge {
 	}
 	out := make([]reExportEdge, len(tsRe))
 	for i, re := range tsRe {
-		out[i] = reExportEdge(re)
+		out[i] = reExportEdge{star: re.star, names: re.names, fromFile: re.fromFile}
 	}
 	return out
 }
@@ -745,51 +1067,119 @@ func (mi *MultiIndexer) reExportsFor(src, srcPath string) []reExportEdge {
 // maxReExportDepth. A symbol's real definition is in one of the
 // returned files, so a caller matching an import target against graph
 // nodes resolves through the barrel / re-exporting module.
-func (mi *MultiIndexer) followReExportChain(startFile, name string, srcCache map[string][]byte) map[string]bool {
-	reachable := map[string]bool{}
-	for _, c := range fileCandidatesFor(startFile) {
-		reachable[c] = true
+type reExportChainResult struct {
+	files  map[string]bool
+	names  map[string]map[string]bool
+	unsafe bool
+}
+
+func addReExportChainTarget(result *reExportChainResult, file, name string) {
+	for _, candidate := range fileCandidatesFor(file) {
+		result.files[candidate] = true
+		if result.names[candidate] == nil {
+			result.names[candidate] = map[string]bool{}
+		}
+		result.names[candidate][name] = true
 	}
+}
+
+func (mi *MultiIndexer) followReExportChain(startFile, name string, srcCache map[string][]byte) map[string]bool {
+	return mi.followReExportChainDetailed(startFile, name, srcCache).files
+}
+
+func (mi *MultiIndexer) followReExportChainChecked(startFile, name string, srcCache map[string][]byte) (map[string]bool, bool) {
+	result := mi.followReExportChainDetailed(startFile, name, srcCache)
+	return result.files, result.unsafe
+}
+
+func (mi *MultiIndexer) followReExportChainDetailed(startFile, name string, srcCache map[string][]byte) reExportChainResult {
+	result := reExportChainResult{
+		files: map[string]bool{}, names: map[string]map[string]bool{},
+	}
+	addReExportChainTarget(&result, startFile, name)
 	type step struct{ file, name string }
-	seen := map[step]bool{{startFile, name}: true}
-	queue := []step{{startFile, name}}
-	for depth := 0; depth < maxReExportDepth && len(queue) > 0; depth++ {
-		var next []step
-		for _, s := range queue {
-			var src []byte
-			var srcPath string
-			for _, c := range fileCandidatesFor(s.file) {
-				if data := mi.cachedSource(c, srcCache); len(data) > 0 {
-					src, srcPath = data, c
-					break
-				}
-			}
-			if len(src) == 0 {
-				continue
-			}
-			for _, re := range mi.reExportsFor(string(src), srcPath) {
-				var want string
-				if re.star {
-					want = s.name
-				} else if orig, ok := re.names[s.name]; ok {
-					want = orig
-				}
-				if want == "" {
-					continue
-				}
-				for _, c := range fileCandidatesFor(re.fromFile) {
-					reachable[c] = true
-				}
-				st := step{file: re.fromFile, name: want}
-				if !seen[st] {
-					seen[st] = true
-					next = append(next, st)
-				}
+	visiting := map[step]bool{}
+	visited := map[step]bool{}
+
+	var visit func(step, int)
+	visit = func(current step, depth int) {
+		if visiting[current] {
+			result.unsafe = true
+			return
+		}
+		if visited[current] {
+			return
+		}
+		visiting[current] = true
+		defer func() {
+			delete(visiting, current)
+			visited[current] = true
+		}()
+
+		type sourceFile struct {
+			data []byte
+			path string
+		}
+		var sources []sourceFile
+		for _, candidate := range fileCandidatesFor(current.file) {
+			if data := mi.cachedSource(candidate, srcCache); len(data) > 0 {
+				sources = append(sources, sourceFile{data: data, path: candidate})
 			}
 		}
-		queue = next
+		if len(sources) == 0 {
+			return
+		}
+
+		forwarded := map[step]bool{}
+		for _, source := range sources {
+			named := map[step]bool{}
+			globs := map[step]bool{}
+			namedMatches := 0
+			for _, re := range mi.reExportsFor(string(source.data), source.path) {
+				if re.ambiguousName[current.name] {
+					result.unsafe = true
+					continue
+				}
+				if re.star {
+					globs[step{file: re.fromFile, name: current.name}] = true
+					continue
+				}
+				if original, ok := re.names[current.name]; ok {
+					namedMatches++
+					named[step{file: re.fromFile, name: original}] = true
+				}
+			}
+
+			// Explicit re-exports shadow globs within one concrete module file.
+			// Alternate lib/main roots remain parallel candidates, and exact graph
+			// identity decides between them after the full chain is collected.
+			selected := globs
+			switch namedMatches {
+			case 0:
+			case 1:
+				selected = named
+			default:
+				result.unsafe = true
+			}
+			for target := range selected {
+				forwarded[target] = true
+			}
+		}
+		if result.unsafe {
+			return
+		}
+		if depth >= maxReExportDepth && len(forwarded) > 0 {
+			result.unsafe = true
+			return
+		}
+		for target := range forwarded {
+			addReExportChainTarget(&result, target.file, target.name)
+			visit(target, depth+1)
+		}
 	}
-	return reachable
+
+	visit(step{file: startFile, name: name}, 0)
+	return result
 }
 
 // isImportResolvableLang reports whether the contract source file

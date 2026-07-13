@@ -58,8 +58,8 @@ import (
 // a module path against a real module-tree node (only the trailing
 // segment + locality is used today).
 //
-// Returns the number of Rust call edges this pass landed on a concrete
-// node.
+// Returns the number of Rust module-import, supertrait, override, and call
+// edges this pass landed on concrete nodes.
 func ResolveRustScopeCalls(g graph.Store) int {
 	if g == nil {
 		return 0
@@ -70,7 +70,8 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	// graph has no unresolved Rust call edges.
 	bound := resolveRustModuleImports(g)
 
-	idx := buildRustScopeIndex(g)
+	idx, extendsResolved := buildRustScopeIndex(g)
+	bound += extendsResolved
 	if idx == nil {
 		return bound
 	}
@@ -244,6 +245,12 @@ func rustScopeEdgeCandidate(e *graph.Edge) bool {
 type rustScopeIndex struct {
 	// methodsByOwner: (repo, ownerType) → method nodes of that type.
 	methodsByOwner map[rustOwnerKey][]*graph.Node
+	// traitTargets resolves a bound path relative to its caller to a concrete
+	// trait node. traitMethodsByID keeps direct and inherited methods attached
+	// to that concrete identity so same-named traits in different modules do
+	// not cross-pollinate through a basename alias.
+	traitTargets     *rustTraitTargetIndex
+	traitMethodsByID map[string][]*graph.Node
 	// freeFuncsByName: (repo, name) → free function nodes.
 	freeFuncsByName map[rustNameKey][]*graph.Node
 	// paramsByOwner: caller function/method ID → set of param names,
@@ -275,12 +282,16 @@ type rustFieldKey struct {
 }
 
 // buildRustScopeIndex walks the graph once and indexes Rust method
-// owners, free functions, and caller params. Returns nil when the graph
-// has no Rust methods or functions (the pass is a no-op for non-Rust
-// graphs).
-func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
+// owners, free functions, and caller params. Supertrait edges are resolved
+// before the method/function early-out; the returned count includes those
+// rewrites even when the graph contains marker traits only.
+func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
+	traitTargets := newRustTraitTargetIndex(g)
+	extendsResolved := resolveRustTraitExtendsWithIndex(g, traitTargets)
 	idx := &rustScopeIndex{
 		methodsByOwner:    map[rustOwnerKey][]*graph.Node{},
+		traitTargets:      traitTargets,
+		traitMethodsByID:  map[string][]*graph.Node{},
 		freeFuncsByName:   map[rustNameKey][]*graph.Node{},
 		paramsByOwner:     map[string]map[string]struct{}{},
 		fieldTypesByOwner: map[rustFieldKey]string{},
@@ -289,6 +300,22 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Language != "rust" {
 			continue
+		}
+		if n.Meta != nil {
+			if traitDecl, _ := n.Meta["trait_decl"].(string); traitDecl == "true" {
+				// Concrete trait identity is indexed after extends resolution;
+				// indexing a declaration under its basename here would merge
+				// same-named traits from different modules. Synthetic legacy
+				// graphs without interface nodes retain exact-owner lookup only.
+				if traitTargets == nil {
+					if owner := rustBaseTypeName(nodeReceiverType(n)); owner != "" {
+						key := rustOwnerKey{repo: n.RepoPrefix, owner: owner}
+						idx.methodsByOwner[key] = append(idx.methodsByOwner[key], n)
+					}
+				}
+				any = true
+				continue
+			}
 		}
 		owner := nodeReceiverType(n)
 		if owner == "" {
@@ -314,7 +341,7 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 		any = true
 	}
 	if !any {
-		return nil
+		return nil, extendsResolved
 	}
 	// Params are read lazily-but-once: index every Rust param by its
 	// enclosing function/method ID for the shadow check.
@@ -350,7 +377,8 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 			field: n.Name,
 		}] = rustBaseTypeName(ft)
 	}
-	return idx
+	inheritRustTraitMethods(g, idx, traitTargets)
+	return idx, extendsResolved
 }
 
 // resolve returns the target node ID an unresolved Rust call edge should
@@ -633,13 +661,33 @@ func (idx *rustScopeIndex) uniqueGenericBoundTraitMethod(repo string, caller *gr
 	if caller == nil || caller.Meta == nil || param == "" || name == "" {
 		return ""
 	}
-	bound := rustTypeParamBound(caller.Meta["type_params"], param)
-	if bound == "" {
+	owners := rustTypeParamTraitNames(caller.Meta["type_params"], param)
+	if len(owners) == 0 {
 		return ""
 	}
 	var hit string
-	for _, owner := range rustTraitBoundNames(bound) {
-		for _, method := range idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}] {
+	for _, owner := range owners {
+		var methods []*graph.Node
+		if idx.traitTargets != nil {
+			traitID := idx.traitTargets.resolve(caller, owner)
+			if traitID == "" {
+				// A qualified path may name an external trait. Never degrade it
+				// to a same-named local basename merely because one exists.
+				continue
+			}
+			methods = idx.traitMethodsByID[traitID]
+		} else {
+			// Compatibility for small synthetic indexes that predate concrete
+			// trait nodes: use only the exact parsed bound key. An explicit
+			// crate:: root is proven local, so its crate-relative exact key is
+			// also safe; arbitrary qualified paths never degrade to basename.
+			methods = idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+			if len(methods) == 0 && strings.HasPrefix(owner, "crate::") {
+				crateRelative := strings.TrimPrefix(owner, "crate::")
+				methods = idx.methodsByOwner[rustOwnerKey{repo: repo, owner: crateRelative}]
+			}
+		}
+		for _, method := range methods {
 			if method == nil || method.Name != name || method.Meta == nil {
 				continue
 			}
