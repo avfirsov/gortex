@@ -678,8 +678,10 @@ func (g *Graph) ReindexEdges(batch []EdgeReindex) {
 // coherence; the watcher uses this for source-span/meta refreshes that must not
 // discard a resolver-selected target.
 func (g *Graph) refreshEdgeIdentity(e *Edge, oldTo, oldFilePath string, oldLine int) {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	g.markMutationReceiptsIncomplete()
 	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
 	defer unlock()
@@ -2059,8 +2061,10 @@ func (g *Graph) unlockAllRead() {
 // are migrated from the old bucket to the new one atomically under the
 // shard lock.
 func (g *Graph) AddNode(n *Node) {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	s := g.shardFor(n.ID)
 	s.mu.Lock()
 	old := s.nodes[n.ID]
@@ -2161,8 +2165,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	nodesByShard := make([][]*Node, g.shardCount)
 	outEdgesByShard := make([][]*Edge, g.shardCount)
 	inEdgesByShard := make([][]*Edge, g.shardCount)
@@ -2259,8 +2265,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	unlock := g.lockTwoWrite(e.From, e.To)
 	sFrom := g.shardFor(e.From)
 	sTo := g.shardFor(e.To)
@@ -2426,8 +2434,10 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 	if oldTo == e.To {
 		return
 	}
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	g.markMutationReceiptsIncomplete()
 	// Must lock the From shard too — we mutate sFrom.outEdgeIdx below,
 	// and without its lock a concurrent AddEdge on From panics the
@@ -2710,8 +2720,10 @@ func (g *Graph) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 // path. Nodes for one file can span many shards (different IDs hash
 // differently), so we lock all shards for this multi-shard operation.
 func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()
@@ -2824,8 +2836,10 @@ func (g *Graph) evictEdgesLocked(evictedIDs map[string]string) int {
 // (same from/to/kind but different file/line — rare but possible),
 // removes the first one encountered.
 func (g *Graph) RemoveEdge(from, to string, kind EdgeKind) bool {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	g.markMutationReceiptsIncomplete()
 	unlock := g.lockTwoWrite(from, to)
 	defer unlock()
@@ -3115,8 +3129,10 @@ func (g *Graph) GetRepoEdges(repoPrefix string) []*Edge {
 // EvictRepo removes all nodes with matching RepoPrefix and all edges
 // referencing those nodes. Returns counts of removed nodes and edges.
 func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
-	endReceiptMutation := g.beginReceiptMutation()
-	defer endReceiptMutation()
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()

@@ -3,6 +3,7 @@ package graph
 import (
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 // MutationReceiptToken identifies one active graph-mutation receipt. Tokens are
@@ -107,9 +108,16 @@ func sortedReceiptKeys(values map[string]struct{}) []string {
 // mutationReceiptState is embedded in the in-memory Graph. Keeping it separate
 // makes the optional capability self-contained and avoids widening Store.
 type mutationReceiptState struct {
-	// gate makes receipt boundaries atomic with graph writes without
-	// serialising writers: mutations hold a shared lock for their duration;
-	// Begin/End take the exclusive lock only while adding/removing a window.
+	// activeCount keeps the overwhelmingly common no-receipt mutation path
+	// lock- and allocation-free. Begin/End publish it while holding gate
+	// exclusively, so a mutation that observes zero can be linearized before
+	// an overlapping Begin (or after an overlapping End).
+	activeCount atomic.Uint64
+
+	// gate makes active receipt boundaries atomic with graph writes without
+	// serialising writers: mutations hold a shared lock only while at least one
+	// receipt is active; Begin/End take the exclusive lock while changing the
+	// active window set.
 	gate   sync.RWMutex
 	mu     sync.Mutex
 	next   MutationReceiptToken
@@ -131,6 +139,7 @@ func (g *Graph) BeginMutationReceipt() MutationReceiptToken {
 	}
 	token := g.mutationReceipts.next
 	g.mutationReceipts.active[token] = newMutationReceiptAccumulator()
+	g.mutationReceipts.activeCount.Store(uint64(len(g.mutationReceipts.active)))
 	return token
 }
 
@@ -147,16 +156,28 @@ func (g *Graph) EndMutationReceipt(token MutationReceiptToken) MutationReceipt {
 		return MutationReceipt{Complete: false}
 	}
 	delete(g.mutationReceipts.active, token)
+	g.mutationReceipts.activeCount.Store(uint64(len(g.mutationReceipts.active)))
 	return acc.receipt()
 }
 
-func (g *Graph) beginReceiptMutation() func() {
+// beginReceiptMutation enters the receipt gate only when a window is active.
+// A mutation that observes zero overlaps any concurrent Begin and is
+// linearizable immediately before it; an active mutation holds the shared gate
+// through recording so End cannot retire its accumulator too early.
+func (g *Graph) beginReceiptMutation() bool {
+	if g.mutationReceipts.activeCount.Load() == 0 {
+		return false
+	}
 	g.mutationReceipts.gate.RLock()
-	return g.mutationReceipts.gate.RUnlock
+	return true
+}
+
+func (g *Graph) endReceiptMutation() {
+	g.mutationReceipts.gate.RUnlock()
 }
 
 func (g *Graph) recordAddedNodeForReceipts(n *Node, definition, exact bool) {
-	if n == nil {
+	if n == nil || g.mutationReceipts.activeCount.Load() == 0 {
 		return
 	}
 	g.mutationReceipts.mu.Lock()
@@ -188,7 +209,7 @@ func (g *Graph) recordAddedNodeForReceipts(n *Node, definition, exact bool) {
 }
 
 func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
-	if e == nil {
+	if e == nil || g.mutationReceipts.activeCount.Load() == 0 {
 		return
 	}
 	g.mutationReceipts.mu.Lock()
@@ -224,6 +245,9 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 }
 
 func (g *Graph) markMutationReceiptsIncomplete() {
+	if g.mutationReceipts.activeCount.Load() == 0 {
+		return
+	}
 	g.mutationReceipts.mu.Lock()
 	defer g.mutationReceipts.mu.Unlock()
 	for _, acc := range g.mutationReceipts.active {

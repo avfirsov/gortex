@@ -269,22 +269,12 @@ func TestWatcher_OldDatabaseFirstPatchIsConservative(t *testing.T) {
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
-	// Simulate a graph restored from a database written before extraction
-	// fingerprints existed. Fresh cold indexes now stamp these values, so merely
-	// calling Index no longer exercises the compatibility fallback.
-	for _, n := range idx.graph.GetFileNodes("main.go") {
-		if n == nil || n.Kind != graph.KindFile || n.Meta == nil {
-			continue
-		}
-		delete(n.Meta, sourceSemanticFingerprintMeta)
-		delete(n.Meta, sourceMetadataFingerprintMeta)
-		delete(n.Meta, sourceCoreFingerprintMeta)
-		delete(n.Meta, sourceDerivedDeclFingerprintMeta)
-		delete(n.Meta, sourceDerivedImportFingerprintMeta)
-		delete(n.Meta, sourceDerivedRuntimeFingerprintMeta)
-		delete(n.Meta, sourceDerivedArtifactFingerprintMeta)
-		idx.graph.AddNode(n)
-	}
+	// Cold indexing deliberately skips edit-routing fingerprints. The first
+	// patch must therefore fail closed to a structural file refresh; that patch
+	// stamps the exact extraction so subsequent edits can take narrower routes.
+	coldNodes := idx.graph.GetFileNodes("main.go")
+	assert.Equal(t, fileDeltaFingerprints{}, storedExtractionGraphFingerprints(coldNodes))
+	assert.False(t, storedDerivedFingerprints(coldNodes).complete())
 	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true}, zap.NewNop())
 	require.NoError(t, err)
 

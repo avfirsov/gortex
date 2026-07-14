@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -167,7 +166,7 @@ type Watcher struct {
 const maxHistory = 1000
 
 var (
-	errMutationSuperseded = errors.New("mutation generation superseded")
+	errMutationSuperseded   = errors.New("mutation generation superseded")
 	errMutationPatchAborted = errors.New("mutation patch aborted")
 )
 
@@ -1816,34 +1815,6 @@ func (w *Watcher) snapshotSymbols(graphKey string) []*graph.Node {
 		snapshot = append(snapshot, cp)
 	}
 	return snapshot
-}
-
-// structuralFingerprint reduces a set of symbols to an order-independent
-// string identity built only from each structural symbol's kind, name,
-// qualified name, and signature — never its line range. Two snapshots
-// of the same file taken before and after an edit produce an equal
-// fingerprint exactly when the edit changed no structural symbol: a
-// comment-only change, a whitespace reflow, or a doc / config-value
-// edit shifts line numbers but leaves every (kind, name, sig) tuple
-// intact, while renaming a function, changing a signature, or
-// adding / removing a declaration changes the fingerprint.
-//
-// Non-structural nodes (file, import, params, closures, coverage-domain
-// kinds) are skipped so a change confined to them is still treated as
-// inert — they carry no structural graph shape.
-func structuralFingerprint(symbols []*graph.Node) string {
-	lines := make([]string, 0, len(symbols))
-	for _, n := range symbols {
-		if !isStructuralKind(n.Kind) {
-			continue
-		}
-		sig, _ := n.Meta["signature"].(string)
-		// NUL separates fields so a value containing the field
-		// delimiter can't forge a collision across two symbols.
-		lines = append(lines, string(n.Kind)+"\x00"+n.Name+"\x00"+n.QualName+"\x00"+sig)
-	}
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
 }
 
 // normalizeEventPath aligns an event path emitted by the OS-level

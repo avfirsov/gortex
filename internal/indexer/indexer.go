@@ -2870,10 +2870,6 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 							if result == nil {
 								continue
 							}
-							// Stamp edit-routing fingerprints from the extraction already in
-							// memory. This adds no parse or file I/O and makes the first live
-							// edit after a fresh index eligible for bounded routing.
-							stampExtractionGraphFingerprint(result)
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
 							if contentWipeFile != nil {
 								contentWipeFile(firstContentFilePath(result.Nodes))
@@ -2966,10 +2962,6 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// a source the parser could not survive.
 					if !skipped {
 						idx.applyCoverageDomains(relPath, lang, src, result)
-						// Hash the post-coverage extraction already resident in memory.
-						// No second parse/read is performed; the persisted hashes let the
-						// first later edit prove its exact derived-work frontier.
-						stampExtractionGraphFingerprint(result)
 					}
 
 					idx.applyRepoPrefix(result.Nodes, result.Edges)

@@ -1,9 +1,6 @@
 package indexer
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"sort"
 	"strings"
 
@@ -89,121 +86,6 @@ type derivedFingerprints struct {
 
 func (f derivedFingerprints) complete() bool {
 	return f.declarations != "" && f.imports != "" && f.runtime != "" && f.artifacts != ""
-}
-
-func extractionDerivedFingerprints(result *parser.ExtractionResult) (derivedFingerprints, bool) {
-	if result == nil {
-		return derivedFingerprints{}, false
-	}
-	artifactIDs := make(map[string]struct{})
-	for _, node := range result.Nodes {
-		if node != nil && isArtifactNodeKind(node.Kind) {
-			artifactIDs[node.ID] = struct{}{}
-		}
-	}
-
-	var declarations, imports, runtime, artifacts []string
-	for _, node := range result.Nodes {
-		if node == nil {
-			continue
-		}
-		row, ok := derivedNodeFingerprintRow(node)
-		if !ok {
-			return derivedFingerprints{}, false
-		}
-		if isDeclarationNodeKind(node.Kind) {
-			declarations = append(declarations, "N\x00"+row)
-		}
-		if isImportNodeKind(node.Kind) {
-			imports = append(imports, "N\x00"+row)
-		}
-		if _, artifact := artifactIDs[node.ID]; artifact {
-			artifacts = append(artifacts, "N\x00"+row)
-		}
-	}
-	for _, edge := range result.Edges {
-		if edge == nil {
-			continue
-		}
-		row, ok := derivedEdgeFingerprintRow(edge)
-		if !ok {
-			return derivedFingerprints{}, false
-		}
-		if isDeclarationEdgeKind(edge.Kind) {
-			declarations = append(declarations, "E\x00"+row)
-		}
-		if isImportEdgeKind(edge.Kind) {
-			imports = append(imports, "E\x00"+row)
-		}
-		if isRuntimeDerivedEdgeKind(edge.Kind) {
-			runtime = append(runtime, "E\x00"+row)
-		}
-		if _, fromArtifact := artifactIDs[edge.From]; fromArtifact {
-			artifacts = append(artifacts, "E\x00"+row)
-		} else if _, toArtifact := artifactIDs[edge.To]; toArtifact {
-			artifacts = append(artifacts, "E\x00"+row)
-		}
-	}
-	return derivedFingerprints{
-		declarations: stableFingerprintRows(declarations),
-		imports:      stableFingerprintRows(imports),
-		runtime:      stableFingerprintRows(runtime),
-		artifacts:    stableFingerprintRows(artifacts),
-	}, true
-}
-
-func derivedNodeFingerprintRow(node *graph.Node) (string, bool) {
-	cp := *node
-	cp.StartLine, cp.EndLine, cp.StartColumn, cp.EndColumn = 0, 0, 0, 0
-	cp.Meta = derivedFingerprintMeta(node.Meta)
-	encoded, err := json.Marshal(&cp)
-	return string(encoded), err == nil
-}
-
-func derivedEdgeFingerprintRow(edge *graph.Edge) (string, bool) {
-	row := edgeFingerprintRow{
-		From: edge.From, To: edge.To, Kind: edge.Kind, FilePath: edge.FilePath,
-		Confidence: edge.Confidence, ConfidenceLabel: edge.ConfidenceLabel,
-		Origin: edge.Origin, Tier: edge.Tier, CrossRepo: edge.CrossRepo, Alias: edge.Alias,
-		Meta: derivedFingerprintMeta(edge.Meta),
-	}
-	encoded, err := json.Marshal(&row)
-	return string(encoded), err == nil
-}
-
-func derivedFingerprintMeta(meta map[string]any) map[string]any {
-	if len(meta) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(meta))
-	for key, value := range meta {
-		lower := strings.ToLower(key)
-		if isFingerprintMeta(key) {
-			continue
-		}
-		if _, presentation := presentationMetaKeys[key]; presentation {
-			continue
-		}
-		switch lower {
-		case "body", "body_hash", "body_text", "clone_sig", "content", "raw_source", "snippet", "source_text":
-			continue
-		}
-		out[key] = value
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func stableFingerprintRows(rows []string) string {
-	sort.Strings(rows)
-	h := sha256.New()
-	for _, row := range rows {
-		_, _ = h.Write([]byte(row))
-		_, _ = h.Write([]byte{'\n'})
-	}
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 func isDeclarationNodeKind(kind graph.NodeKind) bool {

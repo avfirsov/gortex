@@ -3,11 +3,15 @@ package indexer
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"hash"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -105,10 +109,9 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 	probe.coverage = time.Since(started)
 
 	started = time.Now()
-	fingerprints, ok := extractionGraphFingerprints(result)
-	derived, derivedOK := extractionDerivedFingerprints(result)
+	fingerprints, derived, ok := extractionFingerprints(result)
 	probe.fingerprintTime = time.Since(started)
-	if !ok || !derivedOK {
+	if !ok {
 		return probe, false
 	}
 	probe.fingerprints = fingerprints
@@ -181,6 +184,7 @@ const (
 	fingerprintMetadata fingerprintMode = iota
 	fingerprintSemantic
 	fingerprintCore
+	fingerprintDerived
 )
 
 var presentationMetaKeys = map[string]struct{}{
@@ -209,129 +213,284 @@ func isArtifactNodeKind(kind graph.NodeKind) bool {
 	}
 }
 
-func filteredFingerprintMeta(meta map[string]any, mode fingerprintMode, keepPresentation bool) map[string]any {
+func fingerprintMetaKeys(meta map[string]any, mode fingerprintMode, keepPresentation bool) []string {
 	if len(meta) == 0 {
 		return nil
 	}
-	out := make(map[string]any, len(meta))
-	for key, value := range meta {
+	keys := make([]string, 0, len(meta))
+	for key := range meta {
 		if isFingerprintMeta(key) {
 			continue
 		}
-		if mode != fingerprintMetadata && !keepPresentation {
+		if mode != fingerprintMetadata && (!keepPresentation || mode == fingerprintDerived) {
 			if _, presentation := presentationMetaKeys[key]; presentation {
 				continue
 			}
 		}
-		out[key] = value
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-type edgeFingerprintRow struct {
-	From            string         `json:"from"`
-	To              string         `json:"to"`
-	Kind            graph.EdgeKind `json:"kind"`
-	FilePath        string         `json:"file_path"`
-	Line            int            `json:"line"`
-	Confidence      float64        `json:"confidence"`
-	ConfidenceLabel string         `json:"confidence_label"`
-	Origin          string         `json:"origin"`
-	Tier            string         `json:"tier"`
-	CrossRepo       bool           `json:"cross_repo"`
-	Alias           string         `json:"alias"`
-	Meta            map[string]any `json:"meta"`
-}
-
-func extractionFingerprint(result *parser.ExtractionResult, mode fingerprintMode, artifactIDs map[string]struct{}) (string, bool) {
-	rows := make([]string, 0, len(result.Nodes)+len(result.Edges))
-	for _, n := range result.Nodes {
-		if n == nil {
-			continue
-		}
-		if mode == fingerprintCore {
-			if _, artifact := artifactIDs[n.ID]; artifact {
+		if mode == fingerprintDerived {
+			switch strings.ToLower(key) {
+			case "body", "body_hash", "body_text", "clone_sig", "content", "raw_source", "snippet", "source_text":
 				continue
 			}
 		}
-		cp := *n
-		if mode != fingerprintMetadata {
-			cp.StartLine, cp.EndLine, cp.StartColumn, cp.EndColumn = 0, 0, 0, 0
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// semanticFingerprintCoversDerived reports whether the semantic row digest is
+// also a valid derived-work digest. Most extracted rows have no metadata, so
+// reusing that digest removes a third full field/hash pass from cold indexing.
+func semanticFingerprintCoversDerived(meta map[string]any, keepPresentation bool) bool {
+	for key := range meta {
+		if isFingerprintMeta(key) {
+			continue
 		}
-		cp.Meta = filteredFingerprintMeta(n.Meta, mode, isArtifactNodeKind(n.Kind))
-		encoded, err := json.Marshal(&cp)
+		if _, presentation := presentationMetaKeys[key]; presentation {
+			if keepPresentation {
+				return false
+			}
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "body", "body_hash", "body_text", "clone_sig", "content", "raw_source", "snippet", "source_text":
+			return false
+		}
+	}
+	return true
+}
+
+type fingerprintDigest [sha256.Size]byte
+
+func writeFingerprintUint(h hash.Hash, value uint64) {
+	var scratch [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(scratch[:], value)
+	_, _ = h.Write(scratch[:n])
+}
+
+func writeFingerprintInt(h hash.Hash, value int) {
+	var scratch [binary.MaxVarintLen64]byte
+	n := binary.PutVarint(scratch[:], int64(value))
+	_, _ = h.Write(scratch[:n])
+}
+
+func writeFingerprintBytes(h hash.Hash, value []byte) {
+	writeFingerprintUint(h, uint64(len(value)))
+	_, _ = h.Write(value)
+}
+
+func writeFingerprintString(h hash.Hash, value string) {
+	writeFingerprintUint(h, uint64(len(value)))
+	_, _ = h.Write([]byte(value))
+}
+
+func writeFingerprintBool(h hash.Hash, value bool) {
+	if value {
+		_, _ = h.Write([]byte{1})
+		return
+	}
+	_, _ = h.Write([]byte{0})
+}
+
+func writeFingerprintMeta(h hash.Hash, meta map[string]any, mode fingerprintMode, keepPresentation bool) bool {
+	keys := fingerprintMetaKeys(meta, mode, keepPresentation)
+	writeFingerprintUint(h, uint64(len(keys)))
+	for _, key := range keys {
+		encoded, err := json.Marshal(meta[key])
 		if err != nil {
-			return "", false
+			return false
 		}
-		rows = append(rows, "N\x00"+string(encoded))
+		writeFingerprintString(h, key)
+		writeFingerprintBytes(h, encoded)
+	}
+	return true
+}
+
+func nodeFingerprintDigest(h hash.Hash, node *graph.Node, mode fingerprintMode) (fingerprintDigest, bool) {
+	h.Reset()
+	_, _ = h.Write([]byte{'N'})
+	writeFingerprintString(h, node.ID)
+	writeFingerprintString(h, string(node.Kind))
+	writeFingerprintString(h, node.Name)
+	writeFingerprintString(h, node.QualName)
+	writeFingerprintString(h, node.FilePath)
+	if mode == fingerprintMetadata {
+		writeFingerprintInt(h, node.StartLine)
+		writeFingerprintInt(h, node.EndLine)
+		writeFingerprintInt(h, node.StartColumn)
+		writeFingerprintInt(h, node.EndColumn)
+	} else {
+		writeFingerprintInt(h, 0)
+		writeFingerprintInt(h, 0)
+		writeFingerprintInt(h, 0)
+		writeFingerprintInt(h, 0)
+	}
+	writeFingerprintString(h, node.Language)
+	if !writeFingerprintMeta(h, node.Meta, mode, isArtifactNodeKind(node.Kind)) {
+		return fingerprintDigest{}, false
+	}
+	writeFingerprintString(h, node.RepoPrefix)
+	writeFingerprintString(h, node.WorkspaceID)
+	writeFingerprintString(h, node.ProjectID)
+	writeFingerprintString(h, node.AbsoluteFilePath)
+	writeFingerprintString(h, node.Origin)
+	writeFingerprintBool(h, node.Stub)
+	fetchedAt, err := node.FetchedAt.MarshalJSON()
+	if err != nil {
+		return fingerprintDigest{}, false
+	}
+	writeFingerprintBytes(h, fetchedAt)
+	var digest fingerprintDigest
+	h.Sum(digest[:0])
+	return digest, true
+}
+
+func edgeFingerprintDigest(h hash.Hash, edge *graph.Edge, mode fingerprintMode) (fingerprintDigest, bool) {
+	if math.IsNaN(edge.Confidence) || math.IsInf(edge.Confidence, 0) {
+		return fingerprintDigest{}, false
+	}
+	h.Reset()
+	_, _ = h.Write([]byte{'E'})
+	writeFingerprintString(h, edge.From)
+	writeFingerprintString(h, edge.To)
+	writeFingerprintString(h, string(edge.Kind))
+	writeFingerprintString(h, edge.FilePath)
+	if mode == fingerprintMetadata {
+		writeFingerprintInt(h, edge.Line)
+	} else {
+		writeFingerprintInt(h, 0)
+	}
+	writeFingerprintUint(h, math.Float64bits(edge.Confidence))
+	writeFingerprintString(h, edge.ConfidenceLabel)
+	writeFingerprintString(h, edge.Origin)
+	writeFingerprintString(h, edge.Tier)
+	writeFingerprintBool(h, edge.CrossRepo)
+	writeFingerprintString(h, edge.Alias)
+	if !writeFingerprintMeta(h, edge.Meta, mode, false) {
+		return fingerprintDigest{}, false
+	}
+	var digest fingerprintDigest
+	h.Sum(digest[:0])
+	return digest, true
+}
+
+func stableFingerprintDigests(rows []fingerprintDigest) string {
+	sort.Slice(rows, func(i, j int) bool {
+		return bytes.Compare(rows[i][:], rows[j][:]) < 0
+	})
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = h.Write(row[:])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerprints, derivedFingerprints, bool) {
+	if result == nil {
+		return fileDeltaFingerprints{}, derivedFingerprints{}, false
+	}
+	var artifactIDs map[string]struct{}
+	for _, node := range result.Nodes {
+		if node == nil || !isArtifactNodeKind(node.Kind) {
+			continue
+		}
+		if artifactIDs == nil {
+			artifactIDs = make(map[string]struct{})
+		}
+		artifactIDs[node.ID] = struct{}{}
+	}
+
+	capacity := len(result.Nodes) + len(result.Edges)
+	metadataRows := make([]fingerprintDigest, 0, capacity)
+	semanticRows := make([]fingerprintDigest, 0, capacity)
+	coreRows := make([]fingerprintDigest, 0, capacity)
+	var declarations, imports, runtimeRows, artifacts []fingerprintDigest
+	h := sha256.New()
+	for _, node := range result.Nodes {
+		if node == nil {
+			continue
+		}
+		metadata, ok := nodeFingerprintDigest(h, node, fingerprintMetadata)
+		if !ok {
+			return fileDeltaFingerprints{}, derivedFingerprints{}, false
+		}
+		semantic, ok := nodeFingerprintDigest(h, node, fingerprintSemantic)
+		if !ok {
+			return fileDeltaFingerprints{}, derivedFingerprints{}, false
+		}
+		artifact := false
+		if _, artifact = artifactIDs[node.ID]; !artifact {
+			coreRows = append(coreRows, semantic)
+		}
+		derived := semantic
+		if !semanticFingerprintCoversDerived(node.Meta, artifact) {
+			derived, ok = nodeFingerprintDigest(h, node, fingerprintDerived)
+			if !ok {
+				return fileDeltaFingerprints{}, derivedFingerprints{}, false
+			}
+		}
+		metadataRows = append(metadataRows, metadata)
+		semanticRows = append(semanticRows, semantic)
+		if isDeclarationNodeKind(node.Kind) {
+			declarations = append(declarations, derived)
+		}
+		if isImportNodeKind(node.Kind) {
+			imports = append(imports, derived)
+		}
+		if artifact {
+			artifacts = append(artifacts, derived)
+		}
 	}
 	for _, edge := range result.Edges {
 		if edge == nil {
 			continue
 		}
-		if mode == fingerprintCore {
-			if _, artifact := artifactIDs[edge.From]; artifact {
-				continue
+		metadata, ok := edgeFingerprintDigest(h, edge, fingerprintMetadata)
+		if !ok {
+			return fileDeltaFingerprints{}, derivedFingerprints{}, false
+		}
+		semantic, ok := edgeFingerprintDigest(h, edge, fingerprintSemantic)
+		if !ok {
+			return fileDeltaFingerprints{}, derivedFingerprints{}, false
+		}
+		_, fromArtifact := artifactIDs[edge.From]
+		_, toArtifact := artifactIDs[edge.To]
+		if !fromArtifact && !toArtifact {
+			coreRows = append(coreRows, semantic)
+		}
+		derived := semantic
+		if !semanticFingerprintCoversDerived(edge.Meta, false) {
+			derived, ok = edgeFingerprintDigest(h, edge, fingerprintDerived)
+			if !ok {
+				return fileDeltaFingerprints{}, derivedFingerprints{}, false
 			}
-			if _, artifact := artifactIDs[edge.To]; artifact {
-				continue
-			}
 		}
-		row := edgeFingerprintRow{
-			From: edge.From, To: edge.To, Kind: edge.Kind, FilePath: edge.FilePath,
-			Line: edge.Line, Confidence: edge.Confidence, ConfidenceLabel: edge.ConfidenceLabel,
-			Origin: edge.Origin, Tier: edge.Tier, CrossRepo: edge.CrossRepo, Alias: edge.Alias,
-			Meta: filteredFingerprintMeta(edge.Meta, mode, false),
+		metadataRows = append(metadataRows, metadata)
+		semanticRows = append(semanticRows, semantic)
+		if isDeclarationEdgeKind(edge.Kind) {
+			declarations = append(declarations, derived)
 		}
-		if mode != fingerprintMetadata {
-			row.Line = 0
+		if isImportEdgeKind(edge.Kind) {
+			imports = append(imports, derived)
 		}
-		encoded, err := json.Marshal(&row)
-		if err != nil {
-			return "", false
+		if isRuntimeDerivedEdgeKind(edge.Kind) {
+			runtimeRows = append(runtimeRows, derived)
 		}
-		rows = append(rows, "E\x00"+string(encoded))
-	}
-	sort.Strings(rows)
-	h := sha256.New()
-	for _, row := range rows {
-		_, _ = h.Write([]byte(row))
-		_, _ = h.Write([]byte{'\n'})
-	}
-	return hex.EncodeToString(h.Sum(nil)), true
-}
-
-func extractionGraphFingerprints(result *parser.ExtractionResult) (fileDeltaFingerprints, bool) {
-	if result == nil {
-		return fileDeltaFingerprints{}, false
-	}
-	artifactIDs := make(map[string]struct{})
-	for _, n := range result.Nodes {
-		if n != nil && isArtifactNodeKind(n.Kind) {
-			artifactIDs[n.ID] = struct{}{}
+		if fromArtifact || toArtifact {
+			artifacts = append(artifacts, derived)
 		}
 	}
-	metadata, ok := extractionFingerprint(result, fingerprintMetadata, artifactIDs)
-	if !ok {
-		return fileDeltaFingerprints{}, false
-	}
-	semantic, ok := extractionFingerprint(result, fingerprintSemantic, artifactIDs)
-	if !ok {
-		return fileDeltaFingerprints{}, false
-	}
-	core, ok := extractionFingerprint(result, fingerprintCore, artifactIDs)
-	if !ok {
-		return fileDeltaFingerprints{}, false
-	}
-	return fileDeltaFingerprints{semantic: semantic, metadata: metadata, core: core}, true
-}
-
-func extractionGraphFingerprint(result *parser.ExtractionResult) (string, bool) {
-	fingerprints, ok := extractionGraphFingerprints(result)
-	return fingerprints.metadata, ok
+	return fileDeltaFingerprints{
+			metadata: stableFingerprintDigests(metadataRows),
+			semantic: stableFingerprintDigests(semanticRows),
+			core:     stableFingerprintDigests(coreRows),
+		}, derivedFingerprints{
+			declarations: stableFingerprintDigests(declarations),
+			imports:      stableFingerprintDigests(imports),
+			runtime:      stableFingerprintDigests(runtimeRows),
+			artifacts:    stableFingerprintDigests(artifacts),
+		}, true
 }
 
 func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerprints fileDeltaFingerprints) {
@@ -350,9 +509,8 @@ func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerpri
 }
 
 func stampExtractionGraphFingerprint(result *parser.ExtractionResult) string {
-	fingerprints, ok := extractionGraphFingerprints(result)
-	derived, derivedOK := extractionDerivedFingerprints(result)
-	if !ok || !derivedOK {
+	fingerprints, derived, ok := extractionFingerprints(result)
+	if !ok {
 		return ""
 	}
 	stampExtractionGraphFingerprints(result, fingerprints)
@@ -371,10 +529,6 @@ func storedExtractionGraphFingerprints(nodes []*graph.Node) fileDeltaFingerprint
 		return fileDeltaFingerprints{semantic: semantic, metadata: metadata, core: core}
 	}
 	return fileDeltaFingerprints{}
-}
-
-func storedExtractionGraphFingerprint(nodes []*graph.Node) string {
-	return storedExtractionGraphFingerprints(nodes).metadata
 }
 
 func mergeRefreshMeta(oldMeta, freshMeta map[string]any) map[string]any {

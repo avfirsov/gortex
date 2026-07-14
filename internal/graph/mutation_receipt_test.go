@@ -116,8 +116,11 @@ func TestMutationReceiptEndWaitsForInFlightMutationRecord(t *testing.T) {
 	mutationStarted := make(chan struct{})
 	releaseMutation := make(chan struct{})
 	go func() {
-		endMutation := g.beginReceiptMutation()
-		defer endMutation()
+		if !g.beginReceiptMutation() {
+			t.Error("active receipt was not observed")
+			return
+		}
+		defer g.endReceiptMutation()
 		close(mutationStarted)
 		<-releaseMutation
 		g.recordAddedNodeForReceipts(&Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", FilePath: "a.go"}, true, true)
