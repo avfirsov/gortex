@@ -44,6 +44,7 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	var cr *analysis.CommunityResult
+	fullGraphBurst := false
 	// incrStats is populated only on the Leiden path; it records
 	// whether the partition was recomputed incrementally (only the
 	// packages that changed since the last call) or in full.
@@ -58,16 +59,23 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 		// output.
 		if resolution == 1.0 {
 			cr, incrStats = s.incrementalCommunities()
+			fullGraphBurst = !incrStats.Incremental
 		} else {
 			cr = analysis.DetectCommunitiesLeidenWith(s.graph, analysis.LeidenOptions{Resolution: resolution})
+			fullGraphBurst = true
 		}
 	case "louvain":
 		cr = analysis.DetectCommunitiesLouvain(s.graph)
+		fullGraphBurst = true
 	case "spectral":
 		cr = analysis.SpectralClusters(s.graph)
+		fullGraphBurst = true
 	default:
 		return mcp.NewToolResultError("analyze clusters: unknown algorithm " + algorithm +
 			" (expected: leiden, louvain, spectral)"), nil
+	}
+	if fullGraphBurst {
+		defer scheduleOSMemoryReleaseAfterBurst(s.logger, "analyze_clusters")
 	}
 
 	// Clamp the global partition to the session workspace so a

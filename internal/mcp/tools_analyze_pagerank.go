@@ -75,13 +75,16 @@ func (s *Server) handleAnalyzePageRank(ctx context.Context, req mcp.CallToolRequ
 		prLimit = 0
 	}
 
-	hits := s.runPageRank(graph.PageRankOpts{
+	hits, fullGraphBurst := s.runPageRank(graph.PageRankOpts{
 		NodeKinds:     nodeKinds,
 		DampingFactor: damping,
 		MaxIterations: maxIter,
 		Tolerance:     tolerance,
 		Limit:         prLimit,
 	})
+	if fullGraphBurst {
+		defer scheduleOSMemoryReleaseAfterBurst(s.logger, "analyze_pagerank")
+	}
 
 	// Narrow to the session workspace + optional repo allow-set, then
 	// re-apply the original limit (runPageRank ran unbounded above under
@@ -143,12 +146,12 @@ func (s *Server) handleAnalyzePageRank(ctx context.Context, req mcp.CallToolRequ
 // runPageRank picks the engine-native PageRanker when the
 // backing store implements it, otherwise falls back to the
 // in-process power iteration.
-func (s *Server) runPageRank(opts graph.PageRankOpts) []graph.PageRankHit {
+func (s *Server) runPageRank(opts graph.PageRankOpts) ([]graph.PageRankHit, bool) {
 	if store := s.backendStore(); store != nil {
 		if pr, ok := store.(graph.PageRanker); ok {
 			hits, err := pr.PageRank(opts)
 			if err == nil {
-				return hits
+				return hits, false
 			}
 			// Fall through to the in-process path on backend
 			// error rather than surface a half-completed
@@ -164,7 +167,7 @@ func (s *Server) runPageRank(opts graph.PageRankOpts) []graph.PageRankHit {
 	// NodeKinds filter is honoured by post-filtering the result.
 	res := analysis.ComputePageRank(s.graph)
 	if res == nil || len(res.Scores) == 0 {
-		return nil
+		return nil, true
 	}
 	allow := makeKindAllow(opts.NodeKinds)
 	hits := make([]graph.PageRankHit, 0, len(res.Scores))
@@ -178,7 +181,7 @@ func (s *Server) runPageRank(opts graph.PageRankOpts) []graph.PageRankHit {
 	if opts.Limit > 0 && opts.Limit < len(hits) {
 		hits = hits[:opts.Limit]
 	}
-	return hits
+	return hits, true
 }
 
 // backendStore returns the underlying graph.Store the indexer

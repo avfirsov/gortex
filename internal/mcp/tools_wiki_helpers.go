@@ -86,10 +86,11 @@ func writeWikiFile(path string, body []byte) error {
 // docs-package shape. Returns nil when no watcher is attached, in
 // which case the recent-changes section will be empty.
 func (s *Server) docsHistoryProvider() docs.HistoryProvider {
-	if s.watcher == nil {
+	watcher := s.currentWatcher()
+	if watcher == nil {
 		return nil
 	}
-	return &watcherHistoryAdapter{w: s.watcher}
+	return &watcherHistoryAdapter{w: watcher}
 }
 
 type watcherHistoryAdapter struct {
