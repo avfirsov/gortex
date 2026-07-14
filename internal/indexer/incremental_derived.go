@@ -64,7 +64,7 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 	// A single unprefixed repo cannot use repo-scoped readers. Falling back to
 	// nil here preserves the old whole-graph behavior, which is still bounded
 	// to that one repository.
-	var scopedPrefixes map[string]bool = prefixScope
+	scopedPrefixes := prefixScope
 	if prefixScope[""] {
 		scopedPrefixes = nil
 	}
