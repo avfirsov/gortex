@@ -75,7 +75,7 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 		return snap
 	}
 
-	nodes := g.AllNodes()
+	nodes := graph.AllNodesLight(g)
 	if len(nodes) == 0 {
 		return snap
 	}

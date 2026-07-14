@@ -448,7 +448,7 @@ func buildCommunityResult(
 	totalWeight float64,
 	degree map[string]float64,
 ) *CommunityResult {
-	nodes := g.AllNodes()
+	nodes := graph.AllNodesLight(g)
 	nodeMap := make(map[string]*graph.Node, len(nodes))
 	for _, n := range nodes {
 		nodeMap[n.ID] = n

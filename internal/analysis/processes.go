@@ -19,100 +19,170 @@ type Step struct {
 	Depth int    `json:"depth"`
 }
 
+const (
+	defaultMaxProcesses         = 50
+	defaultMaxProcessDepth      = 15
+	defaultMaxStepsPerProcess   = 2048
+	defaultMaxTotalProcessSteps = 16384
+)
+
+// ProcessLimits bounds both the CPU work and retained result size of process
+// discovery. Zero values select the safe defaults.
+type ProcessLimits struct {
+	MaxProcesses       int
+	MaxDepth           int
+	MaxStepsPerProcess int
+	MaxTotalSteps      int
+}
+
+func defaultProcessLimits() ProcessLimits {
+	return ProcessLimits{
+		MaxProcesses:       defaultMaxProcesses,
+		MaxDepth:           defaultMaxProcessDepth,
+		MaxStepsPerProcess: defaultMaxStepsPerProcess,
+		MaxTotalSteps:      defaultMaxTotalProcessSteps,
+	}
+}
+
+func (l ProcessLimits) normalized() ProcessLimits {
+	d := defaultProcessLimits()
+	if l.MaxProcesses > 0 {
+		d.MaxProcesses = l.MaxProcesses
+	}
+	if l.MaxDepth > 0 {
+		d.MaxDepth = l.MaxDepth
+	}
+	if l.MaxStepsPerProcess > 0 {
+		d.MaxStepsPerProcess = l.MaxStepsPerProcess
+	}
+	if l.MaxTotalSteps > 0 {
+		d.MaxTotalSteps = l.MaxTotalSteps
+	}
+	return d
+}
+
 // Process represents a discovered execution flow in the codebase.
 type Process struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`        // human-readable name
 	EntryPoint string   `json:"entry_point"` // node ID of the entry function
-	Steps      []Step   `json:"steps"`       // DFS preorder with call-tree depth
+	Steps      []Step   `json:"steps"`       // bounded DFS preorder with call-tree depth
 	StepCount  int      `json:"step_count"`
 	Files      []string `json:"files"` // unique files touched
 	Score      float64  `json:"score"` // entry point confidence score
+	Truncated  bool     `json:"truncated,omitempty"`
 }
 
 // ProcessResult is the output of process discovery.
 type ProcessResult struct {
-	Processes   []Process           `json:"processes"`
-	NodeToProcs map[string][]string `json:"node_to_processes"` // nodeID → process IDs
+	Processes        []Process           `json:"processes"`
+	NodeToProcs      map[string][]string `json:"node_to_processes"` // nodeID → process IDs
+	Truncated        bool                `json:"truncated,omitempty"`
+	TruncationReason string              `json:"truncation_reason,omitempty"`
 }
 
-// DiscoverProcesses finds execution flows by identifying entry points and tracing forward.
+// DiscoverProcesses finds execution flows using fixed, conservative limits so
+// a connected multi-repository graph cannot leave O(processes*nodes) retained
+// in a long-lived daemon.
 func DiscoverProcesses(g graph.Store) *ProcessResult {
-	nodes := g.AllNodes()
-	// Meta-less call-edge scan (see LightEdgeScanner): process discovery reads only
-	// endpoints off each call edge.
-	edges := graph.EdgesForKindsLight(g, graph.EdgeCalls)
+	return DiscoverProcessesWithLimits(g, defaultProcessLimits())
+}
 
-	// Build call graph adjacency (forward only)
-	callees := make(map[string][]string) // who does this function call?
-	callers := make(map[string][]string) // who calls this function?
+// DiscoverProcessesWithLimits is DiscoverProcesses with explicit bounds. It is
+// primarily useful to tests and specialized callers that need a smaller result.
+func DiscoverProcessesWithLimits(g graph.Store, limits ProcessLimits) *ProcessResult {
+	return discoverProcesses(g.AllNodes(), graph.EdgesForKindsLight(g, graph.EdgeCalls), limits)
+}
 
+func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessLimits) *ProcessResult {
+	limits = limits.normalized()
+
+	callees := make(map[string][]string)
+	callers := make(map[string][]string)
 	for _, e := range edges {
-		if e.Kind == graph.EdgeCalls {
+		if e != nil && e.Kind == graph.EdgeCalls {
 			callees[e.From] = append(callees[e.From], e.To)
 			callers[e.To] = append(callers[e.To], e.From)
 		}
 	}
+	// SQLite and in-memory stores do not promise edge scan order. Stable child
+	// order makes a bounded prefix reproducible across runs and backends.
+	for id := range callees {
+		sort.Strings(callees[id])
+	}
 
-	// Score each function/method as a potential entry point
 	type scored struct {
 		node  *graph.Node
 		score float64
 	}
 	var candidates []scored
-
-	nodeMap := make(map[string]*graph.Node)
+	nodeMap := make(map[string]*graph.Node, len(nodes))
 	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
 		nodeMap[n.ID] = n
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
 		}
-
 		score := scoreEntryPoint(n, len(callees[n.ID]), len(callers[n.ID]))
 		if score > 0.5 {
-			candidates = append(candidates, scored{n, score})
+			candidates = append(candidates, scored{node: n, score: score})
 		}
 	}
-
-	// Sort by score descending
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score == candidates[j].score {
+			return candidates[i].node.ID < candidates[j].node.ID
+		}
 		return candidates[i].score > candidates[j].score
 	})
 
-	// Trace forward from each entry point to build processes
-	result := &ProcessResult{
-		NodeToProcs: make(map[string][]string),
-	}
-
-	seen := make(map[string]bool) // avoid duplicate processes
+	result := &ProcessResult{NodeToProcs: make(map[string][]string)}
+	seen := make(map[string]bool)
+	totalSteps := 0
+	stepLimited := false
+	processLimited := false
 	for i, c := range candidates {
-		if i >= 50 { // cap at 50 processes
+		if i >= limits.MaxProcesses {
+			processLimited = true
 			break
 		}
 		if seen[c.node.ID] {
 			continue
 		}
-
-		steps := traceForward(c.node.ID, callees, 15) // max depth 15
+		remaining := limits.MaxTotalSteps - totalSteps
+		if remaining < 2 {
+			stepLimited = true
+			break
+		}
+		stepCap := limits.MaxStepsPerProcess
+		if remaining < stepCap {
+			stepCap = remaining
+		}
+		steps, truncated := traceForwardBounded(c.node.ID, callees, limits.MaxDepth, stepCap)
 		if len(steps) < 2 {
-			continue // not interesting
+			continue
 		}
 		seen[c.node.ID] = true
+		totalSteps += len(steps)
+		if truncated {
+			stepLimited = true
+		}
 
 		fileSet := make(map[string]bool)
-		for _, s := range steps {
-			if n, ok := nodeMap[s.ID]; ok {
+		for _, step := range steps {
+			if n, ok := nodeMap[step.ID]; ok && n.FilePath != "" {
 				fileSet[n.FilePath] = true
 			}
 		}
 		files := make([]string, 0, len(fileSet))
-		for f := range fileSet {
-			files = append(files, f)
+		for file := range fileSet {
+			files = append(files, file)
 		}
 		sort.Strings(files)
 
 		procID := fmt.Sprintf("process-%d", len(result.Processes))
-		proc := Process{
+		result.Processes = append(result.Processes, Process{
 			ID:         procID,
 			Name:       inferProcessName(c.node),
 			EntryPoint: c.node.ID,
@@ -120,14 +190,22 @@ func DiscoverProcesses(g graph.Store) *ProcessResult {
 			StepCount:  len(steps),
 			Files:      files,
 			Score:      c.score,
-		}
-		result.Processes = append(result.Processes, proc)
-
-		for _, s := range steps {
-			result.NodeToProcs[s.ID] = append(result.NodeToProcs[s.ID], procID)
+			Truncated:  truncated,
+		})
+		for _, step := range steps {
+			result.NodeToProcs[step.ID] = append(result.NodeToProcs[step.ID], procID)
 		}
 	}
 
+	result.Truncated = stepLimited || processLimited
+	switch {
+	case stepLimited && processLimited:
+		result.TruncationReason = "step_limit,process_limit"
+	case stepLimited:
+		result.TruncationReason = "step_limit"
+	case processLimited:
+		result.TruncationReason = "process_limit"
+	}
 	return result
 }
 
@@ -136,45 +214,28 @@ func scoreEntryPoint(n *graph.Node, calleeCount, callerCount int) float64 {
 		return 0 // leaf functions are not entry points
 	}
 
-	// Base score: ratio of outgoing to incoming calls
 	base := float64(calleeCount) / (float64(callerCount) + 1.0)
-
-	// Name pattern multiplier
 	nameMult := namePatternMultiplier(n.Name, n.Language)
-
-	// Export/visibility multiplier
 	exportMult := 1.0
 	if isExportedForProcess(n) {
 		exportMult = 1.5
 	}
-
-	// Low caller count bonus (true entry points have few callers)
 	callerMult := 1.0
 	if callerCount == 0 {
 		callerMult = 2.0
 	} else if callerCount <= 2 {
 		callerMult = 1.3
 	}
-
-	// Framework entry points stamped by the entrypoints detector (Spring
-	// handlers, JAX-RS resources, annotated servlets, the JVM main, …)
-	// are invoked by a runtime, not application code — the most reliable
-	// process roots. Test fixtures are stamped too (so dead-code keeps
-	// them live) but are noise as top-level processes, so skip the boost
-	// for them.
 	entryMult := 1.0
 	if ep, _ := n.Meta["entry_point"].(bool); ep {
 		if kind, _ := n.Meta["entry_point_kind"].(string); !strings.HasPrefix(kind, "junit:") {
 			entryMult = 2.0
 		}
 	}
-
 	return base * nameMult * exportMult * callerMult * entryMult
 }
 
-// isExportedForProcess mirrors the dead-code visibility logic: for
-// keyword-visibility languages (Java) it trusts the recorded modifier
-// so a private helper isn't handed the public-API entry-point boost.
+// isExportedForProcess mirrors the dead-code visibility logic.
 func isExportedForProcess(n *graph.Node) bool {
 	if n.Language == "java" {
 		if v, ok := n.Meta["visibility"].(string); ok && v != "" {
@@ -186,8 +247,6 @@ func isExportedForProcess(n *graph.Node) bool {
 
 func namePatternMultiplier(name, lang string) float64 {
 	lower := strings.ToLower(name)
-
-	// High-value entry point patterns
 	entryPatterns := []string{
 		"main", "init", "run", "start", "serve", "listen",
 		"handle", "handler", "controller", "middleware",
@@ -198,8 +257,6 @@ func namePatternMultiplier(name, lang string) float64 {
 			return 1.5
 		}
 	}
-
-	// Go-specific
 	if lang == "go" {
 		if strings.HasPrefix(name, "New") || strings.HasPrefix(name, "Serve") {
 			return 1.3
@@ -208,8 +265,6 @@ func namePatternMultiplier(name, lang string) float64 {
 			return 0.3
 		}
 	}
-
-	// Utility patterns (deprioritize)
 	utilPatterns := []string{
 		"get", "set", "is", "has", "to", "from", "parse",
 		"format", "validate", "helper", "util", "string",
@@ -219,7 +274,6 @@ func namePatternMultiplier(name, lang string) float64 {
 			return 0.5
 		}
 	}
-
 	return 1.0
 }
 
@@ -227,31 +281,44 @@ func isExported(name, lang string) bool {
 	if lang == "go" {
 		return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 	}
-	// For other languages, assume exported if not starting with underscore
 	return !strings.HasPrefix(name, "_")
 }
 
-func traceForward(startID string, callees map[string][]string, maxDepth int) []Step {
-	var result []Step
-	visited := make(map[string]bool)
+func traceForwardBounded(startID string, callees map[string][]string, maxDepth, maxSteps int) ([]Step, bool) {
+	if maxSteps <= 0 {
+		return nil, true
+	}
+	result := make([]Step, 0, min(maxSteps, 64))
+	visited := make(map[string]bool, min(maxSteps, 64))
+	truncated := false
 
 	var dfs func(id string, depth int)
 	dfs = func(id string, depth int) {
-		if visited[id] || depth > maxDepth {
+		if truncated || visited[id] || depth > maxDepth {
+			return
+		}
+		if len(result) >= maxSteps {
+			truncated = true
 			return
 		}
 		visited[id] = true
 		result = append(result, Step{ID: id, Depth: depth})
-
 		for _, callee := range callees[id] {
-			if !visited[callee] {
-				dfs(callee, depth+1)
+			if visited[callee] {
+				continue
+			}
+			if len(result) >= maxSteps {
+				truncated = true
+				return
+			}
+			dfs(callee, depth+1)
+			if truncated {
+				return
 			}
 		}
 	}
-
 	dfs(startID, 0)
-	return result
+	return result, truncated
 }
 
 func inferProcessName(n *graph.Node) string {
