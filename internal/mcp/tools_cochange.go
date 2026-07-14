@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/cochange"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // registerCoChangeTool wires find_co_changing_symbols — the MCP
@@ -206,6 +207,12 @@ func (s *Server) coChangeReady() bool {
 // `gortex enrich cochange` (or a cold reindex) — the lazy path does not
 // auto-re-mine once edges exist.
 func (s *Server) mineCoChange() {
+	runtimeactivity.Begin("cochange")
+	defer func() {
+		runtimeactivity.End("cochange")
+		scheduleOSMemoryReleaseAfterBurst(s.logger, "cochange")
+	}()
+
 	scores := map[string]map[string]float64{}
 	counts := map[string]map[string]int{}
 
