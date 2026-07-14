@@ -6,6 +6,11 @@ import (
 	"runtime"
 	"runtime/debug"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 func TestIndexMemoryBudget(t *testing.T) {
@@ -550,5 +555,19 @@ func TestFreeOSMemoryAfterColdIndex(t *testing.T) {
 	if after.HeapReleased < before.HeapReleased {
 		t.Fatalf("HeapReleased went backwards: before=%d after=%d",
 			before.HeapReleased, after.HeapReleased)
+	}
+}
+
+func TestFreeOSMemoryAfterColdIndexDefersWhileTrackedWorkActive(t *testing.T) {
+	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "1")
+	core, logs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+
+	runtimeactivity.Begin("mcp")
+	defer runtimeactivity.End("mcp")
+	freeOSMemoryAfterColdIndex(logger)
+
+	if got := logs.FilterMessage("indexer: deferred cold-index heap release until process idle").Len(); got != 1 {
+		t.Fatalf("deferred-release logs = %d, want 1", got)
 	}
 }
