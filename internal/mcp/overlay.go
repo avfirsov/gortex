@@ -91,6 +91,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		beginMCPToolCall()
 		defer func() {
 			endMCPToolCall(s.logger, req.Params.Name)
+			s.releaseTransientAnalysisIfIdle()
 		}()
 
 		// Last-resort panic firewall around EVERY tool handler. A Go

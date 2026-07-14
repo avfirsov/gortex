@@ -249,6 +249,9 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	if repoRoot == "" {
 		repoRoot = "."
 	}
+	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); freshnessErr != nil {
+		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil
+	}
 
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
@@ -313,6 +316,10 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	ids := strings.Split(idsStr, ",")
 	for i := range ids {
 		ids[i] = strings.TrimSpace(ids[i])
+	}
+
+	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, s.mutationReposForSymbolIDs(ctx, ids)...); freshnessErr != nil {
+		return mcp.NewToolResultError("change impact refused a stale graph: " + freshnessErr.Error()), nil
 	}
 
 	// Keep the mandatory pre-edit safety gate well below host transport

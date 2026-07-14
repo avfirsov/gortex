@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -181,13 +183,20 @@ type Server struct {
 	// fingerprint packages. On a disk backend the fingerprint scan alone is
 	// ~140s; the cache check is three scalar reads.
 	communitiesToken communityCacheToken
-	// hotspots is the default-threshold (mean + 2*stddev) hotspot
-	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
-	// the wall clock of get_repo_outline / get_architecture /
-	// gortex_wakeup / the analyze(hotspots) resource — caching it
-	// once per RunAnalysis turn turns repeat calls into a map lookup.
-	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
-	hotspots []analysis.HotspotEntry
+	// hotspots is the lazily-built default-threshold (mean + 2*stddev)
+	// ranking. FindHotspots' inner ComputeBetweenness pass is too expensive
+	// to put on every daemon cold-start path; RunAnalysis invalidates this
+	// cache and the first hotspot-consuming request rebuilds it once for that
+	// analysis epoch. Reads/cache state are guarded by analysisMu; the separate
+	// build mutex coalesces concurrent first requests without blocking unrelated
+	// analysis snapshots while betweenness runs.
+	hotspots        []analysis.HotspotEntry
+	hotspotsReady   bool
+	hotspotsBuildMu sync.Mutex
+	analysisEpoch   uint64
+	// hotspotsFn is a test seam for deterministic concurrency/invalidation
+	// tests. Production leaves it nil and uses analysis.FindHotspots.
+	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
 	// adjacency is the compact CSR snapshot of the call / reference
 	// graph, built once per RunAnalysis pass so seeded random-walk
 	// queries (context_closure proximity ranking) never re-scan
@@ -200,7 +209,14 @@ type Server struct {
 	// consumer can tell whether the snapshot still matches the live
 	// graph before trusting it.
 	adjacencyToken communityCacheToken
-	analysisMu     sync.RWMutex
+	// analysisGeneration is the small active durable-generation manifest.
+	// Warm startup publishes only this header; normalized metrics and bounded
+	// memberships stay in SQLite until a request asks for them.
+	analysisGeneration      graph.AnalysisGenerationHeader
+	analysisGenerationReady bool
+	analysisPruneScheduled  atomic.Bool
+	analysisMaterializeMu   sync.Mutex
+	analysisMu              sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -2275,21 +2291,27 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 
 // communityCacheToken is the per-graph identity tuple
 // handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on any structural mutation; NodeCount
-// and EdgeCount cover pure additions / removals that leave the
-// identity counter alone. A zero token is "never populated".
+// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
+// cover additions/removals. analysisRevision closes the remaining same-count
+// mutation gap on durable stores (for example a rebind or source-location
+// shift). A zero token is "never populated".
 type communityCacheToken struct {
-	edgeIdentity int
-	nodeCount    int
-	edgeCount    int
+	edgeIdentity     int
+	nodeCount        int
+	edgeCount        int
+	analysisRevision uint64
 }
 
 func (s *Server) currentCommunityToken() communityCacheToken {
-	return communityCacheToken{
+	token := communityCacheToken{
 		edgeIdentity: s.graph.EdgeIdentityRevisions(),
 		nodeCount:    s.graph.NodeCount(),
 		edgeCount:    s.graph.EdgeCount(),
 	}
+	if writer, _ := s.analysisGenerationBackends(); writer != nil {
+		token.analysisRevision = writer.AnalysisMutationRevision()
+	}
+	return token
 }
 
 // RunAnalysis performs community detection and process discovery on
@@ -2297,47 +2319,20 @@ func (s *Server) currentCommunityToken() communityCacheToken {
 // for every bootstrap resource so subscribed clients can refresh
 // without polling.
 func (s *Server) RunAnalysis() {
+	runtimeactivity.Begin("analysis")
+	analysisStarted := time.Now()
+	var memoryBefore runtime.MemStats
+	runtime.ReadMemStats(&memoryBefore)
+	defer func() {
+		runtimeactivity.End("analysis")
+		s.releaseTransientAnalysisIfIdle()
+		writer, _ := s.analysisGenerationBackends()
+		s.scheduleAnalysisGenerationPrune(writer)
+		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
+	}()
+
 	s.analysisMu.Lock()
-	// Detect communities through the incremental path, threading the
-	// partition cache. When a re-warm only touched a few packages
-	// this recomputes just those; the cache is also left warm so the
-	// next `analyze kind=clusters` call inherits it. The result is
-	// shape-identical to a full DetectCommunities run.
-	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
-	s.communities = communities
-	s.leidenCache = cache
-	s.communitiesToken = s.currentCommunityToken()
-	// Feed the freshly computed per-package fingerprints to the
-	// backend's bundle cache so it retires bundles for packages whose
-	// content changed since the last pass and keeps the rest. The
-	// fingerprints are edge-aware (DetectCommunitiesLeidenIncremental
-	// folds each package's nodes and the edges touching them), so this
-	// is the correct staleness signal for cached node + in/out edges.
-	// A backend without a bundle cache simply doesn't satisfy the
-	// interface and this no-ops.
-	if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && cache != nil {
-		sink.SetBundleFingerprints(cache.PackageFingerprints())
-	}
-	s.processes = analysis.DiscoverProcesses(s.graph)
-	s.pageRank = analysis.ComputePageRank(s.graph)
-	// Compact CSR adjacency over the same call / reference edge set
-	// PageRank uses — the substrate for seeded random-walk proximity
-	// queries. Built once here so per-query walks never re-scan the
-	// graph; stamped with the current graph identity for the same
-	// invalidation discipline as the community cache.
-	s.adjacency = analysis.BuildAdjacencySnapshot(s.graph)
-	s.adjacencyToken = s.currentCommunityToken()
-	// Auto-concept vocabulary: mine domain phrases from symbol names
-	// so equivalence-class expansion can bridge repo-specific terms
-	// even with no LLM provider configured.
-	s.autoConcepts = search.BuildAutoConcepts(s.graph)
-	// HITS authority/hub scores -- fed into the search rerank as an
-	// authority signal that complements raw fan-in.
-	s.hits = analysis.ComputeHITS(s.graph)
-	// Default-threshold hotspot ranking — cached because FindHotspots
-	// triggers ComputeBetweenness which is the shared wall-clock
-	// floor for outline / architecture / wakeup / the resource view.
-	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
+	analysisMetrics := s.populateAnalysisLocked()
 	s.analysisMu.Unlock()
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
@@ -2361,7 +2356,34 @@ func (s *Server) RunAnalysis() {
 		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
 	}
 
-	scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
+	var memoryAfter runtime.MemStats
+	runtime.ReadMemStats(&memoryAfter)
+	if s.logger != nil {
+		s.logger.Info("mcp: analysis pass complete",
+			zap.Bool("cache_hit", analysisMetrics.cacheHit),
+			zap.Duration("cache_load", analysisMetrics.cacheLoad),
+			zap.Duration("cache_save", analysisMetrics.cacheSave),
+			zap.Duration("snapshot", analysisMetrics.snapshot),
+			zap.Duration("leiden", analysisMetrics.leiden),
+			zap.Duration("processes", analysisMetrics.processes),
+			zap.Duration("pagerank", analysisMetrics.pageRank),
+			zap.Duration("adjacency", analysisMetrics.adjacency),
+			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
+			zap.Duration("hits", analysisMetrics.hits),
+			zap.Duration("total", time.Since(analysisStarted)),
+			zap.Uint64("heap_alloc_before_bytes", memoryBefore.HeapAlloc),
+			zap.Uint64("heap_alloc_after_bytes", memoryAfter.HeapAlloc),
+			zap.Uint64("heap_inuse_before_bytes", memoryBefore.HeapInuse),
+			zap.Uint64("heap_inuse_after_bytes", memoryAfter.HeapInuse),
+			zap.Uint64("heap_idle_before_bytes", memoryBefore.HeapIdle),
+			zap.Uint64("heap_idle_after_bytes", memoryAfter.HeapIdle),
+			zap.Uint64("heap_released_before_bytes", memoryBefore.HeapReleased),
+			zap.Uint64("heap_released_after_bytes", memoryAfter.HeapReleased),
+			zap.Uint64("heap_sys_before_bytes", memoryBefore.HeapSys),
+			zap.Uint64("heap_sys_after_bytes", memoryAfter.HeapSys),
+			zap.Uint64("stack_inuse_before_bytes", memoryBefore.StackInuse),
+			zap.Uint64("stack_inuse_after_bytes", memoryAfter.StackInuse))
+	}
 }
 
 var osMemoryReleaseScheduled atomic.Bool
@@ -2400,9 +2422,17 @@ func (s *Server) resetConfirmedRefs() {
 	})
 }
 
+func (s *Server) analysisSnapshotCurrentLocked() bool {
+	return s.analysisEpoch > 0 && s.communitiesToken == s.currentCommunityToken()
+}
+
 func (s *Server) getCommunities() *analysis.CommunityResult {
+	_ = s.ensureCommunitiesMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.communities
 }
 
@@ -2423,6 +2453,8 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 // incremental run (no changed packages, no repartitioned nodes) so
 // callers see the cache hit on the wire.
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
+	_ = s.ensureCommunitiesMaterialized()
+	_ = s.ensureLeidenMaterialized()
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
 	cur := s.currentCommunityToken()
@@ -2465,18 +2497,33 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 	// the state the result was actually computed against, and the next
 	// call's token comparison stays meaningful.
 	s.communitiesToken = s.currentCommunityToken()
+	// A cache miss ran a real community recompute. Invalidate the dependent
+	// hotspot ranking and advance its epoch while holding analysisMu: an
+	// in-flight getHotspots build that captured the old communities will see
+	// the epoch change, discard its result, and rebuild before publishing.
+	s.hotspots = nil
+	s.hotspotsReady = false
+	s.analysisEpoch++
 	return result, stats
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {
+	_ = s.ensureProcessesMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.processes
 }
 
 func (s *Server) getPageRank() *analysis.PageRankResult {
+	_ = s.ensureNodeMetricsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.pageRank
 }
 
@@ -2485,8 +2532,12 @@ func (s *Server) getPageRank() *analysis.PageRankResult {
 // immutable after construction, so the caller may run seeded walks over
 // it after releasing the read lock.
 func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
+	_ = s.ensureAdjacencyMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.adjacency
 }
 
@@ -2494,8 +2545,12 @@ func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
 // vocabulary. Nil until the first RunAnalysis pass; callers
 // nil-check (AutoConcepts.Expand is itself nil-safe).
 func (s *Server) getAutoConcepts() *search.AutoConcepts {
+	_ = s.ensureAutoConceptsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.autoConcepts
 }
 
@@ -2503,20 +2558,77 @@ func (s *Server) getAutoConcepts() *search.AutoConcepts {
 // first RunAnalysis pass; callers nil-check (HITSResult accessors
 // are themselves nil-safe).
 func (s *Server) getHITS() *analysis.HITSResult {
+	_ = s.ensureNodeMetricsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.hits
 }
 
-// getHotspots returns the default-threshold hotspot ranking computed
-// by the most recent RunAnalysis pass. Nil/empty until the first
-// pass; callers use the live FindHotspots(threshold) path when they
-// need a non-default threshold. Returned slice is shared and must
-// not be mutated by the caller.
+// getHotspots returns the default-threshold hotspot ranking for the current
+// analysis epoch, computing it on first demand. Concurrent first callers are
+// coalesced. If RunAnalysis invalidates the epoch while a build is in flight,
+// the stale result is discarded and rebuilt against the new communities.
+// The returned slice is shared and must not be mutated by the caller.
 func (s *Server) getHotspots() []analysis.HotspotEntry {
+	if !s.ensureCommunitiesMaterialized() && s.hotspotsFn == nil {
+		return nil
+	}
 	s.analysisMu.RLock()
-	defer s.analysisMu.RUnlock()
-	return s.hotspots
+	if !s.analysisSnapshotCurrentLocked() {
+		s.analysisMu.RUnlock()
+		return nil
+	}
+	if s.hotspotsReady {
+		hotspots := s.hotspots
+		s.analysisMu.RUnlock()
+		return hotspots
+	}
+	s.analysisMu.RUnlock()
+
+	s.hotspotsBuildMu.Lock()
+	defer s.hotspotsBuildMu.Unlock()
+	for {
+		s.analysisMu.RLock()
+		if !s.analysisSnapshotCurrentLocked() {
+			s.analysisMu.RUnlock()
+			return nil
+		}
+		if s.hotspotsReady {
+			hotspots := s.hotspots
+			s.analysisMu.RUnlock()
+			return hotspots
+		}
+		epoch := s.analysisEpoch
+		token := s.communitiesToken
+		communities := s.communities
+		s.analysisMu.RUnlock()
+
+		build := analysis.FindHotspots
+		if s.hotspotsFn != nil {
+			build = s.hotspotsFn
+		}
+		hotspots := build(s.graph, communities, 0)
+
+		s.analysisMu.Lock()
+		if s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
+			s.hotspots = hotspots
+			s.hotspotsReady = true
+			s.analysisMu.Unlock()
+			scheduleOSMemoryReleaseAfterBurst(s.logger, "lazy_hotspots")
+			return hotspots
+		}
+		epochChanged := s.analysisEpoch != epoch
+		s.analysisMu.Unlock()
+		if !epochChanged {
+			// The graph changed before a new analysis snapshot was published.
+			// Fail closed instead of spinning or serving hotspots built from the
+			// stale community assignment.
+			return nil
+		}
+	}
 }
 
 // SetArchitecture installs the declarative architecture-rules DSL so
