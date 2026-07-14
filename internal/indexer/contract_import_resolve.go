@@ -143,10 +143,6 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	return hit
 }
 
-func (mi *MultiIndexer) resolveRustUseFactTarget(fact rustUseFact, g graph.Store, srcCache map[string][]byte) string {
-	return mi.resolveRustUseFactsTarget([]rustUseFact{fact}, g, srcCache)
-}
-
 func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.Store, srcCache map[string][]byte) string {
 	seen := map[string]bool{}
 	var hit string
@@ -1003,14 +999,6 @@ func rustImportFactsForName(src, srcFile, name string) ([]rustUseFact, bool) {
 		globs = append(globs, fact)
 	}
 	return globs, len(globs) > 0
-}
-
-func rustImportFactForName(src, srcFile, name string) (rustUseFact, bool) {
-	facts, ok := rustImportFactsForName(src, srcFile, name)
-	if !ok || len(facts) != 1 {
-		return rustUseFact{}, false
-	}
-	return facts[0], true
 }
 
 // isRustFile reports whether a repo-prefixed path is a Rust source

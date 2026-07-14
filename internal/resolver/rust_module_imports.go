@@ -56,6 +56,12 @@ func resolveRustModuleImports(g graph.Store) int {
 	var reindexBatch []graph.EdgeReindex
 	for _, e := range cands {
 		raw := strings.TrimPrefix(e.To, "unresolved::import::")
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		if _, exists := e.Meta["rust_use_path"]; !exists {
+			e.Meta["rust_use_path"] = normalizeRustUsePath(raw)
+		}
 		target := resolveRustUseFile(e.From, strings.Split(raw, "/"), fileIDs)
 		if target == "" || target == e.From {
 			continue

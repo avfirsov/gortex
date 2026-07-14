@@ -243,14 +243,7 @@ type rustTraitTargetIndex struct {
 	nodes    map[string]*graph.Node
 }
 
-func resolveRustTraitExtends(g graph.Store) int {
-	if g == nil {
-		return 0
-	}
-	return resolveRustTraitExtendsWithIndex(g, newRustTraitTargetIndex(g))
-}
-
-func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex) int {
+func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex, aliases *rustTypeAliasIndex) int {
 	if g == nil || idx == nil {
 		return 0
 	}
@@ -268,6 +261,13 @@ func resolveRustTraitExtendsWithIndex(g graph.Store, idx *rustTraitTargetIndex) 
 			if path, _ := edge.Meta["rust_trait_path"].(string); path != "" {
 				raw = path
 			}
+		}
+		if aliases != nil {
+			resolvedPath, _, ok := aliases.resolve(child, raw)
+			if !ok {
+				continue
+			}
+			raw = resolvedPath
 		}
 		target := idx.resolve(child, raw)
 		if target == "" || target == edge.From {
@@ -655,17 +655,4 @@ func sortRustOwnerKeys(keys []rustOwnerKey) {
 		}
 		return keys[i].owner < keys[j].owner
 	})
-}
-
-func dedupeRustOwnerKeys(keys []rustOwnerKey) []rustOwnerKey {
-	if len(keys) < 2 {
-		return keys
-	}
-	out := keys[:1]
-	for _, key := range keys[1:] {
-		if key != out[len(out)-1] {
-			out = append(out, key)
-		}
-	}
-	return out
 }

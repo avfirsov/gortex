@@ -53,10 +53,9 @@ import (
 // matches, the pass skips the edge (zero false positives over breadth).
 //
 // Out of scope (left for the generic resolver, the cross-repo resolver,
-// or future work): cross-repo Rust calls, trait-bound / generic-typed
-// receivers, fully-qualified `<T as Trait>::method` UFCS, and resolving
-// a module path against a real module-tree node (only the trailing
-// segment + locality is used today).
+// or future work): cross-repo Rust calls, fully-qualified
+// `<T as Trait>::method` UFCS, and resolving a module path against a real
+// module-tree node (only the trailing segment + locality is used today).
 //
 // Returns the number of Rust module-import, supertrait, override, and call
 // edges this pass landed on concrete nodes.
@@ -251,6 +250,9 @@ type rustScopeIndex struct {
 	// not cross-pollinate through a basename alias.
 	traitTargets     *rustTraitTargetIndex
 	traitMethodsByID map[string][]*graph.Node
+	// typeAliases follows file-scoped use aliases and crate-visible re-export
+	// chains before owner and trait lookup. Ambiguous aliases fail closed.
+	typeAliases *rustTypeAliasIndex
 	// freeFuncsByName: (repo, name) → free function nodes.
 	freeFuncsByName map[rustNameKey][]*graph.Node
 	// paramsByOwner: caller function/method ID → set of param names,
@@ -286,12 +288,14 @@ type rustFieldKey struct {
 // before the method/function early-out; the returned count includes those
 // rewrites even when the graph contains marker traits only.
 func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
+	typeAliases := newRustTypeAliasIndex(g)
 	traitTargets := newRustTraitTargetIndex(g)
-	extendsResolved := resolveRustTraitExtendsWithIndex(g, traitTargets)
+	extendsResolved := resolveRustTraitExtendsWithIndex(g, traitTargets, typeAliases)
 	idx := &rustScopeIndex{
 		methodsByOwner:    map[rustOwnerKey][]*graph.Node{},
 		traitTargets:      traitTargets,
 		traitMethodsByID:  map[string][]*graph.Node{},
+		typeAliases:       typeAliases,
 		freeFuncsByName:   map[rustNameKey][]*graph.Node{},
 		paramsByOwner:     map[string]map[string]struct{}{},
 		fieldTypesByOwner: map[rustFieldKey]string{},
@@ -430,9 +434,17 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 	// method.
 	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
 		if name := selectorCallName(e.To); name != "" {
-			if id := idx.uniqueMethod(repo, rustBaseTypeName(rt), name); id != "" {
-				idx.set(graph.OriginASTResolved, 0.88, "receiver_type")
+			if id, aliased, valid := idx.ownerMethod(caller, rt, name); id != "" {
+				reason := "receiver_type"
+				if aliased {
+					reason = "receiver_type_alias"
+				}
+				idx.set(graph.OriginASTResolved, 0.88, reason)
 				return id
+			} else if !valid || aliased {
+				// An ambiguous alias, or a qualified alias whose destination did
+				// not match a graph owner, must not degrade to basename guessing.
+				return ""
 			}
 			// A parameter whose declared type is a generic (`matcher: M`)
 			// has no concrete method owner. If the enclosing function's
@@ -473,11 +485,17 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 
 	case isRustTypeName(qualifier):
 		// Type::method() — bind to a method whose owner type is the
-		// qualifier. The receiver type is named explicitly in source, so
-		// this is structurally resolved within that type.
-		if id := idx.uniqueMethod(repo, qualifier, last); id != "" {
-			idx.set(graph.OriginASTResolved, 0.9, "impl_owner")
+		// qualifier. File-local aliases and public re-export chains are
+		// canonicalised before owner lookup.
+		if id, aliased, valid := idx.ownerMethod(caller, qualifier, last); id != "" {
+			reason := "impl_owner"
+			if aliased {
+				reason = "impl_owner_alias"
+			}
+			idx.set(graph.OriginASTResolved, 0.9, reason)
 			return id
+		} else if !valid || aliased {
+			return ""
 		}
 		// Ambiguous by type name alone — the same type name is defined in
 		// more than one crate/module (e.g. grep::regex::RegexMatcherBuilder
@@ -520,6 +538,38 @@ func (idx *rustScopeIndex) set(origin string, conf float64, reason string) {
 	idx.lastReason = reason
 }
 
+// ownerMethod resolves a possibly aliased Rust owner and returns its unique
+// method. Qualified alias destinations are matched against file-path segments
+// before any basename lookup, preventing an external or ambiguous alias from
+// silently binding to an unrelated local type.
+func (idx *rustScopeIndex) ownerMethod(caller *graph.Node, owner, name string) (id string, aliased, valid bool) {
+	if caller == nil || owner == "" || name == "" {
+		return "", false, false
+	}
+	ownerPath := rustBaseTypeName(owner)
+	if idx.typeAliases != nil {
+		var ok bool
+		ownerPath, aliased, ok = idx.typeAliases.resolve(caller, ownerPath)
+		if !ok || ownerPath == "" {
+			return "", aliased, false
+		}
+	}
+	canonicalOwner := rustUseBindingName(ownerPath)
+	if canonicalOwner == "" {
+		return "", aliased, false
+	}
+	if aliased && strings.Contains(ownerPath, "::") {
+		segments := strings.Split(ownerPath, "::")
+		if id := idx.methodByPathSegments(caller.RepoPrefix, canonicalOwner, name, segments); id != "" {
+			return id, true, true
+		}
+		// A qualified alias carries stronger evidence than a basename. If
+		// its path cannot identify a matching owner, fail closed.
+		return "", true, true
+	}
+	return idx.uniqueMethod(caller.RepoPrefix, canonicalOwner, name), aliased, true
+}
+
 // uniqueMethod returns the ID of the single method named `name` owned by
 // (repo, owner), or "" when there is no match or the choice is
 // ambiguous (more than one).
@@ -554,7 +604,7 @@ func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segmen
 			if seg == "" || seg == owner || seg == name {
 				continue
 			}
-			if strings.Contains(m.FilePath, "/"+seg+"/") {
+			if rustFileMatchesModuleSegment(m.FilePath, seg) {
 				if hit != "" && hit != m.ID {
 					return "" // more than one crate/module matched
 				}
@@ -564,6 +614,18 @@ func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segmen
 		}
 	}
 	return hit
+}
+
+func rustFileMatchesModuleSegment(filePath, segment string) bool {
+	filePath = strings.TrimSpace(strings.ReplaceAll(filePath, "\\", "/"))
+	segment = strings.Trim(strings.TrimSpace(segment), "/:")
+	if filePath == "" || segment == "" {
+		return false
+	}
+	return strings.Contains(filePath, "/"+segment+"/") ||
+		strings.HasSuffix(filePath, "/"+segment+".rs") ||
+		strings.HasSuffix(filePath, "/"+segment+"/mod.rs") ||
+		filePath == segment+".rs"
 }
 
 // methodBySameCrate disambiguates a `Type::method` call that names no
@@ -668,6 +730,13 @@ func (idx *rustScopeIndex) uniqueGenericBoundTraitMethod(repo string, caller *gr
 	var hit string
 	for _, owner := range owners {
 		var methods []*graph.Node
+		if idx.typeAliases != nil {
+			resolvedOwner, _, ok := idx.typeAliases.resolve(caller, owner)
+			if !ok {
+				return ""
+			}
+			owner = resolvedOwner
+		}
 		if idx.traitTargets != nil {
 			traitID := idx.traitTargets.resolve(caller, owner)
 			if traitID == "" {
@@ -701,95 +770,6 @@ func (idx *rustScopeIndex) uniqueGenericBoundTraitMethod(repo string, caller *gr
 		}
 	}
 	return hit
-}
-
-func rustTypeParamBound(value any, param string) string {
-	switch entries := value.(type) {
-	case []map[string]string:
-		for _, entry := range entries {
-			if entry["name"] == param {
-				return strings.TrimSpace(entry["bound"])
-			}
-		}
-	case []any:
-		for _, raw := range entries {
-			switch entry := raw.(type) {
-			case map[string]any:
-				name, _ := entry["name"].(string)
-				bound, _ := entry["bound"].(string)
-				if name == param {
-					return strings.TrimSpace(bound)
-				}
-			case map[string]string:
-				if entry["name"] == param {
-					return strings.TrimSpace(entry["bound"])
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func rustTraitBoundNames(bound string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, raw := range splitRustTraitBounds(bound) {
-		name := strings.TrimSpace(raw)
-		name = strings.TrimPrefix(name, "?")
-		if strings.HasPrefix(name, "for<") {
-			if end := strings.Index(name, ">"); end >= 0 {
-				name = strings.TrimSpace(name[end+1:])
-			}
-		}
-		if strings.HasPrefix(name, "'") {
-			continue
-		}
-		if i := strings.IndexAny(name, "<("); i >= 0 {
-			name = strings.TrimSpace(name[:i])
-		}
-		if i := strings.LastIndex(name, "::"); i >= 0 {
-			name = strings.TrimSpace(name[i+2:])
-		}
-		if name == "" || seen[name] {
-			continue
-		}
-		seen[name] = true
-		out = append(out, name)
-	}
-	return out
-}
-
-func splitRustTraitBounds(bound string) []string {
-	var out []string
-	start := 0
-	angle, paren := 0, 0
-	for i := 0; i < len(bound); i++ {
-		switch bound[i] {
-		case '<':
-			angle++
-		case '>':
-			if angle > 0 {
-				angle--
-			}
-		case '(':
-			paren++
-		case ')':
-			if paren > 0 {
-				paren--
-			}
-		case '+':
-			if angle == 0 && paren == 0 {
-				if part := strings.TrimSpace(bound[start:i]); part != "" {
-					out = append(out, part)
-				}
-				start = i + 1
-			}
-		}
-	}
-	if part := strings.TrimSpace(bound[start:]); part != "" {
-		out = append(out, part)
-	}
-	return out
 }
 
 // uniqueFreeFunc returns the ID of a free function named `name` in repo,

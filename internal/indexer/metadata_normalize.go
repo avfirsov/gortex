@@ -690,15 +690,3 @@ func ownerNameFromID(id string) string {
 	}
 	return strings.TrimSpace(id)
 }
-
-func joinQualified(owner, name string) string {
-	owner = strings.TrimRight(strings.TrimSpace(owner), ".:")
-	name = strings.TrimSpace(name)
-	if owner == "" || name == "" {
-		return ""
-	}
-	if owner == name || strings.HasSuffix(owner, "."+name) || strings.HasSuffix(owner, "::"+name) {
-		return owner
-	}
-	return owner + "." + name
-}
