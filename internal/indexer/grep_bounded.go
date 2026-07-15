@@ -114,13 +114,31 @@ func (mi *MultiIndexer) GrepLiteralForRepoBounded(
 	limit int,
 	maxFiles int,
 ) ([]trigram.Match, bool) {
-	if mi == nil || repoPrefix == "" {
+	if mi == nil {
 		return nil, false
 	}
 	idx := mi.GetIndexer(repoPrefix)
+	if repoPrefix == "" {
+		idx = mi.soleUnprefixedIndexer()
+	}
 	if idx == nil {
 		return nil, false
 	}
 	matches, incomplete := idx.GrepLiteralBounded(ctx, query, limit, maxFiles)
 	return stampGrepMatchPaths(repoPrefix, matches), incomplete
+}
+
+// soleUnprefixedIndexer returns the empty-prefix indexer only when it is the
+// MultiIndexer's entire repository set. This makes isolated single-repository
+// sessions usable without turning an empty prefix into a multi-repo fan-out.
+func (mi *MultiIndexer) soleUnprefixedIndexer() *Indexer {
+	if mi == nil {
+		return nil
+	}
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	if len(mi.indexers) != 1 {
+		return nil
+	}
+	return mi.indexers[""]
 }

@@ -169,18 +169,18 @@ func (s *Server) searchExploreSourceLiteral(
 ) ([]trigram.Match, bool) {
 	if s.multiIndexer != nil {
 		if repoPrefix == "" {
+			haveScopedPrefix := false
 			for prefix, allowed := range scope.RepoAllow {
 				if !allowed {
 					continue
 				}
-				if repoPrefix != "" {
+				prefix = strings.TrimSuffix(strings.TrimSpace(prefix), "/")
+				if haveScopedPrefix && repoPrefix != prefix {
 					return nil, false
 				}
 				repoPrefix = prefix
+				haveScopedPrefix = true
 			}
-		}
-		if repoPrefix == "" {
-			return nil, false
 		}
 		return s.multiIndexer.GrepLiteralForRepoBounded(
 			ctx, repoPrefix, term,

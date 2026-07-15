@@ -65,6 +65,44 @@ func TestGrepLiteralForRepoBoundedStampsPaths(t *testing.T) {
 	require.False(t, incomplete)
 }
 
+func TestGrepLiteralForRepoBoundedUsesSoleUnprefixedIndexer(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/FormatterRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
+	idx := &Indexer{rootPath: root, fileMtimes: map[string]int64{rel: 1}}
+	multi := &MultiIndexer{indexers: map[string]*Indexer{"": idx}}
+
+	matches, incomplete := multi.GrepLiteralForRepoBounded(
+		context.Background(), "", "ku", 24, 8,
+	)
+
+	require.Len(t, matches, 1)
+	require.Equal(t, rel, matches[0].Path, "empty-prefix matches must remain unstamped")
+	require.False(t, incomplete)
+}
+
+func TestGrepLiteralForRepoBoundedRejectsEmptyPrefixWithMultipleIndexers(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/FormatterRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
+	idx := &Indexer{rootPath: root, fileMtimes: map[string]int64{rel: 1}}
+	multi := &MultiIndexer{indexers: map[string]*Indexer{
+		"":      idx,
+		"other": {rootPath: t.TempDir(), fileMtimes: map[string]int64{}},
+	}}
+
+	matches, incomplete := multi.GrepLiteralForRepoBounded(
+		context.Background(), "", "ku", 24, 8,
+	)
+
+	require.Empty(t, matches)
+	require.False(t, incomplete)
+}
+
 func TestGrepLiteralBoundedPrioritizesProductionAndDiversifiesFiles(t *testing.T) {
 	root := t.TempDir()
 	mtimes := make(map[string]int64)
