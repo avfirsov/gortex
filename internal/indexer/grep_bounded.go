@@ -1,0 +1,64 @@
+package indexer
+
+import (
+	"context"
+	"sort"
+
+	"github.com/zzet/gortex/internal/search/trigram"
+)
+
+// GrepTextBounded searches already-indexed files without triggering the lazy
+// full trigram build. A current warm searcher supplies candidate filtering;
+// otherwise the same bounded scanner runs over a sorted snapshot of known
+// files. The boolean result is true when a cap or cancellation may have hidden
+// additional matches.
+func (idx *Indexer) GrepTextBounded(
+	ctx context.Context,
+	query string,
+	limit int,
+	maxFiles int,
+) ([]trigram.Match, bool) {
+	if idx == nil || query == "" {
+		return nil, false
+	}
+	gen := idx.indexGen.Load()
+	idx.trigramMu.Lock()
+	searcher := idx.trigramSearcher
+	warm := searcher != nil && idx.trigramGen == gen
+	idx.trigramMu.Unlock()
+	if warm {
+		matches, stats := searcher.GrepBounded(ctx, query, limit, maxFiles)
+		return matches, stats.Incomplete
+	}
+
+	idx.mtimeMu.RLock()
+	paths := make([]string, 0, len(idx.fileMtimes))
+	for rel := range idx.fileMtimes {
+		paths = append(paths, rel)
+	}
+	idx.mtimeMu.RUnlock()
+	sort.Strings(paths)
+	matches, stats := trigram.GrepPathsBounded(ctx, idx.rootPath, paths, query, limit, maxFiles)
+	return matches, stats.Incomplete
+}
+
+// GrepTextForRepoBounded is the single-repository MultiIndexer bridge. It
+// intentionally cannot fan out: source-literal localization must remain bound
+// to the active repository even when the daemon tracks many repositories.
+func (mi *MultiIndexer) GrepTextForRepoBounded(
+	ctx context.Context,
+	repoPrefix string,
+	query string,
+	limit int,
+	maxFiles int,
+) ([]trigram.Match, bool) {
+	if mi == nil || repoPrefix == "" {
+		return nil, false
+	}
+	idx := mi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return nil, false
+	}
+	matches, incomplete := idx.GrepTextBounded(ctx, query, limit, maxFiles)
+	return stampGrepMatchPaths(repoPrefix, matches), incomplete
+}

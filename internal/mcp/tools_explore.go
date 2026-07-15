@@ -2692,6 +2692,33 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 			}
 		}
 	}
+	hasExact := false
+	for _, exact := range exactHit {
+		if exact {
+			hasExact = true
+			break
+		}
+	}
+	if !hasExact && ctx.Err() == nil {
+		sourceRecall := s.gatherExploreSourceLiteralRecall(ctx, terms, repoPrefix, scope)
+		for _, hit := range sourceRecall.hits {
+			if previous, exists := bestRank[hit.nodeID]; !exists {
+				order = append(order, hit.nodeID)
+				bestRank[hit.nodeID] = hit.rank
+			} else if hit.rank < previous {
+				bestRank[hit.nodeID] = hit.rank
+			}
+			if termCount[hit.nodeID] == 0 {
+				termCount[hit.nodeID] = 1
+			}
+			exactHit[hit.nodeID] = true
+			if sourceRecall.ambiguous {
+				ambiguousExact[hit.nodeID] = true
+			} else {
+				uniqueExact[hit.nodeID] = true
+			}
+		}
+	}
 	if len(order) == 0 {
 		return nil
 	}
