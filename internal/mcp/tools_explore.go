@@ -969,6 +969,13 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	if exploreLocalizationExplicitAnchor(query, head.node) {
 		return true
 	}
+	// Quoted recall terms make a factual source claim. When the ranked head has
+	// no verified exact literal evidence, ordinary concept alignment must not
+	// turn that claim into a terminal answer. Explicit path/symbol/signature
+	// anchors and the unique/ambiguous exact paths above retain their behavior.
+	if len(exploreQuotedRecallTerms(task)) > 0 {
+		return false
+	}
 
 	// Ordinary non-literal concept localization needs one identifier-backed
 	// callable with a real body. Fields, enum variants, types, and signature-only
@@ -1628,7 +1635,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		ranked = limitExploreCandidates(ranked, fetch*2)
 		if content := s.gatherExploreQuotedContentCandidates(ctx, task, fetch, opts); len(content) > 0 {
 			ranked = mergeExploreCandidates(ranked, content, 0)
-			ranked = limitExploreCandidates(ranked, fetch*2)
+			ranked = limitExploreCandidatesPreservingSourceLiteral(ranked, fetch*2)
 		}
 		if pipeline := eng.Rerank(); pipeline != nil {
 			ranked = pipeline.Rerank(searchQuery, ranked, rctx)
@@ -2896,6 +2903,7 @@ const (
 	exploreContentRecallTermSignal      = "explore_content_terms"
 	exploreContentRecallExactSignal     = "explore_content_exact"
 	exploreContentRecallAmbiguousSignal = "explore_content_exact_ambiguous"
+	exploreSourceLiteralSignal          = "explore_source_literal"
 	exploreQuotedRecallMaxTerms         = 3
 	exploreQuotedRecallMaxPerTerm       = 12
 	exploreQuotedRecallRetryMaxRows     = 24
@@ -3040,6 +3048,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 	exactHit := make(map[string]bool, len(pages)*perTerm)
 	uniqueExact := make(map[string]bool, len(pages)*perTerm)
 	ambiguousExact := make(map[string]bool, len(pages)*perTerm)
+	sourceLiteralHit := make(map[string]float64)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -3090,6 +3099,13 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 				termCount[hit.nodeID] = 1
 			}
 			exactHit[hit.nodeID] = true
+			sourceRank := 1.0
+			if hit.rank > 0 {
+				sourceRank = 1 / float64(hit.rank+1)
+			}
+			if sourceRank > sourceLiteralHit[hit.nodeID] {
+				sourceLiteralHit[hit.nodeID] = sourceRank
+			}
 			if sourceRecall.ambiguous {
 				ambiguousExact[hit.nodeID] = true
 			} else {
@@ -3117,6 +3133,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 			if ambiguousExact[id] && !uniqueExact[id] {
 				signals[exploreContentRecallAmbiguousSignal] = 1
 			}
+		}
+		if sourceRank := sourceLiteralHit[id]; sourceRank > 0 {
+			signals[exploreSourceLiteralSignal] = sourceRank
 		}
 		candidates = append(candidates, &rerank.Candidate{
 			Node:       node,
@@ -3304,16 +3323,26 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 			}
 			// Request-local recall annotations survive dedup when a source-body
 			// hit names a symbol already present in the ordinary metadata channel.
-			for _, key := range []string{exploreContentRecallRankSignal, exploreContentRecallTermSignal, exploreContentRecallExactSignal, exploreContentRecallAmbiguousSignal} {
-				if clone.Signals == nil || clone.Signals[key] <= 0 {
+			signalsDetached := false
+			for _, key := range []string{
+				exploreContentRecallRankSignal,
+				exploreContentRecallTermSignal,
+				exploreContentRecallExactSignal,
+				exploreContentRecallAmbiguousSignal,
+				exploreSourceLiteralSignal,
+			} {
+				if clone.Signals == nil || clone.Signals[key] <= current.Signals[key] {
 					continue
 				}
-				if current.Signals == nil {
-					current.Signals = make(map[string]float64, 2)
+				if !signalsDetached {
+					copied := make(map[string]float64, len(current.Signals)+1)
+					for existingKey, value := range current.Signals {
+						copied[existingKey] = value
+					}
+					current.Signals = copied
+					signalsDetached = true
 				}
-				if clone.Signals[key] > current.Signals[key] {
-					current.Signals[key] = clone.Signals[key]
-				}
+				current.Signals[key] = clone.Signals[key]
 			}
 			return
 		}
@@ -3378,6 +3407,41 @@ func limitExploreCandidates(candidates []*rerank.Candidate, limit int) []*rerank
 		return rrf(bounded[i]) > rrf(bounded[j])
 	})
 	return bounded[:limit]
+}
+
+// limitExploreCandidatesPreservingSourceLiteral reserves one slot for the best
+// request-local raw-source literal hit after the ordinary retrieval union is
+// full. The reservation replaces the weakest bounded candidate; it never grows
+// the candidate set or performs another graph lookup.
+func limitExploreCandidatesPreservingSourceLiteral(candidates []*rerank.Candidate, limit int) []*rerank.Candidate {
+	bounded := limitExploreCandidates(candidates, limit)
+	if limit <= 0 || len(candidates) <= limit || len(bounded) == 0 {
+		return bounded
+	}
+
+	var best *rerank.Candidate
+	bestSignal := 0.0
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil || candidate.Signals == nil {
+			continue
+		}
+		if signal := candidate.Signals[exploreSourceLiteralSignal]; signal > bestSignal {
+			best = candidate
+			bestSignal = signal
+		}
+	}
+	if best == nil {
+		return bounded
+	}
+	for _, candidate := range bounded {
+		if candidate != nil && candidate.Node != nil && candidate.Node.ID == best.Node.ID {
+			return bounded
+		}
+	}
+
+	reserved := append([]*rerank.Candidate(nil), bounded...)
+	reserved[len(reserved)-1] = best
+	return reserved
 }
 
 // exploreConceptRecallTerms preserves the query's discriminative concepts in
