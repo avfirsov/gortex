@@ -932,9 +932,9 @@ func TestExploreLocalizationExactTargetPrefersRareTaskCoverage(t *testing.T) {
 }
 
 func TestExploreLocalizationExactTargetIsStableAndHonorsExplicitAnchor(t *testing.T) {
-	head := exploreTarget{node: &graph.Node{ID: "a.go::Alpha", Name: "Alpha", Kind: graph.KindFunction, FilePath: "a.go"}}
-	second := exploreTarget{node: &graph.Node{ID: "b.go::Beta", Name: "Beta", Kind: graph.KindFunction, FilePath: "b.go"}}
-	if got := exploreLocalizationExactTarget("alpha beta behavior", []exploreTarget{head, second}); got != head.node.ID {
+	head := exploreTarget{node: &graph.Node{ID: "a.go::Alpha", Name: "Alpha", Kind: graph.KindFunction, FilePath: "common.go"}}
+	second := exploreTarget{node: &graph.Node{ID: "b.go::Beta", Name: "Beta", Kind: graph.KindFunction, FilePath: "common.go"}}
+	if got := exploreLocalizationExactTarget("alpha beta common behavior", []exploreTarget{head, second}); got != head.node.ID {
 		t.Fatalf("equal evidence must retain retrieval order, got %q", got)
 	}
 	setter := exploreTarget{node: &graph.Node{

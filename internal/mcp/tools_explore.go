@@ -77,13 +77,14 @@ func (s *Server) registerExploreTool() {
 // exploreTarget is one ranked candidate plus its bounded neighborhood,
 // gathered before rendering so the renderer can honour the token budget.
 type exploreTarget struct {
-	node          *graph.Node
-	score         float64
-	callers       []*graph.Node
-	callees       []*graph.Node
-	causalCallees []exploreCausalNeighbor
-	source        string // full body (may be empty for non-source kinds)
-	exactContent  bool   // verified full quoted-literal hit from content_fts
+	node                  *graph.Node
+	score                 float64
+	callers               []*graph.Node
+	callees               []*graph.Node
+	causalCallees         []exploreCausalNeighbor
+	source                string // full body (may be empty for non-source kinds)
+	exactContent          bool   // verified full quoted-literal hit from content_fts
+	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 }
 
 type exploreCausalNeighbor struct {
@@ -864,19 +865,20 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		return false
 	}
 
-	matchedNode := func(node *graph.Node) int {
+	matchedNodeFor := func(node *graph.Node, terms map[string]struct{}) int {
 		if node == nil {
 			return 0
 		}
 		candidateTerms := exploreTerminalTerms(exploreTerminalNodeText(node))
 		count := 0
-		for term := range queryTerms {
+		for term := range terms {
 			if _, ok := candidateTerms[term]; ok {
 				count++
 			}
 		}
 		return count
 	}
+	matchedNode := func(node *graph.Node) int { return matchedNodeFor(node, queryTerms) }
 	head := targets[0]
 	headMatches := matchedNode(head.node)
 
@@ -886,10 +888,9 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	if class == rerank.QueryClassPath || class == rerank.QueryClassSymbol || class == rerank.QueryClassSignature {
 		return exploreLocalizationExplicitAnchor(query, head.node)
 	}
-	// A verified full quoted literal is direct implementation evidence. Prefix
-	// FTS matches never set this bit, so a nearby vocabulary collision cannot
-	// make a concept request terminal.
-	if head.exactContent {
+	// A unique verified full quoted literal is direct implementation evidence.
+	// Saturated pages and visible exact peers take the guarded path below.
+	if head.exactContent && !head.exactContentAmbiguous {
 		return true
 	}
 
@@ -907,6 +908,31 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		if structuralAligned {
 			break
 		}
+	}
+
+	if head.exactContent {
+		nonLiteralTerms := make(map[string]struct{}, len(queryTerms))
+		for term := range queryTerms {
+			nonLiteralTerms[term] = struct{}{}
+		}
+		for _, literal := range exploreQuotedRecallTerms(task) {
+			for term := range exploreTerminalTerms(literal) {
+				delete(nonLiteralTerms, term)
+			}
+		}
+		headEvidence := matchedNodeFor(head.node, nonLiteralTerms)
+		if headEvidence == 0 {
+			return false
+		}
+		for _, peer := range targets[1:] {
+			if peer.node == nil || !peer.exactContent || peer.node.ID == head.node.ID {
+				continue
+			}
+			if matchedNodeFor(peer.node, nonLiteralTerms) >= headEvidence {
+				return false
+			}
+		}
+		return headEvidence >= 2 || (headEvidence >= 1 && structuralAligned)
 	}
 
 	// Broad prompts require more evidence concentrated in the ranked head.
@@ -1105,7 +1131,7 @@ func exploreLocalizationExactTarget(task string, targets []exploreTarget) string
 	// neighborhood, in which case retrieval order remains the stable tie-breaker.
 	// Repeating one generic token (for example walk/walker/walking) still leaves
 	// frequency with one key and cannot turn retrieval order into exactness.
-	if class == rerank.QueryClassConcept && bestOverlap < 2 && len(frequency) < 2 {
+	if class == rerank.QueryClassConcept && bestOverlap < 2 {
 		return ""
 	}
 	return targets[best].node.ID
@@ -1355,6 +1381,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		t := exploreTarget{node: n, score: c.Score}
 		if c.Signals != nil {
 			t.exactContent = c.Signals[exploreContentRecallExactSignal] > 0
+			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
 		if callers := eng.GetCallers(n.ID, ringOpts); callers != nil {
@@ -2492,11 +2519,13 @@ func inlineLeadClause(task string) string {
 }
 
 const (
-	exploreContentRecallRankSignal  = "explore_content_rank"
-	exploreContentRecallTermSignal  = "explore_content_terms"
-	exploreContentRecallExactSignal = "explore_content_exact"
-	exploreQuotedRecallMaxTerms     = 3
-	exploreQuotedRecallMaxPerTerm   = 12
+	exploreContentRecallRankSignal      = "explore_content_rank"
+	exploreContentRecallTermSignal      = "explore_content_terms"
+	exploreContentRecallExactSignal     = "explore_content_exact"
+	exploreContentRecallAmbiguousSignal = "explore_content_exact_ambiguous"
+	exploreQuotedRecallMaxTerms         = 3
+	exploreQuotedRecallMaxPerTerm       = 12
+	exploreQuotedRecallRetryMaxRows     = 24
 )
 
 // exploreQuotedRecallTerms extracts only explicit, high-signal literal anchors
@@ -2550,8 +2579,8 @@ func exploreQuotedRecallTerms(task string) []string {
 	return out
 }
 
-// gatherExploreQuotedContentCandidates performs at most three bounded indexed
-// point searches. It never scans source files and never materializes bodies:
+// gatherExploreQuotedContentCandidates performs at most four bounded indexed
+// point searches: three literals plus one adaptive retry. It never scans source files:
 // content_fts returns symbol IDs, then one batched graph lookup supplies nodes.
 func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task string, limit int, scope query.QueryOptions) []*rerank.Candidate {
 	if s == nil || s.graph == nil || ctx.Err() != nil {
@@ -2578,10 +2607,12 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 		repoPrefix, _ = s.sessionLocality(ctx)
 	}
 
-	order := make([]string, 0, len(terms)*perTerm)
-	bestRank := make(map[string]int, len(terms)*perTerm)
-	termCount := make(map[string]int, len(terms)*perTerm)
-	exactHit := make(map[string]bool, len(terms)*perTerm)
+	type recallPage struct {
+		term      string
+		hits      []graph.ContentHit
+		saturated bool
+	}
+	pages := make([]recallPage, 0, len(terms))
 	for _, term := range terms {
 		if ctx.Err() != nil {
 			break
@@ -2590,8 +2621,55 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 		if err != nil {
 			continue
 		}
-		seenForTerm := make(map[string]struct{}, len(hits))
-		for rank, hit := range hits {
+		pages = append(pages, recallPage{term: term, hits: hits, saturated: len(hits) >= perTerm})
+	}
+
+	// A short or collision-heavy literal can fill the first page before its
+	// exact body appears. Retry one saturated page globally, prioritizing a page
+	// with no visible exact peer and then shorter terms. Replacing (not merging)
+	// the page keeps each term's evidence count idempotent.
+	retry := -1
+	retryPriority := -1
+	for i := range pages {
+		if !pages[i].saturated {
+			continue
+		}
+		exactIDs := make(map[string]struct{})
+		for _, hit := range pages[i].hits {
+			if hit.NodeID != "" && exploreTextHasExactLiteral(hit.Snippet, pages[i].term) {
+				exactIDs[hit.NodeID] = struct{}{}
+			}
+		}
+		priority := 0
+		if len(exactIDs) == 0 {
+			priority += 4
+		} else if len(exactIDs) > 1 {
+			priority++
+		}
+		if len([]rune(pages[i].term)) <= 3 {
+			priority += 2
+		}
+		if priority > retryPriority {
+			retry, retryPriority = i, priority
+		}
+	}
+	if retry >= 0 && ctx.Err() == nil {
+		if hits, err := content.SearchContent(pages[retry].term, repoPrefix, exploreQuotedRecallRetryMaxRows); err == nil {
+			pages[retry].hits = hits
+			pages[retry].saturated = len(hits) >= exploreQuotedRecallRetryMaxRows
+		}
+	}
+
+	order := make([]string, 0, len(pages)*perTerm)
+	bestRank := make(map[string]int, len(pages)*perTerm)
+	termCount := make(map[string]int, len(pages)*perTerm)
+	exactHit := make(map[string]bool, len(pages)*perTerm)
+	uniqueExact := make(map[string]bool, len(pages)*perTerm)
+	ambiguousExact := make(map[string]bool, len(pages)*perTerm)
+	for _, page := range pages {
+		seenForTerm := make(map[string]struct{}, len(page.hits))
+		exactIDs := make(map[string]struct{})
+		for rank, hit := range page.hits {
 			if hit.NodeID == "" {
 				continue
 			}
@@ -2606,8 +2684,17 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 				bestRank[hit.NodeID] = rank
 			}
 			termCount[hit.NodeID]++
-			if exploreTextHasExactLiteral(hit.Snippet, term) {
-				exactHit[hit.NodeID] = true
+			if exploreTextHasExactLiteral(hit.Snippet, page.term) {
+				exactIDs[hit.NodeID] = struct{}{}
+			}
+		}
+		ambiguous := page.saturated || len(exactIDs) > 1
+		for id := range exactIDs {
+			exactHit[id] = true
+			if ambiguous {
+				ambiguousExact[id] = true
+			} else {
+				uniqueExact[id] = true
 			}
 		}
 	}
@@ -2628,6 +2715,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(ctx context.Context, task 
 		}
 		if exactHit[id] {
 			signals[exploreContentRecallExactSignal] = 1
+			if ambiguousExact[id] && !uniqueExact[id] {
+				signals[exploreContentRecallAmbiguousSignal] = 1
+			}
 		}
 		candidates = append(candidates, &rerank.Candidate{
 			Node:       node,
@@ -2653,11 +2743,12 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		return candidates
 	}
 	type evidence struct {
-		explicit     bool
-		exactContent bool
-		overlap      int
-		contentTerms float64
-		contentRank  float64
+		explicit       bool
+		exactContent   bool
+		ambiguousExact bool
+		overlap        int
+		contentTerms   float64
+		contentRank    float64
 	}
 	metrics := make(map[*rerank.Candidate]evidence, len(candidates))
 	for _, candidate := range candidates {
@@ -2689,6 +2780,7 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 			metric.contentTerms = candidate.Signals[exploreContentRecallTermSignal]
 			metric.contentRank = candidate.Signals[exploreContentRecallRankSignal]
 			metric.exactContent = candidate.Signals[exploreContentRecallExactSignal] > 0
+			metric.ambiguousExact = candidate.Signals[exploreContentRecallAmbiguousSignal] > 0
 		}
 		metrics[candidate] = metric
 	}
@@ -2706,20 +2798,42 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 	}
 	priorityTier := func(candidate *rerank.Candidate) int {
 		metric := metrics[candidate]
-		if metric.explicit {
+		switch {
+		case metric.explicit:
+			return 3
+		case metric.exactContent && !metric.ambiguousExact:
 			return 2
-		}
-		if metric.exactContent {
+		case metric.exactContent:
 			return 1
+		default:
+			return 0
 		}
-		return 0
 	}
 	// Explicit anchors and verified full quoted literals may cross semantic
-	// candidates. All other coverage evidence only reorders lexical-only slots,
-	// preserving both the positions and relative order learned by the vector
-	// pipeline.
+	// candidates. Unique exact evidence leads ambiguous pages; ambiguous exact
+	// peers use task coverage before content-channel rank. All other evidence
+	// only reorders lexical-only slots, preserving vector ordering.
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return priorityTier(candidates[i]) > priorityTier(candidates[j])
+		a, b := candidates[i], candidates[j]
+		at, bt := priorityTier(a), priorityTier(b)
+		if at != bt {
+			return at > bt
+		}
+		if at != 1 {
+			return false
+		}
+		am, bm := metrics[a], metrics[b]
+		ac, bc := coverageTier(am.overlap), coverageTier(bm.overlap)
+		if ac != bc {
+			return ac > bc
+		}
+		if am.overlap != bm.overlap {
+			return am.overlap > bm.overlap
+		}
+		if am.contentTerms != bm.contentTerms {
+			return am.contentTerms > bm.contentTerms
+		}
+		return am.contentRank > bm.contentRank
 	})
 	priorityEnd := 0
 	for priorityEnd < len(candidates) && priorityTier(candidates[priorityEnd]) > 0 {
@@ -2791,7 +2905,7 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 			}
 			// Request-local recall annotations survive dedup when a source-body
 			// hit names a symbol already present in the ordinary metadata channel.
-			for _, key := range []string{exploreContentRecallRankSignal, exploreContentRecallTermSignal, exploreContentRecallExactSignal} {
+			for _, key := range []string{exploreContentRecallRankSignal, exploreContentRecallTermSignal, exploreContentRecallExactSignal, exploreContentRecallAmbiguousSignal} {
 				if clone.Signals == nil || clone.Signals[key] <= 0 {
 					continue
 				}
