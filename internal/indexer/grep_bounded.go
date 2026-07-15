@@ -42,6 +42,48 @@ func (idx *Indexer) GrepTextBounded(
 	return matches, stats.Incomplete
 }
 
+// GrepLiteralBounded is the localization-specific variant. It filters out
+// substring-only occurrences, prioritizes production files, and retains at
+// most one representative per file so a test-heavy path prefix cannot consume
+// the global recall budget.
+func (idx *Indexer) GrepLiteralBounded(
+	ctx context.Context,
+	query string,
+	limit int,
+	maxFiles int,
+) ([]trigram.Match, bool) {
+	if idx == nil || query == "" {
+		return nil, false
+	}
+	gen := idx.indexGen.Load()
+	idx.trigramMu.Lock()
+	searcher := idx.trigramSearcher
+	warm := searcher != nil && idx.trigramGen == gen
+	idx.trigramMu.Unlock()
+	if warm {
+		matches, stats := searcher.GrepLiteralBounded(
+			ctx, query, limit, maxFiles, isProductionSourcePath,
+		)
+		return matches, stats.Incomplete
+	}
+
+	idx.mtimeMu.RLock()
+	paths := make([]string, 0, len(idx.fileMtimes))
+	for rel := range idx.fileMtimes {
+		paths = append(paths, rel)
+	}
+	idx.mtimeMu.RUnlock()
+	sort.Strings(paths)
+	matches, stats := trigram.GrepLiteralPathsBounded(
+		ctx, idx.rootPath, paths, query, limit, maxFiles, isProductionSourcePath,
+	)
+	return matches, stats.Incomplete
+}
+
+func isProductionSourcePath(path string) bool {
+	return !IsTestFile(path)
+}
+
 // GrepTextForRepoBounded is the single-repository MultiIndexer bridge. It
 // intentionally cannot fan out: source-literal localization must remain bound
 // to the active repository even when the daemon tracks many repositories.
@@ -60,5 +102,25 @@ func (mi *MultiIndexer) GrepTextForRepoBounded(
 		return nil, false
 	}
 	matches, incomplete := idx.GrepTextBounded(ctx, query, limit, maxFiles)
+	return stampGrepMatchPaths(repoPrefix, matches), incomplete
+}
+
+// GrepLiteralForRepoBounded is the single-repository bridge for the
+// localization-specific literal policy.
+func (mi *MultiIndexer) GrepLiteralForRepoBounded(
+	ctx context.Context,
+	repoPrefix string,
+	query string,
+	limit int,
+	maxFiles int,
+) ([]trigram.Match, bool) {
+	if mi == nil || repoPrefix == "" {
+		return nil, false
+	}
+	idx := mi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return nil, false
+	}
+	matches, incomplete := idx.GrepLiteralBounded(ctx, query, limit, maxFiles)
 	return stampGrepMatchPaths(repoPrefix, matches), incomplete
 }

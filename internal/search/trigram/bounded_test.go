@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -71,6 +72,67 @@ func TestGrepBoundedUsesWarmTrigramCandidates(t *testing.T) {
 	require.Equal(t, 1, stats.CandidateFiles)
 	require.Equal(t, 1, stats.ScannedFiles)
 	require.False(t, stats.Incomplete)
+}
+
+func TestGrepLiteralPathsBoundedSkipsSubstringNoiseAndDeduplicatesFiles(t *testing.T) {
+	root, paths := boundedSearchFixture(t, 3, func(i int) string {
+		switch i {
+		case 0:
+			return strings.Repeat("skuValue = 1;\n", 32) +
+				"Register(\"ku\");\nRegister(\"ku\");\n"
+		case 1:
+			return strings.Repeat("kurdish_sku = 1;\n", 32)
+		default:
+			return "Register(\"ku\");\n"
+		}
+	})
+
+	matches, stats := GrepLiteralPathsBounded(
+		context.Background(), root, paths, "ku", 24, 3, nil,
+	)
+
+	require.Len(t, matches, 2)
+	require.Equal(t, paths[0], matches[0].Path)
+	require.Equal(t, paths[2], matches[1].Path)
+	require.NotContains(t, matches[0].Text, "sku")
+	require.False(t, stats.Incomplete)
+}
+
+func TestGrepLiteralBoundedWarmSkipsSubstringNoise(t *testing.T) {
+	root, paths := boundedSearchFixture(t, 32, func(i int) string {
+		if i == 31 {
+			return "Register(\"ku\");\n"
+		}
+		return strings.Repeat("skuValue = 1;\n", 8)
+	})
+	searcher := Build(root, paths)
+
+	matches, stats := searcher.GrepLiteralBounded(
+		context.Background(), "ku", 24, 32, nil,
+	)
+
+	require.Len(t, matches, 1)
+	require.Equal(t, paths[31], matches[0].Path)
+	require.False(t, stats.Incomplete)
+}
+
+func BenchmarkGrepLiteralPathsBoundedShortLiteralNoise(b *testing.B) {
+	root, paths := boundedSearchFixture(b, 512, func(i int) string {
+		if i == 511 {
+			return strings.Repeat("skuValue = 1;\n", 8) + "Register(\"ku\");\n"
+		}
+		return strings.Repeat("skuValue = 1;\n", 8)
+	})
+	ctx := context.Background()
+	matches, stats := GrepLiteralPathsBounded(ctx, root, paths, "ku", 24, 512, nil)
+	require.Len(b, matches, 1)
+	require.False(b, stats.Incomplete)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		GrepLiteralPathsBounded(ctx, root, paths, "ku", 24, 512, nil)
+	}
 }
 
 func BenchmarkGrepPathsBoundedShortLiteralMiss(b *testing.B) {

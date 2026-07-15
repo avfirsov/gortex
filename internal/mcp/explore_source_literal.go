@@ -140,14 +140,14 @@ func (s *Server) searchExploreSourceLiteral(
 		if repoPrefix == "" {
 			return nil, false
 		}
-		return s.multiIndexer.GrepTextForRepoBounded(
+		return s.multiIndexer.GrepLiteralForRepoBounded(
 			ctx, repoPrefix, term,
 			exploreSourceLiteralRecallMaxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
 	}
 	if s.indexer != nil {
-		return s.indexer.GrepTextBounded(
+		return s.indexer.GrepLiteralBounded(
 			ctx, term,
 			exploreSourceLiteralRecallMaxHits,
 			exploreSourceLiteralRecallMaxFiles,
