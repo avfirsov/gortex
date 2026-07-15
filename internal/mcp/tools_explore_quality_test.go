@@ -238,11 +238,18 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 
 	require.False(t, result.IsError, text)
 	require.Contains(t, text, `"state":"needs_refinement"`)
-	require.Contains(t, text, `"required_action":"refine_from_candidates"`)
+	require.Contains(t, text, `"required_action":"read_one_candidate"`)
 	require.Contains(t, text, `"allowed_tool_calls":1`)
 	require.Contains(t, text, `"evidence":[{`)
 	require.NotContains(t, text, "localization confidence is insufficient")
-	require.Nil(t, server.localization.block("search", "symbols", map[string]any{"query": "locale formatter"}))
+	terminal := server.localizationFor(context.Background())
+	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "locale formatter"}))
+	candidateRead := map[string]any{"target": map[string]any{"symbol": "demo/registry.go::registerFormats"}}
+	blocked, reserved := terminal.authorize("read", "source", candidateRead)
+	require.Nil(t, blocked)
+	require.True(t, reserved)
+	terminal.finishReservedRead(true)
+	require.NotNil(t, terminal.block("search", "symbols", map[string]any{"query": "another search"}))
 }
 
 func TestHandleExploreLocalizeAcceptsVerifiedLiteralAndExplicitSymbol(t *testing.T) {

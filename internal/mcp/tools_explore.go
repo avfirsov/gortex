@@ -1446,7 +1446,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// exploration, multiplying turns and payloads. Keep the session open and
 		// direct at most one refinement call at the evidence already returned.
 		completion := newLocalizationRefinementCompletion()
-		s.localizationFor(ctx).keepOpenForTask(task)
+		candidateSymbols := make([]string, 0, len(targets))
+		for _, target := range targets {
+			if target.node != nil {
+				candidateSymbols = append(candidateSymbols, target.node.ID)
+			}
+		}
+		s.localizationFor(ctx).armRefinementForTask(task, candidateSymbols)
 		return newLocalizationExploreResultForTask(completion, task, targets, budget), nil
 	}
 	completion := newLocalizationCompletion(answerReady, exactSymbol)

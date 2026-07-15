@@ -183,6 +183,39 @@ func TestLocalizationNeedsExactlyOneRead(t *testing.T) {
 	}
 }
 
+func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
+	state := newLocalizationTerminalState()
+	candidate := "repo/pkg/file.go::Resolver.Run"
+	state.armRefinementForTask("locate resolver behavior", []string{candidate, "repo/pkg/other.go::Other"})
+
+	wrong := map[string]any{"target": map[string]any{"symbol": "repo/pkg/wrong.go::Wrong"}}
+	if blocked, reserved := state.authorize("read", "source", wrong); blocked == nil || reserved {
+		t.Fatalf("unreturned refinement target was admitted: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	if blocked, reserved := state.authorize("search", "text", map[string]any{"query": "Run"}); blocked == nil || reserved {
+		t.Fatalf("broad refinement search was admitted: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	if blocked, reserved := state.authorize("change", "impact", nil); blocked != nil || reserved {
+		t.Fatalf("non-navigation tool was blocked: blocked=%#v reserved=%v", blocked, reserved)
+	}
+
+	read := map[string]any{"target": map[string]any{"symbol": candidate}}
+	if blocked, reserved := state.authorize("read", "source", read); blocked != nil || !reserved {
+		t.Fatalf("candidate refinement read was not reserved: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	if blocked, reserved := state.authorize("read", "source", read); blocked == nil || reserved {
+		t.Fatalf("concurrent refinement read was admitted: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	state.finishReservedRead(false)
+	if blocked, reserved := state.authorize("read", "source", read); blocked != nil || !reserved {
+		t.Fatalf("failed refinement did not restore allowance: blocked=%#v reserved=%v", blocked, reserved)
+	}
+	state.finishReservedRead(true)
+	if blocked, reserved := state.authorize("read", "source", read); blocked == nil || reserved {
+		t.Fatalf("second successful refinement read was admitted: blocked=%#v reserved=%v", blocked, reserved)
+	}
+}
+
 func TestLocalizationTerminalStateIsPerSession(t *testing.T) {
 	server := &Server{
 		localization: newLocalizationTerminalState(),

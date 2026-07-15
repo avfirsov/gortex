@@ -13,6 +13,7 @@ const (
 	localizationStateInactive          = ""
 	localizationStateNeedsExactRead    = "needs_exact_read"
 	localizationStateNeedsRefinement   = "needs_refinement"
+	localizationStateRefineInFlight    = "refinement_in_flight"
 	localizationStateExactReadInFlight = "exact_read_in_flight"
 	localizationStateAnswerReady       = "answer_ready"
 )
@@ -27,6 +28,11 @@ type localizationCompletion struct {
 	RequiredAction   string `json:"required_action"`
 	AllowedToolCalls int    `json:"allowed_tool_calls"`
 	ExactSymbol      string `json:"exact_symbol,omitempty"`
+
+	// refinementSymbols is session-only authorization state. Candidate IDs are
+	// already present once in the envelope's symbols field, so they are not
+	// serialized again in the completion payload.
+	refinementSymbols []string
 }
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
@@ -48,14 +54,14 @@ func newLocalizationCompletion(answerReady bool, exactSymbol string) localizatio
 }
 
 // newLocalizationRefinementCompletion keeps uncertain localization successful
-// and bounded. The ranked evidence remains usable, while the host is directed
-// to spend at most one follow-up on those candidates instead of restarting a
+// and bounded. The ranked evidence remains usable, while the server permits
+// exactly one source read of a returned candidate instead of allowing another
 // broad exploration loop.
 func newLocalizationRefinementCompletion() localizationCompletion {
 	return localizationCompletion{
 		State:            localizationStateNeedsRefinement,
 		Scope:            "localization",
-		RequiredAction:   "refine_from_candidates",
+		RequiredAction:   "read_one_candidate",
 		AllowedToolCalls: 1,
 	}
 }
@@ -64,13 +70,14 @@ func newLocalizationRefinementCompletion() localizationCompletion {
 // mutation, analysis, workspace, or memory tools; it only prevents an agent
 // from reopening localization after an explicit localization-only request.
 type localizationTerminalState struct {
-	mu              sync.Mutex
-	state           string
-	exactSymbol     string
-	taskFingerprint string
-	generation      uint64
-	nextReservation uint64
-	reservation     *localizationReservation
+	mu                sync.Mutex
+	state             string
+	exactSymbol       string
+	refinementSymbols []string
+	taskFingerprint   string
+	generation        uint64
+	nextReservation   uint64
+	reservation       *localizationReservation
 }
 
 type localizationReservation struct {
@@ -93,6 +100,7 @@ func (s *localizationTerminalState) reset() {
 	s.generation++
 	s.state = localizationStateInactive
 	s.exactSymbol = ""
+	s.refinementSymbols = nil
 	s.taskFingerprint = ""
 	// Keep an in-flight reservation until its owner finishes. Its captured
 	// generation is now stale, so finishLocalize cannot commit it, while a
@@ -128,11 +136,68 @@ func (s *localizationTerminalState) keepOpenForTask(task string) {
 	s.armForTask(localizationCompletion{State: localizationStateInactive}, task)
 }
 
+func (s *localizationTerminalState) armRefinementForTask(task string, symbols []string) {
+	completion := newLocalizationRefinementCompletion()
+	seen := make(map[string]struct{}, min(len(symbols), 12))
+	completion.refinementSymbols = make([]string, 0, min(len(symbols), 12))
+	for _, symbol := range symbols {
+		symbol = strings.TrimSpace(symbol)
+		if symbol == "" {
+			continue
+		}
+		if _, duplicate := seen[symbol]; duplicate {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		completion.refinementSymbols = append(completion.refinementSymbols, symbol)
+		if len(completion.refinementSymbols) == 12 {
+			break
+		}
+	}
+	if len(completion.refinementSymbols) == 0 {
+		s.keepOpenForTask(task)
+		return
+	}
+	s.armForTask(completion, task)
+}
+
 func (s *localizationTerminalState) commitLocalizationLocked(completion localizationCompletion, fingerprint string) {
 	s.generation++
 	s.state = completion.State
 	s.exactSymbol = completion.ExactSymbol
+	s.refinementSymbols = nil
+	if completion.State == localizationStateNeedsRefinement {
+		s.refinementSymbols = append([]string(nil), completion.refinementSymbols...)
+	}
 	s.taskFingerprint = fingerprint
+}
+
+func (s *localizationTerminalState) completionLocked() localizationCompletion {
+	switch s.state {
+	case localizationStateNeedsRefinement, localizationStateRefineInFlight:
+		completion := newLocalizationRefinementCompletion()
+		if s.state == localizationStateRefineInFlight {
+			completion.State = localizationStateRefineInFlight
+			completion.AllowedToolCalls = 0
+		}
+		return completion
+	case localizationStateNeedsExactRead, localizationStateExactReadInFlight:
+		return newLocalizationCompletion(false, s.exactSymbol)
+	default:
+		return newLocalizationCompletion(true, "")
+	}
+}
+
+func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
+	if symbol == "" {
+		return false
+	}
+	for _, candidate := range s.refinementSymbols {
+		if symbol == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // beginLocalize reserves the only localization handler slot for this session.
@@ -154,7 +219,7 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 		return 0, localizationInProgressResult()
 	}
 	if s.state != localizationStateInactive && !newUserTask {
-		completion := newLocalizationCompletion(s.state == localizationStateAnswerReady, s.exactSymbol)
+		completion := s.completionLocked()
 		return 0, NewStructuredErrorResult(StructuredError{
 			ErrorCode: ErrCodeLocalizationComplete,
 			Message:   "this user request already has a localization completion contract; follow it instead of starting another localize call",
@@ -214,9 +279,10 @@ func localizationTaskFingerprint(task string) string {
 	return strings.Join(strings.Fields(task), " ")
 }
 
-// authorize checks a navigation call and reserves the one exact-read slot when
-// applicable. The caller must finish the reservation after invocation so a
-// failed read restores the allowance instead of silently consuming it.
+// authorize checks a navigation call and reserves the single permitted
+// localization read when applicable. The caller must finish the reservation
+// after invocation so a failed read restores the allowance instead of silently
+// consuming it.
 func (s *localizationTerminalState) authorize(facade, operation string, arguments map[string]any) (*mcpgo.CallToolResult, bool) {
 	if s == nil || !localizationNavigationFacade(facade) {
 		return nil, false
@@ -234,15 +300,22 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 		s.state = localizationStateExactReadInFlight
 		return nil, true
 	}
+	if s.state == localizationStateNeedsRefinement && facade == "read" && operation == "source" && s.refinementAllowsLocked(exactLocalizationSymbol(arguments)) {
+		s.state = localizationStateRefineInFlight
+		return nil, true
+	}
 
-	answerReady := s.state == localizationStateAnswerReady
-	completion := newLocalizationCompletion(answerReady, s.exactSymbol)
+	completion := s.completionLocked()
 	message := "localization is complete; return the existing evidence without another Gortex navigation call"
 	switch s.state {
 	case localizationStateNeedsExactRead:
 		message = fmt.Sprintf("localization needs exactly one read(operation:\"source\") for %q; other navigation calls are blocked", s.exactSymbol)
 	case localizationStateExactReadInFlight:
 		message = "the permitted exact localization read is already in progress"
+	case localizationStateNeedsRefinement:
+		message = "localization permits exactly one read(operation:\"source\") of a returned candidate symbol; other navigation calls are blocked"
+	case localizationStateRefineInFlight:
+		message = "the permitted localization refinement read is already in progress"
 	}
 	return NewStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeLocalizationComplete,
@@ -255,21 +328,28 @@ func (s *localizationTerminalState) authorize(facade, operation string, argument
 	}), false
 }
 
-func (s *localizationTerminalState) finishExactRead(success bool) {
+func (s *localizationTerminalState) finishReservedRead(success bool) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != localizationStateExactReadInFlight {
-		return
+	switch s.state {
+	case localizationStateExactReadInFlight:
+		if success {
+			s.state = localizationStateAnswerReady
+			s.exactSymbol = ""
+			return
+		}
+		s.state = localizationStateNeedsExactRead
+	case localizationStateRefineInFlight:
+		if success {
+			s.state = localizationStateAnswerReady
+			s.refinementSymbols = nil
+			return
+		}
+		s.state = localizationStateNeedsRefinement
 	}
-	if success {
-		s.state = localizationStateAnswerReady
-		s.exactSymbol = ""
-		return
-	}
-	s.state = localizationStateNeedsExactRead
 }
 
 // block is retained for direct state checks; production dispatch uses

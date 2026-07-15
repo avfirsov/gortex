@@ -354,11 +354,11 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			return blocked, nil
 		}
 	}
-	exactReadReserved := false
-	exactReadSucceeded := false
+	localizationReadReserved := false
+	localizationReadSucceeded := false
 	defer func() {
-		if exactReadReserved {
-			terminal.finishExactRead(exactReadSucceeded)
+		if localizationReadReserved {
+			terminal.finishReservedRead(localizationReadSucceeded)
 		}
 		if localizeReservation != 0 && !localizeFinished {
 			// Errors and panics roll back to the previous completion contract.
@@ -371,12 +371,12 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
 		}
-		exactReadReserved = reserved
+		localizationReadReserved = reserved
 	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
-	if exactReadReserved {
-		exactReadSucceeded = succeeded
+	if localizationReadReserved {
+		localizationReadSucceeded = succeeded
 	}
 	if freshLocalizeFlow {
 		terminal.finishLocalize(localizeReservation, succeeded)
