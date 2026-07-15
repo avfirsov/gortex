@@ -106,32 +106,34 @@ func (mi *MultiIndexer) GrepTextForRepoBounded(
 }
 
 // GrepLiteralForRepoBounded is the single-repository bridge for the
-// localization-specific literal policy.
+// localization-specific literal policy. The third result reports ownership,
+// separating an owned zero-match result from an unresolved repository.
 func (mi *MultiIndexer) GrepLiteralForRepoBounded(
 	ctx context.Context,
 	repoPrefix string,
 	query string,
 	limit int,
 	maxFiles int,
-) ([]trigram.Match, bool) {
+) ([]trigram.Match, bool, bool) {
 	if mi == nil {
-		return nil, false
+		return nil, false, false
 	}
 	idx := mi.GetIndexer(repoPrefix)
 	if repoPrefix == "" {
-		idx = mi.soleUnprefixedIndexer()
+		idx = mi.soleIndexer()
 	}
 	if idx == nil {
-		return nil, false
+		return nil, false, false
 	}
 	matches, incomplete := idx.GrepLiteralBounded(ctx, query, limit, maxFiles)
-	return stampGrepMatchPaths(repoPrefix, matches), incomplete
+	return stampGrepMatchPaths(repoPrefix, matches), incomplete, true
 }
 
-// soleUnprefixedIndexer returns the empty-prefix indexer only when it is the
-// MultiIndexer's entire repository set. This makes isolated single-repository
-// sessions usable without turning an empty prefix into a multi-repo fan-out.
-func (mi *MultiIndexer) soleUnprefixedIndexer() *Indexer {
+// soleIndexer returns the only registered indexer, regardless of its registry
+// key. A graph may use unprefixed file paths even when the repository is stored
+// under a canonical name; cardinality, rather than the key spelling, makes an
+// empty graph prefix unambiguous.
+func (mi *MultiIndexer) soleIndexer() *Indexer {
 	if mi == nil {
 		return nil
 	}
@@ -140,5 +142,8 @@ func (mi *MultiIndexer) soleUnprefixedIndexer() *Indexer {
 	if len(mi.indexers) != 1 {
 		return nil
 	}
-	return mi.indexers[""]
+	for _, idx := range mi.indexers {
+		return idx
+	}
+	return nil
 }

@@ -56,31 +56,37 @@ func TestGrepLiteralForRepoBoundedStampsPaths(t *testing.T) {
 	idx := &Indexer{rootPath: root, fileMtimes: map[string]int64{rel: 1}}
 	multi := &MultiIndexer{indexers: map[string]*Indexer{"humanizer": idx}}
 
-	matches, incomplete := multi.GrepLiteralForRepoBounded(
+	matches, incomplete, owned := multi.GrepLiteralForRepoBounded(
 		context.Background(), "humanizer", "ku", 24, 8,
 	)
 
 	require.Len(t, matches, 1)
 	require.Equal(t, "humanizer/"+rel, matches[0].Path)
 	require.False(t, incomplete)
+	require.True(t, owned)
 }
 
-func TestGrepLiteralForRepoBoundedUsesSoleUnprefixedIndexer(t *testing.T) {
-	root := t.TempDir()
-	rel := "src/FormatterRegistry.cs"
-	path := filepath.Join(root, filepath.FromSlash(rel))
-	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
-	idx := &Indexer{rootPath: root, fileMtimes: map[string]int64{rel: 1}}
-	multi := &MultiIndexer{indexers: map[string]*Indexer{"": idx}}
+func TestGrepLiteralForRepoBoundedUsesSoleIndexerForUnprefixedGraph(t *testing.T) {
+	for _, registryKey := range []string{"", "humanizer"} {
+		t.Run(registryKey, func(t *testing.T) {
+			root := t.TempDir()
+			rel := "src/FormatterRegistry.cs"
+			path := filepath.Join(root, filepath.FromSlash(rel))
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
+			idx := &Indexer{rootPath: root, fileMtimes: map[string]int64{rel: 1}}
+			multi := &MultiIndexer{indexers: map[string]*Indexer{registryKey: idx}}
 
-	matches, incomplete := multi.GrepLiteralForRepoBounded(
-		context.Background(), "", "ku", 24, 8,
-	)
+			matches, incomplete, owned := multi.GrepLiteralForRepoBounded(
+				context.Background(), "", "ku", 24, 8,
+			)
 
-	require.Len(t, matches, 1)
-	require.Equal(t, rel, matches[0].Path, "empty-prefix matches must remain unstamped")
-	require.False(t, incomplete)
+			require.Len(t, matches, 1)
+			require.Equal(t, rel, matches[0].Path, "empty-prefix matches must remain unstamped")
+			require.False(t, incomplete)
+			require.True(t, owned)
+		})
+	}
 }
 
 func TestGrepLiteralForRepoBoundedRejectsEmptyPrefixWithMultipleIndexers(t *testing.T) {
@@ -95,12 +101,13 @@ func TestGrepLiteralForRepoBoundedRejectsEmptyPrefixWithMultipleIndexers(t *test
 		"other": {rootPath: t.TempDir(), fileMtimes: map[string]int64{}},
 	}}
 
-	matches, incomplete := multi.GrepLiteralForRepoBounded(
+	matches, incomplete, owned := multi.GrepLiteralForRepoBounded(
 		context.Background(), "", "ku", 24, 8,
 	)
 
 	require.Empty(t, matches)
 	require.False(t, incomplete)
+	require.False(t, owned)
 }
 
 func TestGrepLiteralBoundedPrioritizesProductionAndDiversifiesFiles(t *testing.T) {

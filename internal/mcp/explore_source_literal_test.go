@@ -182,6 +182,32 @@ func TestGatherExploreQuotedContentCandidatesMergesSourceLiteralWithExactContent
 	require.NotNil(t, candidateByID(candidates, constructor.ID), "an exact non-source content hit must not suppress bounded source recall")
 }
 
+func TestSearchExploreSourceLiteralFallsBackWhenMultiIndexerDoesNotOwnRepo(t *testing.T) {
+	root := t.TempDir()
+	rel := "src/FormatterRegistry.cs"
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("Register(\"ku\")\n"), 0o644))
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	idx := indexer.New(store, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	idx.SetFileMtimes(map[string]int64{rel: 1})
+	multi := indexer.NewMultiIndexer(store, parser.NewRegistry(), nil, nil, zap.NewNop())
+	server := &Server{graph: store, indexer: idx, multiIndexer: multi}
+
+	matches, incomplete := server.searchExploreSourceLiteral(
+		context.Background(), "ku", "", query.QueryOptions{},
+	)
+
+	require.Len(t, matches, 1)
+	require.Equal(t, rel, matches[0].Path)
+	require.False(t, incomplete)
+}
+
 func BenchmarkMapExploreSourceLiteralMatches(b *testing.B) {
 	path := "demo/src/FormatterRegistry.cs"
 	nodes := []*graph.Node{

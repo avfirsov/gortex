@@ -182,11 +182,14 @@ func (s *Server) searchExploreSourceLiteral(
 				haveScopedPrefix = true
 			}
 		}
-		return s.multiIndexer.GrepLiteralForRepoBounded(
+		matches, incomplete, owned := s.multiIndexer.GrepLiteralForRepoBounded(
 			ctx, repoPrefix, term,
 			exploreSourceLiteralRecallMaxHits,
 			exploreSourceLiteralRecallMaxFiles,
 		)
+		if owned {
+			return matches, incomplete
+		}
 	}
 	if s.indexer != nil {
 		return s.indexer.GrepLiteralBounded(
