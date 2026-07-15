@@ -1161,6 +1161,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if task == "" {
 		return mcp.NewToolResultError("task is required"), nil
 	}
+	// Classify artifact intent from the untouched task. Query shaping below is
+	// intentionally optimized for source symbols and may discard the exact
+	// paths, keys, flags, and environment names needed by config/CI searches.
+	artifactIntent := classifyExploreArtifactIntent(task)
 	maxSymbols := clampInt(req.GetInt("max_symbols", exploreDefaultMaxSymbols), 1, exploreMaxMaxSymbols)
 	budget := clampInt(req.GetInt("token_budget", exploreDefaultBudgetTokens), exploreMinBudgetTokens, exploreMaxBudgetTokens)
 
@@ -1177,6 +1181,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		ProjectID:   resolved.ProjectID,
 		RepoAllow:   resolved.RepoAllow,
 	}
+	// The lane is a strict no-op for ordinary code tasks. Active artifact
+	// requests reuse existing file nodes and content FTS under fixed fan-out
+	// caps, including declaration-free config files found by explicit path.
+	artifactLane := s.gatherExploreArtifactLane(ctx, artifactIntent, opts)
 	// The task text is pasted verbatim by the agent and is frequently a
 	// whole issue report — a title, then a body of repro commands, stack
 	// traces, environment tables and issue-template prompts. Fed raw to
@@ -1307,7 +1315,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		cands = append(cands, test[:room]...)
 	}
-	if len(cands) == 0 {
+	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if req.GetBool("localize", false) {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
 		}
@@ -1334,7 +1342,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	causalAdmitted := 0
 	var causalElapsed time.Duration
-	targets := make([]exploreTarget, 0, len(cands))
+	artifactTargets := artifactLane.targets
+	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
+	// Artifact evidence leads only when the strong classifier activated its
+	// lane. Ordinary source localization retains the exact prior target order.
+	targets = append(targets, artifactTargets...)
 	for _, c := range cands {
 		if c == nil || c.Node == nil {
 			continue
@@ -1396,8 +1408,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !req.GetBool("localize", false) {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
-	answerReady := exploreAnswerReady(task, targets)
-	exactSymbol := exploreLocalizationExplicitTarget(task, targets)
+	symbolTargets := targets[len(artifactTargets):]
+	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
+	// File evidence can make localization answer-ready, but it never becomes a
+	// synthetic exact-symbol read. Exact reads remain declaration-only.
+	exactSymbol := exploreLocalizationExplicitTarget(task, symbolTargets)
 	if !answerReady && exactSymbol == "" {
 		anchors := make([]string, 0, 3)
 		for _, target := range targets {
