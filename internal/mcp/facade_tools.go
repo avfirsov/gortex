@@ -999,7 +999,57 @@ func normalizeFacadeArguments(spec facadeOperationSpec, input map[string]any) ma
 	for key, value := range spec.Fixed {
 		out[key] = value
 	}
+	normalizeFacadeReadFileRange(spec, out)
 	return out
+}
+
+func normalizeFacadeReadFileRange(spec facadeOperationSpec, out map[string]any) {
+	if spec.Legacy != "read_file" {
+		return
+	}
+	line := func(primary, alias string) (int, bool) {
+		raw, ok := out[primary]
+		if !ok && alias != "" {
+			raw, ok = out[alias]
+		}
+		if !ok {
+			return 0, false
+		}
+		switch value := raw.(type) {
+		case int:
+			return value, true
+		case int32:
+			return int(value), true
+		case int64:
+			return int(value), true
+		case float32:
+			return int(value), true
+		case float64:
+			return int(value), true
+		default:
+			return 0, false
+		}
+	}
+
+	start, hasStart := line("start_line", "start")
+	end, hasEnd := line("end_line", "end")
+	if !hasStart && !hasEnd {
+		return
+	}
+	if !hasStart || start < 1 {
+		start = 1
+	}
+	out["offset"] = start
+	if hasEnd {
+		if end < start {
+			end = start
+		}
+		out["limit"] = end - start + 1
+	}
+	delete(out, "start_line")
+	delete(out, "end_line")
+	delete(out, "start")
+	delete(out, "end")
 }
 
 func normalizeFacadeAliases(spec facadeOperationSpec, input, out map[string]any) {
@@ -1418,9 +1468,13 @@ func applyFacadeTarget(legacy string, out, target map[string]any) {
 			for _, value := range values {
 				parts = append(parts, fmt.Sprint(value))
 			}
-			set("ids", strings.Join(parts, ","))
+			if encoded, err := json.Marshal(parts); err == nil {
+				set("ids", string(encoded))
+			}
 		} else if values, ok := symbols.([]string); ok {
-			set("ids", strings.Join(values, ","))
+			if encoded, err := json.Marshal(values); err == nil {
+				set("ids", string(encoded))
+			}
 		} else {
 			set("ids", symbols)
 		}

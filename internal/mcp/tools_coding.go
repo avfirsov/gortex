@@ -1081,15 +1081,49 @@ func extractLinesFromContent(content string, startLine, endLine, contextLines in
 	return strings.Join(picked, "\n"), from, totalChars, nil
 }
 
-func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("ids")
-	if err != nil {
-		return mcp.NewToolResultError("ids is required"), nil
+func parseBatchSymbolIDs(raw any) ([]string, bool) {
+	var ids []string
+	switch value := raw.(type) {
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if strings.HasPrefix(trimmed, "[") {
+			// Facade arrays cross the legacy string schema as JSON so commas in
+			// generic parameter lists remain part of one opaque symbol ID.
+			if err := json.Unmarshal([]byte(trimmed), &ids); err != nil {
+				return nil, false
+			}
+		} else {
+			// Backward compatibility for the original CLI/MCP shorthand. Scalar
+			// values are the only shape where commas mean multiple IDs.
+			ids = strings.Split(value, ",")
+		}
+	case []string:
+		ids = append(ids, value...)
+	case []any:
+		ids = make([]string, 0, len(value))
+		for _, item := range value {
+			id, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			ids = append(ids, id)
+		}
+	default:
+		return nil, false
 	}
-
-	ids := strings.Split(idsStr, ",")
 	for i := range ids {
 		ids[i] = strings.TrimSpace(ids[i])
+		if ids[i] == "" {
+			return nil, false
+		}
+	}
+	return ids, len(ids) > 0
+}
+
+func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ids, ok := parseBatchSymbolIDs(req.GetArguments()["ids"])
+	if !ok {
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	includeSource := false

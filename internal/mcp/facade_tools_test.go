@@ -1476,7 +1476,7 @@ func TestFacadeReadSelectorCardinalityDefaultsAndAliases(t *testing.T) {
 		"operation": "source",
 		"target":    map[string]any{"symbols": []any{"a.go::A", "b.go::B"}},
 	})
-	require.Equal(t, "a.go::A,b.go::B", batch["ids"])
+	require.Equal(t, `["a.go::A","b.go::B"]`, batch["ids"])
 	require.Equal(t, true, batch["include_source"])
 
 	metadataOnly := call(map[string]any{

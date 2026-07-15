@@ -96,7 +96,7 @@ func TestFacadeResolvedTargetShapesReachLegacyHandlers(t *testing.T) {
 		"operation": "source",
 		"target":    map[string]any{"symbols": []any{node.ID}},
 	})
-	require.Equal(t, node.ID, batch["ids"])
+	require.Equal(t, `["repo/pkg/worker.go::Run"]`, batch["ids"])
 	require.Equal(t, true, batch["include_source"])
 }
 
