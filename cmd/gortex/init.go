@@ -480,7 +480,7 @@ func emitJSONReport(w io.Writer, results []*agents.Result, opts agents.ApplyOpts
 // emitHumanSummary prints the per-agent file counts to stderr.
 func emitHumanSummary(w io.Writer, results []*agents.Result, opts agents.ApplyOpts) {
 	emitAgentSummary(w, results, opts, []string{
-		"if your editor uses MCP, enable the gortex server there (and reload the window) when tools do not appear after the first init",
+		"if this first init ran inside an active editor/agent session, start a new session so the host loads the generated MCP config; no separate MCP enablement is normally required, though host trust or admin policy may still require approval",
 		"commit the generated files your team relies on (.mcp.json, .claude/, .cursor/, CLAUDE.md, and other adapter outputs)",
 		"run `gortex install` once per machine to wire user-level integration",
 	})

@@ -204,8 +204,10 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 type warmupTimings struct {
 	parse         time.Duration
 	resolve       time.Duration
+	enrich        time.Duration
 	globalResolve time.Duration
 	endBatch      time.Duration
+	analysis      time.Duration
 	// reposChanged is the number of tracked repos whose reindex actually did
 	// work this warmup (cold track, or a reconcile with stale/deleted files).
 	reposChanged int
@@ -675,6 +677,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
 		timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
 			zap.Duration("elapsed", time.Since(phaseStart)))
@@ -834,6 +837,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
 		return nil, timings
 	}
+	// Attach the live watcher before publishing watcher_started. This makes
+	// readiness truthful: once clients observe the phase, mutation handlers
+	// can already enqueue path-scoped work instead of falling back to a costly
+	// synchronous IndexFile call.
+	if state.mcpServer != nil {
+		state.mcpServer.SetWatcher(mw)
+		srv := state.mcpServer
+		mw.OnDegraded(func(reason string) {
+			srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
+		})
+	}
 	logger.Info("daemon: watching", zap.Int("repos", len(watchCfgs)))
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
 		"watched_repos": len(watchCfgs),
@@ -855,8 +869,10 @@ func logWarmupSummary(logger *zap.Logger, warmup *warmupTimings, queryable, tota
 	logger.Info("daemon: warmup summary",
 		zap.Float64("parse_s", warmup.parse.Seconds()),
 		zap.Float64("resolve_s", warmup.resolve.Seconds()),
+		zap.Float64("enrich_s", warmup.enrich.Seconds()),
 		zap.Float64("global_resolve_s", warmup.globalResolve.Seconds()),
 		zap.Float64("end_batch_s", warmup.endBatch.Seconds()),
+		zap.Float64("analysis_s", warmup.analysis.Seconds()),
 		zap.Float64("queryable_s", queryable.Seconds()),
 		zap.Int("repos_changed", warmup.reposChanged),
 		zap.Int("files_reindexed", warmup.filesReindexed),

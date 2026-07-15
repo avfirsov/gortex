@@ -32,6 +32,10 @@ type incrementalCloneIndex struct {
 	shingles map[string][]uint64 // node id -> raw shingle set (cache)
 	corpus   int
 	built    bool
+	// pending is true when an edit touched clone-capable functions while
+	// the in-memory index was unbuilt. It is observable and stays true
+	// until an explicit global/clone-consuming rebuild completes.
+	pending bool
 }
 
 // newIncrementalCloneIndex returns an empty, un-built index. built stays
@@ -173,6 +177,45 @@ func (ci *incrementalCloneIndex) Rebuild(g graph.Store, repoPrefix string) {
 		ci.lsh.Add(clones.Item{ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n)})
 	}
 	ci.built = true
+	ci.pending = false
+}
+
+// Ready reports whether one-file clone maintenance can run without a
+// graph-wide seed.
+func (ci *incrementalCloneIndex) Ready() bool {
+	if ci == nil {
+		return false
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return ci.built
+}
+
+// MarkPending records that clone edges may be incomplete after a bounded
+// edit. It intentionally schedules no background work: an automatic rebuild
+// would merely move whole-graph starvation off the watcher goroutine.
+func (ci *incrementalCloneIndex) MarkPending() {
+	if ci == nil {
+		return
+	}
+	ci.mu.Lock()
+	ci.pending = true
+	ci.mu.Unlock()
+}
+
+func (ci *incrementalCloneIndex) Pending() bool {
+	if ci == nil {
+		return false
+	}
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return ci.pending
+}
+
+// CloneIndexPending reports whether clone-derived edges are awaiting an
+// explicit global/clone-consuming rebuild.
+func (idx *Indexer) CloneIndexPending() bool {
+	return idx != nil && idx.cloneIndex != nil && idx.cloneIndex.Pending()
 }
 
 // EvictFuncs removes a set of function/method nodes from the index: it

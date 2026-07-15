@@ -1,17 +1,23 @@
 package claudecode
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
 
 // TestCommandPRReviewAgent_ShellsTheReviewVerb asserts the agent-review skill
-// instructs a coding agent to shell the review verb in its terse audience mode.
-// The whole point of the skill is to replace hand-walking the review gates with
-// a single `gortex review --audience agent` call, so that exact invocation must
-// appear in the generated content.
+// retains the dedicated CLI path only for a harness with no MCP transport by
+// design. A missing configured handle remains an integration failure.
 func TestCommandPRReviewAgent_ShellsTheReviewVerb(t *testing.T) {
 	for _, want := range []string{
+		"Native Gortex MCP is mandatory",
+		"review({operation: \"run\"",
+		"configured callable tools are missing",
+		"Gortex MCP integration failure",
+		"do not start a daemon or use the Bash path below",
+		"## Bash-only harness",
+		"no MCP transport by design",
 		"gortex review --audience agent",
 		"--format json",
 		"VERDICT:",
@@ -19,6 +25,53 @@ func TestCommandPRReviewAgent_ShellsTheReviewVerb(t *testing.T) {
 	} {
 		if !strings.Contains(commandPRReviewAgent, want) {
 			t.Errorf("commandPRReviewAgent must reference %q so the agent shells the verb and parses its output", want)
+		}
+	}
+	if strings.Contains(commandPRReviewAgent, "when native Gortex MCP is available") {
+		t.Error("commandPRReviewAgent must not reinterpret a missing MCP bridge as transport unavailability")
+	}
+}
+
+func TestGeneratedClaudeContent_UsesOnlyPublicToolDomains(t *testing.T) {
+	public := map[string]bool{
+		"analyze": true, "ask": true, "capabilities": true, "change": true,
+		"edit": true, "explore": true, "overlay": true, "pr": true,
+		"publish_review": true, "read": true, "recall": true, "refactor": true,
+		"relations": true, "remember": true, "response": true, "review": true,
+		"search": true, "session": true, "trace": true, "workspace": true,
+		"workspace_admin": true,
+	}
+	legacy := []string{
+		"smart_context", "search_symbols", "search_text", "read_file",
+		"get_symbol_source", "get_editing_context", "find_usages", "get_callers",
+		"get_call_chain", "detect_changes", "explain_change_impact", "verify_change",
+		"check_guards", "get_test_targets", "preview_edit", "simulate_chain",
+		"batch_edit", "edit_symbol", "rename_symbol", "get_code_actions",
+		"tools_search", "tool_profile", "facade-v1",
+	}
+	callPattern := regexp.MustCompile(`\b([a-z][a-z0-9_]*)\(\{`)
+
+	artifacts := make(map[string]string, len(SlashCommands)+len(GlobalSkills))
+	for name, body := range SlashCommands {
+		artifacts["command/"+name] = body
+	}
+	for name, body := range GlobalSkills {
+		artifacts["skill/"+name] = body
+	}
+
+	for name, body := range artifacts {
+		for _, hidden := range legacy {
+			if strings.Contains(body, hidden) {
+				t.Errorf("%s exposes hidden implementation tool %q", name, hidden)
+			}
+		}
+		for _, match := range callPattern.FindAllStringSubmatch(body, -1) {
+			if !public[match[1]] {
+				t.Errorf("%s instructs the agent to call non-public tool %q", name, match[1])
+			}
+		}
+		if len(body) > 6000 {
+			t.Errorf("%s is not lean: %d bytes (limit 6000)", name, len(body))
 		}
 	}
 }

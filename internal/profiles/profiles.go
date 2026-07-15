@@ -57,8 +57,8 @@ type Profile struct {
 	Summary string
 	// ToolPreset is the MCP tool-surface preset sessions default to
 	// while this profile is active. Empty keeps the server's existing
-	// client-aware defaults (known coding agents get the `agent`
-	// floor, everyone else the server's global preset).
+	// client-aware default (named MCP clients get the compact public
+	// surface; uninitialized sessions keep the server's global preset).
 	ToolPreset string
 	// EagerTools, when non-nil, is the eager allow-set of the preset
 	// named by ToolPreset. internal/mcp builds the preset from this

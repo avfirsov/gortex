@@ -81,12 +81,13 @@ type impactRow struct {
 	Community  float64 `json:"community"`
 
 	// Raw inputs behind the axes, for explainability.
-	PageRank      float64 `json:"pagerank"`
-	ReachCount    int     `json:"reach_count"`
-	Cyclomatic    int     `json:"cyclomatic"`
-	CoChangeFiles int     `json:"co_change_files"`
-	CommunitySpan int     `json:"community_span"`
-	FanIn         int     `json:"fan_in"`
+	PageRank        float64 `json:"pagerank"`
+	ReachCount      int     `json:"reach_count"`
+	ReachLowerBound bool    `json:"reach_lower_bound,omitempty"`
+	Cyclomatic      int     `json:"cyclomatic"`
+	CoChangeFiles   int     `json:"co_change_files"`
+	CommunitySpan   int     `json:"community_span"`
+	FanIn           int     `json:"fan_in"`
 }
 
 // handleAnalyzeImpactComposite ranks scoped symbols by composite
@@ -123,8 +124,12 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		allowedKinds = parseAnalyzeKindsFilter(k)
 	}
 
-	// Co-change feeds one axis — make sure the git mine has run.
-	s.ensureCoChange()
+	// Legacy analyze historically starts the co-change mine lazily. The compact
+	// read-only adapter fixes refresh_cochange=false, so it consumes only the
+	// daemon-prewarmed cache and cannot cause durable EdgeCoChange writes.
+	if requestBoolDefault(req, "refresh_cochange", true) {
+		s.ensureCoChange()
+	}
 
 	pr := s.getPageRank()
 	maxPR := 0.0
@@ -223,11 +228,21 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 			centrality = 100 * prVal / maxPR
 		}
 
-		// Reach: precomputed transitive set when the index is built,
-		// otherwise direct fan-in as the depth-1 proxy.
+		// Reach: consume an already-published transitive set when available,
+		// otherwise direct fan-in is the depth-1 proxy. This must be cache-only:
+		// invoking lazy BFS once per candidate turns a ranking call into an
+		// accidental eager all-symbol reach build.
 		reachCount := fanIn[n.ID]
-		if d1, d2, d3, hit := reach.Lookup(s.graph, n.ID); hit {
-			reachCount = len(d1) + len(d2) + len(d3)
+		reachLowerBound := false
+		if d1, d2, d3, hit, bounded := reach.LookupCached(s.graph, n.ID); hit {
+			observed := len(d1) + len(d2) + len(d3)
+			if observed > reachCount {
+				reachCount = observed
+			}
+			reachLowerBound = bounded
+		} else if bounded {
+			// Lock/cancellation failure is not evidence of a small reach set.
+			reachLowerBound = true
 		}
 		reachScore := saturate(float64(reachCount), impactReachK)
 
@@ -268,10 +283,14 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 			Community:     roundTo(communityScore, 2),
 			PageRank:      prVal,
 			ReachCount:    reachCount,
+			ReachLowerBound: reachLowerBound,
 			Cyclomatic:    cyc,
 			CoChangeFiles: ccFiles,
 			CommunitySpan: span,
 			FanIn:         fanIn[n.ID],
+		}
+		if reachLowerBound && row.Risk == "LOW" {
+			row.Risk = "MEDIUM"
 		}
 		if minScore >= 0 && row.Score < minScore {
 			continue

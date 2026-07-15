@@ -3,6 +3,7 @@ package antigravity
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
@@ -49,6 +50,92 @@ func TestAntigravityRegistersMCPAndWritesKI(t *testing.T) {
 			t.Errorf("KI artifact missing: %s (%v)", p, err)
 		}
 	}
-
+	instructionsPath := filepath.Join(kiBase, "artifacts", "gortex-instructions.md")
+	instructions, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	text := string(instructions)
+	for _, want := range []string{
+		agents.InstructionsSentinel,
+		"Call `explore` first",
+		"change(operation:\"impact\")",
+		"Gortex MCP integration failure",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Antigravity instructions missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"./gortex query", "facade-v1", "tools_search", "gortex call", "daemon start"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("Antigravity instructions contain obsolete agent vocabulary %q", forbidden)
+		}
+	}
 	agentstest.AssertIdempotent(t, a, env)
+}
+
+func TestAntigravityMigratesExactV060KI(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	kiBase := filepath.Join(env.Home, ".gemini", "antigravity", "knowledge", "gortex-workflow")
+	metadataPath := filepath.Join(kiBase, "metadata.json")
+	instructionsPath := filepath.Join(kiBase, "artifacts", "gortex-instructions.md")
+	for path, content := range map[string]string{
+		metadataPath:     v060Metadata,
+		instructionsPath: v060Instructions,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for path, want := range map[string]string{
+		metadataPath:     Metadata,
+		instructionsPath: Instructions,
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("v0.60.0 artifact %s was not migrated", path)
+		}
+	}
+}
+
+func TestAntigravityPreservesCustomizedKI(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	kiBase := filepath.Join(env.Home, ".gemini", "antigravity", "knowledge", "gortex-workflow")
+	metadataPath := filepath.Join(kiBase, "metadata.json")
+	instructionsPath := filepath.Join(kiBase, "artifacts", "gortex-instructions.md")
+	custom := map[string]string{
+		metadataPath:     `{"summary":"my policy"}`,
+		instructionsPath: "# Keep my custom workflow\n",
+	}
+	for path, content := range custom {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{Force: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for path, want := range custom {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("customized artifact %s was overwritten", path)
+		}
+	}
 }

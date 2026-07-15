@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -200,6 +201,283 @@ func (s synthFunc) synthesizeScoped(g graph.Store, scope map[string]bool) int {
 	return s.fn(g)
 }
 
+// frameworkSynthLanguageFamilies is deliberately conservative. An absent
+// entry means that the pass is generic, spans too many runtimes to bound
+// safely, or has not yet been audited, and therefore always runs. A mapped
+// pass may be skipped only when its candidate domain contains none of the
+// listed language families.
+var frameworkSynthLanguageFamilies = map[string][]string{
+	SynthSwiftObjC:           {"apple"},
+	SynthReactNative:         {"web", "apple", "jvm"},
+	SynthReactNativePair:     {"apple", "jvm"},
+	SynthClosureCollection:   {"apple"},
+	SynthKMPExpectActual:     {"jvm"},
+	SynthExpoModules:         {"web", "apple", "jvm"},
+	SynthFabric:              {"web", "apple", "jvm"},
+	SynthMyBatis:             {"jvm"},
+	SynthSQLCallsite:         {"sql"},
+	SynthStoreFactory:        {"web"},
+	SynthReduxThunk:          {"web"},
+	SynthNgRxEffect:          {"web"},
+	SynthObjectRegistry:      {"web"},
+	SynthRTKQuery:            {"web"},
+	SynthVuexDispatch:        {"web"},
+	SynthCelery:              {"python"},
+	SynthSpringEvent:         {"jvm"},
+	SynthMediatR:             {"dotnet"},
+	SynthCSharpIfaceDispatch: {"dotnet"},
+	SynthSidekiq:             {"ruby"},
+	SynthLaravelEvent:        {"php"},
+	SynthFnPointerDispatch:   {"c"},
+	SynthMacroExpansion:      {"c"},
+	SynthGinMiddleware:       {"go"},
+	SynthExpressResolve:      {"web"},
+	SynthReactResolve:        {"web"},
+	SynthFastAPIResolve:      {"python"},
+	SynthRailsResolve:        {"ruby"},
+	SynthSwiftUIResolve:      {"apple"},
+	SynthUIKitResolve:        {"apple"},
+	SynthVaporResolve:        {"apple"},
+	SynthGoFrameRoute:        {"go"},
+	SynthSvelteKitLoad:       {"web"},
+	SynthRustScope:           {"rust"},
+	SynthPascalFormName:      {"pascal"},
+}
+
+type frameworkCandidateSummary struct {
+	all           map[string]int
+	scoped        map[string]int
+	allMarkers    map[string]int
+	scopedMarkers map[string]int
+}
+
+// summarizeFrameworkCandidates makes one metadata-free node pass for the
+// entire synthesizer run. Both the whole-graph and changed-repo views are
+// populated in that same pass so a synthesizer that falls back to its global
+// implementation is never gated by the narrower repo scope.
+func summarizeFrameworkCandidates(g graph.Store, scope map[string]bool) frameworkCandidateSummary {
+	summary := frameworkCandidateSummary{
+		all:           map[string]int{},
+		scoped:        map[string]int{},
+		allMarkers:    map[string]int{},
+		scopedMarkers: map[string]int{},
+	}
+	var observerRoles map[string]uint8
+	for _, n := range graph.AllNodesLight(g) {
+		if n == nil {
+			continue
+		}
+		family := frameworkLanguageFamily(n.Language)
+		if role := recordFrameworkNodeCandidates(summary.allMarkers, n, family); role != 0 && n.ID != "" {
+			if observerRoles == nil {
+				observerRoles = map[string]uint8{}
+			}
+			observerRoles[n.ID] = role
+		}
+		if scope != nil && scope[n.RepoPrefix] {
+			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
+		}
+		if family == "" {
+			continue
+		}
+		summary.all[family]++
+		if scope != nil && scope[n.RepoPrefix] {
+			summary.scoped[family]++
+		}
+	}
+	// Observer synthesis needs registrar and dispatcher methods accessing the
+	// same field. When both name vocabularies exist, one metadata-free scan of
+	// accesses_field edges proves whether such a channel can exist. This is
+	// stricter than two unrelated name hits but retains every candidate the
+	// synthesizer itself can consume.
+	if summary.allMarkers[frameworkMarkerObserverRegistrar] > 0 &&
+		summary.allMarkers[frameworkMarkerObserverDispatcher] > 0 {
+		fieldRoles := map[string]uint8{}
+		for _, e := range graph.EdgesForKindsLight(g, graph.EdgeAccessesField) {
+			if e == nil || e.From == "" || e.To == "" {
+				continue
+			}
+			role := observerRoles[e.From]
+			if role == 0 {
+				continue
+			}
+			fieldRoles[e.To] |= role
+			if fieldRoles[e.To] == (frameworkObserverRegistrarRole | frameworkObserverDispatcherRole) {
+				summary.allMarkers[SynthObserverChannel]++
+				break
+			}
+		}
+	}
+	return summary
+}
+
+const (
+	frameworkMarkerObserverRegistrar  = "observer-channel:registrar"
+	frameworkMarkerObserverDispatcher = "observer-channel:dispatcher"
+	frameworkMarkerSwift              = "swift-objc-bridge:swift"
+	frameworkMarkerObjC               = "swift-objc-bridge:objc"
+
+	frameworkObserverRegistrarRole  uint8 = 1
+	frameworkObserverDispatcherRole uint8 = 2
+)
+
+// frameworkSynthNodePreflights names passes with necessary candidate shapes
+// visible in the light node projection. Every listed marker is required: a
+// missing marker proves the pass cannot produce an edge and avoids its full
+// graph scans. These are deliberately one-way gates; a marker hit only keeps
+// the pass enabled and does not claim that an edge will be produced.
+var frameworkSynthNodePreflights = map[string][]string{
+	SynthEventChannel:    {SynthEventChannel},
+	SynthSwiftObjC:       {frameworkMarkerSwift, frameworkMarkerObjC},
+	SynthObserverChannel: {SynthObserverChannel},
+	SynthReactSetState:   {SynthReactSetState},
+	SynthFlutterSetState: {SynthFlutterSetState},
+	SynthMyBatis:         {SynthMyBatis},
+	SynthSidekiq:         {SynthSidekiq},
+	SynthLaravelEvent:    {SynthLaravelEvent},
+	SynthSwiftUIResolve:  {SynthSwiftUIResolve},
+	SynthUIKitResolve:    {SynthUIKitResolve},
+	SynthVaporResolve:    {SynthVaporResolve},
+}
+
+func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family string) uint8 {
+	if isPubsubEventNode(n.ID) || isEmitterEventNode(n.ID) {
+		markers[SynthEventChannel]++
+	}
+
+	language := strings.ToLower(strings.TrimSpace(n.Language))
+	switch language {
+	case "swift":
+		markers[frameworkMarkerSwift]++
+	case "objc", "objective-c", "objectivec":
+		markers[frameworkMarkerObjC]++
+	case "mybatis":
+		if n.Kind == graph.KindMethod {
+			markers[SynthMyBatis]++
+		}
+	case "ruby":
+		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name == "perform" {
+			markers[SynthSidekiq]++
+		}
+	case "php":
+		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name == "handle" {
+			markers[SynthLaravelEvent]++
+		}
+	}
+
+	observerRole := uint8(0)
+	if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name != "" {
+		if observerRegistrarRe.MatchString(n.Name) {
+			markers[frameworkMarkerObserverRegistrar]++
+			observerRole |= frameworkObserverRegistrarRole
+		}
+		if observerDispatcherRe.MatchString(n.Name) {
+			markers[frameworkMarkerObserverDispatcher]++
+			observerRole |= frameworkObserverDispatcherRole
+		}
+	}
+	if n.Kind == graph.KindMethod {
+		switch n.Name {
+		case "render":
+			markers[SynthReactSetState]++
+		case "build":
+			markers[SynthFlutterSetState]++
+		}
+	}
+	if family != "apple" {
+		return observerRole
+	}
+	name := n.Name
+	path := strings.ToLower(strings.ReplaceAll(n.FilePath, "\\", "/"))
+	if strings.HasSuffix(name, "ViewModel") || strings.HasSuffix(name, "View") ||
+		strings.HasSuffix(name, "Store") || strings.HasSuffix(name, "Manager") ||
+		strings.Contains(path, "/models/") || strings.Contains(path, "/model/") {
+		markers[SynthSwiftUIResolve]++
+	}
+	if strings.HasSuffix(name, "ViewController") || strings.HasSuffix(name, "Cell") ||
+		strings.HasSuffix(name, "Delegate") || strings.HasSuffix(name, "DataSource") {
+		markers[SynthUIKitResolve]++
+	}
+	if (strings.HasSuffix(name, "Controller") && !strings.HasSuffix(name, "ViewController")) ||
+		strings.HasSuffix(name, "Middleware") || strings.Contains(path, "/models/") ||
+		strings.Contains(path, "/model/") {
+		markers[SynthVaporResolve]++
+	}
+	return observerRole
+}
+
+func frameworkLanguageFamily(language string) string {
+	language = strings.ToLower(strings.TrimSpace(language))
+	if family := languageFamily(language); family != "" {
+		return family
+	}
+	switch language {
+	case "go", "golang":
+		return "go"
+	case "rust":
+		return "rust"
+	case "python", "py":
+		return "python"
+	case "ruby":
+		return "ruby"
+	case "php":
+		return "php"
+	case "dart":
+		return "dart"
+	case "sql":
+		return "sql"
+	case "pascal", "object-pascal", "object_pascal":
+		return "pascal"
+	case "vue", "svelte", "astro":
+		return "web"
+	case "objective-c++", "objc++", "objective-cpp":
+		return "apple"
+	default:
+		return ""
+	}
+}
+
+func frameworkSynthUsesScopedCandidates(s FrameworkSynthesizer, scope map[string]bool) bool {
+	if scope == nil {
+		return false
+	}
+	// synthFunc implements scopedSynthesizer even when scopedFn is nil so it
+	// can transparently fall back to fn. Inspect the adapter directly to avoid
+	// mistaking that global fallback for a scoped pass.
+	if sf, ok := s.(synthFunc); ok {
+		return sf.scopedFn != nil
+	}
+	_, ok := s.(scopedSynthesizer)
+	return ok
+}
+
+func shouldRunFrameworkSynthesizer(s FrameworkSynthesizer, scope map[string]bool, summary frameworkCandidateSummary) bool {
+	present := summary.all
+	markers := summary.allMarkers
+	if frameworkSynthUsesScopedCandidates(s, scope) {
+		present = summary.scoped
+		markers = summary.scopedMarkers
+	}
+	if families := frameworkSynthLanguageFamilies[s.Name()]; len(families) > 0 {
+		found := false
+		for _, family := range families {
+			if present[family] > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	for _, marker := range frameworkSynthNodePreflights[s.Name()] {
+		if markers[marker] == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // defaultFrameworkSynthesizers returns the registered framework
 // synthesizers in run order. Order is load-bearing: every synthesizer
 // here runs after InferImplements/InferOverrides (some depend on the
@@ -384,22 +662,26 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // RunFrameworkSynthesizersScoped is RunFrameworkSynthesizers with an armed
 // changed-repo scope: each synthesizer that implements scopedSynthesizer
 // narrows its candidate scan to those repos, the rest run whole-graph. A nil
-// scope runs every pass whole-graph, so the fresh-index / single-repo path is
-// byte-identical to the pre-scoping behaviour. The claiming-resolver, family-
-// gate and receiver-gate tail passes always run whole-graph — they reconcile
+// scope uses the whole-graph candidate census; language-specific passes proven
+// irrelevant are skipped, while generic or unaudited passes always run. The
+// claiming-resolver, family-gate and receiver-gate tail passes always run
+// whole-graph — they reconcile
 // the settled cross-repo call graph, not a per-repo candidate set.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
 		return rep
 	}
+	candidates := summarizeFrameworkCandidates(g, scope)
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
-		if ss, ok := s.(scopedSynthesizer); ok {
-			n = ss.synthesizeScoped(g, scope)
-		} else {
-			n = s.Synthesize(g)
+		if shouldRunFrameworkSynthesizer(s, scope, candidates) {
+			if ss, ok := s.(scopedSynthesizer); ok {
+				n = ss.synthesizeScoped(g, scope)
+			} else {
+				n = s.Synthesize(g)
+			}
 		}
 		rep.Per = append(rep.Per, SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()})
 		rep.Total += n

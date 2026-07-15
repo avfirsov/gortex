@@ -1,0 +1,216 @@
+// Package runtimeactivity coordinates process-wide work with expensive runtime
+// maintenance such as debug.FreeOSMemory. The daemon, MCP handlers, and
+// background indexers share one tracker because a process-wide GC cannot be
+// made safe by guarding only one subsystem.
+package runtimeactivity
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Snapshot is a point-in-time view of process work. ByKind is a defensive copy
+// and can be inspected without holding the tracker lock.
+type Snapshot struct {
+	Active         int64
+	Epoch          uint64
+	LastTransition time.Time
+	ByKind         map[string]int64
+}
+
+// QuietFor reports how long no tracked work transition has occurred. It is
+// zero while work is active or when the snapshot predates tracker startup.
+func (s Snapshot) QuietFor(now time.Time) time.Duration {
+	if s.Active != 0 || s.LastTransition.IsZero() || now.Before(s.LastTransition) {
+		return 0
+	}
+	return now.Sub(s.LastTransition)
+}
+
+// Tracker closes the check-to-maintenance race with gate: Begin and End take a
+// read lock while a maintenance callback takes the write lock. Once RunIfQuiet
+// admits a callback, no new tracked work can start until it returns.
+type Tracker struct {
+	gate sync.RWMutex
+
+	active   atomic.Int64
+	epoch    atomic.Uint64
+	lastNano atomic.Int64
+
+	kindsMu sync.Mutex
+	byKind  map[string]int64
+
+	hooksMu sync.RWMutex
+	hooks   []func(string)
+}
+
+// NewTracker returns an independent tracker. Most production code uses the
+// process-wide package functions below; the constructor exists for isolated
+// policy and race tests.
+func NewTracker() *Tracker {
+	t := &Tracker{byKind: make(map[string]int64)}
+	t.lastNano.Store(time.Now().UnixNano())
+	return t
+}
+
+// Begin marks one unit of work active. kind should be a bounded subsystem name,
+// not a path or user-provided value.
+func (t *Tracker) Begin(kind string) {
+	if t == nil {
+		return
+	}
+	kind = normalizeKind(kind)
+	t.gate.RLock()
+	t.active.Add(1)
+	t.epoch.Add(1)
+	t.lastNano.Store(time.Now().UnixNano())
+	t.kindsMu.Lock()
+	if t.byKind == nil {
+		t.byKind = make(map[string]int64)
+	}
+	t.byKind[kind]++
+	t.kindsMu.Unlock()
+	t.gate.RUnlock()
+}
+
+// End balances Begin. A defensive underflow repair prevents a caller bug from
+// permanently disabling reclamation; per-kind counts are repaired likewise.
+func (t *Tracker) End(kind string) {
+	if t == nil {
+		return
+	}
+	kind = normalizeKind(kind)
+	t.gate.RLock()
+	remaining := t.active.Add(-1)
+	if remaining < 0 {
+		t.active.Store(0)
+		remaining = 0
+	}
+	t.epoch.Add(1)
+	t.lastNano.Store(time.Now().UnixNano())
+	t.kindsMu.Lock()
+	if n := t.byKind[kind]; n > 1 {
+		t.byKind[kind] = n - 1
+	} else {
+		delete(t.byKind, kind)
+	}
+	t.kindsMu.Unlock()
+	t.gate.RUnlock()
+
+	if remaining == 0 {
+		t.notifyIdle(kind)
+	}
+}
+
+// Snapshot returns process activity without blocking a running maintenance
+// callback for longer than the small map copy.
+func (t *Tracker) Snapshot() Snapshot {
+	if t == nil {
+		return Snapshot{}
+	}
+	s := Snapshot{
+		Active: t.active.Load(),
+		Epoch:  t.epoch.Load(),
+	}
+	if n := t.lastNano.Load(); n > 0 {
+		s.LastTransition = time.Unix(0, n)
+	}
+	t.kindsMu.Lock()
+	if len(t.byKind) > 0 {
+		s.ByKind = make(map[string]int64, len(t.byKind))
+		for kind, count := range t.byKind {
+			s.ByKind[kind] = count
+		}
+	}
+	t.kindsMu.Unlock()
+	return s
+}
+
+// RunIfQuiet runs fn only when there is no active work and the last activity
+// transition is at least quiet ago. retryAfter is the earliest useful retry.
+// The callback runs behind the exclusive gate, so Begin cannot race between
+// the idle check and a stop-the-world runtime operation.
+func (t *Tracker) RunIfQuiet(quiet time.Duration, fn func()) (ran bool, retryAfter time.Duration) {
+	if t == nil {
+		return false, quiet
+	}
+	if quiet < 0 {
+		quiet = 0
+	}
+	t.gate.Lock()
+	defer t.gate.Unlock()
+
+	if t.active.Load() != 0 {
+		return false, quiet
+	}
+	last := time.Unix(0, t.lastNano.Load())
+	if remaining := quiet - time.Since(last); remaining > 0 {
+		return false, remaining
+	}
+	if fn != nil {
+		fn()
+	}
+	return true, 0
+}
+
+// RegisterIdleHook registers a process-lifetime callback invoked after tracked
+// activity transitions to zero. Hooks must return quickly; schedulers should
+// launch their expensive work asynchronously. The returned function unregisters
+// the hook and is primarily useful to tests.
+func (t *Tracker) RegisterIdleHook(hook func(string)) func() {
+	if t == nil || hook == nil {
+		return func() {}
+	}
+	t.hooksMu.Lock()
+	t.hooks = append(t.hooks, hook)
+	idx := len(t.hooks) - 1
+	t.hooksMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.hooksMu.Lock()
+			if idx < len(t.hooks) {
+				t.hooks[idx] = nil
+			}
+			t.hooksMu.Unlock()
+		})
+	}
+}
+
+func (t *Tracker) notifyIdle(kind string) {
+	t.hooksMu.RLock()
+	hooks := append([]func(string){}, t.hooks...)
+	t.hooksMu.RUnlock()
+	for _, hook := range hooks {
+		if hook != nil {
+			hook(kind)
+		}
+	}
+}
+
+func normalizeKind(kind string) string {
+	if kind == "" {
+		return "unspecified"
+	}
+	return kind
+}
+
+var process = NewTracker()
+
+// Begin marks process-wide work active.
+func Begin(kind string) { process.Begin(kind) }
+
+// End balances a process-wide Begin.
+func End(kind string) { process.End(kind) }
+
+// Current returns a process-wide activity snapshot.
+func Current() Snapshot { return process.Snapshot() }
+
+// RunIfQuiet executes fn behind the process-wide exclusive gate.
+func RunIfQuiet(quiet time.Duration, fn func()) (bool, time.Duration) {
+	return process.RunIfQuiet(quiet, fn)
+}
+
+// RegisterIdleHook registers a process-wide idle-transition callback.
+func RegisterIdleHook(hook func(string)) func() { return process.RegisterIdleHook(hook) }

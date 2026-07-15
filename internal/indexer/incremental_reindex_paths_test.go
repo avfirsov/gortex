@@ -155,6 +155,26 @@ func TestIncrementalReindexPaths_EvictsDeletedFileInScope(t *testing.T) {
 		"a deletion outside the scoped path must NOT be evicted by a scoped pass")
 }
 
+func TestIncrementalDiscoverPaths_PreservesDeletedTrackedFile(t *testing.T) {
+	dir := t.TempDir()
+	gone := filepath.Join(dir, "gone.go")
+	writeFile(t, gone, "package main\n\nfunc Original() {}\n")
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.NotEmpty(t, g.FindNodesByName("Original"))
+
+	require.NoError(t, os.Remove(gone))
+	res, err := idx.incrementalDiscoverPaths(dir, nil)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Zero(t, res.DeletedFileCount)
+	assert.NotEmpty(t, g.FindNodesByName("Original"),
+		"directory discovery must leave deletion ownership to the file event")
+}
+
 // TestIncrementalReindexPaths_RejectsPathOutsideRoot verifies that a
 // scoped path escaping the repository root is rejected — scoping is a
 // narrowing operation, never an escape hatch.

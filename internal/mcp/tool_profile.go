@@ -6,6 +6,8 @@ import (
 	"sort"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 // IsToolEnabled reports whether a tool is reachable in this server's
@@ -64,11 +66,103 @@ func (s *Server) liveToolNames() []string {
 	return out
 }
 
+// sessionLiveToolNames returns the exact eagerly-visible surface for ctx.
+// It deliberately drives the same per-session filter used by tools/list so
+// client-aware presets, planning/workflow mode, learned promotions, and host
+// exclusions cannot drift from what tool_profile reports.
+func (s *Server) sessionLiveToolNames(ctx context.Context) []string {
+	registered := s.mcpServer.ListTools()
+	tools := make([]mcp.Tool, 0, len(registered))
+	for _, entry := range registered {
+		if entry == nil {
+			continue
+		}
+		tools = append(tools, entry.Tool)
+	}
+
+	tools = s.toolSurfaceFilter(ctx, tools)
+	out := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, tool.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// registeredToolNames returns the complete catalog behind this server: both
+// the currently registered MCP tools and the lazy registry's cold tools.
+func (s *Server) registeredToolNames() []string {
+	names := make(map[string]bool)
+	for name := range s.mcpServer.ListTools() {
+		names[name] = true
+	}
+	if s.lazy != nil {
+		for _, name := range s.lazy.DeferredNames() {
+			names[name] = true
+		}
+	}
+
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sessionToolBlocked reports whether a registered tool is intentionally
+// unavailable in this session rather than merely withheld from tools/list.
+func (s *Server) sessionToolBlocked(ctx context.Context, p *toolPolicy, name string) bool {
+	if p != nil && p.preset == FacadeSurfaceVersion && !isFacadeToolName(name) {
+		return true
+	}
+	if isDedicatedFacadeTool(name) {
+		return true
+	}
+	if name == "ask" {
+		if _, available := s.facades.legacy("ask"); !available {
+			return true
+		}
+	}
+	if p != nil && p.hideMode() && !s.sessionAllows(p, name) {
+		return true
+	}
+	if s.editingToolsHidden(ctx) && daemon.IsMutating(name) {
+		return true
+	}
+	return s.sessionHostContext(ctx).excluded[name]
+}
+
+// sessionToolStatus classifies name against the effective surface for ctx,
+// rather than the process-global registration split.
+func (s *Server) sessionToolStatus(ctx context.Context, name string) string {
+	if !slices.Contains(s.registeredToolNames(), name) {
+		return "absent"
+	}
+	if slices.Contains(s.sessionLiveToolNames(ctx), name) {
+		return "live"
+	}
+	if s.sessionToolBlocked(ctx, s.effectiveSessionPolicy(ctx), name) {
+		return "blocked"
+	}
+	return "deferred"
+}
+
+// IsToolEnabledForSession reports whether name is callable in ctx's effective
+// surface. Unlike the legacy process-global IsToolEnabled helper, this honors
+// client/preset negotiation plus planning, workflow, and host restrictions.
+// The daemon dispatcher consults it before promote-on-demand so a rejected
+// hidden call cannot mutate the shared lazy registry first.
+func (s *Server) IsToolEnabledForSession(ctx context.Context, name string) bool {
+	status := s.sessionToolStatus(ctx, name)
+	return status == "live" || status == "deferred"
+}
+
 // registerToolProfileTool wires the `tool_profile` introspection tool.
 func (s *Server) registerToolProfileTool() {
 	s.addTool(
 		mcp.NewTool("tool_profile",
-			mcp.WithDescription("Report the active MCP tool profile so the agent knows what is actually available instead of guessing. With no arguments: returns `{lazy_enabled, total, live_count, deferred_count, live[], deferred[], scopes{}, categories{}}` plus `preset` / `preset_mode` when a tool preset narrows the surface — `live` tools are in the current tools/list, `deferred` tools are reachable via `tools_search`, and `categories` groups every tool into a functional family (nav / read / edit / analysis / review / pr / memory / overlay / subscription / enrich / workspace / admin). With `tool:\"<name>\"`: returns `{tool, enabled, status, scope, category}` for that one tool (status ∈ live | deferred | blocked | absent)."),
+			mcp.WithDescription("Report the effective MCP tool profile for this session so the agent knows what is actually available instead of guessing. With no arguments: returns `{lazy_enabled, total, live_count, deferred_count, blocked_count, live[], deferred[], blocked[], scopes{}, categories{}}` plus `preset` / `preset_mode` when a tool preset narrows the surface — `live` exactly matches this session's current tools/list, `deferred` tools remain callable on demand, and `blocked` tools are prohibited by this session's hide/planning/workflow/host policy. With `tool:\"<name>\"`: returns `{tool, enabled, status, scope, category}` for that one tool (status ∈ live | deferred | blocked | absent)."),
 			mcp.WithString("tool", mcp.Description("Optional — report only this tool's enabled status and scope instead of the whole profile.")),
 		),
 		s.handleToolProfile,
@@ -81,30 +175,47 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 
 	// Per-tool advisory mode.
 	if name, _ := args["tool"].(string); name != "" {
+		status := s.sessionToolStatus(ctx, name)
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"tool":     name,
-			"enabled":  s.IsToolEnabled(name),
-			"status":   s.toolStatus(name),
+			"enabled":  status == "live" || status == "deferred",
+			"status":   status,
 			"scope":    scopes[name],
 			"category": toolCategory(name),
 		})
 	}
 
 	// Full-profile mode.
-	live := s.liveToolNames()
-	var deferred []string
+	p := s.effectiveSessionPolicy(ctx)
+	live := s.sessionLiveToolNames(ctx)
+	liveSet := make(map[string]bool, len(live))
+	for _, name := range live {
+		liveSet[name] = true
+	}
+	var deferred, blocked []string
+	for _, name := range s.registeredToolNames() {
+		if liveSet[name] {
+			continue
+		}
+		if s.sessionToolBlocked(ctx, p, name) {
+			blocked = append(blocked, name)
+			continue
+		}
+		deferred = append(deferred, name)
+	}
 	lazyEnabled := false
 	if s.lazy != nil {
 		lazyEnabled = s.lazy.Enabled()
-		deferred = s.lazy.DeferredNames()
 	}
 	profile := map[string]any{
 		"lazy_enabled":   lazyEnabled,
 		"total":          len(live) + len(deferred),
 		"live_count":     len(live),
 		"deferred_count": len(deferred),
+		"blocked_count":  len(blocked),
 		"live":           live,
 		"deferred":       deferred,
+		"blocked":        blocked,
 		"scopes":         scopes,
 		"categories":     toolCategories(append(append([]string{}, live...), deferred...)),
 		// Per-tool metadata catalog (category / mutating / presets /
@@ -112,20 +223,19 @@ func (s *Server) handleToolProfile(ctx context.Context, req mcp.CallToolRequest)
 		// the socket instead of re-deriving each tool's classification.
 		"descriptors": s.ToolDescriptors(),
 	}
-	// Active tool preset (mcp.tools / GORTEX_TOOLS): report the preset
-	// name and mode so an agent knows its surface was deliberately
-	// narrowed rather than the daemon mis-registering tools.
-	if s.toolPolicy.isActive() {
-		profile["preset"] = s.toolPolicy.preset
-		profile["preset_mode"] = s.toolPolicy.mode
+	// Effective tool preset for THIS session (forwarded mcp.tools /
+	// GORTEX_TOOLS, client-aware default, then daemon global): report the
+	// name and mode so an agent knows its surface was deliberately narrowed
+	// rather than the daemon mis-registering tools.
+	if p != nil && p.isActive() {
+		profile["preset"] = p.preset
+		profile["preset_mode"] = p.mode
 	}
-	// Per-host runtime context — the resolved host name and its guidance
-	// fragment, when the MCP client identified itself (host_context.go).
+	// Per-host runtime context. Guidance is emitted at initialize time from the
+	// effective tool policy; tool_profile may describe a legacy surface and
+	// therefore must not inject compact-only names.
 	if hc := s.sessionHostContext(ctx); hc.name != "" {
 		profile["host"] = hc.name
-		if hc.instruction != "" {
-			profile["host_instruction"] = hc.instruction
-		}
 	}
 	return s.respondJSONOrTOON(ctx, req, profile)
 }

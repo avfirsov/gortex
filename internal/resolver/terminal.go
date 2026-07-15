@@ -227,16 +227,37 @@ func terminalEdgeAnchoredToScope(e *graph.Edge, scope map[string]struct{}) bool 
 // reconcileTerminalStampsBulk's doc for why the bulk path can skip fromLang /
 // language-family entirely without changing the outcome.
 func (r *Resolver) reconcileTerminalStamps() (stamped, unstamped int) {
+	return r.reconcileTerminalStampsExcluding(nil)
+}
+
+// reconcileTerminalStampsExcluding applies the normal full-pass terminal
+// classification except for deferred LSP edges the pass budget did not let us
+// query. Those skips carry no terminality evidence and must remain retryable.
+func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPEdgeKey]struct{}) (stamped, unstamped int) {
 	var stillPending []*graph.Edge
+	var changed []*graph.Edge
 	for e := range r.graph.EdgesWithUnresolvedTarget() {
-		if e != nil {
-			stillPending = append(stillPending, e)
+		if e == nil {
+			continue
 		}
+		if _, skip := excluded[deferredLSPKey(e)]; skip {
+			// A pass-budget skip is not evidence that the edge is terminal.
+			// Clear an older stamp so a later scoped pass may retry LSP.
+			if edgeTerminalFlag(e) {
+				clearEdgeTerminal(e)
+				changed = append(changed, e)
+				unstamped++
+			}
+			continue
+		}
+		stillPending = append(stillPending, e)
 	}
 
-	var changed []*graph.Edge
 	if counter, ok := r.graph.(graph.NodeNameClassCounter); ok {
-		changed, stamped, unstamped = r.reconcileTerminalStampsBulk(stillPending, counter)
+		bulkChanged, bulkStamped, bulkUnstamped := r.reconcileTerminalStampsBulk(stillPending, counter)
+		changed = append(changed, bulkChanged...)
+		stamped += bulkStamped
+		unstamped += bulkUnstamped
 	} else {
 		for _, e := range stillPending {
 			reason, terminal := r.classifyTerminal(e)

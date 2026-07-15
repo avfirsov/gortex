@@ -10,6 +10,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
+
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
 
 // newCallTestCmd builds a fresh call command bound to an out/err buffer and
@@ -23,6 +25,7 @@ func newCallTestCmd(t *testing.T) (*cobra.Command, *bytes.Buffer) {
 	callFormat = "json"
 	callDry = false
 	callQuiet = false
+	callLegacy = false
 
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{Use: "call", RunE: runCall}
@@ -183,6 +186,192 @@ func TestCallDry_NoDaemon(t *testing.T) {
 	require.Contains(t, out, `"id": "pkg/foo.go::Bar"`)
 	require.Contains(t, out, `"depth": 2`)
 	require.Contains(t, out, `"verbose": true`)
+}
+
+func TestCall_AllCompactNamesUseFacadeRelay(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() {
+		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
+	})
+
+	for _, name := range gortexmcp.FacadeToolNames() {
+		t.Run(name, func(t *testing.T) {
+			var facadeTool string
+			callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+				t.Fatalf("compact call %q touched legacy relay with %q", name, tool)
+				return nil, nil
+			}
+			callFacadeDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+				facadeTool = tool
+				return json.RawMessage(`{"ok":true}`), nil
+			}
+
+			cmd, _ := newCallTestCmd(t)
+			require.NoError(t, runCall(cmd, []string{name}))
+			require.Equal(t, name, facadeTool)
+		})
+	}
+}
+
+func TestCall_HelpUsesOneClientNeutralShellContract(t *testing.T) {
+	help := strings.ToLower(callCmd.Long)
+	require.Contains(t, help, "gortex call capabilities")
+	require.NotContains(t, help, "facade-v1")
+	for _, client := range []string{"codex", "claude", "cursor", "vscode"} {
+		require.NotContains(t, help, client)
+	}
+	require.False(t, isKnownRootCommand("facade"), "compact calls must not create a second top-level CLI contract")
+}
+
+func TestCall_CompactRequestObjectIsForwardedUnchanged(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() {
+		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
+	})
+	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("compact call must not use legacy relay")
+		return nil, nil
+	}
+	var got map[string]any
+	callFacadeDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+		require.Equal(t, "read", tool)
+		got = args
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+
+	cmd, _ := newCallTestCmd(t)
+	callArgs = []string{"operation=file", `target:={"file":"internal/mcp/server.go"}`}
+	require.NoError(t, runCall(cmd, []string{"read"}))
+	require.Equal(t, "file", got["operation"])
+	require.Equal(t, map[string]any{"file": "internal/mcp/server.go"}, got["target"])
+	require.NotContains(t, got, "format")
+	require.NotContains(t, got, "output", "the default CLI format must not rewrite an exact compact MCP request")
+}
+
+func TestCall_CompactDefaultPreservesRequestOutputFormat(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
+	var got map[string]any
+	callFacadeDaemonTool = func(_ string, _ string, args map[string]any) (json.RawMessage, error) {
+		got = args
+		return json.RawMessage("TOON|results|...\n"), nil
+	}
+
+	cmd, buf := newCallTestCmd(t)
+	callJSON = `{"operation":"symbols","query":"Server","output":{"format":"toon","limit":7}}`
+	require.NoError(t, runCall(cmd, []string{"search"}))
+	output := got["output"].(map[string]any)
+	require.Equal(t, "toon", output["format"])
+	require.Equal(t, float64(7), output["limit"])
+	require.Equal(t, "TOON|results|...\n", buf.String())
+}
+
+func TestCall_CompactDryRunShowsFinalExplicitFormat(t *testing.T) {
+	cmd, buf := newCallTestCmd(t)
+	callDry = true
+	callFormat = "gcx"
+	callJSON = `{"operation":"symbols","query":"Server","output":{"format":"toon"}}`
+	require.NoError(t, runCall(cmd, []string{"search"}))
+	require.Contains(t, buf.String(), `"format": "gcx"`)
+	require.NotContains(t, buf.String(), `"format": "toon"`)
+}
+
+func TestCall_CompactFormatMergesIntoExistingOutput(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() {
+		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
+	})
+	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("compact call must not use legacy relay")
+		return nil, nil
+	}
+	var got map[string]any
+	callFacadeDaemonTool = func(_ string, _ string, args map[string]any) (json.RawMessage, error) {
+		got = args
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+
+	cmd, _ := newCallTestCmd(t)
+	callFormat = "gcx"
+	callJSON = `{"operation":"symbols","query":"Server","output":{"limit":7,"fields":"id,name","format":"toon"}}`
+	require.NoError(t, runCall(cmd, []string{"search"}))
+	output, ok := got["output"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "gcx", output["format"], "CLI --format must win")
+	require.Equal(t, float64(7), output["limit"])
+	require.Equal(t, "id,name", output["fields"])
+	require.NotContains(t, got, "format")
+}
+
+func TestCall_EffectfulCompactToolWarnsWithoutCatalog(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() {
+		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
+	})
+	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("compact call must not use legacy relay")
+		return nil, nil
+	}
+	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+
+	cmd, buf := newCallTestCmd(t)
+	require.NoError(t, runCall(cmd, []string{"session"}))
+	require.Contains(t, buf.String(), "can change session state")
+
+	cmd, buf = newCallTestCmd(t)
+	callQuiet = true
+	require.NoError(t, runCall(cmd, []string{"session"}))
+	require.NotContains(t, buf.String(), "note:")
+}
+
+func TestCall_LegacyNameUsesLegacyRelay(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() {
+		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
+	})
+	var called []string
+	callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+		called = append(called, tool)
+		if tool == "tool_profile" {
+			return json.RawMessage(cannedToolProfileJSON), nil
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("legacy name must not use the compact relay")
+		return nil, nil
+	}
+
+	cmd, _ := newCallTestCmd(t)
+	require.NoError(t, runCall(cmd, []string{"search_symbols"}))
+	require.Equal(t, []string{"tool_profile", "search_symbols"}, called)
+}
+
+func TestCall_LegacyEscapePreservesSharedAnalyzeContract(t *testing.T) {
+	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
+	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
+	var called []string
+	callDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+		called = append(called, tool)
+		if tool == "tool_profile" {
+			return json.RawMessage(`{"live":["analyze"],"descriptors":[{"name":"analyze","mutating":false}]}`), nil
+		}
+		require.Equal(t, "analyze", tool)
+		require.Equal(t, "temporal_verify", args["kind"])
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("--legacy must not negotiate the compact surface")
+		return nil, nil
+	}
+
+	cmd, _ := newCallTestCmd(t)
+	callLegacy = true
+	callArgs = []string{"kind=temporal_verify"}
+	require.NoError(t, runCall(cmd, []string{"analyze"}))
+	require.Equal(t, []string{"tool_profile", "analyze"}, called)
 }
 
 // cannedToolProfileJSON is a minimal tool_profile response with a descriptors

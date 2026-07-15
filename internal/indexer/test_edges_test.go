@@ -1,9 +1,11 @@
 package indexer
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestMarkTestSymbolsAndEmitEdges_GoStyle(t *testing.T) {
@@ -271,5 +273,79 @@ func TestMarkTestSymbolsAndEmitEdges_DedupesParallelCalls(t *testing.T) {
 	_, emitted := markTestSymbolsAndEmitEdges(g)
 	if emitted != 1 {
 		t.Fatalf("expected 1 deduped EdgeTests, got %d", emitted)
+	}
+}
+
+func TestMarkTestSymbolsAndEmitEdges_PersistsMetadataAcrossSQLiteReload(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.sqlite")
+	g, err := store_sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+
+	g.AddBatch([]*graph.Node{
+		{ID: "pkg/foo_test.go", Kind: graph.KindFile, Name: "pkg/foo_test.go", FilePath: "pkg/foo_test.go", Language: "go"},
+		{ID: "pkg/foo.go", Kind: graph.KindFile, Name: "pkg/foo.go", FilePath: "pkg/foo.go", Language: "go"},
+		{ID: "pkg/foo_test.go::TestFoo", Kind: graph.KindFunction, Name: "TestFoo", FilePath: "pkg/foo_test.go", Language: "go"},
+		{ID: "pkg/foo_test.go::Suite.TestBar", Kind: graph.KindMethod, Name: "TestBar", FilePath: "pkg/foo_test.go", Language: "go"},
+		{ID: "pkg/foo.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "pkg/foo.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "pkg/foo_test.go::TestFoo", To: "pkg/foo.go::Foo", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 10},
+		{From: "pkg/foo_test.go::Suite.TestBar", To: "pkg/foo.go::Foo", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 20},
+	})
+
+	marked, emitted := markTestSymbolsAndEmitEdges(g)
+	if marked != 2 || emitted != 2 {
+		t.Fatalf("mark/emit counts = %d/%d, want 2/2", marked, emitted)
+	}
+	markedAgain, emittedAgain := markTestSymbolsAndEmitEdges(g)
+	if markedAgain != 2 || emittedAgain != 2 {
+		t.Fatalf("repeat mark/emit counts = %d/%d, want 2/2", markedAgain, emittedAgain)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatalf("close sqlite store: %v", err)
+	}
+
+	reloaded, err := store_sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite store: %v", err)
+	}
+	defer func() { _ = reloaded.Close() }()
+
+	file := reloaded.GetNode("pkg/foo_test.go")
+	if file == nil {
+		t.Fatal("test file missing after reload")
+	}
+	if got, _ := file.Meta["is_test_file"].(bool); !got {
+		t.Fatalf("test file is_test_file = %v, want true", file.Meta["is_test_file"])
+	}
+	if got, _ := file.Meta["test_runner"].(string); got != "gotest" {
+		t.Fatalf("test file test_runner = %q, want gotest", got)
+	}
+
+	for _, id := range []string{"pkg/foo_test.go::TestFoo", "pkg/foo_test.go::Suite.TestBar"} {
+		n := reloaded.GetNode(id)
+		if n == nil {
+			t.Fatalf("test symbol %s missing after reload", id)
+		}
+		if got, _ := n.Meta["is_test"].(bool); !got {
+			t.Errorf("%s is_test = %v, want true", id, n.Meta["is_test"])
+		}
+		if got, _ := n.Meta["test_role"].(string); got != "test" {
+			t.Errorf("%s test_role = %q, want test", id, got)
+		}
+		if got, _ := n.Meta["test_runner"].(string); got != "gotest" {
+			t.Errorf("%s test_runner = %q, want gotest", id, got)
+		}
+	}
+
+	var persistedEdges int
+	for edge := range reloaded.EdgesByKind(graph.EdgeTests) {
+		if edge != nil && edge.To == "pkg/foo.go::Foo" {
+			persistedEdges++
+		}
+	}
+	if persistedEdges != 2 {
+		t.Fatalf("persisted EdgeTests = %d, want 2", persistedEdges)
 	}
 }

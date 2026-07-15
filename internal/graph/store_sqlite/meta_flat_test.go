@@ -118,8 +118,9 @@ func TestFlatCodecDeterministic(t *testing.T) {
 // model makes encodeMeta fall back to JSON (leading '{'), and decodeMeta
 // still reads it. No data is dropped.
 func TestEncodeMetaFallbackToJSON(t *testing.T) {
-	// uint64 is deliberately outside the modelled type set.
-	in := map[string]any{"weird": uint64(42), "name": "keep"}
+	// []int is deliberately outside the modelled type set. uint64 is now an
+	// exact fast-codec type because reach generations must survive reloads.
+	in := map[string]any{"weird": []int{42}, "name": "keep"}
 
 	if _, ok := encodeMetaFast(in); ok {
 		t.Fatal("encodeMetaFast should bail on an unmodelled value type")
@@ -139,8 +140,8 @@ func TestEncodeMetaFallbackToJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeMeta(json fallback): %v", err)
 	}
-	// The JSON fallback widens uint64 -> int (documented, lossy only for the
-	// exotic tail), but the string survives and no row is lost.
+	// The exotic tail may widen through JSON, but the string survives and no
+	// row is lost.
 	if got["name"] != "keep" {
 		t.Errorf("name not preserved through JSON fallback: %#v", got["name"])
 	}

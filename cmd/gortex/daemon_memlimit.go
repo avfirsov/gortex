@@ -4,14 +4,13 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"time"
 
 	"go.uber.org/zap"
 
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -186,14 +185,12 @@ func parseByteSize(s string) (int64, error) {
 // memory limit. Call once at boot, after logging and config are up and
 // before warmup starts allocating.
 //
-// Composition with the cold-index window (internal/indexer/gc_tune.go): a
-// cold index briefly raises the limit to a larger budget (RAM/2) and, on
-// exit, restores the value it captured via debug.SetMemoryLimit(-1) — which
-// is exactly the standing limit installed here. Installing this before any
-// index runs is what makes that restore land on our value rather than on
-// "no limit". The two are therefore composable: the daemon holds a modest
-// standing ceiling, cold indexes get their wider one-shot budget, and the
-// standing ceiling comes back afterward untouched.
+// Composition with the cold-index window (internal/indexer/gc_tune.go): the
+// indexer captures this limit and may install a tighter host/cgroup-derived
+// budget, but it never raises an already-lower standing limit. On exit it
+// restores the exact captured value. Installing this before any index runs
+// therefore keeps both cold and steady-state allocation inside the daemon's
+// configured envelope.
 func applyStandingMemoryLimit(logger *zap.Logger, cfgVal string) {
 	d := resolveStandingMemoryLimit(
 		platform.HostPhysicalMemoryBytes(),
@@ -254,26 +251,9 @@ func releaseMemoryToOS(logger *zap.Logger, reason string) {
 	if !memReleaseEnabled() {
 		return
 	}
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	start := time.Now()
-	debug.FreeOSMemory()
-	elapsed := time.Since(start)
-	runtime.ReadMemStats(&after)
-	// Concurrent allocation between the two reads can re-acquire released
-	// pages faster than this call released them, making the raw delta
-	// negative; report that as zero net release rather than a nonsense
-	// negative byte count.
-	freed := int64(after.HeapReleased) - int64(before.HeapReleased)
-	if freed < 0 {
-		freed = 0
-	}
-	if logger != nil {
-		logger.Info("daemon: released heap to OS",
-			zap.String("reason", reason),
-			zap.Duration("elapsed", elapsed),
-			zap.Int64("freed_bytes", freed),
-			zap.Uint64("heap_sys_bytes", after.HeapSys),
-			zap.Uint64("heap_released_bytes", after.HeapReleased))
-	}
+	// MCP calls and daemon background work share one process, activity gate,
+	// quiet window, cooldown, and scheduler. Scheduling here avoids a
+	// stop-the-world GC on the warmup/janitor goroutine and guarantees that a
+	// new tool call or another background job postpones reclamation.
+	gortexmcp.ScheduleMemoryReleaseAfterBurst(logger, reason)
 }

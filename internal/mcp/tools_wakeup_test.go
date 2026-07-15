@@ -31,13 +31,11 @@ func newWakeupTestServer(t *testing.T) *Server {
 		sessions:   newSessionMap(),
 		toolScopes: newScopeRegistry(),
 	}
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(s, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "c1", Label: "core", Size: 3, Hub: "Run", Members: []string{"p/main.go::Run", "p/util.go::Helper"}},
 		},
-	}
-	s.analysisMu.Unlock()
+	})
 	return s
 }
 
@@ -130,8 +128,7 @@ func TestWakeup_TokenBudgetCaps(t *testing.T) {
 
 func TestWakeup_TopCommunitiesCap(t *testing.T) {
 	s := newWakeupTestServer(t)
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(s, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "c1", Label: "a", Size: 5},
 			{ID: "c2", Label: "b", Size: 4},
@@ -139,8 +136,7 @@ func TestWakeup_TopCommunitiesCap(t *testing.T) {
 			{ID: "c4", Label: "d", Size: 2},
 			{ID: "c5", Label: "e", Size: 1},
 		},
-	}
-	s.analysisMu.Unlock()
+	})
 
 	text, _ := callWakeupHandler(t, s, map[string]any{"top_communities": 2})
 	assert.Contains(t, text, "a (5")

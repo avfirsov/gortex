@@ -202,6 +202,47 @@ func (r *Registry) ByFile(filePath string) []Contract {
 	return out
 }
 
+// ReplaceFile atomically replaces the contracts owned by one source file while
+// preserving every other file's registry entries. Incremental indexing uses
+// this to keep contract extraction bounded to the changed-file frontier.
+func (r *Registry) ReplaceFile(filePath string, list []Contract) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, old := range r.byFilePath[filePath] {
+		r.byID[old.ID] = removeContract(r.byID[old.ID], old)
+		if len(r.byID[old.ID]) == 0 {
+			delete(r.byID, old.ID)
+		}
+		r.byRepo[old.RepoPrefix] = removeContract(r.byRepo[old.RepoPrefix], old)
+		if len(r.byRepo[old.RepoPrefix]) == 0 {
+			delete(r.byRepo, old.RepoPrefix)
+		}
+		if old.SymbolID != "" {
+			r.bySymbol[old.SymbolID] = removeContract(r.bySymbol[old.SymbolID], old)
+			if len(r.bySymbol[old.SymbolID]) == 0 {
+				delete(r.bySymbol, old.SymbolID)
+			}
+		}
+		workspace := old.EffectiveWorkspace()
+		r.byWorkspace[workspace] = removeContract(r.byWorkspace[workspace], old)
+		if len(r.byWorkspace[workspace]) == 0 {
+			delete(r.byWorkspace, workspace)
+		}
+	}
+	delete(r.byFilePath, filePath)
+
+	for _, c := range list {
+		r.byID[c.ID] = append(r.byID[c.ID], c)
+		r.byRepo[c.RepoPrefix] = append(r.byRepo[c.RepoPrefix], c)
+		if c.SymbolID != "" {
+			r.bySymbol[c.SymbolID] = append(r.bySymbol[c.SymbolID], c)
+		}
+		r.byFilePath[c.FilePath] = append(r.byFilePath[c.FilePath], c)
+		r.byWorkspace[c.EffectiveWorkspace()] = append(r.byWorkspace[c.EffectiveWorkspace()], c)
+	}
+}
+
 // ByWorkspace returns every contract whose effective workspace
 // (WorkspaceID || RepoPrefix default) equals workspaceID. Used by
 // per-workspace `contracts check` calls so each workspace's matcher

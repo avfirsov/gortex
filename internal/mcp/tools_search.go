@@ -56,7 +56,7 @@ func (s *Server) registerToolsSearch() {
 		)),
 	)
 
-	s.mcpServer.AddTool(tool, s.wrapToolHandler(s.handleToolsSearch))
+	s.addControlTool(tool, s.handleToolsSearch)
 }
 
 // toolsSearchPayload is the structured form of the discovery tool's

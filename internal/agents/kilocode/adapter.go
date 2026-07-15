@@ -29,21 +29,21 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
-// alwaysAllow is Kilo Code's auto-approve list, matching the Cline
-// equivalent — Kilo Code is a Cline fork and uses the same field.
-var alwaysAllow = []string{
+// alwaysAllow is Kilo Code's coarse tool-level auto-approve list. Kilo is a
+// Cline fork and uses the same field and compact-tool policy.
+var alwaysAllow = agents.CompactMCPAutoApproveTools()
+
+// v060AlwaysAllow fingerprints the exact approval list shipped by gortex
+// v0.60.0. User customizations, including deliberately narrower lists, are
+// never widened. The concrete retirement gate is in docs/versioning.md.
+var v060AlwaysAllow = []string{
 	"graph_stats", "search_symbols", "winnow_symbols", "get_symbol", "get_file_summary",
-	"get_editing_context", "get_dependencies", "get_dependents",
-	"get_call_chain", "get_callers", "find_implementations", "find_usages",
-	"get_cluster", "get_symbol_source", "batch_symbols",
-	"find_import_path", "explain_change_impact", "get_recent_changes",
-	"smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
-	"get_communities", "get_processes",
-	"detect_changes", "index_repository", "reindex_repository",
-	"verify_change", "check_guards", "prefetch_context",
-	"analyze", "diff_context", "index_health", "get_symbol_history",
-	"scaffold", "batch_edit", "contracts", "feedback",
-	"flow_between", "taint_paths",
+	"get_editing_context", "get_dependencies", "get_dependents", "get_call_chain", "get_callers",
+	"find_implementations", "find_usages", "get_cluster", "get_symbol_source", "batch_symbols",
+	"find_import_path", "explain_change_impact", "get_recent_changes", "smart_context", "get_edit_plan", "get_test_targets", "suggest_pattern",
+	"get_communities", "get_processes", "detect_changes", "index_repository", "reindex_repository",
+	"verify_change", "check_guards", "prefetch_context", "analyze", "diff_context", "index_health", "get_symbol_history",
+	"scaffold", "batch_edit", "contracts", "feedback", "flow_between", "taint_paths",
 }
 
 // globalStoragePaths returns candidate paths for Kilo Code's MCP
@@ -125,7 +125,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	entry["alwaysAllow"] = alwaysAllow
 
 	merge := func(root map[string]any, _ bool) (bool, error) {
-		return agents.UpsertMCPServer(root, "gortex", entry, opts), nil
+		return agents.UpsertMCPServerApprovalList(root, "gortex", "alwaysAllow", alwaysAllow, entry, opts, v060AlwaysAllow), nil
 	}
 
 	// Project-level first, if a .kilocode/ dir already exists.

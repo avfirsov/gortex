@@ -2,38 +2,96 @@ package hooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 )
 
-// RunCodex handles the Codex hook wire shape. Codex support is deliberately
-// soft-only: PreToolUse is forced through ModeEnrich, PostToolUse only emits
-// additionalContext, and UserPromptSubmit re-surfaces prompt-relevant graph
-// symbols on every turn. No branch ever denies a tool call.
-func RunCodex(port int) {
+// CodexMode is deliberately separate from the cross-agent hook Mode: Codex's
+// compatibility default must remain advisory even though the generic hook
+// command defaults to deny for Claude Code.
+type CodexMode int
+
+const (
+	CodexModeEnrich CodexMode = iota
+	CodexModeDeny
+	CodexModeRewrite
+	CodexModeSuppress
+)
+
+func ParseCodexMode(value string) CodexMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "deny", "hard-deny":
+		return CodexModeDeny
+	case "rewrite", "input-rewrite":
+		return CodexModeRewrite
+	case "suppress", "replace-output", "output-suppression":
+		return CodexModeSuppress
+	default:
+		return CodexModeEnrich
+	}
+}
+
+func (m CodexMode) String() string {
+	switch m {
+	case CodexModeDeny:
+		return "deny"
+	case CodexModeRewrite:
+		return "rewrite"
+	case CodexModeSuppress:
+		return "suppress"
+	default:
+		return "enrich"
+	}
+}
+
+// RunCodex handles the Codex hook wire shape. Advisory enrich remains the
+// default. Operators may opt into hard deny, conservative input rewrite, or
+// supported PostToolUse result replacement (the current Codex release rejects
+// the nominal suppressOutput field, so suppress mode never emits it).
+func RunCodex(port int, selected ...CodexMode) {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return
 	}
-	runCodex(data, port)
+	runCodex(data, port, selected...)
 }
 
-func runCodex(data []byte, port int) {
+func runCodex(data []byte, port int, selected ...CodexMode) {
 	var peek struct {
 		HookEventName string `json:"hook_event_name"`
 		ToolName      string `json:"tool_name"`
+		CWD           string `json:"cwd"`
 	}
 	if err := json.Unmarshal(data, &peek); err != nil {
 		return
 	}
+	mode := CodexModeEnrich
+	if len(selected) > 0 {
+		mode = selected[0]
+	}
+	setHookCWD(peek.CWD)
+	defer setHookCWD("")
 
 	switch {
+	case peek.HookEventName == "SessionStart":
+		runSessionStart(data)
 	case peek.HookEventName == "PreToolUse" && peek.ToolName == "Bash":
-		runPreToolUse(data, port, ModeEnrich)
+		switch mode {
+		case CodexModeDeny:
+			runCodexBashHardDeny(data, port)
+		case CodexModeRewrite:
+			runCodexBashRewrite(data, port)
+		default:
+			runPreToolUse(data, port, ModeEnrich)
+		}
 	case peek.HookEventName == "PreToolUse" && codexMCPReadPreToolUseTool(peek.ToolName):
-		runCodexMCPReadPreToolUse(data)
-	case peek.HookEventName == "PostToolUse" && peek.ToolName == "Bash":
-		runCodexPostToolUse(data)
+		runCodexMCPReadPreToolUse(data, mode)
+	case peek.HookEventName == "PostToolUse" && (peek.ToolName == "Bash" || peek.ToolName == "apply_patch"):
+		runCodexPostToolUse(data, port, mode)
 	case peek.HookEventName == "UserPromptSubmit":
 		// Re-surface graph symbols relevant to the prompt on every turn.
 		// Codex forgets MCP tools as context grows, so a SessionStart
@@ -44,16 +102,157 @@ func runCodex(data []byte, port int) {
 	}
 }
 
+func runCodexBashHardDeny(data []byte, port int) {
+	started := time.Now()
+	var input HookInput
+	if err := json.Unmarshal(data, &input); err != nil || input.HookEventName != "PreToolUse" || input.ToolName != "Bash" {
+		return
+	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+	}()
+
+	result := enrich(input, port)
+	classification := classifyBashCommand(fmt.Sprint(input.ToolInput["command"]))
+	searchShape := classification.Action == BashActionGrepLike || classification.Action == BashActionFindName
+	workspaceScoped := !searchShape || bashSearchTargetsWorkspace(fmt.Sprint(input.ToolInput["command"]), input.CWD, classification.Action)
+	if result.deny && searchShape && !workspaceScoped {
+		// A graph hit does not prove an explicitly external grep/find target is
+		// indexed. Keep the reminder but never block that command.
+		result = enrichResult{context: defaultGrepGuidance()}
+	}
+	if !result.deny && daemonReachableFn() && workspaceScoped &&
+		classification.Action == BashActionGrepLike && result.context != "" &&
+		codexTextSearchHitFn(port, classification.Pattern) {
+		result.deny = true
+		result.reason = "[Gortex] BLOCKED by opt-in Codex deny posture. Use the public MCP search/relations operations instead of a raw source search.\n" + result.context
+		result.context = ""
+	}
+	if result.context == "" && !result.deny {
+		return
+	}
+	hso := &HookSpecificOutput{HookEventName: "PreToolUse"}
+	if result.deny {
+		hso.PermissionDecision = "deny"
+		hso.PermissionDecisionReason = result.reason
+	} else {
+		hso.AdditionalContext = result.context
+	}
+	emitted = true
+	emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+}
+
+// codexTextSearchHitFn confirms that a raw regex/literal search actually has
+// an indexed-code match before the opt-in deny posture blocks it. Keeping the
+// check behind a seam makes the hard-deny boundary testable without a daemon.
+var codexTextSearchHitFn = codexTextSearchHasHit
+
+func codexTextSearchHasHit(port int, pattern string) bool {
+	if strings.TrimSpace(pattern) == "" {
+		return false
+	}
+	raw := callServerTool(port, "search_text", map[string]any{
+		"query": pattern, "regexp": true, "limit": 1,
+	})
+	var result struct {
+		Count int `json:"count"`
+	}
+	return json.Unmarshal([]byte(raw), &result) == nil && result.Count > 0
+}
+
+// bashSearchTargetsWorkspace accepts only a single grep/find command whose
+// explicit search roots stay under cwd. Compound commands remain advisory;
+// an absolute or ../ scope outside the workspace can never be hard-denied just
+// because the same pattern happens to exist in the graph.
+func bashSearchTargetsWorkspace(command, cwd string, action BashAction) bool {
+	if !simpleBashCommand(command) {
+		return false
+	}
+	tokens := tokenize(command)
+	for len(tokens) > 0 && (tokens[0] == "sudo" || tokens[0] == "time" ||
+		(strings.Contains(tokens[0], "=") && !strings.HasPrefix(tokens[0], "-"))) {
+		tokens = tokens[1:]
+	}
+	if len(tokens) == 0 {
+		return false
+	}
+	var scopes []string
+	switch action {
+	case BashActionGrepLike:
+		_, patternAt, ok := extractGrepPatternAt(tokens)
+		if !ok {
+			return false
+		}
+		for i := patternAt + 1; i < len(tokens); i++ {
+			token := tokens[i]
+			if token == "--" {
+				scopes = append(scopes, tokens[i+1:]...)
+				break
+			}
+			if strings.HasPrefix(token, "--") && strings.Contains(token, "=") {
+				continue
+			}
+			if grepFlagsTakingArg[token] {
+				i++
+				continue
+			}
+			if strings.HasPrefix(token, "-") {
+				continue
+			}
+			scopes = append(scopes, token)
+		}
+	case BashActionFindName:
+		for _, token := range tokens[1:] {
+			if strings.HasPrefix(token, "-") || token == "!" || token == "(" {
+				break
+			}
+			scopes = append(scopes, token)
+		}
+	default:
+		return false
+	}
+	if len(scopes) == 0 {
+		scopes = []string{"."}
+	}
+	for _, scope := range scopes {
+		if !pathWithinWorkspace(cwd, scope) {
+			return false
+		}
+	}
+	return true
+}
+
+func pathWithinWorkspace(cwd, scope string) bool {
+	if strings.TrimSpace(scope) == "" || scope == "-" {
+		return false
+	}
+	root, err := filepath.Abs(cwd)
+	if err != nil || strings.TrimSpace(cwd) == "" {
+		root = ""
+	}
+	candidate := filepath.Clean(scope)
+	if root == "" {
+		return !filepath.IsAbs(candidate) && candidate != ".." && !strings.HasPrefix(candidate, ".."+string(filepath.Separator))
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(root, candidate)
+	}
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func codexMCPReadPreToolUseTool(toolName string) bool {
 	switch toolName {
-	case gortexReadFileTool, gortexEditingContextTool:
+	case gortexCompactReadTool, gortexReadFileTool, gortexEditingContextTool:
 		return true
 	default:
 		return false
 	}
 }
 
-func runCodexMCPReadPreToolUse(data []byte) {
+func runCodexMCPReadPreToolUse(data []byte, mode CodexMode) {
+	started := time.Now()
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -61,25 +260,131 @@ func runCodexMCPReadPreToolUse(data []byte) {
 	if input.HookEventName != "PreToolUse" || !codexMCPReadPreToolUseTool(input.ToolName) {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 
 	ctx := gortexReadNudge(input.ToolName, input.ToolInput)
 	if ctx == "" {
 		return
 	}
-	emitPreToolUse(HookOutput{
-		HookSpecificOutput: &HookSpecificOutput{
-			HookEventName:     "PreToolUse",
-			AdditionalContext: ctx,
-		},
-	})
+	hso := &HookSpecificOutput{HookEventName: "PreToolUse", AdditionalContext: ctx}
+	switch mode {
+	case CodexModeDeny:
+		hso.AdditionalContext = ""
+		hso.PermissionDecision = "deny"
+		hso.PermissionDecisionReason = ctx
+	case CodexModeRewrite:
+		hso.PermissionDecision = "allow"
+		hso.UpdatedInput = rewrittenGortexReadInput(input.ToolName, input.ToolInput)
+	}
+	emitted = true
+	emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 }
 
-func runCodexPostToolUse(data []byte) {
+func rewrittenGortexReadInput(toolName string, input map[string]any) map[string]any {
+	out := cloneStringAnyMap(input)
+	switch strings.TrimSpace(toolName) {
+	case gortexCompactReadTool, "read":
+		options, _ := input["options"].(map[string]any)
+		options = cloneStringAnyMap(options)
+		options["compress_bodies"] = true
+		out["options"] = options
+	default:
+		out["compress_bodies"] = true
+	}
+	return out
+}
+
+func cloneStringAnyMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input)+1)
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func runCodexBashRewrite(data []byte, port int) {
+	started := time.Now()
+	var input HookInput
+	if err := json.Unmarshal(data, &input); err != nil || input.HookEventName != "PreToolUse" || input.ToolName != "Bash" {
+		return
+	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+	}()
+
+	if updated, message, ok := rewrittenCodexBashInput(input); ok {
+		emitted = true
+		emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			HookEventName:      "PreToolUse",
+			AdditionalContext:  message,
+			PermissionDecision: "allow",
+			UpdatedInput:       updated,
+		}})
+		return
+	}
+
+	result := applyMode(input, false, ModeEnrich, enrich(input, port))
+	if result.context == "" {
+		return
+	}
+	emitted = true
+	emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+		HookEventName:     "PreToolUse",
+		AdditionalContext: result.context,
+	}})
+}
+
+// rewrittenCodexBashInput rewrites only a single, unpiped `cat <source>` for
+// a file the daemon confirms is indexed. Head/tail, compound commands,
+// redirects, and search/list shapes retain advisory behavior because changing
+// their output contract could alter caller semantics.
+func rewrittenCodexBashInput(input HookInput) (map[string]any, string, bool) {
+	command, _ := input.ToolInput["command"].(string)
+	classification := classifyBashCommand(command)
+	if classification.Action != BashActionReadSource || classification.Primary != "cat" || !simpleBashCommand(command) {
+		return nil, "", false
+	}
+	indexed, _ := queryFileIndexed(input.CWD, classification.Path)
+	if !indexed {
+		return nil, "", false
+	}
+	args, err := json.Marshal(map[string]any{"target": map[string]any{"file": classification.Path}})
+	if err != nil {
+		return nil, "", false
+	}
+	updated := cloneStringAnyMap(input.ToolInput)
+	updated["command"] = "gortex call read --json " + shellSingleQuote(string(args))
+	return updated, fmt.Sprintf("[Gortex] Rewrote indexed source read %s to the exact public read mirror.", classification.Path), true
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
+	started := time.Now()
 	var input postHookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
 	}
-	if input.HookEventName != "PostToolUse" || input.ToolName != "Bash" {
+	if input.HookEventName != "PostToolUse" {
+		return
+	}
+	if input.ToolName == "apply_patch" {
+		ctx := buildMutationBriefing(port)
+		emitted := ctx != ""
+		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+		if !emitted {
+			return
+		}
+		emitPostToolContext(ctx, mode == CodexModeSuppress)
+		return
+	}
+	if input.ToolName != "Bash" {
 		return
 	}
 
@@ -91,9 +396,9 @@ func runCodexPostToolUse(data []byte) {
 		// the existing PostToolUse enrichment can parse path:line output and do
 		// the graph lookup without changing Claude Code behavior.
 		input.ToolName = "Grep"
-	case BashActionFindName:
+	case BashActionFindName, BashActionFileList:
 		input.ToolName = "Glob"
-	case BashActionReadSource:
+	case BashActionReadSource, BashActionReadRange:
 		if classification.Path == "" {
 			return
 		}
@@ -110,5 +415,14 @@ func runCodexPostToolUse(data []byte) {
 	if err != nil {
 		return
 	}
-	runPostToolUse(normalized)
+	if mode != CodexModeSuppress {
+		runPostToolUse(normalized)
+		return
+	}
+	ctx := postToolContext(input)
+	emitted := ctx != ""
+	logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+	if emitted {
+		emitPostToolContext(ctx, true)
+	}
 }

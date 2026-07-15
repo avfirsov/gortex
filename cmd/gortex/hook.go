@@ -35,10 +35,9 @@ var hookCmd = &cobra.Command{
 			hooks.RunPi(hookPort, hooks.ParseMode(hookMode))
 			return
 		case "codex":
-			// Codex support is intentionally soft-only: the adapter installs
-			// Bash PreToolUse/PostToolUse plus a UserPromptSubmit hook that emit
-			// additionalContext without ever denying the tool call.
-			hooks.RunCodex(hookPort)
+			// Codex defaults to advisory context. Explicit postures add hard
+			// deny, conservative input rewrite, or PostToolUse result replacement.
+			hooks.RunCodex(hookPort, hooks.ParseCodexMode(hookMode))
 			return
 		case "kimi":
 			// Kimi Code CLI: UserPromptSubmit / PreToolUse / Stop /
@@ -59,9 +58,9 @@ var hookCmd = &cobra.Command{
 
 func init() {
 	hookCmd.Flags().IntVar(&hookPort, "port", 8765, "Gortex web server port")
-	hookCmd.Flags().StringVar(&hookMode, "mode", "deny",
-		"hook posture: 'deny' (redirect Grep/Glob/Read of indexed source), 'enrich' (never deny; PostToolUse appends graph context), 'consult-unlock' (deny fallback reads until the graph is queried once this session), or 'nudge' (soft-deny once per burst of non-symbolic calls)")
+	hookCmd.Flags().StringVar(&hookMode, "mode", "",
+		"hook posture: Claude defaults to deny and accepts deny|enrich|consult-unlock|nudge; Codex defaults to enrich and accepts enrich|deny|rewrite|suppress")
 	hookCmd.Flags().StringVar(&hookAgent, "agent", "",
-		"hook wire protocol: empty/'claude' (Claude Code PreToolUse/UserPromptSubmit), 'codex' (Codex Bash PreToolUse/PostToolUse + UserPromptSubmit soft context), 'kimi' (Kimi Code CLI UserPromptSubmit/PreToolUse/Stop/SubagentStart; plain-stdout context, permissionDecision deny for indexed reads), 'hermes' (NousResearch hermes-agent pre_tool_call/pre_llm_call), 'pi' (earendil-works/pi extension bridge — normalized PiEvent envelope in, PiDecision out), or 'gemini'/'antigravity' (emits hookSpecificOutput.additionalContext). Default (empty) is the Claude Code format.")
+		"hook wire protocol: empty/'claude' (Claude Code lifecycle hooks), 'codex' (Codex Bash/MCP/apply_patch hooks), 'kimi' (Kimi Code CLI hooks), 'hermes' (NousResearch hermes-agent hooks), 'pi' (Pi extension bridge), or 'gemini'/'antigravity'. Default (empty) is Claude Code.")
 	rootCmd.AddCommand(hookCmd)
 }

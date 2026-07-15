@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
-	"errors"
-	"io"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
@@ -158,55 +154,4 @@ func filterToolsListFrame(line []byte, surface *gortexmcp.ToolSurface) []byte {
 		return line
 	}
 	return append(out, '\n')
-}
-
-// pumpRequestsFiltered relays client→daemon frames, gating disallowed
-// tools/call frames with a synthesized error reply written to clientOut.
-func pumpRequestsFiltered(src io.Reader, daemonW, clientOut io.Writer, outMu *sync.Mutex, surface *gortexmcp.ToolSurface) error {
-	r := bufio.NewReaderSize(src, 1<<20)
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 {
-			if reply, gated := gateToolCallFrame(line, surface); gated {
-				outMu.Lock()
-				_, werr := clientOut.Write(reply)
-				outMu.Unlock()
-				if werr != nil {
-					return werr
-				}
-			} else if _, werr := daemonW.Write(line); werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-// pumpResponsesFiltered relays daemon→client frames, filtering tools/list
-// results down to the surface.
-func pumpResponsesFiltered(src io.Reader, clientOut io.Writer, outMu *sync.Mutex, surface *gortexmcp.ToolSurface) error {
-	r := bufio.NewReaderSize(src, 1<<20)
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 {
-			out := filterToolsListFrame(line, surface)
-			outMu.Lock()
-			_, werr := clientOut.Write(out)
-			outMu.Unlock()
-			if werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
 }

@@ -18,31 +18,49 @@ func TestMaybeToolInvocationHint(t *testing.T) {
 			name:         "read_file tool name",
 			args:         []string{"read_file", "foo.go"},
 			wantHint:     true,
-			wantContains: []string{"gortex call read_file --arg path=<file>", "not a gortex command"},
+			wantContains: []string{"gortex call read --arg target='{\"file\":\"<file>\"}'", "legacy Gortex MCP name"},
+		},
+		{
+			name:         "long-tail legacy name maps to public discovery",
+			args:         []string{"flow_between"},
+			wantHint:     true,
+			wantContains: []string{"gortex call capabilities --arg domain='trace' --arg operation='flow'", "legacy Gortex MCP name"},
 		},
 		{
 			name:         "get_symbol_source tool name",
 			args:         []string{"get_symbol_source"},
 			wantHint:     true,
-			wantContains: []string{"gortex call get_symbol_source --arg"},
+			wantContains: []string{"gortex call read --arg target='{\"symbol\":\"<file>::<Name|Recv.Name>\"}'"},
+		},
+		{
+			name:         "dedicated facade tool name",
+			args:         []string{"read"},
+			wantHint:     true,
+			wantContains: []string{"gortex call read --arg target='{\"file\":\"<file>\"}'", "gortex call capabilities"},
 		},
 		{
 			name:         "tool name behind leading global flag",
 			args:         []string{"--config", "x.yaml", "read_file", "foo.go"},
 			wantHint:     true,
-			wantContains: []string{"gortex call read_file --arg path=<file>"},
+			wantContains: []string{"gortex call read --arg target='{\"file\":\"<file>\"}'"},
 		},
 		{
 			name:         "fuzzy: reindex suggests reindex_repository",
 			args:         []string{"reindex"},
 			wantHint:     true,
-			wantContains: []string{`unknown command "reindex"`, "gortex call reindex_repository --arg path=<repo-root>"},
+			wantContains: []string{`unknown command "reindex"`, "gortex call workspace_admin --arg operation=reindex"},
 		},
 		{
 			name:         "fuzzy: index suggests index_repository",
 			args:         []string{"index", "."},
 			wantHint:     true,
-			wantContains: []string{`unknown command "index"`, "gortex call index_repository --arg path=<repo-root>"},
+			wantContains: []string{`unknown command "index"`, "gortex call workspace_admin --arg operation=index"},
+		},
+		{
+			name:         "fuzzy facade uses negotiating command",
+			args:         []string{"publish"},
+			wantHint:     true,
+			wantContains: []string{`unknown command "publish"`, "gortex call publish_review --arg operation='<operation>'"},
 		},
 		{
 			name:     "real cobra command is not intercepted",
@@ -100,5 +118,13 @@ func TestMaybeToolInvocationHint(t *testing.T) {
 				t.Errorf("hint must teach the `gortex call` shape:\n%s", out)
 			}
 		})
+	}
+}
+
+func TestCompactCLIInvocationQuotesShellPlaceholders(t *testing.T) {
+	for _, tool := range []string{"analyze", "ask", "capabilities", "explore", "search", "relations"} {
+		if got := cliInvocationForTool(tool); strings.Contains(got, "=<") {
+			t.Errorf("cliInvocationForTool(%q) contains shell redirection syntax: %s", tool, got)
+		}
 	}
 }

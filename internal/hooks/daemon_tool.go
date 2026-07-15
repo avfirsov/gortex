@@ -47,6 +47,25 @@ var callServerToolDaemonFn = callServerToolViaDaemon
 // hook past the host's own hook timeout.
 const callServerToolTimeout = 5 * time.Second
 
+const (
+	hookInternalToolSurface = "core"
+	hookInternalToolMode    = "defer"
+)
+
+// hookMCPHandshake explicitly selects the compatibility surface used by hook
+// internals. Hooks call canonical implementation tools such as
+// get_file_summary and detect_changes; they are not an agent session and must
+// not inherit the compact named-client default.
+func hookMCPHandshake(cwd string) daemon.Handshake {
+	return daemon.Handshake{
+		Mode:       daemon.ModeMCP,
+		ClientName: "gortex-hook",
+		CWD:        cwd,
+		Tools:      hookInternalToolSurface,
+		ToolsMode:  hookInternalToolMode,
+	}
+}
+
 // callServerToolViaDaemon runs one MCP tools/call against the local daemon over
 // its AF_UNIX socket and returns the first text content block, or "" on any
 // error. cwd scopes the handshake to the caller's workspace so tools that read
@@ -57,11 +76,7 @@ func callServerToolViaDaemon(cwd, name string, args map[string]any) string {
 	if args == nil {
 		args = map[string]any{}
 	}
-	client, err := daemon.Dial(daemon.Handshake{
-		Mode:       daemon.ModeMCP,
-		ClientName: "gortex-hook",
-		CWD:        cwd,
-	})
+	client, err := daemon.Dial(hookMCPHandshake(cwd))
 	if err != nil {
 		return ""
 	}

@@ -447,42 +447,123 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
 	mi.mu.RUnlock()
 	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
 	enrichScheduled := 0
+	catchupNeeded := false
+	catchupScopeKnown := true
+	catchupScope := make(map[string]struct{})
 	for _, idx := range indexers {
-		if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
-			continue
-		}
-		if idx.pendingEnrich.Load() || forced {
+		enrich := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() &&
+			(idx.pendingEnrich.Load() || forced)
+		if enrich {
 			enrichScheduled++
 		}
+		// This remains the conservative fallback for stores that do not yet
+		// advertise exact mutation receipts (notably SQLite).
+		if !enrich && idx.pendingContractReg == nil {
+			continue
+		}
+		catchupNeeded = true
+		if idx.repoPrefix == "" {
+			catchupScopeKnown = false
+			continue
+		}
+		catchupScope[idx.repoPrefix] = struct{}{}
 	}
 	for _, idx := range indexers {
 		idx.SetSkipResolveInDeferred(true)
 	}
-	// Per-repo deferred work in three phases. gomod (materialises dep
-	// contract nodes) and contracts (extract + commit, which walk repo edges)
-	// mutate the shared graph in ways that race across repos, so they stay
-	// serial. Enrichment is the dominant cost — LSP background-indexing and
-	// hover I/O — and is safe to overlap across repos: the manager hands each
-	// repo its own LSP provider instance, go-types stashes per repo, and every
-	// provider serialises its graph mutations on the backend resolve mutex.
-	for _, idx := range indexers {
-		idx.runDeferredGoMod()
-	}
-	mi.runDeferredEnrichParallel(indexers)
-	for _, idx := range indexers {
-		idx.runDeferredContracts()
-	}
+
+	// Keep the receipt window exact: only go.mod materialisation, semantic
+	// enrichment, and contract commits are observed. The capability is optional;
+	// unsupported stores retain the conservative scheduled-work fallback below.
+	var mutationReceipt *graph.MutationReceipt
+	receiptStore, _ := mi.graph.(graph.MutationReceiptStore)
+	func() {
+		var token graph.MutationReceiptToken
+		if receiptStore != nil {
+			token = receiptStore.BeginMutationReceipt()
+			defer func() {
+				receipt := receiptStore.EndMutationReceipt(token)
+				mutationReceipt = &receipt
+			}()
+		}
+
+		// Per-repo deferred work starts with serial go.mod materialisation.
+		// Semantic enrichment then runs in bounded parallel batches; after each
+		// batch drains, its contract passes run serially and release compiler
+		// state. No contract mutation overlaps enrichment.
+		for _, idx := range indexers {
+			idx.runDeferredGoMod()
+		}
+		mi.runDeferredEnrichBatches(indexers, func(batch []*Indexer) {
+			for _, idx := range batch {
+				idx.runDeferredContractsAndReleaseSemanticState()
+			}
+		})
+	}()
+
 	for _, idx := range indexers {
 		idx.SetSkipResolveInDeferred(false)
 	}
-	// Re-run the master same-repo resolver to lift the placeholder edges the
-	// enrichment + contract passes just added. The references-completeness
-	// resolve already ran ahead of enrichment in RunPreEnrichResolve, so this
-	// is the idempotent catch-up pass for edges minted during enrichment.
-	// Whole-graph (nil scope): enrichment can mint placeholder edges in any
-	// repo, and scoping this catch-up is left to a follow-up.
-	mi.runMasterResolve(nil)
+	catchupScope = normalizeDeferredCatchupScope(catchupScope, catchupScopeKnown, len(indexers))
+	mi.resolveDeferredMutations(mutationReceipt, catchupNeeded, catchupScope)
 	return enrichScheduled
+}
+
+// normalizeDeferredCatchupScope preserves the resolver's full-pass semantics
+// when deferred work covered every registered repo. A non-empty scope disables
+// terminal-unresolved stamping inside ResolveAll; treating an all-repo map as
+// scoped would therefore leave permanently external edges hot on every future
+// warmup even though the pass had complete workspace evidence. Unknown/single-
+// repo prefixes are likewise conservative full passes. Only a strict subset is
+// safe to retain as a scoped catch-up.
+func normalizeDeferredCatchupScope(scope map[string]struct{}, known bool, repoCount int) map[string]struct{} {
+	if !known || (repoCount > 0 && len(scope) >= repoCount) {
+		return nil
+	}
+	return scope
+}
+
+type deferredResolveMode string
+
+const (
+	deferredResolveSkipped  deferredResolveMode = "skipped"
+	deferredResolveExact    deferredResolveMode = "exact_files"
+	deferredResolveFallback deferredResolveMode = "fallback_all"
+)
+
+// resolveDeferredMutations chooses the narrowest safe catch-up resolution.
+// A complete receipt is authoritative even when the old scheduled-work
+// heuristic predicted mutations; an incomplete receipt always fails closed to
+// a whole-graph pass. nil means the store does not support receipts yet.
+func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt, fallbackNeeded bool, fallbackScope map[string]struct{}) deferredResolveMode {
+	if receipt != nil {
+		if !receipt.Complete {
+			mi.logger.Info("DEFERRED-TIMING mutation receipt incomplete; resolving all")
+			mi.runMasterResolve(nil, false)
+			return deferredResolveFallback
+		}
+		if !receipt.ResolutionRelevant {
+			mi.logger.Info("DEFERRED-TIMING mutation receipt has no resolution delta",
+				zap.Int("changed_files", len(receipt.ChangedFiles)),
+				zap.Int("target_ids", len(receipt.TargetIDs)))
+			return deferredResolveSkipped
+		}
+		files := receipt.ResolutionFiles()
+		if len(files) == 0 {
+			// Completeness implementations should already reject this shape, but
+			// keep the consumer fail-closed if a future backend gets it wrong.
+			mi.logger.Warn("DEFERRED-TIMING resolution delta lacks exact files; resolving all")
+			mi.runMasterResolve(nil, false)
+			return deferredResolveFallback
+		}
+		mi.runMasterResolveFiles(files, false)
+		return deferredResolveExact
+	}
+	if !fallbackNeeded {
+		return deferredResolveSkipped
+	}
+	mi.runMasterResolve(fallbackScope, false)
+	return deferredResolveFallback
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
@@ -493,26 +574,35 @@ func (mi *MultiIndexer) RunDeferredPassesAll(ctx context.Context) int {
 // into one of the named changed repos (see resolver.SetScope). It is honoured
 // only when scoped global passes are enabled; a nil / empty scope or a
 // disabled switch runs the whole-graph resolve, exactly the prior behaviour.
-func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
+func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	if mi.graph == nil {
-		return
+		return nil
 	}
 	master := resolver.New(mi.graph)
 	master.SetLogger(mi.logger)
 	// The master resolve is the only pass with whole-graph evidence, so it is
 	// the one allowed to durably flag terminally-unresolved edges (permanently
 	// external / stdlib / definition-less) that a later scoped warm resolve can
-	// skip. A scoped master pass leaves the flag alone (stamping is gated on an
-	// empty scope inside ResolveAll); only a full pass stamps and self-heals.
+	// skip. A scoped/file pass leaves the flag alone; only a full ResolveAll
+	// stamps and self-heals terminal state.
 	master.SetStampTerminal(true)
-	// Mirror the resolve-time LSP helper onto the master pass so TS/JS-family
-	// edges pick up LSP-precision answers just like the per-repo passes do.
-	if mi.resolverLSPHelper != nil {
+	// The pre-enrichment queryability pass uses resolver-time LSP precision.
+	// The post-enrichment catch-up disables it because semantic providers just
+	// ran and replaying synchronous definition lookups dominates cold startup.
+	if useLSP && mi.resolverLSPHelper != nil {
 		master.SetLSPHelper(mi.resolverLSPHelper)
 	}
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	return master
+}
+
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) {
+	master := mi.newMasterResolver(useLSP)
+	if master == nil {
+		return
+	}
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
 	if scoped {
 		master.SetScope(scope)
@@ -522,7 +612,23 @@ func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}) {
 	mi.logger.Info("DEFERRED-TIMING master.ResolveAll",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("scoped", scoped),
+		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
 		zap.Int("scope_repos", len(scope)),
+		zap.Int("pending_before", stats.PendingBefore),
+		zap.Int("pending_after", stats.PendingAfter))
+}
+
+func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
+	master := mi.newMasterResolver(useLSP)
+	if master == nil {
+		return
+	}
+	mt := time.Now()
+	stats := master.ResolveFilesAndIncoming(files)
+	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
+		zap.Int("files", len(files)),
 		zap.Int("pending_before", stats.PendingBefore),
 		zap.Int("pending_after", stats.PendingAfter))
 }
@@ -557,7 +663,7 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	for _, idx := range indexers {
 		idx.runDeferredGoMod()
 	}
-	mi.runMasterResolve(scope)
+	mi.runMasterResolve(scope, true)
 	// Cross-repo references resolve here too so a multi-repo workspace is fully
 	// queryable at "ready", not just within each repo. Whole-graph so inbound
 	// references from unchanged repos into the changed repos bind before ready.
@@ -570,6 +676,12 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 // repo's LSP provider in-use for the duration of its pass, so the router's
 // LRU evictor never closes a provider another repo is still enriching against.
 func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
+	mi.runDeferredEnrichBatches(indexers, nil)
+}
+
+// runDeferredEnrichBatches preserves the bounded parallel enrichment posture
+// while exposing a serial boundary after each fully drained worker batch.
+func (mi *MultiIndexer) runDeferredEnrichBatches(indexers []*Indexer, afterBatch func([]*Indexer)) {
 	// Per-repo language sets computed once from a single graph-stats scan,
 	// shared by the spec-grouped ordering and the batch pool-raise sizing
 	// so the Manager's per-repo enrichment scan is not duplicated here.
@@ -592,21 +704,32 @@ func (mi *MultiIndexer) runDeferredEnrichParallel(indexers []*Indexer) {
 	if conc <= 1 {
 		for _, idx := range indexers {
 			idx.runDeferredEnrich()
+			if afterBatch != nil {
+				afterBatch([]*Indexer{idx})
+			}
 		}
 		return
 	}
 
-	sem := make(chan struct{}, conc)
-	var wg sync.WaitGroup
-	for _, idx := range indexers {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx *Indexer) {
-			defer func() { <-sem; wg.Done() }()
-			idx.runDeferredEnrich()
-		}(idx)
+	for start := 0; start < len(indexers); start += conc {
+		end := start + conc
+		if end > len(indexers) {
+			end = len(indexers)
+		}
+		batch := indexers[start:end]
+		var wg sync.WaitGroup
+		wg.Add(len(batch))
+		for _, idx := range batch {
+			go func(idx *Indexer) {
+				defer wg.Done()
+				idx.runDeferredEnrich()
+			}(idx)
+		}
+		wg.Wait()
+		if afterBatch != nil {
+			afterBatch(batch)
+		}
 	}
-	wg.Wait()
 }
 
 // maxBatchProviders caps the temporary live-provider pool raise during
@@ -1599,7 +1722,9 @@ func (mi *MultiIndexer) IncrementalReindexRepo(repoPrefix string, paths []string
 	}
 	mi.mu.Unlock()
 
-	mi.ReconcileContractEdges()
+	mi.RunIncrementalDerivedPasses(context.Background(), map[string]DerivedInvalidationPlan{
+		repoPrefix: result.DerivedInvalidation,
+	})
 
 	return result, nil
 }
@@ -2086,6 +2211,12 @@ func firstNStrings(s []string, n int) []string {
 // permission bit on one repo should not starve reconciliation on the
 // others.
 func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
+	return mi.ReconcileAllCtx(context.Background())
+}
+
+// ReconcileAllCtx is ReconcileAll with cooperative cancellation between
+// repositories and before the derived pass coordinator.
+func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexResult {
 	mi.mu.RLock()
 	prefixes := make([]string, 0, len(mi.indexers))
 	for p := range mi.indexers {
@@ -2108,9 +2239,15 @@ func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
 	defer mi.ResetBatch()
 
 	results := make(map[string]*IndexResult, len(prefixes))
-	reindexed := 0
-	changedPrefixes := make(map[string]struct{})
+	plans := make(map[string]DerivedInvalidationPlan)
 	for _, prefix := range prefixes {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return results
+			default:
+			}
+		}
 		mi.mu.RLock()
 		idx, ok := mi.indexers[prefix]
 		meta, metaOK := mi.repos[prefix]
@@ -2128,8 +2265,9 @@ func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
 			mi.logger.Info("janitor: reconciled repo",
 				zap.String("prefix", prefix),
 				zap.Int("stale_files_reindexed", result.StaleFileCount))
-			reindexed++
-			changedPrefixes[prefix] = struct{}{}
+			plan := plans[prefix]
+			plan.Merge(result.DerivedInvalidation)
+			plans[prefix] = plan
 		}
 		results[prefix] = result
 
@@ -2143,19 +2281,11 @@ func (mi *MultiIndexer) ReconcileAll() map[string]*IndexResult {
 		mi.mu.Unlock()
 	}
 
-	if reindexed > 0 {
-		mi.ReconcileContractEdges()
-		// Only now — when at least one repo actually reindexed — is it
-		// worth the full-graph derivation pass. Nothing changed → skip it
-		// (the deferred ResetBatch still clears the batch flags). Scope the
-		// per-repo clone detection + Rebuild to just the repos that changed
-		// this cycle: an unchanged repo's clone edges are already on disk, so
-		// re-detecting all of them holds the resolve mutex for tens of seconds
-		// and stalls every concurrent interactive edit. Warmup arms the same
-		// scope; without this the janitor re-ran clone detection over every
-		// tracked repo on every cycle that touched even one file.
-		mi.ArmBatchScope(changedPrefixes)
-		mi.RunGlobalGraphPasses(context.Background())
+	if len(plans) > 0 {
+		// Run only the derived families selected by each repo's exact file
+		// deltas. Body-only and metadata-only changes therefore avoid global
+		// derivation, while structural changes retain conservative fallbacks.
+		mi.RunIncrementalDerivedPasses(ctx, plans)
 	}
 	return results
 }

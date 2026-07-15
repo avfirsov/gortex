@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
 )
@@ -86,7 +87,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		entry := agents.DefaultGortexMCPEntry()
 		entry["disabled"] = false
 		entry["autoApprove"] = AutoApproveTools
-		return agents.UpsertMCPServer(root, "gortex", entry, opts), nil
+		return agents.UpsertMCPServerApprovalList(root, "gortex", "autoApprove", AutoApproveTools, entry, opts, v060AutoApproveTools), nil
 	}, opts)
 	if err != nil {
 		return res, fmt.Errorf("kiro mcp.json: %w", err)
@@ -100,18 +101,19 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		return res, nil
 	}
 
-	// 2. Steering docs — static, created if absent.
+	// 2. Steering docs — preserve user-authored replacements, but migrate the
+	//    legacy Gortex-authored tool vocabulary to the compact surface.
 	for name, content := range SteeringFiles {
-		action, err := agents.WriteIfNotExists(env.Stderr, filepath.Join(env.Root, ".kiro", "steering", name), content, opts)
+		action, err := writeKiroArtifact(env.Stderr, filepath.Join(env.Root, ".kiro", "steering", name), content, opts)
 		if err != nil {
 			return res, err
 		}
 		res.Files = append(res.Files, action)
 	}
 
-	// 3. Agent hooks — static JSON, created if absent.
+	// 3. Agent hooks — use the same targeted migration policy.
 	for name, content := range HookFiles {
-		action, err := agents.WriteIfNotExists(env.Stderr, filepath.Join(env.Root, ".kiro", "hooks", name), content, opts)
+		action, err := writeKiroArtifact(env.Stderr, filepath.Join(env.Root, ".kiro", "hooks", name), content, opts)
 		if err != nil {
 			return res, err
 		}
@@ -120,6 +122,26 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	res.Configured = true
 	return res, nil
+}
+
+func writeKiroArtifact(w io.Writer, path, content string, opts agents.ApplyOpts) (agents.FileAction, error) {
+	if existing, err := os.ReadFile(path); err == nil && isLegacyKiroArtifact(string(existing)) {
+		return agents.WriteOwnedFile(w, path, content, opts)
+	}
+	return agents.WriteIfNotExists(w, path, content, opts)
+}
+
+func isLegacyKiroArtifact(body string) bool {
+	owned := strings.Contains(body, "# Gortex") || strings.Contains(body, `"name": "Gortex:`)
+	if !owned {
+		return false
+	}
+	for _, legacy := range []string{"smart_context", "search_symbols", "get_editing_context", "detect_changes"} {
+		if strings.Contains(body, legacy) {
+			return true
+		}
+	}
+	return false
 }
 
 // mcpConfigPath returns the mcp.json path for the given Env's

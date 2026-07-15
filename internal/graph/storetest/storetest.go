@@ -68,6 +68,7 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("NodesByKind", func(t *testing.T) { testNodesByKind(t, factory) })
 	t.Run("EdgesWithUnresolvedTarget", func(t *testing.T) { testEdgesWithUnresolvedTarget(t, factory) })
 	t.Run("FnValuePlaceholderEdges", func(t *testing.T) { testFnValuePlaceholderEdges(t, factory) })
+	t.Run("NodeLightScanner", func(t *testing.T) { testNodeLightScanner(t, factory) })
 	t.Run("LightEdgeScanner", func(t *testing.T) { testLightEdgeScanner(t, factory) })
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
@@ -656,6 +657,26 @@ func testReindexEdges(t *testing.T, factory Factory) {
 		t.Fatalf("GetOutEdges(a) after batch reindex = %d, want 3", got)
 	}
 
+	// Full-identity refresh updates source location/meta while preserving the
+	// resolver-selected target and adjacency.
+	oldLine := e1.Line
+	refreshed := *e1
+	refreshed.Line = 41
+	refreshed.Meta = map[string]any{"doc": "shifted"}
+	s.ReindexEdges([]graph.EdgeReindex{{
+		Edge: &refreshed, OldTo: e1.To, OldFilePath: e1.FilePath,
+		OldLine: oldLine, RefreshIdentity: true,
+	}})
+	var found *graph.Edge
+	for _, edge := range s.GetOutEdges("a") {
+		if edge.To == "z" && edge.Line == 41 {
+			found = edge
+		}
+	}
+	if found == nil {
+		t.Fatal("full-identity refresh did not move edge line while preserving target")
+	}
+
 	// Empty batch is a no-op.
 	s.ReindexEdges(nil)
 	s.ReindexEdges([]graph.EdgeReindex{})
@@ -1001,7 +1022,7 @@ func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
 		t.Skip("backend does not implement FnValuePlaceholderScanner")
 	}
 	s.AddNode(mkNode("a", "A", "x.go", graph.KindFunction))
-	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))         // real reference — not a placeholder
+	s.AddEdge(mkEdge("a", "b", graph.EdgeReferences))          // real reference — not a placeholder
 	s.AddEdge(mkEdge("a", "unresolved::Foo", graph.EdgeCalls)) // unresolved, but not fn-value
 	s.AddEdge(mkEdge("a", "resolved", graph.EdgeReferences))   // resolved
 	ph1 := mkEdge("a", "unresolved::fnvalue::handler", graph.EdgeReferences)
@@ -1026,6 +1047,65 @@ func testFnValuePlaceholderEdges(t *testing.T, factory Factory) {
 	}
 	if !seen["gortex::unresolved::fnvalue::handler"] {
 		t.Fatalf("FnValuePlaceholderEdges missed the multi-repo COPY-rewrite form; got %v", seen)
+	}
+}
+
+// testNodeLightScanner proves a whole-graph summary projection preserves the
+// identity/location fields its analysis callers consume while omitting all
+// Meta, including promoted docs and signatures.
+func testNodeLightScanner(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	sc, ok := s.(graph.NodeLightScanner)
+	if !ok {
+		t.Skip("backend does not implement NodeLightScanner")
+	}
+
+	a := mkNode("repo/pkg/a.go::A", "A", "pkg/a.go", graph.KindFunction)
+	a.RepoPrefix = "repo"
+	a.Language = "go"
+	a.QualName = "repo.pkg.A"
+	a.StartLine = 11
+	a.EndLine = 19
+	a.StartColumn = 2
+	a.EndColumn = 8
+	a.WorkspaceID = "workspace"
+	a.ProjectID = "project"
+	a.Meta = map[string]any{
+		"signature": "func A()",
+		"doc":       "large promoted documentation",
+		"blob_only": "large opaque payload",
+	}
+	b := mkNode("repo/pkg/b.go::B", "B", "pkg/b.go", graph.KindType)
+	b.RepoPrefix = "repo"
+	b.Language = "go"
+	for _, n := range []*graph.Node{a, b} {
+		s.AddNode(n)
+	}
+
+	got := sc.AllNodesLight()
+	if ids := sortNodeIDs(got); fmt.Sprint(ids) != fmt.Sprint([]string{a.ID, b.ID}) {
+		t.Fatalf("AllNodesLight IDs = %v, want [%s %s]", ids, a.ID, b.ID)
+	}
+	var lightA *graph.Node
+	for _, n := range got {
+		if n.ID == a.ID {
+			lightA = n
+			break
+		}
+	}
+	if lightA == nil {
+		t.Fatal("AllNodesLight did not return A")
+	}
+	if lightA.Kind != a.Kind || lightA.Name != a.Name || lightA.QualName != a.QualName ||
+		lightA.FilePath != a.FilePath || lightA.StartLine != a.StartLine || lightA.EndLine != a.EndLine ||
+		lightA.StartColumn != a.StartColumn || lightA.EndColumn != a.EndColumn ||
+		lightA.Language != a.Language || lightA.RepoPrefix != a.RepoPrefix ||
+		lightA.WorkspaceID != a.WorkspaceID || lightA.ProjectID != a.ProjectID {
+		t.Fatalf("AllNodesLight altered identity/location fields: got %#v", lightA)
+	}
+	if lightA.Meta != nil {
+		t.Fatalf("AllNodesLight materialized metadata: %#v", lightA.Meta)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/cochange"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // registerCoChangeTool wires find_co_changing_symbols — the MCP
@@ -21,6 +22,7 @@ func (s *Server) registerCoChangeTool() {
 			mcp.WithString("file_path", mcp.Description("File path to analyse directly. One of symbol_id / file_path is required.")),
 			mcp.WithNumber("limit", mcp.Description("Cap the number of co-changing files returned (default: 20).")),
 			mcp.WithNumber("min_score", mcp.Description("Drop co-change relationships scoring below this threshold, 0..1 (default: 0).")),
+			mcp.WithBoolean("refresh", mcp.Description("Start the legacy lazy git-history mine when the cache is cold (default true). Compact public analysis fixes this false; daemon prewarming remains independent.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx, or toon")),
 		),
 		s.handleFindCoChangingSymbols,
@@ -60,7 +62,9 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError("target symbol has no file path"), nil
 	}
 
-	s.ensureCoChange()
+	if requestBoolDefault(req, "refresh", true) {
+		s.ensureCoChange()
+	}
 	scores := s.coChangeScores(targetFile)
 	counts := s.coChangeCounts(targetFile)
 
@@ -140,9 +144,9 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 // turned every queued tool call into a blocked-for-60s caller. The
 // async shape keeps the request path off the slow path.
 //
-// PrewarmCoChange (called from RunAnalysis at daemon-ready) fires
-// the mine ahead of any user-visible call so the cache is already
-// populated by the time the first find_co_changing_symbols arrives.
+// PrewarmCoChange (called from RunAnalysis at daemon-ready) is the only normal
+// entrypoint. Read-only query handlers never call ensureCoChange: doing so
+// would make a query causally responsible for durable EdgeCoChange writes.
 //
 // Returning immediately means the first user call may see an empty
 // cache when the prewarm goroutine has not yet completed. That is
@@ -203,6 +207,12 @@ func (s *Server) coChangeReady() bool {
 // `gortex enrich cochange` (or a cold reindex) — the lazy path does not
 // auto-re-mine once edges exist.
 func (s *Server) mineCoChange() {
+	runtimeactivity.Begin("cochange")
+	defer func() {
+		runtimeactivity.End("cochange")
+		scheduleOSMemoryReleaseAfterBurst(s.logger, "cochange")
+	}()
+
 	scores := map[string]map[string]float64{}
 	counts := map[string]map[string]int{}
 

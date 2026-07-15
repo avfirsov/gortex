@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"iter"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -579,6 +580,48 @@ func TestResolveFile(t *testing.T) {
 
 	assert.Equal(t, 1, stats.Resolved)
 	assert.Equal(t, "b.go::Bar", callEdge.To)
+}
+
+type countingPassIndexStore struct {
+	graph.Store
+	nodesByKindCalls int
+}
+
+func (s *countingPassIndexStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	s.nodesByKindCalls++
+	return s.Store.NodesByKind(kind)
+}
+
+func TestResolveFileAndIncomingSkipsPassIndexesWithoutPendingEdges(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "results.json", Kind: graph.KindFile, Name: "results.json", FilePath: "results.json", Language: "json"})
+	g.AddNode(&graph.Node{ID: "results.json::records", Kind: graph.KindVariable, Name: "records", FilePath: "results.json", Language: "json"})
+	g.AddEdge(&graph.Edge{From: "results.json", To: "results.json::records", Kind: graph.EdgeDefines, FilePath: "results.json"})
+
+	store := &countingPassIndexStore{Store: g}
+	stats := New(store).ResolveFileAndIncoming("results.json")
+
+	assert.Zero(t, stats.Resolved)
+	assert.Zero(t, stats.Unresolved)
+	assert.Zero(t, store.nodesByKindCalls,
+		"a file with no pending forward or incoming edges must not build graph-wide pass indexes")
+}
+
+func TestResolveFileAndIncomingBuildsPassIndexesForPendingEdge(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "a.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "a.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "b.go", Language: "go"})
+	callEdge := &graph.Edge{From: "a.go::Foo", To: "unresolved::Bar", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 5}
+	g.AddEdge(callEdge)
+
+	store := &countingPassIndexStore{Store: g}
+	stats := New(store).ResolveFileAndIncoming("a.go")
+
+	assert.Equal(t, 1, stats.Resolved)
+	assert.Equal(t, "b.go::Bar", callEdge.To)
+	assert.NotZero(t, store.nodesByKindCalls,
+		"pending work must retain the normal pass-indexed resolver path")
 }
 
 // TestResolveMethodCall_ImportReachabilityFilter exercises Pass 0:

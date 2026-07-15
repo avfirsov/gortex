@@ -13,6 +13,12 @@ import (
 type EdgeReindex struct {
 	Edge  *Edge
 	OldTo string
+	// RefreshIdentity replaces the complete stored edge payload while moving
+	// its identity from (OldTo, OldFilePath, OldLine) to Edge's current key.
+	// Resolver callers leave it false and retain the historical To-only path.
+	RefreshIdentity bool
+	OldFilePath     string
+	OldLine         int
 }
 
 // EdgeProvenanceUpdate is the per-edge payload for
@@ -1068,6 +1074,27 @@ type EnrichmentStateStore interface {
 // fall back to the full scan.
 type LightNodeReader interface {
 	GetRepoNodesLight(repoPrefix string) []*Node
+}
+
+// NodeLightScanner is an optional reader capability for whole-graph algorithms
+// that need only the Node struct's identity and location fields. Implementations
+// must not materialize Meta, including promoted metadata such as docs and
+// signatures. Callers must treat returned nodes as read-only snapshots and must
+// not depend on Meta being present. A backend that persists federation proxy
+// nodes must preserve Origin, Stub, and FetchedAt so centrality filters remain
+// sound (SQLite never persists proxy nodes).
+type NodeLightScanner interface {
+	AllNodesLight() []*Node
+}
+
+// AllNodesLight uses the metadata-free summary projection when the reader
+// supports it. In-memory and overlay readers fall back to AllNodes because their
+// nodes are already materialized and no disk blob decoding is involved.
+func AllNodesLight(s Reader) []*Node {
+	if scanner, ok := s.(NodeLightScanner); ok {
+		return scanner.AllNodesLight()
+	}
+	return s.AllNodes()
 }
 
 // LightEdgeScanner is an optional store capability: a kind-scoped edge scan

@@ -46,10 +46,11 @@ func TestOpenStampsFreshDB(t *testing.T) {
 	}
 }
 
-// TestOpenBaselineStampsOldDBWithoutWipe: a pre-versioning store (user_version
-// 0, reconcilable to current by schemaSQL + ensureNodeColumns) is stamped in
-// place — its data must survive, not be wiped.
-func TestOpenBaselineStampsOldDBWithoutWipe(t *testing.T) {
+// TestOpenPreVersionStoreRequiresRebuild: once a rebuild boundary ships, an
+// existing user_version=0 graph cannot be confused with a brand-new empty DB.
+// The default open preserves it and returns ErrSchemaRebuildRequired; the
+// exclusive daemon path wipes it and reports NeedsRebuild.
+func TestOpenPreVersionStoreRequiresRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	// Create the store, then simulate a pre-versioning DB: a row + user_version 0.
@@ -69,16 +70,25 @@ func TestOpenBaselineStampsOldDBWithoutWipe(t *testing.T) {
 		}
 	})
 
-	s2, err := Open(path)
+	if _, err := Open(path); !errors.Is(err, ErrSchemaRebuildRequired) {
+		t.Fatalf("reopen old DB error = %v, want ErrSchemaRebuildRequired", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if n := nodeCount(t, db); n != 1 {
+			t.Fatalf("refused rebuild changed node count to %d, want 1", n)
+		}
+	})
+
+	s2, err := Open(path, WithRebuild())
 	if err != nil {
-		t.Fatalf("reopen old DB: %v", err)
+		t.Fatalf("exclusive rebuild: %v", err)
 	}
 	defer s2.Close()
-	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
-		t.Fatalf("user_version after baseline = %d, want %d", v, currentSchemaVersion)
+	if !s2.NeedsRebuild() {
+		t.Fatal("rebuilt pre-version store did not report NeedsRebuild")
 	}
-	if n := nodeCount(t, s2.db); n != 1 {
-		t.Fatalf("node count after baseline = %d, want 1 (data must NOT be wiped)", n)
+	if n := nodeCount(t, s2.db); n != 0 {
+		t.Fatalf("node count after integrity rebuild = %d, want 0", n)
 	}
 }
 
@@ -188,6 +198,52 @@ func TestPlanSchemaMigration(t *testing.T) {
 					c.stored, c.current, got.wipe, got.stamp, len(got.inPlace), c.wantWipe, c.wantStamp, c.wantInPlace)
 			}
 		})
+	}
+}
+
+func TestOpenV2RequiresTopologyIntegrityRebuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+			t.Fatalf("set v2: %v", err)
+		}
+	})
+
+	if _, err := Open(path); !errors.Is(err, ErrSchemaRebuildRequired) {
+		t.Fatalf("default v2 open error = %v, want ErrSchemaRebuildRequired", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if v, err := readUserVersion(db); err != nil || v != 2 {
+			t.Fatalf("refused v2 version = %d (err %v), want 2", v, err)
+		}
+		if n := nodeCount(t, db); n != 1 {
+			t.Fatalf("refused v2 rebuild changed node count to %d, want 1", n)
+		}
+	})
+
+	rebuilt, err := Open(path, WithRebuild())
+	if err != nil {
+		t.Fatalf("exclusive v2 rebuild: %v", err)
+	}
+	defer rebuilt.Close()
+	if !rebuilt.NeedsRebuild() {
+		t.Fatal("v2 integrity rebuild did not report NeedsRebuild")
+	}
+	if v, err := readUserVersion(rebuilt.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("rebuilt version = %d (err %v), want %d", v, err, currentSchemaVersion)
+	}
+	if n := nodeCount(t, rebuilt.db); n != 0 {
+		t.Fatalf("rebuilt v2 node count = %d, want 0", n)
 	}
 }
 
@@ -506,14 +562,16 @@ func TestOpenDedupesFnValuePlaceholders(t *testing.T) {
 		}
 	})
 
-	s2, err := Open(path)
+	// Exercise the historical v1->v2 in-place migration in isolation. The
+	// shipped v3 boundary intentionally rebuilds every v2-or-older graph.
+	s2, err := openWith(path, 2, schemaMigrations[:1], false)
 	if err != nil {
 		t.Fatalf("reopen for dedup: %v", err)
 	}
 	defer s2.Close()
 
-	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
-		t.Fatalf("user_version after dedup = %d, want %d", v, currentSchemaVersion)
+	if v, _ := readUserVersion(s2.db); v != 2 {
+		t.Fatalf("user_version after dedup = %d, want 2", v)
 	}
 
 	present := func(id int) bool {

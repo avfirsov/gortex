@@ -63,6 +63,18 @@ func (s *Store) PurgeRepo(prefix string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// PurgeRepo bypasses the ordinary Add/Evict entry points, so invalidate a
+	// persisted whole-graph analysis before the transaction can delete live graph
+	// rows. The preflight is safe under writeMu and avoids touching analysis state
+	// for sidecar-only purges.
+	var hasGraphRows int
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? LIMIT 1)`, prefix).Scan(&hasGraphRows); err != nil {
+		return fmt.Errorf("store_sqlite: PurgeRepo graph preflight: %w", err)
+	}
+	if hasGraphRows != 0 && !s.invalidateAnalysisBeforeMutationLocked() {
+		return fmt.Errorf("store_sqlite: PurgeRepo could not invalidate active analysis")
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -85,17 +97,33 @@ func (s *Store) PurgeRepo(prefix string) error {
 		return fmt.Errorf("store_sqlite: PurgeRepo vectors: %w", err)
 	}
 
+	changed := len(ids) > 0
 	for _, table := range purgeSidecarTables {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix); err != nil {
+		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
+		if err != nil {
 			return fmt.Errorf("store_sqlite: PurgeRepo %s: %w", table, err)
+		}
+		if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
+			changed = true
 		}
 	}
 
-	if _, err := tx.Exec(`DELETE FROM nodes WHERE repo_prefix = ?`, prefix); err != nil {
+	res, err := tx.Exec(`DELETE FROM nodes WHERE repo_prefix = ?`, prefix)
+	if err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo nodes: %w", err)
 	}
+	if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
+		changed = true
+	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.finishAnalysisMutationLocked(len(ids) > 0)
+	if changed {
+		s.markMutationReceiptsIncompleteLocked()
+	}
+	return nil
 }
 
 // orphanScanTables are the tables OrphanRepoPrefixes unions DISTINCT
@@ -169,7 +197,7 @@ func (s *Store) OrphanRepoPrefixes(known []string) []string {
 // to new. Every one is keyed by repo_prefix (+ file_path or provider), NOT
 // by node_id, so its row content survives a node-id change: file_mtimes /
 // files by (repo_prefix, file_path); repo_index_state / enrichment_state by
-// repo_prefix (+ provider). At a solo->multi migration every '' row in these
+// repo_prefix (+ provider). At a solo->multi migration every ” row in these
 // belongs to the one migrating repo — global externals live in the NODES
 // table and hold NO rows here — so moving them wholesale is safe. UPDATE OR
 // REPLACE folds any row the re-mint re-index already wrote under new
@@ -219,7 +247,7 @@ var rekeyDropTables = []string{
 // Refuses new=="" (cannot rekey INTO the protected empty prefix). old=="" IS
 // allowed — that is the whole point, since solo repos index unprefixed — and
 // is safe here because this method touches SIDECAR tables ONLY; the synthetic
-// global externals that also carry repo_prefix='' live in the NODES table,
+// global externals that also carry repo_prefix=” live in the NODES table,
 // which RekeyRepoPrefix never writes.
 func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	if newPrefix == "" {
@@ -238,14 +266,23 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for _, table := range rekeyMoveTables {
-		if _, err := tx.Exec(`UPDATE OR REPLACE `+table+` SET repo_prefix = ? WHERE repo_prefix = ?`, newPrefix, oldPrefix); err != nil {
+		res, err := tx.Exec(`UPDATE OR REPLACE `+table+` SET repo_prefix = ? WHERE repo_prefix = ?`, newPrefix, oldPrefix)
+		if err != nil {
 			return fmt.Errorf("store_sqlite: RekeyRepoPrefix move %s: %w", table, err)
+		}
+		if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
+			changed = true
 		}
 	}
 	for _, table := range rekeyDropTables {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, oldPrefix); err != nil {
+		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, oldPrefix)
+		if err != nil {
 			return fmt.Errorf("store_sqlite: RekeyRepoPrefix drop %s: %w", table, err)
+		}
+		if n, rowsErr := res.RowsAffected(); rowsErr == nil && n > 0 {
+			changed = true
 		}
 	}
 	// vectors is intentionally omitted: it has NO repo_prefix column (keyed
@@ -254,7 +291,13 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	// dangling, and absent in the common case (embeddings are opt-in). They
 	// are left to a node-membership vector GC rather than guessed at here.
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		s.markMutationReceiptsIncompleteLocked()
+	}
+	return nil
 }
 
 // repoNodeIDsTx returns every node id in repoPrefix, read inside tx. The

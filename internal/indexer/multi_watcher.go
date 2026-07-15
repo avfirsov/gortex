@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -359,6 +360,34 @@ func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
 	for _, w := range watchers {
 		w.OnDegraded(cb)
 	}
+}
+
+// EnqueueFileMutation routes a committed file mutation to the active watcher
+// that owns the path. Routing is path-scoped: an unrelated degraded watcher
+// cannot force a synchronous fallback, and a watcher that failed to start is
+// never reported as accepting work.
+func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := mw.multi.RepoForFile(filePath)
+	mw.mu.Lock()
+	w := mw.watchers[prefix]
+	started := mw.started[prefix]
+	// A single-repo MultiIndexer may intentionally use the empty prefix;
+	// when RepoForFile cannot distinguish it from "not covered", let the
+	// per-repo watcher perform the authoritative containment check.
+	if w == nil && prefix == "" && len(mw.watchers) == 1 {
+		for candidatePrefix, candidate := range mw.watchers {
+			w = candidate
+			started = mw.started[candidatePrefix]
+		}
+	}
+	mw.mu.Unlock()
+	if w == nil || !started {
+		return nil, nil
+	}
+	return w.EnqueueFileMutation(ctx, filePath)
 }
 
 // DegradedReason returns the first non-empty per-repo degraded reason, prefixed

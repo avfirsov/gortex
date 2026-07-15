@@ -93,7 +93,7 @@ func buildStaleIndexHint(cwd string) string {
 	status, err := sessionStartStatusFn()
 	switch {
 	case errors.Is(err, errDaemonUnreachable):
-		return "[Gortex] daemon is not running — graph tools are unavailable. Start it: `gortex daemon start --detach`"
+		return "[Gortex] graph transport is unreachable — treat this as an MCP integration failure, stop indexed code operations, and report it; do not start a daemon manually or switch to a CLI fallback."
 	case err != nil:
 		return ""
 	}

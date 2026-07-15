@@ -37,10 +37,18 @@ var userPromptProbe grepProbeFn = probeViaDaemon
 // polluted, and no warning is emitted (SessionStart already warns once when the
 // daemon is down; doing so every turn would be noise).
 func runUserPromptSubmit(data []byte) {
+	started := time.Now()
 	var input UserPromptSubmitInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
 	}
+	if input.HookEventName != "UserPromptSubmit" {
+		return
+	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("UserPromptSubmit", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 	block := buildUserPromptSubmitContext(input.HookEventName, input.Prompt)
 	if block == "" {
 		return
@@ -54,6 +62,7 @@ func runUserPromptSubmit(data []byte) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -128,13 +137,13 @@ func buildPromptInjection(hits []grepSymbolHit) string {
 	}
 	if lean {
 		sb.WriteString("\nLeads, not the full picture — call `explore` with the request text for the ranked neighborhood " +
-			"in one call; `get_symbol_source` reads one symbol. Prefer these graph facts over grep/Read.\n")
+			"in one call; use `read(operation:\"source\")` for one symbol. Prefer these graph facts over grep/Read.\n")
 	} else {
 		sb.WriteString("\nThese are leads, not the full picture — call `explore` with the request text to get the ranked " +
 			"neighborhood (these symbols and their siblings, WITH source + call paths + the files to change) in one call, " +
-			"then answer or edit directly from it. To read just one of them use `get_symbol_source` (several: `batch_symbols`); " +
-			"trace with `find_usages` / `get_callers`. These are indexed graph facts — prefer them over grep/Read. " +
-			"Shell only (no MCP tools)? Reach any with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("explore") + "`).\n")
+			"then answer or edit directly from it. Use `read(operation:\"source\")` for one symbol or operation `symbols` for a batch; " +
+			"use `relations(operation:\"usages\")` for references or operation `callers` for callers. Prefer these graph facts over grep/Read.\n")
 	}
+	sb.WriteString(toolref.MCPRequiredLine())
 	return sb.String()
 }

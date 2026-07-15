@@ -275,7 +275,7 @@ var analyzeKindDescriptions = map[string]string{
 	"pubsub":                      "Pub/sub topics with publishers + subscribers (NATS/Kafka/RabbitMQ/Redis/EventEmitter/Socket.IO)",
 	"race_writes":                 "Concurrent-write race detection",
 	"ref_facts":                   "Resolved-reference facts — each reference edge + the provenance tier that resolved it",
-	"releases":                    "Stamp meta.added_in on file nodes from git tags",
+	"releases":                    "Read the precomputed release timeline and per-tag files from graph metadata",
 	"resolution_outcomes":         "Classify unresolved call/ref edges by why the resolver gave up (ambiguous/out-of-scope/cross-language/stub/no-def)",
 	"retrieval_log":               "Mine the retrieval query log — zero-result queries + per-tool latency/result-size rollups for recall tuning",
 	"review":                      "Idiomatic/correctness rulepack (NPE, thread-safety check-then-act, N+1, logic-error; Go+Python) — the engine behind gortex review",

@@ -104,8 +104,7 @@ func TestCoupling_InternalEdgesNotInCaCe(t *testing.T) {
 
 func TestCoupling_CommunityRollupHonored(t *testing.T) {
 	s := newCouplingTestServer(t)
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(s, &analysis.CommunityResult{
 		NodeToComm: map[string]string{
 			"api/h.go::Handle":      "c-edge",
 			"service/s.go::Process": "c-core",
@@ -115,8 +114,7 @@ func TestCoupling_CommunityRollupHonored(t *testing.T) {
 			{ID: "c-edge", Members: []string{"api/h.go::Handle"}},
 			{ID: "c-core", Members: []string{"service/s.go::Process", "repo/r.go::Fetch"}},
 		},
-	}
-	s.analysisMu.Unlock()
+	})
 
 	out := callCouplingHandler(t, s, map[string]any{"unit": "community"})
 

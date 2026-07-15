@@ -58,8 +58,12 @@ func TestHandleExternalAgent_AfterToolDaemonDown(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
-	if !strings.Contains(payload.HookSpecificOutput.AdditionalContext, "daemon is not running") {
-		t.Errorf("expected a daemon-down hint, got:\n%s", payload.HookSpecificOutput.AdditionalContext)
+	context := payload.HookSpecificOutput.AdditionalContext
+	if !strings.Contains(context, "graph transport is unreachable") || !strings.Contains(context, "MCP integration failure") {
+		t.Errorf("expected an MCP integration-failure hint, got:\n%s", context)
+	}
+	if strings.Contains(context, "gortex daemon start") || strings.Contains(context, "gortex call ") {
+		t.Errorf("native MCP guidance must not advertise a manual fallback, got:\n%s", context)
 	}
 }
 

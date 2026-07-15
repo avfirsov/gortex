@@ -99,6 +99,10 @@ func TestAnalyzeRole_AdapterDetectedViaCommunities(t *testing.T) {
 			"p/util.go::Leaf":   "c-core",
 		},
 	}
+	token := s.currentCommunityToken()
+	s.communitiesToken = token
+	s.adjacencyToken = token
+	s.analysisEpoch = 1
 	s.analysisMu.Unlock()
 
 	out := callAnalyzeRole(t, s, map[string]any{})

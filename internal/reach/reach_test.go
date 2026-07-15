@@ -2,7 +2,9 @@ package reach
 
 import (
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -188,13 +190,192 @@ func TestLookup_LazyComputesOnFirstMiss(t *testing.T) {
 	if len(d3) != 0 {
 		t.Errorf("expected d3=[], got %#v", d3)
 	}
-	// The lazy compute should have stamped the result for next time.
+	// Lazy lookup is intentionally read-only. Persisting this result would
+	// turn a safety check into an uncancellable store write; eager BuildIndex
+	// remains the only reach-cache publication path.
 	n := g.GetNode(seed)
-	if n == nil || n.Meta == nil {
-		t.Fatalf("lazy Lookup should have stamped result on %s", seed)
+	if n == nil {
+		t.Fatalf("seed %s disappeared after lazy lookup", seed)
 	}
-	if _, ok := n.Meta[MetaReachBuild]; !ok {
-		t.Errorf("lazy Lookup should have stamped MetaReachBuild on %s", seed)
+	if _, ok := n.Meta[MetaReachBuild]; ok {
+		t.Errorf("lazy Lookup must not stamp MetaReachBuild on %s", seed)
+	}
+}
+
+// TestLookup_ConcurrentBuildNeverReturnsPartial exercises the real publication
+// path while eager rebuilds and hot cache reads overlap. Every generation has
+// identical graph topology, so a reader may observe either adjacent complete
+// generation, but it must never observe an empty or truncated tier.
+func TestLookup_ConcurrentBuildNeverReturnsPartial(t *testing.T) {
+	g, ids := newCallChain(t, 5)
+	seed := ids[4]
+	BuildIndex(g)
+
+	const (
+		builds  = 40
+		readers = 8
+		reads   = 400
+	)
+	start := make(chan struct{})
+	errs := make(chan string, readers*reads)
+	var wg sync.WaitGroup
+	wg.Add(1 + readers)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range builds {
+			BuildIndex(g)
+		}
+	}()
+	for range readers {
+		go func() {
+			defer wg.Done()
+			<-start
+			for range reads {
+				d1, d2, d3, hit := Lookup(g, seed)
+				if !hit || joinIDs(d1) != ids[3] || joinIDs(d2) != ids[2] || joinIDs(d3) != ids[1] {
+					errs <- "lookup observed an incomplete reach generation"
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	if err := <-errs; err != "" {
+		t.Fatal(err)
+	}
+}
+
+// TestLookup_ConcurrentUnrelatedMetaMutation proves the cache fast path shares
+// ResolveMutex with graph-wide passes that still update non-reach Node.Meta
+// fields in place. The race detector used to report readCached racing the
+// writer below even though both reach writers themselves were copy-on-write.
+func TestLookup_ConcurrentUnrelatedMetaMutation(t *testing.T) {
+	g, ids := newCallChain(t, 5)
+	seed := ids[4]
+	BuildIndex(g)
+
+	const iterations = 1000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := range iterations {
+			mu := g.ResolveMutex()
+			mu.Lock()
+			n := g.GetNode(seed)
+			n.Meta["unrelated_test_generation"] = i
+			mu.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			d1, d2, d3, hit := Lookup(g, seed)
+			if !hit || joinIDs(d1) != ids[3] || joinIDs(d2) != ids[2] || joinIDs(d3) != ids[1] {
+				t.Errorf("lookup changed while unrelated metadata was updated")
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+}
+
+// TestTopologyMutationPublishesBeforeLookup ensures a cached zero-impact
+// answer cannot escape while the watcher is replacing topology. Readers wait
+// for the mutation's invalidation, then compute from the complete new graph.
+func TestTopologyMutationPublishesBeforeLookup(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "sink", Kind: graph.KindFunction, Name: "sink", FilePath: "sink.go"})
+	if d1, _, _, hit := Lookup(g, "sink"); !hit || len(d1) != 0 {
+		t.Fatalf("fixture must begin with a cached empty reach record; hit=%v d1=%v", hit, d1)
+	}
+
+	finishMutation := BeginTopologyMutation(g)
+	type lookupResult struct {
+		d1  []Entry
+		hit bool
+	}
+	resultCh := make(chan lookupResult, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		d1, _, _, hit := Lookup(g, "sink")
+		resultCh <- lookupResult{d1: d1, hit: hit}
+	}()
+	<-started
+
+	select {
+	case result := <-resultCh:
+		t.Fatalf("lookup escaped an active topology mutation: %+v", result)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	g.AddNode(&graph.Node{ID: "caller", Kind: graph.KindFunction, Name: "caller", FilePath: "caller.go"})
+	g.AddEdge(&graph.Edge{From: "caller", To: "sink", Kind: graph.EdgeCalls, Confidence: 1})
+	finishMutation(true)
+
+	select {
+	case result := <-resultCh:
+		if !result.hit || len(result.d1) != 1 || result.d1[0].ID != "caller" {
+			t.Fatalf("lookup did not observe the fully published topology: hit=%v d1=%v", result.hit, result.d1)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lookup remained blocked after topology publication")
+	}
+}
+
+type countingBatchStore struct {
+	graph.Store
+	mu      sync.Mutex
+	batches int
+	maxRows int
+}
+
+func (s *countingBatchStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.mu.Lock()
+	s.batches++
+	if len(nodes) > s.maxRows {
+		s.maxRows = len(nodes)
+	}
+	s.mu.Unlock()
+	s.Store.AddBatch(nodes, edges)
+}
+
+func (s *countingBatchStore) reset() {
+	s.mu.Lock()
+	s.batches = 0
+	s.maxRows = 0
+	s.mu.Unlock()
+}
+
+func (s *countingBatchStore) counts() (batches, maxRows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.batches, s.maxRows
+}
+
+// TestReachMaintenancePublishesBoundedBatches prevents eager maintenance from
+// retaining a full-graph duplicate of Node + Meta records before publication.
+func TestReachMaintenancePublishesBoundedBatches(t *testing.T) {
+	g, _ := newCallChain(t, reachPublishBatchSize+17)
+	store := &countingBatchStore{Store: g}
+
+	BuildIndex(store)
+	if batches, maxRows := store.counts(); batches < 2 || maxRows > reachPublishBatchSize {
+		t.Fatalf("BuildIndex batches=%d max_rows=%d; want multiple batches capped at %d", batches, maxRows, reachPublishBatchSize)
+	}
+
+	store.reset()
+	ClearIndex(store)
+	if batches, maxRows := store.counts(); batches < 2 || maxRows > reachPublishBatchSize {
+		t.Fatalf("ClearIndex batches=%d max_rows=%d; want multiple batches capped at %d", batches, maxRows, reachPublishBatchSize)
 	}
 }
 
@@ -228,7 +409,7 @@ func TestClearIndex_RemovesStampsAndBumpsCounter(t *testing.T) {
 		if n.Meta == nil {
 			continue
 		}
-		for _, k := range []string{MetaReachD1, MetaReachD2, MetaReachD3, MetaReachBuild} {
+		for _, k := range []string{MetaReachD1, MetaReachD2, MetaReachD3, MetaReachBuild, MetaReachComplete} {
 			if _, ok := n.Meta[k]; ok {
 				t.Errorf("node %s still has key %q after ClearIndex", n.ID, k)
 			}

@@ -15,8 +15,8 @@ import (
 )
 
 // federationReadTools is the allowlist of read traversal tools eligible
-// for remote fan-out. Anything not here (and everything in MutatingTools)
-// is never federated.
+// for remote fan-out. Anything not here (and every effectful tool) is never
+// federated.
 var federationReadTools = map[string]bool{
 	"find_usages":          true,
 	"get_callers":          true,
@@ -35,11 +35,11 @@ const localSchemaMajor = 1
 // FederationConfig carries the tunable knobs (from .gortex.yaml's
 // federation: block). Zero values fall back to sane defaults.
 type FederationConfig struct {
-	PerRemoteTimeout time.Duration
-	Budget           time.Duration
-	BreakerThreshold int
-	BreakerCooldown  time.Duration
-	HealthTTL        time.Duration
+	PerRemoteTimeout  time.Duration
+	Budget            time.Duration
+	BreakerThreshold  int
+	BreakerCooldown   time.Duration
+	HealthTTL         time.Duration
 	NameKeyedFallback bool
 }
 
@@ -125,7 +125,7 @@ func (f *Federator) Augment(ctx context.Context, tool string, body, localResult 
 	// roster) is unaffected; the federation{} block + origins map are
 	// the additive superset that appears only when there is something to
 	// federate.
-	if !federationReadTools[tool] || MutatingTools[tool] || len(remotes) == 0 {
+	if !federationReadTools[tool] || IsEffectful(tool) || len(remotes) == 0 {
 		return localResult
 	}
 

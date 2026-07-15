@@ -37,6 +37,7 @@ type SessionStartInput struct {
 // hook still emits a block — but its content tells the user that
 // enforcement is disabled and how to fix it.
 func runSessionStart(data []byte) {
+	started := time.Now()
 	var input SessionStartInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -44,6 +45,10 @@ func runSessionStart(data []byte) {
 	if input.HookEventName != "SessionStart" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("SessionStart", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 
 	ctx := buildSessionStartBriefing(input.CWD)
 	if ctx == "" {
@@ -60,6 +65,7 @@ func runSessionStart(data []byte) {
 	if err != nil {
 		return
 	}
+	emitted = true
 	fmt.Print(string(out))
 }
 
@@ -111,8 +117,7 @@ func buildSessionStartBriefing(cwd string) string {
 	status, err := sessionStartStatusFn()
 	switch {
 	case errors.Is(err, errDaemonUnreachable):
-		sb.WriteString("⚠️  **Gortex daemon is not running.** Code-operation enforcement is disabled for this session: Read/Grep/Glob/Bash on indexed source files will not be redirected to graph tools.\n\n")
-		sb.WriteString("Start it with: `gortex daemon start --detach`\n\n")
+		sb.WriteString("⚠️  **Gortex graph transport is unreachable.** Required native MCP tools and code-operation enforcement cannot be assumed healthy. Treat this as an MCP integration failure: stop indexed code operations and report it; do not start a daemon manually or switch to a CLI fallback.\n\n")
 		sb.WriteString(rulePreamble())
 		return sb.String()
 	case err != nil:
@@ -284,13 +289,10 @@ func hasPathPrefix(path, prefix string) bool {
 // — this is just enough that an agent in the very first turn knows
 // to reach for graph tools first.
 func rulePreamble() string {
-	return "**Rule:** Use Gortex MCP tools for code operations in this repo. Prefer:\n" +
-		"- **`explore` first for any task or bug report** — one call returns the ranked neighborhood (likely symbols + their source + call paths + the files to change); answer or start editing from it\n" +
-		"- `search_symbols` / `find_usages` / `get_callers` over `grep` / `Grep`\n" +
-		"- `get_symbol_source` / `batch_symbols` / `get_file_summary` over `Read`\n" +
-		"- `edit_symbol` / `edit_file` / `rename_symbol` over `Edit` / `Write` for indexed source\n\n" +
-		"Pre-tool hooks will deny attempts to Read/Grep/Glob indexed source files; the deny message names the right tool.\n" +
-		"Shell only (no MCP tools)? Reach any tool with `gortex call <tool> --arg k=v` (e.g. `" + toolref.CLIFallback("get_symbol_source") + "`) — there is no bare `gortex <tool>` verb.\n"
+	return "**Rule:** Call `explore` first for every code task. Inspect indexed code with `search`, `read`, `relations`, or `trace`; never Read/Grep/Glob it. " +
+		"Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
+		"Call `capabilities` only when exact operation fields are unknown.\n" +
+		toolref.MCPRequiredLine()
 }
 
 // formatDuration renders a number of seconds as "1h7m" or "45s".

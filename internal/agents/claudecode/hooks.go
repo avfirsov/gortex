@@ -20,12 +20,13 @@ import (
 // upgradeGortexMatcher rewrites those in place. Edit and Write are
 // included so the hook can redirect whole-file rewrites of indexed
 // source to the Gortex MCP edit tools (gated by GORTEX_HOOK_BLOCK_EDIT
-// in the hook itself). The two mcp__gortex__ read tools are included so
-// the hook can also nudge a full-body read_file / get_editing_context
-// toward compress_bodies / search_text — the one gap that fires once
-// the agent is already inside a Gortex tool (gated by
-// GORTEX_HOOK_FORCE_COMPRESS for the hard-deny posture).
-const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
+// in the hook itself). The compact mcp__gortex__read tool is included so the
+// hook can also enforce read shaping after the client has entered Gortex.
+const CurrentPreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read"
+
+// v060PreToolUseMatcher fingerprints the exact matcher shipped by gortex
+// v0.60.0. The concrete retirement gate is documented in docs/versioning.md.
+const v060PreToolUseMatcher = "Read|Grep|Glob|Task|Bash|Edit|Write|mcp__gortex__read_file|mcp__gortex__get_editing_context"
 
 // CurrentPostToolUseMatcher names the tools whose response the
 // PostToolUse hook augments. Only the read-shaped tools have an obvious
@@ -43,6 +44,13 @@ const (
 	HookModeEnrich        = "enrich"
 	HookModeConsultUnlock = "consult-unlock"
 	HookModeAdaptiveNudge = "nudge"
+)
+
+const (
+	preToolUseStatusDeny          = "Enforcing Gortex graph access policy..."
+	preToolUseStatusEnrich        = "Enriching with Gortex graph context..."
+	preToolUseStatusConsultUnlock = "Consulting Gortex graph before tool use..."
+	preToolUseStatusNudge         = "Checking Gortex graph guidance..."
 )
 
 // normalizeHookMode maps user input to a canonical mode. Empty or
@@ -77,6 +85,19 @@ func hookCommandWithMode(base, mode string) string {
 		return base + " --mode=nudge"
 	default:
 		return base
+	}
+}
+
+func preToolUseStatusMessage(mode string) string {
+	switch normalizeHookMode(mode) {
+	case HookModeEnrich:
+		return preToolUseStatusEnrich
+	case HookModeConsultUnlock:
+		return preToolUseStatusConsultUnlock
+	case HookModeAdaptiveNudge:
+		return preToolUseStatusNudge
+	default:
+		return preToolUseStatusDeny
 	}
 }
 
@@ -202,12 +223,13 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 	if !ok {
 		return false
 	}
-	legacyMatchers := map[string]bool{
+	supersededMatchers := map[string]bool{
 		"Read|Grep":                           true,
 		"Read|Grep|Glob":                      true,
 		"Read|Grep|Glob|Task":                 true,
 		"Read|Grep|Glob|Task|Bash":            true,
 		"Read|Grep|Glob|Task|Bash|Edit|Write": true,
+		v060PreToolUseMatcher:                 true,
 	}
 	upgraded := false
 	for _, h := range pre {
@@ -216,7 +238,7 @@ func upgradeGortexMatcher(hooks map[string]any) bool {
 			continue
 		}
 		matcher, _ := hm["matcher"].(string)
-		if !legacyMatchers[matcher] {
+		if !supersededMatchers[matcher] {
 			continue
 		}
 		if !entryInvokesGortexHook(hm) {
@@ -340,6 +362,60 @@ func rewriteGortexHookMode(hooks map[string]any, newCommand string) int {
 	return rewritten
 }
 
+// rewriteGortexPreToolUseStatus keeps the installer-authored progress text in
+// sync with the configured posture. A message outside the known generated set
+// belongs to the user and is deliberately left untouched.
+func rewriteGortexPreToolUseStatus(hooks map[string]any, mode string) int {
+	list, ok := hooks["PreToolUse"].([]any)
+	if !ok {
+		return 0
+	}
+	desired := preToolUseStatusMessage(mode)
+	generated := map[string]struct{}{
+		preToolUseStatusDeny:          {},
+		preToolUseStatusEnrich:        {},
+		preToolUseStatusConsultUnlock: {},
+		preToolUseStatusNudge:         {},
+	}
+	rewritten := 0
+	for _, h := range list {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		inner, ok := hm["hooks"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range inner {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			command, _ := entry["command"].(string)
+			if !commandInvokesGortexHook(command) {
+				continue
+			}
+			current, exists := entry["statusMessage"]
+			if exists {
+				currentText, isString := current.(string)
+				if !isString {
+					continue
+				}
+				if _, managed := generated[currentText]; !managed {
+					continue
+				}
+				if currentText == desired {
+					continue
+				}
+			}
+			entry["statusMessage"] = desired
+			rewritten++
+		}
+	}
+	return rewritten
+}
+
 // removeGortexHookEntries drops every entry under hooks[event] that
 // invokes `gortex hook`, preserving entries owned by other tools.
 // Returns the number of entries removed. Used to clean up PostToolUse
@@ -442,6 +518,7 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	healedCount := healStaleHookCommands(hooks, hookCommand)
 	matcherUpgraded := upgradeGortexMatcher(hooks)
 	modeRewriteCount := rewriteGortexHookMode(hooks, hookCommand)
+	statusRewriteCount := rewriteGortexPreToolUseStatus(hooks, mode)
 	dedupedCount := dedupGortexEntries(hooks, "PreToolUse") +
 		dedupGortexEntries(hooks, "PreCompact") +
 		dedupGortexEntries(hooks, "PostToolUse") +
@@ -472,7 +549,7 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 					"type":          "command",
 					"command":       hookCommand,
 					"timeout":       3000,
-					"statusMessage": "Enriching with Gortex graph context...",
+					"statusMessage": preToolUseStatusMessage(mode),
 				},
 			},
 		})
@@ -556,7 +633,7 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	allPresent := preToolUseInstalled && preCompactInstalled && stopInstalled && sessionStartInstalled &&
 		userPromptSubmitInstalled && (mode != HookModeEnrich || postToolUseInstalled)
 	noChanges := allPresent && !matcherUpgraded && dedupedCount == 0 && healedCount == 0 &&
-		modeRewriteCount == 0 && postToolUseRemoved == 0 && !postToolUseAdded
+		modeRewriteCount == 0 && statusRewriteCount == 0 && postToolUseRemoved == 0 && !postToolUseAdded
 	if noChanges {
 		if w != nil {
 			fmt.Fprintf(w, "[gortex init] all hooks already present in %s\n", settingsPath)
@@ -615,6 +692,9 @@ func InstallHookWithMode(w io.Writer, settingsPath string, mode string, opts age
 	}
 	if modeRewriteCount > 0 {
 		changes = append(changes, fmt.Sprintf("rewrote %d hook command(s) for mode=%s", modeRewriteCount, mode))
+	}
+	if statusRewriteCount > 0 {
+		changes = append(changes, fmt.Sprintf("rewrote %d PreToolUse status message(s) for mode=%s", statusRewriteCount, mode))
 	}
 	if w != nil {
 		fmt.Fprintf(w, "[gortex init] %s in %s\n", strings.Join(changes, ", "), settingsPath)

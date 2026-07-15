@@ -13,6 +13,7 @@ import (
 )
 
 const testCodexHookCommand = "/tmp/test-gortex hook --agent=codex --mode=enrich"
+const v060CodexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
 
 // TestCodexWritesMcpServersTOMLTable verifies we produce the
 // documented [mcp_servers.gortex] table — not a legacy
@@ -57,6 +58,255 @@ func TestCodexWritesMcpServersTOMLTable(t *testing.T) {
 	agentstest.AssertIdempotent(t, a, env)
 }
 
+func TestCodexMakesGortexToolsDirectAndRequired(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	a := New()
+
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	servers := cfg["mcp_servers"].(map[string]any)
+	server := servers["gortex"].(map[string]any)
+	if server["required"] != true {
+		t.Fatalf("mcp_servers.gortex.required=%v want true", server["required"])
+	}
+	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
+		t.Fatalf("mcp_servers.gortex.startup_timeout_sec=%v want %d", server["startup_timeout_sec"], codexMCPStartupTimeoutSeconds)
+	}
+
+	features := cfg["features"].(map[string]any)
+	codeMode := features["code_mode"].(map[string]any)
+	namespaces, ok := codexStringList(codeMode["direct_only_tool_namespaces"])
+	if !ok || len(namespaces) != 2 || namespaces[0] != codexGortexToolNamespace || namespaces[1] != codexGortexNonPrefixedToolNamespace {
+		t.Fatalf("direct_only_tool_namespaces=%#v want [%q %q]", codeMode["direct_only_tool_namespaces"], codexGortexToolNamespace, codexGortexNonPrefixedToolNamespace)
+	}
+	if _, exists := codeMode["enabled"]; exists {
+		t.Fatalf("Gortex must not enable Codex's experimental code mode: %#v", codeMode)
+	}
+}
+
+func TestCodexAvailabilityMergePreservesCustomConfig(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	path := codexConfigPath(env)
+	seed := `model = "gpt-5.4"
+
+[features.code_mode]
+enabled = false
+excluded_tool_namespaces = ["mcp__private"]
+direct_only_tool_namespaces = ["mcp__history"]
+
+[mcp_servers.gortex]
+command = "gortex"
+args = ["mcp", "--custom"]
+required = false
+startup_timeout_sec = 15
+tool_timeout_sec = 321
+
+[mcp_servers.gortex.env]
+CUSTOM_GORTEX = "yes"
+
+[mcp_servers.other]
+command = "other"
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	if cfg["model"] != "gpt-5.4" {
+		t.Fatalf("unrelated top-level config changed: %#v", cfg)
+	}
+	servers := cfg["mcp_servers"].(map[string]any)
+	server := servers["gortex"].(map[string]any)
+	if server["command"] != "gortex" {
+		t.Fatalf("custom command changed: %#v", server)
+	}
+	args, ok := codexStringList(server["args"])
+	if !ok || len(args) != 2 || args[1] != "--custom" {
+		t.Fatalf("custom args changed: %#v", server["args"])
+	}
+	if server["tool_timeout_sec"] != int64(321) {
+		t.Fatalf("custom tool timeout changed: %#v", server)
+	}
+	if server["required"] != true {
+		t.Fatalf("required=%v want true", server["required"])
+	}
+	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
+		t.Fatalf("startup timeout=%v want %d", server["startup_timeout_sec"], codexMCPStartupTimeoutSeconds)
+	}
+	envMap := server["env"].(map[string]any)
+	if envMap["CUSTOM_GORTEX"] != "yes" {
+		t.Fatalf("custom environment changed: %#v", envMap)
+	}
+	if _, exists := servers["other"]; !exists {
+		t.Fatalf("unrelated MCP server removed: %#v", servers)
+	}
+
+	features := cfg["features"].(map[string]any)
+	codeMode := features["code_mode"].(map[string]any)
+	if codeMode["enabled"] != false {
+		t.Fatalf("code_mode.enabled changed: %#v", codeMode)
+	}
+	excluded, ok := codexStringList(codeMode["excluded_tool_namespaces"])
+	if !ok || len(excluded) != 1 || excluded[0] != "mcp__private" {
+		t.Fatalf("excluded namespaces changed: %#v", codeMode)
+	}
+	direct, ok := codexStringList(codeMode["direct_only_tool_namespaces"])
+	if !ok || len(direct) != 3 || direct[0] != "mcp__history" || direct[1] != codexGortexToolNamespace || direct[2] != codexGortexNonPrefixedToolNamespace {
+		t.Fatalf("direct namespaces=%#v", direct)
+	}
+
+	res, err := a.Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	agentstest.AssertCountsByAction(t, res, map[agents.ActionKind]int{agents.ActionSkip: 1})
+}
+
+func TestCodexDirectNamespaceUpgradesBooleanFeatureForm(t *testing.T) {
+	root := map[string]any{
+		"features": map[string]any{"code_mode": true},
+	}
+	if !upsertCodexDirectToolNamespaces(root) {
+		t.Fatal("expected boolean code_mode form to be upgraded")
+	}
+	features := root["features"].(map[string]any)
+	codeMode := features["code_mode"].(map[string]any)
+	if codeMode["enabled"] != true {
+		t.Fatalf("boolean feature value not preserved: %#v", codeMode)
+	}
+	namespaces, ok := codexStringList(codeMode["direct_only_tool_namespaces"])
+	if !ok || len(namespaces) != 2 || namespaces[0] != codexGortexToolNamespace || namespaces[1] != codexGortexNonPrefixedToolNamespace {
+		t.Fatalf("direct namespaces=%#v", namespaces)
+	}
+}
+
+func TestCodexPreservesUserOwnedGortexServer(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	path := codexConfigPath(env)
+	seed := `[mcp_servers.gortex]
+command = "company-gortex-wrapper"
+args = ["serve", "--company-policy"]
+custom = "keep"
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	server := cfg["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
+	if server["command"] != "company-gortex-wrapper" || server["custom"] != "keep" {
+		t.Fatalf("user-owned server changed: %#v", server)
+	}
+	if _, exists := server["required"]; exists {
+		t.Fatalf("user-owned server gained managed required policy: %#v", server)
+	}
+	if _, exists := server["startup_timeout_sec"]; exists {
+		t.Fatalf("user-owned server gained managed startup timeout: %#v", server)
+	}
+	features := cfg["features"].(map[string]any)
+	codeMode := features["code_mode"].(map[string]any)
+	namespaces, ok := codexStringList(codeMode["direct_only_tool_namespaces"])
+	if !ok || len(namespaces) != 2 {
+		t.Fatalf("Gortex server namespace should still be direct: %#v", codeMode)
+	}
+}
+
+func TestCodexMCPServerPreservesLongerStartupTimeout(t *testing.T) {
+	root := map[string]any{
+		"mcp_servers": map[string]any{
+			"gortex": map[string]any{
+				"command":             "gortex",
+				"args":                []any{"mcp"},
+				"required":            true,
+				"startup_timeout_sec": int64(180),
+			},
+		},
+	}
+	if upsertCodexMCPServer(root, agents.ApplyOpts{}) {
+		t.Fatal("a longer user-selected startup timeout should already satisfy the invariant")
+	}
+	server := root["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
+	if server["startup_timeout_sec"] != int64(180) {
+		t.Fatalf("longer startup timeout changed: %#v", server)
+	}
+}
+
+func TestCodexDirectNamespaceVersionGate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		output    string
+		supported bool
+		version   string
+	}{
+		{name: "current", output: "codex-cli 0.144.1\n", supported: true, version: "0.144.1"},
+		{name: "first supported minor", output: "codex-cli 0.142.0\n", supported: true, version: "0.142.0"},
+		{name: "unsupported", output: "codex-cli 0.141.0\n", supported: false, version: "0.141.0"},
+		{name: "future major", output: "codex-cli v1.0.0\n", supported: true, version: "1.0.0"},
+		{name: "unparseable app or IDE version", output: "codex-cli dev\n", supported: true, version: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubCodexVersion(t, tc.output)
+			supported, detected := codexSupportsDirectToolNamespaces()
+			if supported != tc.supported || detected != tc.version {
+				t.Fatalf("support=(%v, %q) want (%v, %q)", supported, detected, tc.supported, tc.version)
+			}
+		})
+	}
+}
+
+func TestCodexOldVersionSkipsUnsupportedDirectNamespaceConfig(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	stubCodexVersion(t, "codex-cli 0.141.0\n")
+
+	if _, err := New().Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	if _, exists := cfg["features"]; exists {
+		t.Fatalf("Codex 0.141 must not receive unsupported features.code_mode fields: %#v", cfg["features"])
+	}
+	server := cfg["mcp_servers"].(map[string]any)["gortex"].(map[string]any)
+	if server["required"] != true || server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
+		t.Fatalf("version gate must not weaken MCP startup safety: %#v", server)
+	}
+}
+
+func TestCodexOldVersionMergesExistingDirectNamespaceField(t *testing.T) {
+	env := codexGlobalEnv(t)
+	env.InstallHooks = false
+	stubCodexVersion(t, "codex-cli 0.141.0\n")
+	path := codexConfigPath(env)
+	seed := `[features.code_mode]
+direct_only_tool_namespaces = ["mcp__history"]
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	codeMode := cfg["features"].(map[string]any)["code_mode"].(map[string]any)
+	direct, ok := codexStringList(codeMode["direct_only_tool_namespaces"])
+	if !ok || len(direct) != 3 || direct[0] != "mcp__history" || direct[1] != codexGortexToolNamespace || direct[2] != codexGortexNonPrefixedToolNamespace {
+		t.Fatalf("existing supported field was not merged: %#v", codeMode)
+	}
+}
+
 func TestCodexInstallsSessionStartHook(t *testing.T) {
 	env := codexGlobalEnv(t)
 	a := New()
@@ -84,21 +334,15 @@ func TestCodexInstallsSessionStartHook(t *testing.T) {
 	if handler["type"] != "command" {
 		t.Errorf("hook type=%v want command", handler["type"])
 	}
-	if handler["command"] != codexSessionStartCommand {
-		t.Errorf("command=%v want %q", handler["command"], codexSessionStartCommand)
+	if handler["command"] != testCodexHookCommand {
+		t.Errorf("command=%v want %q", handler["command"], testCodexHookCommand)
 	}
-	if handler["command_windows"] != codexSessionStartWindowsCommand {
-		t.Errorf("command_windows=%v want %q", handler["command_windows"], codexSessionStartWindowsCommand)
+	if _, exists := handler["command_windows"]; exists {
+		t.Errorf("SessionStart should use the same managed hook command on every platform: %#v", handler)
 	}
 	command := handler["command"].(string)
-	if !strings.Contains(command, "IMPORTANT: Prefer Gortex MCP tools") {
-		t.Errorf("command should emit the graph-tools orientation: %v", handler["command"])
-	}
-	if !strings.Contains(command, "edit_file") {
-		t.Errorf("command should mention edit_file: %v", handler["command"])
-	}
-	if strings.Contains(command, "[Gortex]") {
-		t.Errorf("command should not duplicate the Gortex label: %v", handler["command"])
+	if !codexCommandInvokesCodexHook(command) {
+		t.Errorf("SessionStart must flow through the managed Codex hook for effectiveness telemetry: %v", handler["command"])
 	}
 }
 
@@ -156,6 +400,9 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	if entry["matcher"] != codexPostToolUseMatcher {
 		t.Fatalf("matcher=%v want %q", entry["matcher"], codexPostToolUseMatcher)
 	}
+	if !strings.Contains(codexPostToolUseMatcher, "apply_patch") {
+		t.Fatalf("PostToolUse matcher must cover mutation-aware apply_patch handling: %q", codexPostToolUseMatcher)
+	}
 	handlers, ok := codexHookList(entry["hooks"])
 	if !ok || len(handlers) != 1 {
 		t.Fatalf("handlers=%#v", entry["hooks"])
@@ -170,6 +417,40 @@ func TestCodexInstallsPostToolUseHook(t *testing.T) {
 	}
 	if handler["timeout"] != int64(codexHookTimeoutSeconds) {
 		t.Errorf("timeout=%v want %d", handler["timeout"], codexHookTimeoutSeconds)
+	}
+}
+
+func TestCodexHookModeIsOptInAndMigratesInPlace(t *testing.T) {
+	env := codexGlobalEnv(t)
+	a := New()
+	if got := codexHookMode(); got != "enrich" {
+		t.Fatalf("default Codex posture=%q want enrich", got)
+	}
+	t.Setenv(codexHookModeEnvVar, "deny")
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := readCodexConfig(t, env)
+	if !hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("deny posture not installed: %#v", preToolUseEntries(t, cfg))
+	}
+	if !hasSessionStartCommand(t, cfg, "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("SessionStart did not migrate to deny command: %#v", sessionStartEntries(t, cfg))
+	}
+
+	t.Setenv(codexHookModeEnvVar, "rewrite")
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg = readCodexConfig(t, env)
+	if !hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=rewrite") {
+		t.Fatalf("rewrite posture not installed: %#v", preToolUseEntries(t, cfg))
+	}
+	if hasHookCommand(t, cfg, "PreToolUse", "/tmp/test-gortex hook --agent=codex --mode=deny") {
+		t.Fatalf("stale deny hook survived posture migration: %#v", preToolUseEntries(t, cfg))
+	}
+	if count := gortexPreToolUseHookCount(t, cfg); count != 2 {
+		t.Fatalf("posture migration duplicated PreToolUse hooks: %d", count)
 	}
 }
 
@@ -446,6 +727,52 @@ func TestCodexSessionStartHookIdempotent(t *testing.T) {
 	}
 }
 
+func TestCodexUpgradesV060CompactSurfaceHooks(t *testing.T) {
+	env := codexGlobalEnv(t)
+	path := codexConfigPath(env)
+	seed := `[[hooks.SessionStart]]
+matcher = "startup|resume|clear|compact"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "` + strings.ReplaceAll(v060CodexSessionStartCommand, `\`, `\\`) + `"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "` + testCodexHookCommand + `"
+
+[[hooks.PreToolUse]]
+matcher = "^mcp__gortex__(read_file|get_editing_context)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "` + testCodexHookCommand + `"
+`
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	if _, err := InstallHooksOnly(env.Stderr, path, env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("upgrade hooks: %v", err)
+	}
+	cfg := readCodexConfig(t, env)
+	if len(sessionStartEntries(t, cfg)) != 1 {
+		t.Fatalf("v0.60.0 SessionStart should update in place: %#v", sessionStartEntries(t, cfg))
+	}
+	if !hasSessionStartCommand(t, cfg, testCodexHookCommand) {
+		t.Fatalf("managed SessionStart hook missing after static-command migration: %#v", sessionStartEntries(t, cfg))
+	}
+	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", codexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 1 {
+		t.Fatalf("compact read matcher count=%d want 1: %#v", count, preToolUseEntries(t, cfg))
+	}
+	if count := hookMatcherCommandCount(t, cfg, "PreToolUse", v060CodexMCPReadPreToolUseMatcher, testCodexHookCommand); count != 0 {
+		t.Fatalf("v0.60.0 read matcher survived upgrade: %#v", preToolUseEntries(t, cfg))
+	}
+}
+
 func TestCodexSessionStartHookPreservesExistingConfig(t *testing.T) {
 	env := codexGlobalEnv(t)
 	path := codexConfigPath(env)
@@ -617,12 +944,21 @@ func TestCodexNoHooksSkipsSessionStartHook(t *testing.T) {
 
 func codexGlobalEnv(t *testing.T) agents.Env {
 	t.Helper()
+	t.Setenv(codexHookModeEnvVar, "")
+	stubCodexVersion(t, "codex-cli 0.144.1\n")
 	env, _ := agentstest.NewEnv(t)
 	env.Mode = agents.ModeGlobal
 	if err := os.MkdirAll(filepath.Join(env.Home, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return env
+}
+
+func stubCodexVersion(t *testing.T, output string) {
+	t.Helper()
+	previous := codexVersionOutput
+	codexVersionOutput = func() ([]byte, error) { return []byte(output), nil }
+	t.Cleanup(func() { codexVersionOutput = previous })
 }
 
 func codexConfigPath(env agents.Env) string {

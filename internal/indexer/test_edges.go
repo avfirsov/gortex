@@ -58,19 +58,43 @@ func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string
 	g.ResolveMutex().Lock()
 	defer g.ResolveMutex().Unlock()
 
-	testNodes, markedTests := markTestSymbolsLocked(g)
+	testNodes, markedTests, changedNodes := markTestSymbolsLocked(g)
 	if len(testNodes) == 0 {
+		// Test-file metadata still needs persistence even when the file has no
+		// function or method symbols. There are no test edges to batch with in
+		// this case, so persist just the changed nodes while ResolveMutex is held.
+		g.AddBatch(changedNodes, nil)
 		return markedTests, 0
 	}
-	edgesEmitted = emitTestEdgesLocked(g, testNodes, changedPrefixes)
+	edgesEmitted = emitTestEdgesAndPersistLocked(g, testNodes, changedNodes, changedPrefixes)
 	return markedTests, edgesEmitted
 }
 
 // markTestSymbolsLocked runs Pass 1: it stamps test Meta on every test symbol
-// and returns the complete test-node membership set plus the marked count. The
-// caller must hold g.ResolveMutex(). Always whole-graph — see the scoped
-// entry point for why the set must be complete.
-func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTests int) {
+// and returns the complete test-node membership set, marked count, and every
+// node whose test metadata changed. The caller persists changedNodes through
+// the same AddBatch as the derived test edges. The caller must hold
+// g.ResolveMutex(). Always whole-graph — see the scoped entry point for why the
+// set must be complete.
+func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTests int, changedNodes []*graph.Node) {
+	setMeta := func(n *graph.Node, key string, value any) bool {
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		switch want := value.(type) {
+		case bool:
+			if got, ok := n.Meta[key].(bool); ok && got == want {
+				return false
+			}
+		case string:
+			if got, ok := n.Meta[key].(string); ok && got == want {
+				return false
+			}
+		}
+		n.Meta[key] = value
+		return true
+	}
+
 	// Pass 1: classify file nodes, then function/method nodes. Build
 	// a local testNodes set keyed by node id so Pass 2 can probe it
 	// without re-walking the Meta. (Node.Meta mutations on returned
@@ -84,13 +108,13 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 		}
 		if IsTestFile(n.FilePath) {
 			testFiles[n.ID] = true
-			if n.Meta == nil {
-				n.Meta = map[string]any{}
-			}
-			n.Meta["is_test_file"] = true
+			changed := setMeta(n, "is_test_file", true)
 			if runner := detectTestRunnerForFile(g, n); runner != "" {
-				n.Meta["test_runner"] = runner
+				changed = setMeta(n, "test_runner", runner) || changed
 				fileRunners[n.FilePath] = runner
+			}
+			if changed {
+				changedNodes = append(changedNodes, n)
 			}
 		}
 	}
@@ -145,13 +169,13 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 		default:
 			return
 		}
-		if n.Meta == nil {
-			n.Meta = map[string]any{}
-		}
-		n.Meta["is_test"] = true
-		n.Meta["test_role"] = role
+		changed := setMeta(n, "is_test", true)
+		changed = setMeta(n, "test_role", role) || changed
 		if runner != "" {
-			n.Meta["test_runner"] = runner
+			changed = setMeta(n, "test_runner", runner) || changed
+		}
+		if changed {
+			changedNodes = append(changedNodes, n)
 		}
 		testNodes[n.ID] = true
 		markedTests++
@@ -174,7 +198,7 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 			stampTestSymbol(n)
 		}
 	}
-	return testNodes, markedTests
+	return testNodes, markedTests, changedNodes
 }
 
 // emitTestEdgesLocked runs Pass 2: for each (test, non-test) call it emits a
@@ -189,7 +213,12 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 // testNodes[e.To] test→test skip stays correct across repos because testNodes is
 // complete (Pass 1 is whole-graph).
 func emitTestEdgesLocked(g graph.Store, testNodes map[string]bool, changedPrefixes map[string]bool) int {
-	edgesEmitted := 0
+	return emitTestEdgesAndPersistLocked(g, testNodes, nil, changedPrefixes)
+}
+
+// emitTestEdgesAndPersistLocked additionally persists changedNodes in the same
+// AddBatch as the derived edges so disk-backed stores retain the classification.
+func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, changedNodes []*graph.Node, changedPrefixes map[string]bool) int {
 	seen := map[string]bool{}
 	type pending struct {
 		from, to, file string
@@ -227,8 +256,9 @@ func emitTestEdgesLocked(g graph.Store, testNodes map[string]bool, changedPrefix
 			}
 		}
 	}
+	edges := make([]*graph.Edge, 0, len(out))
 	for _, p := range out {
-		g.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
 			From:     p.from,
 			To:       p.to,
 			Kind:     graph.EdgeTests,
@@ -236,9 +266,9 @@ func emitTestEdgesLocked(g graph.Store, testNodes map[string]bool, changedPrefix
 			Line:     p.line,
 			Origin:   graph.OriginASTInferred,
 		})
-		edgesEmitted++
 	}
-	return edgesEmitted
+	g.AddBatch(changedNodes, edges)
+	return len(edges)
 }
 
 // detectTestRunnerForFile resolves the runner identifier for a test file

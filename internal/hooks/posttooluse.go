@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // postHookInput is the PostToolUse payload Claude Code sends. It differs
@@ -44,6 +45,7 @@ type postHookInput struct {
 // was removed when the web surface migrated to the daemon, so these
 // lookups silently returned nothing regardless of configuration (#241).
 func runPostToolUse(data []byte) {
+	started := time.Now()
 	var input postHookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -51,25 +53,44 @@ func runPostToolUse(data []byte) {
 	if input.HookEventName != "PostToolUse" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PostToolUse", emitted, daemonReachableFn(), 0, time.Since(started))
+	}()
 
-	var ctx string
-	switch input.ToolName {
-	case "Grep":
-		ctx = postGrep(input)
-	case "Glob":
-		ctx = postGlob(input)
-	case "Read":
-		ctx = postRead(input)
-	}
+	ctx := postToolContext(input)
 	if ctx == "" {
 		return
 	}
+	emitted = true
+	emitPostToolContext(ctx, false)
+}
 
+func postToolContext(input postHookInput) string {
+	switch input.ToolName {
+	case "Grep":
+		return postGrep(input)
+	case "Glob":
+		return postGlob(input)
+	case "Read":
+		return postRead(input)
+	}
+	return ""
+}
+
+func emitPostToolContext(ctx string, replace bool) {
 	output := HookOutput{
 		HookSpecificOutput: &HookSpecificOutput{
 			HookEventName:     "PostToolUse",
 			AdditionalContext: ctx,
 		},
+	}
+	if replace {
+		// Codex currently implements output replacement through the supported
+		// PostToolUse block decision. The nominal suppressOutput field is parsed
+		// but rejected by current releases, so never emit it.
+		output.Decision = "block"
+		output.Reason = ctx
 	}
 	out, err := json.Marshal(output)
 	if err != nil {
@@ -134,7 +155,7 @@ func postGrep(input postHookInput) string {
 	for _, line := range enriched {
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("Follow-up: pass any symbol ID to `find_usages` / `get_callers` for blast radius without re-Grep.\n")
+	b.WriteString("Follow-up: call `relations(operation:\"usages\", target:{symbol:\"<id>\"})`; choose operation `callers` when you need only callers. Do not re-Grep.\n")
 	return b.String()
 }
 
@@ -185,7 +206,7 @@ func postGlob(input postHookInput) string {
 	if len(paths)-unindexed > len(indexed) {
 		fmt.Fprintf(&b, "  ... and %d more indexed file(s)\n", (len(paths)-unindexed)-len(indexed))
 	}
-	b.WriteString("Follow-up: `get_file_summary` for any single file; `get_repo_outline` for the whole workspace shape.\n")
+	b.WriteString("Follow-up: use `read(operation:\"summary\", target:{file:\"<path>\"})` for one file or `explore(operation:\"outline\")` for the workspace shape.\n")
 	return b.String()
 }
 
@@ -209,7 +230,7 @@ func postRead(input postHookInput) string {
 	if summary.Dependents > 0 {
 		fmt.Fprintf(&b, "  %d file(s) import this one\n", summary.Dependents)
 	}
-	b.WriteString("Follow-up: `get_file_summary` / `get_editing_context` returns the same info plus signatures, no re-Read needed.\n")
+	b.WriteString("Follow-up: call `read(operation:\"summary\", target:{file:\"<path>\"})`; choose operation `editing_context` before editing. Do not re-Read.\n")
 	return b.String()
 }
 

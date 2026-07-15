@@ -131,6 +131,12 @@ func (c *Client) WriteMCPFrame(frame []byte) error {
 // ReadMCPFrame reads one MCP JSON-RPC frame from the daemon. Returns
 // io.EOF when the daemon closes the connection.
 func (c *Client) ReadMCPFrame() ([]byte, error) {
+	if c.reader == nil {
+		if c.Conn == nil {
+			return nil, net.ErrClosed
+		}
+		c.reader = bufio.NewReader(c.Conn)
+	}
 	line, err := c.reader.ReadBytes('\n')
 	if err != nil {
 		return nil, err

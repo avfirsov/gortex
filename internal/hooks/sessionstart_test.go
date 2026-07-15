@@ -40,11 +40,14 @@ func TestRunSessionStart_DaemonDown(t *testing.T) {
 		t.Fatalf("invalid HookOutput JSON: %v\n%s", err, out)
 	}
 	ac := payload.HookSpecificOutput.AdditionalContext
-	if !strings.Contains(ac, "daemon is not running") {
-		t.Errorf("expected daemon-down notice, got:\n%s", ac)
+	if !strings.Contains(ac, "graph transport is unreachable") {
+		t.Errorf("expected transport-down notice, got:\n%s", ac)
 	}
-	if !strings.Contains(ac, "gortex daemon start") {
-		t.Errorf("expected start command, got:\n%s", ac)
+	if !strings.Contains(ac, "MCP integration failure") {
+		t.Errorf("expected integration-failure direction, got:\n%s", ac)
+	}
+	if strings.Contains(ac, "gortex daemon start") || strings.Contains(ac, "gortex call ") {
+		t.Errorf("native MCP guidance must not advertise a manual fallback, got:\n%s", ac)
 	}
 	if !strings.Contains(ac, "Rule:") {
 		t.Errorf("rule preamble missing, got:\n%s", ac)

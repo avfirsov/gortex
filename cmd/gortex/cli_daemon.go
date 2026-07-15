@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/zzet/gortex/internal/daemon"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -21,6 +22,11 @@ var ErrNoExecutor = errors.New("no warm daemon and --oneshot not set")
 // it as a hard error.
 var ErrRepoNotTracked = errors.New("repository not tracked by the daemon")
 
+const (
+	cliLegacyToolSurface = "core"
+	cliLegacyToolMode    = "defer"
+)
+
 // cliExecutor runs a registered MCP tool by name and returns its raw
 // result JSON (the same payload the MCP server returns).
 type cliExecutor interface {
@@ -32,13 +38,14 @@ type cliExecutor interface {
 // ModeMCP channel — the same warm graph the editor proxies hit, no cold
 // index. It pins the JSON wire format so per-tool decoding is stable.
 type daemonExecutor struct {
-	client *daemon.Client
-	nextID int
+	client         *daemon.Client
+	nextID         int
+	pinJSONDefault bool
 }
 
 func (d *daemonExecutor) CallTool(_ context.Context, tool string, args map[string]any) (json.RawMessage, error) {
 	d.nextID++
-	frame, err := buildToolCallFrame(d.nextID, tool, args)
+	frame, err := buildToolCallFrameWithDefault(d.nextID, tool, args, d.pinJSONDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -56,13 +63,17 @@ func (d *daemonExecutor) CallTool(_ context.Context, tool string, args map[strin
 // JSON wire format so the daemon's per-client GCX/TOON auto-selection does
 // not defeat the per-tool decode.
 func buildToolCallFrame(id int, tool string, args map[string]any) ([]byte, error) {
+	return buildToolCallFrameWithDefault(id, tool, args, true)
+}
+
+func buildToolCallFrameWithDefault(id int, tool string, args map[string]any, pinJSON bool) ([]byte, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
 	// Default to JSON, but honour a caller-provided format (e.g.
 	// mermaid / dot for diagram output) so the CLI can request the
 	// daemon's other renderers.
-	if _, ok := args["format"]; !ok {
+	if _, ok := args["format"]; pinJSON && !ok {
 		args["format"] = "json"
 	}
 	return json.Marshal(map[string]any{
@@ -121,6 +132,15 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 // no-executor case; --oneshot and autostart land with the shared
 // constructor and the autostart primitive.
 func resolveExecutor(repoPath string) (cliExecutor, error) {
+	return resolveExecutorWithToolSurface(repoPath, cliLegacyToolSurface, cliLegacyToolMode)
+}
+
+// resolveExecutorWithToolSurface is the daemon-first executor with an
+// optional per-connection MCP surface. Ordinary CLI verbs explicitly request
+// core/defer so legacy tool names keep their historical semantics regardless
+// of daemon/client defaults; compact calls request facade-v1/hide. Neither path
+// changes the shared daemon or any other session.
+func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecutor, error) {
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		abs = repoPath
@@ -131,11 +151,20 @@ func resolveExecutor(repoPath string) (cliExecutor, error) {
 	if !daemonOwnsRepo(abs) {
 		return nil, ErrNoExecutor
 	}
-	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeMCP, ClientName: "cli", CWD: abs})
+	c, err := daemon.Dial(daemon.Handshake{
+		Mode:       daemon.ModeMCP,
+		ClientName: "cli",
+		CWD:        abs,
+		Tools:      tools,
+		ToolsMode:  toolsMode,
+	})
 	if err != nil {
 		return nil, ErrNoExecutor
 	}
-	return &daemonExecutor{client: c}, nil
+	return &daemonExecutor{
+		client:         c,
+		pinJSONDefault: tools != gortexmcp.FacadeSurfaceVersion,
+	}, nil
 }
 
 // daemonOwnsRepo reports whether the running daemon tracks a repo that

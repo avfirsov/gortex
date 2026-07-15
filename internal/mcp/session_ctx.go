@@ -117,8 +117,9 @@ func repoAllowFromContext(ctx context.Context) map[string]bool {
 // stay on *Server directly or are referenced via pointers that all
 // sessions share.
 type sessionLocal struct {
-	session    *sessionState
-	tokenStats *tokenStats
+	session      *sessionState
+	tokenStats   *tokenStats
+	localization *localizationTerminalState
 }
 
 // newSessionLocal constructs a fresh per-session state container. The
@@ -130,7 +131,8 @@ type sessionLocal struct {
 // shared default reflects daemon-wide live activity.
 func newSessionLocal(id string, persistent *savings.Store, repoPath string, parent *tokenStats) *sessionLocal {
 	return &sessionLocal{
-		session: newSessionState(),
+		session:      newSessionState(),
+		localization: newLocalizationTerminalState(),
 		tokenStats: &tokenStats{
 			persistent: persistent,
 			repoPath:   repoPath,

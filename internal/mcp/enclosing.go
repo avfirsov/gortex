@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"sort"
 
 	"github.com/zzet/gortex/internal/astquery"
@@ -202,23 +203,55 @@ func enclosingName(n *graph.Node, g graph.Reader) (id, name string) {
 // search_text works from trigram match paths, not AST targets, and
 // needs the same enclosing-scope lookup.
 func (s *Server) buildFileSymbolIndexForPaths(paths map[string]struct{}) map[string]*fileSymbolIndex {
-	if s.graph == nil || len(paths) == 0 {
+	return s.buildFileSymbolIndexForPathsContext(context.Background(), paths)
+}
+
+type contextFileNodeReader interface {
+	GetFileNodesContext(context.Context, string) []*graph.Node
+}
+
+func (s *Server) buildFileSymbolIndexForPathsContext(ctx context.Context, paths map[string]struct{}) map[string]*fileSymbolIndex {
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	return s.buildFileSymbolIndexForOrderedPathsContext(ctx, ordered)
+}
+
+// buildFileSymbolIndexForOrderedPathsContext preserves caller priority while
+// keeping file-node lookup bounded by ctx. Source-literal mapping uses this to
+// query authoritative match paths before compatibility aliases.
+func (s *Server) buildFileSymbolIndexForOrderedPathsContext(ctx context.Context, paths []string) map[string]*fileSymbolIndex {
+	if s.graph == nil || len(paths) == 0 || ctx.Err() != nil {
 		return nil
 	}
 	out := make(map[string]*fileSymbolIndex, len(paths))
-	for _, n := range s.graph.AllNodes() {
-		if _, ok := paths[n.FilePath]; !ok {
-			continue
+	contextReader, hasContextReader := s.graph.(contextFileNodeReader)
+	for _, path := range paths {
+		if ctx.Err() != nil {
+			break
 		}
-		switch n.Kind {
-		case graph.KindFunction, graph.KindMethod, graph.KindClosure,
-			graph.KindType, graph.KindInterface:
-			idx := out[n.FilePath]
-			if idx == nil {
-				idx = &fileSymbolIndex{}
-				out[n.FilePath] = idx
+		var nodes []*graph.Node
+		if hasContextReader {
+			nodes = contextReader.GetFileNodesContext(ctx, path)
+		} else {
+			nodes = s.graph.GetFileNodes(path)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		for _, n := range nodes {
+			switch n.Kind {
+			case graph.KindFunction, graph.KindMethod, graph.KindClosure,
+				graph.KindType, graph.KindInterface:
+				idx := out[n.FilePath]
+				if idx == nil {
+					idx = &fileSymbolIndex{}
+					out[n.FilePath] = idx
+				}
+				idx.add(n)
 			}
-			idx.add(n)
 		}
 	}
 	for _, idx := range out {

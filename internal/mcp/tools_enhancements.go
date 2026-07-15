@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/audit"
 	"github.com/zzet/gortex/internal/blame"
@@ -66,11 +67,10 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 		if !idx.IsTrackedStale(rel) {
 			continue
 		}
-		if err := idx.IndexFile(absPath); err != nil {
+		if !s.reindexFile(absPath) {
 			s.logger.Warn("auto re-index failed",
 				zap.String("file", fp),
-				zap.String("resolved", absPath),
-				zap.Error(err))
+				zap.String("resolved", absPath))
 			continue
 		}
 		// Advance the recorded mtime so a follow-up read in the same window
@@ -98,7 +98,7 @@ func (s *Server) freshnessIndexer(fp string) (*indexer.Indexer, string) {
 		idx, _ := s.multiIndexer.IndexerForFile(abs)
 		return idx, abs
 	}
-	if s.indexer == nil || s.watcher != nil {
+	if s.indexer == nil || s.currentWatcher() != nil {
 		return nil, ""
 	}
 	abs := fp
@@ -202,6 +202,8 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithNumber("min_axes", mcp.Description("(health_score) Require at least this many populated axes per row (default 1; raise to demand multi-signal confidence)")),
 			mcp.WithString("roll_up", mcp.Description("(health_score) Aggregate per-symbol scores up to a coarser scope — 'file' (per-file average + per-grade counts) or 'repo' (per-repo). Omit for per-symbol rows.")),
 			mcp.WithString("ids", mcp.Description("(impact) Comma-separated symbol IDs — score only these, the blast radius of changing specific symbols.")),
+			mcp.WithBoolean("refresh_cochange", mcp.Description("(impact) Start legacy lazy co-change mining when cold (default true). The compact public operation fixes this false.")),
+			mcp.WithBoolean("materialize", mcp.Description("(sql_call_sites) Rebuild SQL table/query edges before reading (legacy default true). The compact public operation fixes this false.")),
 			mcp.WithString("name", mcp.Description("(named) The query bundle to run. Omit to list every available bundle.")),
 			mcp.WithString("group_by", mcp.Description("(tests_as_edges) symbol (default — tested symbol → its tests) or test (test → symbols it exercises).")),
 			mcp.WithString("algorithm", mcp.Description("(clusters) Community-detection algorithm — leiden (default), louvain, or spectral (recursive Fiedler-vector bisection).")),
@@ -288,13 +290,15 @@ func (s *Server) registerEnhancementTools() {
 	// batch_edit
 	s.addTool(
 		mcp.NewTool("batch_edit",
-			mcp.WithDescription("Applies multiple edits in one atomic, dependency-ordered batch. Symbol edits are ordered definitions→callers; the graph re-indexes after each edit; the batch stops on the first failure and skips the rest. Each edit is one of two operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\nPass `edits` as a JSON array of objects (a JSON-encoded string of the same array is also accepted for backward compatibility)."),
-			mcp.WithArray("edits", mcp.Required(),
-				mcp.Description("Edit operations. Each item is an edit_symbol or edit_file object selected by the `op` discriminator."),
+			mcp.WithDescription("Atomically applies a dependency-ordered edit set. Every guard and replacement is evaluated against one locked snapshot before any file is written; a commit failure restores all touched files. The durable transaction receipt survives response loss and daemon restart. Retry with the same transaction_id and identical edits to receive the original result without writing again, or omit edits and pass transaction_id to query status. Each edit is one of two operations selected by `op`:\n  • edit_symbol (default): {id, old_source, new_source} — replace a fragment inside a symbol's body.\n  • edit_file: {op:\"edit_file\", path, old_string, new_string, replace_all?} — replace a string in any file (imports, config, comments).\nPass `edits` as a JSON array of objects (a JSON-encoded string is accepted for compatibility)."),
+			mcp.WithArray("edits",
+				mcp.Description("Edit operations. Required for execution; omit only when querying an existing transaction. Each item is an edit_symbol or edit_file object selected by `op`."),
 				mcp.Items(batchEditItemsSchema()),
 			),
+			mcp.WithString("transaction_id", mcp.Description("Stable caller-chosen idempotency key. Reusing it with identical edits returns the same receipt; a different payload is rejected. When omitted, the server creates a unique transaction ID.")),
+			mcp.WithBoolean("status_only", mcp.Description("Query transaction_id without executing edits. Edits may also simply be omitted.")),
 			mcp.WithBoolean("dry_run", mcp.Description("Return the dependency-ordered plan without applying changes")),
-			mcp.WithBoolean("compact", mcp.Description("One-line-per-edit summary")),
+			mcp.WithBoolean("compact", mcp.Description("One-line transaction and per-edit summary")),
 		),
 		s.handleBatchEdit,
 	)
@@ -2431,6 +2435,9 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 	if v, ok := req.GetArguments()["threshold"].(float64); ok {
 		threshold = v
 	}
+	if threshold != 0 {
+		defer scheduleOSMemoryReleaseAfterBurst(s.logger, "analyze_hotspots")
+	}
 
 	var entries []analysis.HotspotEntry
 	if threshold == 0 {
@@ -3319,11 +3326,17 @@ func (it batchEditItem) kind() string {
 
 // batchEditResult represents the outcome of a single edit in the batch.
 type batchEditResult struct {
-	Op       string `json:"op,omitempty"`
-	SymbolID string `json:"id,omitempty"`
-	FilePath string `json:"path"`
-	Status   string `json:"status"` // "applied", "failed", "skipped"
-	Error    string `json:"error,omitempty"`
+	Op                       string `json:"op,omitempty"`
+	SymbolID                 string `json:"id,omitempty"`
+	FilePath                 string `json:"path"`
+	Status                   string `json:"status"` // "applied", "failed", "skipped"
+	Error                    string `json:"error,omitempty"`
+	Reindexed                bool   `json:"reindexed"`
+	ReindexPending           bool   `json:"reindex_pending,omitempty"`
+	ReindexReceipt           string `json:"reindex_receipt,omitempty"`
+	ReindexGeneration        uint64 `json:"reindex_generation,omitempty"`
+	ReindexAppliedGeneration uint64 `json:"reindex_applied_generation,omitempty"`
+	ReindexError             string `json:"reindex_error,omitempty"`
 	// EOLNormalized is true when the fragment only matched through the
 	// CRLF<->LF-tolerant fallback and the replacement was written with the
 	// file's own line terminators.
@@ -3390,177 +3403,13 @@ func parseBatchEdits(raw any) ([]batchEditItem, error) {
 }
 
 func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	edits, perr := parseBatchEdits(req.GetArguments()["edits"])
-	if perr != nil {
-		return mcp.NewToolResultError(perr.Error()), nil
-	}
-	if len(edits) == 0 {
-		return mcp.NewToolResultError("edits array is empty"), nil
-	}
-
-	dryRun := false
-	if v, ok := req.GetArguments()["dry_run"].(bool); ok {
-		dryRun = v
-	}
-
-	// Sort edits in dependency order using get_edit_plan logic:
-	// Definitions first, then implementations, then callers.
-	type editWithOrder struct {
-		edit  batchEditItem
-		op    string
-		order int
-		file  string
-		idx   int
-	}
-
-	var ordered []editWithOrder
-	for i, edit := range edits {
-		op := edit.kind()
-		if op == "edit_file" {
-			// File edits carry no graph dependency; apply them after all
-			// symbol edits (order 1000), preserving input order via idx.
-			ordered = append(ordered, editWithOrder{edit: edit, op: op, order: 1000, file: edit.Path, idx: i})
-			continue
-		}
-		node := s.engineFor(ctx).GetSymbol(edit.SymbolID)
-		order := 50 // default middle priority
-		filePath := ""
-		if node != nil {
-			filePath = node.FilePath
-			// Definitions/interfaces get lowest order (edited first)
-			if node.Kind == graph.KindInterface || node.Kind == graph.KindType {
-				order = 0
-			} else if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
-				// Check if this symbol is depended on by other edits
-				for _, other := range edits {
-					if other.SymbolID == edit.SymbolID {
-						continue
-					}
-					// Check if other calls this symbol
-					callers := s.engineFor(ctx).GetCallers(edit.SymbolID, query.QueryOptions{Depth: 1, Limit: 100, Detail: "brief"})
-					for _, cn := range callers.Nodes {
-						if cn.ID == other.SymbolID {
-							order = 10 // this is a dependency — edit first
-							break
-						}
-					}
-				}
-				if order == 50 {
-					order = 20 // regular function
-				}
-			}
-		}
-		ordered = append(ordered, editWithOrder{edit: edit, op: op, order: order, file: filePath, idx: i})
-	}
-
-	// Sort by order ascending (lowest = edit first), tie-broken by file then
-	// by original index so same-bucket edits stay in a deterministic order.
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].order != ordered[j].order {
-			return ordered[i].order < ordered[j].order
-		}
-		if ordered[i].file != ordered[j].file {
-			return ordered[i].file < ordered[j].file
-		}
-		return ordered[i].idx < ordered[j].idx
-	})
-
-	if dryRun {
-		var plan []map[string]any
-		for i, o := range ordered {
-			entry := map[string]any{
-				"order":  i + 1,
-				"op":     o.op,
-				"id":     o.edit.SymbolID,
-				"path":   o.file,
-				"status": "planned",
-			}
-			plan = append(plan, entry)
-		}
-
-		if isCompact(req) {
-			var b strings.Builder
-			for _, p := range plan {
-				fmt.Fprintf(&b, "%s %s planned\n", p["id"], p["path"])
-			}
-			return mcp.NewToolResultText(b.String()), nil
-		}
-
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
-			"plan":    plan,
-			"dry_run": true,
-			"total":   len(plan),
-		})
-	}
-
-	// Apply edits sequentially, dispatching per operation kind. Stop on the
-	// first failure and mark the remainder skipped.
-	var results []batchEditResult
-	failed := false
-
-	for _, o := range ordered {
-		if failed {
-			results = append(results, batchEditResult{
-				Op:       o.op,
-				SymbolID: o.edit.SymbolID,
-				FilePath: o.file,
-				Status:   "skipped",
-			})
-			continue
-		}
-		var r batchEditResult
-		switch o.op {
-		case "edit_file":
-			r = s.applyBatchFileEdit(o.edit)
-		default:
-			r = s.applyBatchSymbolEdit(ctx, o.edit)
-		}
-		results = append(results, r)
-		if r.Status == "failed" {
-			failed = true
-		}
-	}
-
-	if isCompact(req) {
-		var b strings.Builder
-		for _, r := range results {
-			target := r.SymbolID
-			if target == "" {
-				target = r.FilePath
-			}
-			fmt.Fprintf(&b, "%s %s %s\n", r.Op, target, r.Status)
-		}
-		return mcp.NewToolResultText(b.String()), nil
-	}
-
-	// Count statuses
-	applied, failedCount, skipped := 0, 0, 0
-	for _, r := range results {
-		switch r.Status {
-		case "applied":
-			applied++
-		case "failed":
-			failedCount++
-		case "skipped":
-			skipped++
-		}
-	}
-
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"results": results,
-		"summary": map[string]int{
-			"applied": applied,
-			"failed":  failedCount,
-			"skipped": skipped,
-			"total":   len(results),
-		},
-	})
+	return s.handleAtomicBatchEdit(ctx, req)
 }
 
 // applyBatchSymbolEdit applies one edit_symbol operation: it locates the
 // symbol's source range, replaces old_source with new_source inside it, writes
 // the file, and re-indexes. Semantics match the legacy single-op batch_edit.
-func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) batchEditResult {
+func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
 	res := batchEditResult{Op: "edit_symbol", SymbolID: edit.SymbolID}
 	if edit.OldSource == edit.NewSource {
 		res.Status, res.Error = "failed", "old_source and new_source are identical"
@@ -3581,6 +3430,14 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) b
 		res.Status, res.Error = "failed", resolveErr.Error()
 		return res
 	}
+	if write {
+		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+		if lockErr != nil {
+			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
+			return res
+		}
+		defer releaseMutation()
+	}
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
@@ -3588,72 +3445,93 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) b
 	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
-	if node.StartLine > len(lines) || node.EndLine > len(lines) {
-		res.Status, res.Error = "failed", "symbol line range exceeds file length"
-		return res
-	}
-	symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
-	effectiveStart := node.StartLine
-	if findEOLMatches(symbolSource, edit.OldSource).count == 0 {
-		// Expand the window upward over preceding doc comments and blank
-		// lines — mirrors handleEditSymbol (agents often include the doc
-		// comment because get_symbol_source returns context above the
-		// symbol).
-		expandedStart := node.StartLine - 1
-		for expandedStart > 0 {
-			trimmed := strings.TrimSpace(lines[expandedStart-1])
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-				strings.HasPrefix(trimmed, "*") || trimmed == "" {
-				expandedStart--
-			} else {
-				break
-			}
-		}
-		if expandedStart < node.StartLine-1 {
-			expanded := strings.Join(lines[expandedStart:node.EndLine], "\n")
-			if findEOLMatches(expanded, edit.OldSource).count > 0 {
-				symbolSource = expanded
-				effectiveStart = expandedStart + 1
-			}
-		}
-	}
-	if findEOLMatches(symbolSource, edit.OldSource).count == 0 {
-		res.Status, res.Error = "failed", "old_source not found within symbol"
-		return res
-	}
+
+	// Prefer the indexed symbol range, including preceding documentation. If a
+	// prior edit in this batch shifted line numbers while watcher reindex is
+	// pending, fall back only when old_source is unique in the current file.
+	regionMatches := findEOLMatches(fileStr, edit.OldSource)
 	symbolStart := 0
-	for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
-		symbolStart += len(lines[i]) + 1
+	rangeMatched := false
+	if node.StartLine <= len(lines) && node.EndLine <= len(lines) {
+		symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
+		effectiveStart := node.StartLine
+		if findEOLMatches(symbolSource, edit.OldSource).count == 0 {
+			expandedStart := node.StartLine - 1
+			for expandedStart > 0 {
+				trimmed := strings.TrimSpace(lines[expandedStart-1])
+				if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
+					strings.HasPrefix(trimmed, "*") || trimmed == "" {
+					expandedStart--
+				} else {
+					break
+				}
+			}
+			if expandedStart < node.StartLine-1 {
+				expanded := strings.Join(lines[expandedStart:node.EndLine], "\n")
+				if findEOLMatches(expanded, edit.OldSource).count > 0 {
+					symbolSource = expanded
+					effectiveStart = expandedStart + 1
+				}
+			}
+		}
+		for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
+			symbolStart += len(lines[i]) + 1
+		}
+		symbolEnd := min(symbolStart+len(symbolSource), len(fileStr))
+		candidate := findEOLMatches(fileStr[symbolStart:symbolEnd], edit.OldSource)
+		if candidate.count == 1 {
+			regionMatches = candidate
+			rangeMatched = true
+		}
 	}
-	symbolEnd := min(symbolStart+len(symbolSource), len(fileStr))
-	// EOL-tolerant region match: spans are byte offsets into the raw
-	// region, so the splice below always lands on the real on-disk bytes.
-	regionMatches := findEOLMatches(fileStr[symbolStart:symbolEnd], edit.OldSource)
-	if len(regionMatches.spans) == 0 {
-		res.Status, res.Error = "failed", "old_source not found in symbol region"
-		return res
+	if !rangeMatched {
+		symbolStart = 0
+		switch regionMatches.count {
+		case 0:
+			res.Status, res.Error = "failed", "old_source not found within symbol or current file"
+			return res
+		case 1:
+			// Safe stale-range fallback.
+		default:
+			res.Status, res.Error = "failed", "symbol range is stale and old_source is not unique in the current file"
+			return res
+		}
 	}
 	span := regionMatches.spans[0]
 	editStart := symbolStart + span.start
 	editEnd := symbolStart + span.end
 	effectiveNew := edit.NewSource
 	if regionMatches.normalized {
-		// Rewrite new_source's terminators to the matched region's own
-		// style so the splice never introduces mixed line endings.
 		effectiveNew = adaptToDominantEOL(edit.NewSource, fileStr[editStart:editEnd])
 		res.EOLNormalized = true
 	}
 	newContent := fileStr[:editStart] + effectiveNew + fileStr[editEnd:]
-	if regionMatches.normalized && newContent == fileStr {
+	if newContent == fileStr {
 		res.Status, res.Error = "failed", "old_source and new_source are identical after line-ending normalization"
 		return res
 	}
-	if writeErr := os.WriteFile(absPath, []byte(newContent), 0o644); writeErr != nil {
+	if !write {
+		res.Status = "validated"
+		return res
+	}
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(absPath); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	if writeErr := agents.AtomicWriteFile(absPath, []byte(newContent), perm); writeErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
 		return res
 	}
-	if s.indexer != nil {
-		_ = s.indexer.IndexFile(absPath)
+	sess := s.sessionFor(ctx)
+	sess.recordModified(node.FilePath)
+	sess.recordSymbol(edit.SymbolID)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
+	res.ReindexReceipt = reindexOutcome.Receipt
+	res.ReindexGeneration = reindexOutcome.Generation
+	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
+	if reindexOutcome.Err != nil {
+		res.ReindexError = reindexOutcome.Err.Error()
 	}
 	res.Status = "applied"
 	return res
@@ -3662,7 +3540,7 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem) b
 // applyBatchFileEdit applies one edit_file operation: it replaces old_string
 // with new_string in the file at path, mirroring edit_file's uniqueness and
 // replace_all semantics, then re-indexes.
-func (s *Server) applyBatchFileEdit(edit batchEditItem) batchEditResult {
+func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
 	res := batchEditResult{Op: "edit_file", FilePath: edit.Path}
 	if edit.Path == "" {
 		res.Status, res.Error = "failed", "edit_file op requires path"
@@ -3678,6 +3556,14 @@ func (s *Server) applyBatchFileEdit(edit batchEditItem) batchEditResult {
 		return res
 	}
 	res.FilePath = relPath
+	if write {
+		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+		if lockErr != nil {
+			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
+			return res
+		}
+		defer releaseMutation()
+	}
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
@@ -3717,15 +3603,27 @@ func (s *Server) applyBatchFileEdit(edit batchEditItem) batchEditResult {
 	default:
 		newContent = strings.Replace(fileStr, edit.OldString, edit.NewString, 1)
 	}
+	if !write {
+		res.Status = "validated"
+		return res
+	}
 	perm := os.FileMode(0o644)
-	if info, e := os.Stat(absPath); e == nil {
+	if info, statErr := os.Stat(absPath); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if writeErr := os.WriteFile(absPath, []byte(newContent), perm); writeErr != nil {
+	if writeErr := agents.AtomicWriteFile(absPath, []byte(newContent), perm); writeErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
 		return res
 	}
-	s.reindexFile(absPath)
+	s.sessionFor(ctx).recordModified(relPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
+	res.ReindexReceipt = reindexOutcome.Receipt
+	res.ReindexGeneration = reindexOutcome.Generation
+	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
+	if reindexOutcome.Err != nil {
+		res.ReindexError = reindexOutcome.Err.Error()
+	}
 	res.Status = "applied"
 	return res
 }

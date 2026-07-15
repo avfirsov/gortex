@@ -52,7 +52,7 @@ func buildWinnowGraph(t *testing.T) *Server {
 	eng := query.NewEngine(g)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	// Seed community membership so community-filter tests have data.
-	srv.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(srv, &analysis.CommunityResult{
 		NodeToComm: map[string]string{
 			"svc/auth.go::Login":           "community-0",
 			"svc/auth.go::Logout":          "community-0",
@@ -63,7 +63,7 @@ func buildWinnowGraph(t *testing.T) *Server {
 			{ID: "community-0", Label: "authz"},
 			{ID: "community-1", Label: "handlers"},
 		},
-	}
+	})
 	return srv
 }
 

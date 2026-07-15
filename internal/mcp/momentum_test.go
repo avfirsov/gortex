@@ -39,6 +39,23 @@ func TestMomentumNoteFiresOnceAtThreshold(t *testing.T) {
 	}
 }
 
+func TestMomentumFacadeReadToolsCountOnce(t *testing.T) {
+	for _, tool := range []string{"search", "read", "relations", "trace"} {
+		s := &Server{session: &sessionState{}}
+		ctx := WithSessionID(context.Background(), "sess_facade_"+tool)
+		for i := 1; i < momentumReadThreshold; i++ {
+			res := s.maybeAttachMomentumNote(ctx, tool, mcp.NewToolResultText("ok"))
+			if strings.Contains(momentumTextOf(res), "Session note") {
+				t.Fatalf("%s facade note fired early at read %d", tool, i)
+			}
+		}
+		res := s.maybeAttachMomentumNote(ctx, tool, mcp.NewToolResultText("ok"))
+		if !strings.Contains(momentumTextOf(res), "Session note") {
+			t.Fatalf("%s facade note did not fire at threshold", tool)
+		}
+	}
+}
+
 func TestMomentumNoteIgnoresNonReadAndErrors(t *testing.T) {
 	s := &Server{}
 	ctx := WithSessionID(context.Background(), "sess_momentum2")

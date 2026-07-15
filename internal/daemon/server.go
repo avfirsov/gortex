@@ -37,6 +37,9 @@ type Server struct {
 	// tests and for early integration before the MCP passthrough lands.
 	MCPDispatcher MCPDispatcher
 
+	// MCPToolCallTimeout bounds individual tools/call dispatches. Zero uses DefaultMCPToolCallTimeout.
+	MCPToolCallTimeout time.Duration
+
 	// Controller handles control-mode RPCs (track/untrack/reload/status/shutdown).
 	Controller Controller
 
@@ -64,6 +67,7 @@ type Server struct {
 	httpListener net.Listener
 	httpServer   *http.Server
 	started      time.Time
+	instanceID   string // unique to this daemon process; exposed in handshake acks
 
 	shutdown chan struct{}
 	doneOnce sync.Once
@@ -146,6 +150,7 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 		SocketPath: socketPath,
 		Version:    version,
 		Logger:     logger,
+		instanceID: newSessionID(),
 		sessions:   NewSessionRegistry(),
 		shutdown:   make(chan struct{}),
 		conns:      make(map[net.Conn]struct{}),
@@ -311,6 +316,9 @@ func (s *Server) runMaintenance() {
 			return
 		case <-t.C:
 			for _, sd := range s.sessions.SweepDead(platform.ProcessAlive) {
+				if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+					hook.SessionEnded(sd)
+				}
 				s.Logger.Info("daemon: swept dead session",
 					zap.String("session_id", sd.ID), zap.Int("client_pid", sd.ClientPID))
 				if sd.Conn != nil {
@@ -438,9 +446,10 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 	sess := s.sessions.Register(conn, h)
 
 	ack := HandshakeAck{
-		OK:            true,
-		SessionID:     sess.ID,
-		DaemonVersion: s.Version,
+		OK:             true,
+		SessionID:      sess.ID,
+		DaemonVersion:  s.Version,
+		DaemonInstance: s.instanceID,
 	}
 	// Stamp warmup state so the client can tell a still-warming daemon from a
 	// ready one. The session is established either way — Warming is advisory.
@@ -477,41 +486,33 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		})
 		return
 	}
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.Logger.Debug("daemon: mcp read closed",
+
+	serveMCPConnection(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
+		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
+			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return reply, err
+		})
+		if err != nil && s.Logger != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				outcome := "cancelled"
+				if errors.Is(ctxErr, context.DeadlineExceeded) {
+					outcome = "deadline"
+				}
+				s.Logger.Warn("daemon: mcp request lifetime ended",
+					zap.String("session_id", sess.ID),
+					zap.String("outcome", outcome),
+					zap.Duration("deadline", s.mcpToolCallTimeout()),
+					zap.Error(ctxErr))
+			} else {
+				s.Logger.Warn("daemon: dispatch error",
 					zap.String("session_id", sess.ID), zap.Error(err))
 			}
-			return
 		}
-		// Scanner-style: trim trailing newline but keep the payload as-is
-		// so the dispatcher sees valid JSON.
-		if n := len(line); n > 0 && line[n-1] == '\n' {
-			line = line[:n-1]
-		}
-		if len(line) == 0 {
-			continue
-		}
-
-		ctx := context.Background()
-		reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
-		if err != nil {
-			s.Logger.Warn("daemon: dispatch error",
-				zap.String("session_id", sess.ID), zap.Error(err))
-			continue
-		}
-		if len(reply) == 0 {
-			continue
-		}
-		// The dispatcher returns a full JSON-RPC frame; re-append newline.
-		if _, werr := conn.Write(append(reply, '\n')); werr != nil {
-			s.Logger.Debug("daemon: mcp write failed",
-				zap.String("session_id", sess.ID), zap.Error(werr))
-			return
-		}
-	}
+		return reply, err
+	})
 }
 
 // serveControl drains ControlRequest messages, invokes the Controller,

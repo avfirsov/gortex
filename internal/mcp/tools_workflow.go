@@ -97,6 +97,7 @@ func (s *Server) checkWorkflowGate(ctx context.Context, toolName string) *mcp.Ca
 	if !daemon.IsMutating(toolName) {
 		return nil
 	}
+	facadeSurface := s.usesFacadeSurface(ctx)
 	sess := s.sessionFor(ctx)
 	if sess == nil {
 		return nil
@@ -111,17 +112,22 @@ func (s *Server) checkWorkflowGate(ctx context.Context, toolName string) *mcp.Ca
 		wf.current = wf.firstEditPhase() // auto-advance
 		return nil
 	}
+	guidance := "Advance the workflow (workflow action=\"advance\") until it reaches an editing phase."
+	recovery := "call the workflow tool with action=advance"
+	if facadeSurface {
+		guidance = "Advance it with session(operation=\"workflow\", arguments={\"action\":\"advance\"}) until it reaches an editing phase."
+		recovery = "call session with operation=workflow and arguments.action=advance"
+	}
 	return NewStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeToolOutOfPhase,
 		Message: fmt.Sprintf("%q is an editing tool but the active workflow is in the %q phase, which "+
-			"does not permit edits. Advance the workflow (workflow action=\"advance\") until it reaches "+
-			"an editing phase.", toolName, wf.phase().name),
+			"does not permit edits. %s", toolName, wf.phase().name, guidance),
 		Retriable: true,
 		Data: map[string]any{
 			"tool":          toolName,
 			"current_phase": wf.phase().name,
 			"phases":        wf.phaseNames(),
-			"recovery":      "call the workflow tool with action=advance",
+			"recovery":      recovery,
 		},
 	})
 }

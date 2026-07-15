@@ -45,21 +45,21 @@ func (s *Server) SetRemoteOverrideSink(sink RemoteOverrideSink) {
 }
 
 func (s *Server) registerProxyTools() {
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("proxy_enable",
 			mcp.WithDescription("Enable federation/proxy to a remote Gortex daemon FOR THIS MCP SESSION ONLY. Overrides the global enabled state for the session's lifetime and auto-reverts on disconnect. For a persistent global change use `gortex proxy on <slug>`."),
 			mcp.WithString("slug", mcp.Required(), mcp.Description("Roster slug of the remote to enable for this session.")),
 		),
 		s.handleProxyEnable,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("proxy_disable",
 			mcp.WithDescription("Disable federation/proxy to a remote Gortex daemon FOR THIS MCP SESSION ONLY. Beats the global enabled state for the session's lifetime; queries from this session skip the remote. Auto-reverts on disconnect. For a persistent global change use `gortex proxy off <slug>`."),
 			mcp.WithString("slug", mcp.Required(), mcp.Description("Roster slug of the remote to disable for this session.")),
 		),
 		s.handleProxyDisable,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("proxy_status",
 			mcp.WithDescription("List every roster remote with its global enabled state, this session's override (if any), and the resulting effective enabled state."),
 		),

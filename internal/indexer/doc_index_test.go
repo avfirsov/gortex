@@ -56,8 +56,8 @@ func TestDocSummary_RuneBound(t *testing.T) {
 
 // TestSearchIndexFields_IncludesDocSummary is the load-bearing regression
 // guard: a code symbol's doc comment reaches the BM25 document (the
-// task-intent recall fix), while a symbol without a doc indexes exactly as
-// before and a prose (KindDoc) node keeps its section-text path untouched.
+// task-intent recall fix), while a symbol without a doc keeps an empty
+// retrieval-qualifier slot and a prose (KindDoc) node stays untouched.
 func TestSearchIndexFields_IncludesDocSummary(t *testing.T) {
 	withDoc := &graph.Node{
 		Kind: graph.KindFunction, Name: "union", FilePath: "crates/regex/src/literal.rs",
@@ -81,7 +81,7 @@ func TestSearchIndexFields_IncludesDocSummary(t *testing.T) {
 		Meta: map[string]any{"signature": "fn helper()"},
 	}
 	got := searchIndexFields(noDoc, "")
-	want := []string{"helper", "x.rs", "fn helper()", ""}
+	want := []string{"helper", "x.rs", "", "fn helper()", ""}
 	if len(got) != len(want) {
 		t.Fatalf("no-doc fields len = %d, want %d (%q)", len(got), len(want), got)
 	}

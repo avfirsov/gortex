@@ -108,13 +108,15 @@ func TestBucketDuration(t *testing.T) {
 		d    time.Duration
 		want string
 	}{
-		{5 * time.Second, "<10s"},
-		{10 * time.Second, "10-60s"},
-		{59 * time.Second, "10-60s"},
-		{time.Minute, "1-5m"},
-		{4 * time.Minute, "1-5m"},
-		{5 * time.Minute, "5m+"},
-		{time.Hour, "5m+"},
+		{500 * time.Microsecond, "<1ms"},
+		{time.Millisecond, "1-10ms"},
+		{9 * time.Millisecond, "1-10ms"},
+		{10 * time.Millisecond, "10-100ms"},
+		{99 * time.Millisecond, "10-100ms"},
+		{100 * time.Millisecond, "100ms-1s"},
+		{999 * time.Millisecond, "100ms-1s"},
+		{time.Second, "1-10s"},
+		{10 * time.Second, "10s+"},
 	}
 	for _, c := range cases {
 		if got := BucketDuration(c.d); got != c.want {
@@ -191,7 +193,10 @@ func TestRollupMerge(t *testing.T) {
 }
 
 func TestIsAllowedMetric(t *testing.T) {
-	for _, k := range []string{"mcp_tool_call", "cli_command", "index", "daemon_session"} {
+	for _, k := range []string{
+		"mcp_tool_call", "mcp_facade_call", "mcp_facade_status", "mcp_facade_outcome",
+		"mcp_facade_invalid", "mcp_facade_latency", "cli_command", "index", "daemon_session",
+	} {
 		if !IsAllowedMetric(k) {
 			t.Errorf("%q should be allow-listed", k)
 		}
@@ -199,6 +204,35 @@ func TestIsAllowedMetric(t *testing.T) {
 	for _, k := range []string{"", "file_path", "user_query", "anything_else"} {
 		if IsAllowedMetric(k) {
 			t.Errorf("%q must not be allow-listed", k)
+		}
+	}
+}
+
+func TestFacadeMetricRollupKeepsOnlyBoundedDimensions(t *testing.T) {
+	r := NewRollup(time.Date(2026, 6, 18, 9, 0, 0, 0, time.UTC))
+	for key, dim := range map[string]string{
+		"mcp_facade_call":    "read.file",
+		"mcp_facade_status":  "read.file.ok",
+		"mcp_facade_outcome": "read.file.success",
+		"mcp_facade_invalid": "read.unknown.invalid_argument",
+		"mcp_facade_latency": "read.file.<1ms",
+	} {
+		if !r.Add(key, dim) {
+			t.Fatalf("%s was unexpectedly rejected", key)
+		}
+		if got := r.Counts[key+":"+dim]; got != 1 {
+			t.Errorf("%s:%s = %d, want 1", key, dim, got)
+		}
+	}
+
+	const sensitive = "/Users/alice/private/repository/operation"
+	r.Add("mcp_facade_outcome", sensitive)
+	if got := r.Counts["mcp_facade_outcome"]; got != 1 {
+		t.Fatalf("unsafe dimension should fold to the bare key, got %v", r.Counts)
+	}
+	for key := range r.Counts {
+		if strings.Contains(key, "alice") || strings.Contains(key, "private") {
+			t.Fatalf("sensitive facade dimension leaked: %q", key)
 		}
 	}
 }

@@ -53,7 +53,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 	if g == nil {
 		return &PageRankResult{Scores: map[string]float64{}}
 	}
-	nodes := excludeProxyNodes(g.AllNodes())
+	nodes := excludeProxyNodes(graph.AllNodesLight(g))
 	n := len(nodes)
 	if n == 0 {
 		return &PageRankResult{Scores: map[string]float64{}}

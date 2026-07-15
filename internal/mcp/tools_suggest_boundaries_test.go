@@ -52,7 +52,7 @@ func TestSuggestBoundariesHandler(t *testing.T) {
 	g.AddNode(&graph.Node{ID: "internal/graph/g.go::G", Name: "G", Kind: graph.KindFunction, FilePath: "internal/graph/g.go"})
 	g.AddEdge(&graph.Edge{From: "internal/parser/a.go::A", To: "internal/graph/g.go::G", Kind: graph.EdgeCalls})
 
-	srv.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(srv, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "c1", Label: "parser", Members: []string{"internal/parser/a.go::A"}, Files: []string{"internal/parser/a.go"}, Size: 4},
 			{ID: "c2", Label: "graph", Members: []string{"internal/graph/g.go::G"}, Files: []string{"internal/graph/g.go"}, Size: 5},
@@ -62,7 +62,7 @@ func TestSuggestBoundariesHandler(t *testing.T) {
 			"internal/graph/g.go::G":  "c2",
 		},
 		Modularity: 0.5,
-	}
+	})
 
 	req := mcplib.CallToolRequest{}
 	req.Params.Arguments = map[string]any{"kind": "suggest_boundaries"}

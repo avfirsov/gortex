@@ -53,13 +53,12 @@ import (
 // matches, the pass skips the edge (zero false positives over breadth).
 //
 // Out of scope (left for the generic resolver, the cross-repo resolver,
-// or future work): cross-repo Rust calls, trait-bound / generic-typed
-// receivers, fully-qualified `<T as Trait>::method` UFCS, and resolving
-// a module path against a real module-tree node (only the trailing
-// segment + locality is used today).
+// or future work): cross-repo Rust calls, fully-qualified
+// `<T as Trait>::method` UFCS, and resolving a module path against a real
+// module-tree node (only the trailing segment + locality is used today).
 //
-// Returns the number of Rust call edges this pass landed on a concrete
-// node.
+// Returns the number of Rust module-import, supertrait, override, and call
+// edges this pass landed on concrete nodes.
 func ResolveRustScopeCalls(g graph.Store) int {
 	if g == nil {
 		return 0
@@ -70,7 +69,8 @@ func ResolveRustScopeCalls(g graph.Store) int {
 	// graph has no unresolved Rust call edges.
 	bound := resolveRustModuleImports(g)
 
-	idx := buildRustScopeIndex(g)
+	idx, extendsResolved := buildRustScopeIndex(g)
+	bound += extendsResolved
 	if idx == nil {
 		return bound
 	}
@@ -244,6 +244,15 @@ func rustScopeEdgeCandidate(e *graph.Edge) bool {
 type rustScopeIndex struct {
 	// methodsByOwner: (repo, ownerType) → method nodes of that type.
 	methodsByOwner map[rustOwnerKey][]*graph.Node
+	// traitTargets resolves a bound path relative to its caller to a concrete
+	// trait node. traitMethodsByID keeps direct and inherited methods attached
+	// to that concrete identity so same-named traits in different modules do
+	// not cross-pollinate through a basename alias.
+	traitTargets     *rustTraitTargetIndex
+	traitMethodsByID map[string][]*graph.Node
+	// typeAliases follows file-scoped use aliases and crate-visible re-export
+	// chains before owner and trait lookup. Ambiguous aliases fail closed.
+	typeAliases *rustTypeAliasIndex
 	// freeFuncsByName: (repo, name) → free function nodes.
 	freeFuncsByName map[rustNameKey][]*graph.Node
 	// paramsByOwner: caller function/method ID → set of param names,
@@ -275,12 +284,18 @@ type rustFieldKey struct {
 }
 
 // buildRustScopeIndex walks the graph once and indexes Rust method
-// owners, free functions, and caller params. Returns nil when the graph
-// has no Rust methods or functions (the pass is a no-op for non-Rust
-// graphs).
-func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
+// owners, free functions, and caller params. Supertrait edges are resolved
+// before the method/function early-out; the returned count includes those
+// rewrites even when the graph contains marker traits only.
+func buildRustScopeIndex(g graph.Store) (*rustScopeIndex, int) {
+	typeAliases := newRustTypeAliasIndex(g)
+	traitTargets := newRustTraitTargetIndex(g)
+	extendsResolved := resolveRustTraitExtendsWithIndex(g, traitTargets, typeAliases)
 	idx := &rustScopeIndex{
 		methodsByOwner:    map[rustOwnerKey][]*graph.Node{},
+		traitTargets:      traitTargets,
+		traitMethodsByID:  map[string][]*graph.Node{},
+		typeAliases:       typeAliases,
 		freeFuncsByName:   map[rustNameKey][]*graph.Node{},
 		paramsByOwner:     map[string]map[string]struct{}{},
 		fieldTypesByOwner: map[rustFieldKey]string{},
@@ -289,6 +304,22 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Language != "rust" {
 			continue
+		}
+		if n.Meta != nil {
+			if traitDecl, _ := n.Meta["trait_decl"].(string); traitDecl == "true" {
+				// Concrete trait identity is indexed after extends resolution;
+				// indexing a declaration under its basename here would merge
+				// same-named traits from different modules. Synthetic legacy
+				// graphs without interface nodes retain exact-owner lookup only.
+				if traitTargets == nil {
+					if owner := rustBaseTypeName(nodeReceiverType(n)); owner != "" {
+						key := rustOwnerKey{repo: n.RepoPrefix, owner: owner}
+						idx.methodsByOwner[key] = append(idx.methodsByOwner[key], n)
+					}
+				}
+				any = true
+				continue
+			}
 		}
 		owner := nodeReceiverType(n)
 		if owner == "" {
@@ -314,7 +345,7 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 		any = true
 	}
 	if !any {
-		return nil
+		return nil, extendsResolved
 	}
 	// Params are read lazily-but-once: index every Rust param by its
 	// enclosing function/method ID for the shadow check.
@@ -350,7 +381,8 @@ func buildRustScopeIndex(g graph.Store) *rustScopeIndex {
 			field: n.Name,
 		}] = rustBaseTypeName(ft)
 	}
-	return idx
+	inheritRustTraitMethods(g, idx, traitTargets)
+	return idx, extendsResolved
 }
 
 // resolve returns the target node ID an unresolved Rust call edge should
@@ -402,8 +434,26 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 	// method.
 	if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
 		if name := selectorCallName(e.To); name != "" {
-			if id := idx.uniqueMethod(repo, rustBaseTypeName(rt), name); id != "" {
-				idx.set(graph.OriginASTResolved, 0.88, "receiver_type")
+			if id, aliased, valid := idx.ownerMethod(caller, rt, name); id != "" {
+				reason := "receiver_type"
+				if aliased {
+					reason = "receiver_type_alias"
+				}
+				idx.set(graph.OriginASTResolved, 0.88, reason)
+				return id
+			} else if !valid || aliased {
+				// An ambiguous alias, or a qualified alias whose destination did
+				// not match a graph owner, must not degrade to basename guessing.
+				return ""
+			}
+			// A parameter whose declared type is a generic (`matcher: M`)
+			// has no concrete method owner. If the enclosing function's
+			// effective type parameters constrain M to a trait that declares
+			// this method, bind to that trait declaration. The helper scans
+			// every bound and returns a target only when the declaration is
+			// unique across the full bound set.
+			if id := idx.uniqueGenericBoundTraitMethod(repo, caller, rustBaseTypeName(rt), name); id != "" {
+				idx.set(graph.OriginASTResolved, 0.86, "generic_trait_bound")
 				return id
 			}
 		}
@@ -435,11 +485,17 @@ func (idx *rustScopeIndex) resolve(e *graph.Edge, caller *graph.Node) string {
 
 	case isRustTypeName(qualifier):
 		// Type::method() — bind to a method whose owner type is the
-		// qualifier. The receiver type is named explicitly in source, so
-		// this is structurally resolved within that type.
-		if id := idx.uniqueMethod(repo, qualifier, last); id != "" {
-			idx.set(graph.OriginASTResolved, 0.9, "impl_owner")
+		// qualifier. File-local aliases and public re-export chains are
+		// canonicalised before owner lookup.
+		if id, aliased, valid := idx.ownerMethod(caller, qualifier, last); id != "" {
+			reason := "impl_owner"
+			if aliased {
+				reason = "impl_owner_alias"
+			}
+			idx.set(graph.OriginASTResolved, 0.9, reason)
 			return id
+		} else if !valid || aliased {
+			return ""
 		}
 		// Ambiguous by type name alone — the same type name is defined in
 		// more than one crate/module (e.g. grep::regex::RegexMatcherBuilder
@@ -482,6 +538,38 @@ func (idx *rustScopeIndex) set(origin string, conf float64, reason string) {
 	idx.lastReason = reason
 }
 
+// ownerMethod resolves a possibly aliased Rust owner and returns its unique
+// method. Qualified alias destinations are matched against file-path segments
+// before any basename lookup, preventing an external or ambiguous alias from
+// silently binding to an unrelated local type.
+func (idx *rustScopeIndex) ownerMethod(caller *graph.Node, owner, name string) (id string, aliased, valid bool) {
+	if caller == nil || owner == "" || name == "" {
+		return "", false, false
+	}
+	ownerPath := rustBaseTypeName(owner)
+	if idx.typeAliases != nil {
+		var ok bool
+		ownerPath, aliased, ok = idx.typeAliases.resolve(caller, ownerPath)
+		if !ok || ownerPath == "" {
+			return "", aliased, false
+		}
+	}
+	canonicalOwner := rustUseBindingName(ownerPath)
+	if canonicalOwner == "" {
+		return "", aliased, false
+	}
+	if aliased && strings.Contains(ownerPath, "::") {
+		segments := strings.Split(ownerPath, "::")
+		if id := idx.methodByPathSegments(caller.RepoPrefix, canonicalOwner, name, segments); id != "" {
+			return id, true, true
+		}
+		// A qualified alias carries stronger evidence than a basename. If
+		// its path cannot identify a matching owner, fail closed.
+		return "", true, true
+	}
+	return idx.uniqueMethod(caller.RepoPrefix, canonicalOwner, name), aliased, true
+}
+
 // uniqueMethod returns the ID of the single method named `name` owned by
 // (repo, owner), or "" when there is no match or the choice is
 // ambiguous (more than one).
@@ -516,7 +604,7 @@ func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segmen
 			if seg == "" || seg == owner || seg == name {
 				continue
 			}
-			if strings.Contains(m.FilePath, "/"+seg+"/") {
+			if rustFileMatchesModuleSegment(m.FilePath, seg) {
 				if hit != "" && hit != m.ID {
 					return "" // more than one crate/module matched
 				}
@@ -526,6 +614,18 @@ func (idx *rustScopeIndex) methodByPathSegments(repo, owner, name string, segmen
 		}
 	}
 	return hit
+}
+
+func rustFileMatchesModuleSegment(filePath, segment string) bool {
+	filePath = strings.TrimSpace(strings.ReplaceAll(filePath, "\\", "/"))
+	segment = strings.Trim(strings.TrimSpace(segment), "/:")
+	if filePath == "" || segment == "" {
+		return false
+	}
+	return strings.Contains(filePath, "/"+segment+"/") ||
+		strings.HasSuffix(filePath, "/"+segment+".rs") ||
+		strings.HasSuffix(filePath, "/"+segment+"/mod.rs") ||
+		filePath == segment+".rs"
 }
 
 // methodBySameCrate disambiguates a `Type::method` call that names no
@@ -610,6 +710,64 @@ func (idx *rustScopeIndex) uniqueTraitMethod(repo, owner, name string) string {
 			return ""
 		}
 		hit = m.ID
+	}
+	return hit
+}
+
+// uniqueGenericBoundTraitMethod returns the single trait declaration method
+// named by all bounds on generic parameter param. It deliberately scans the raw
+// candidate lists rather than composing uniqueTraitMethod calls: a duplicated
+// declaration for one bound must keep the call unresolved even if another bound
+// happens to have one unique declaration.
+func (idx *rustScopeIndex) uniqueGenericBoundTraitMethod(repo string, caller *graph.Node, param, name string) string {
+	if caller == nil || caller.Meta == nil || param == "" || name == "" {
+		return ""
+	}
+	owners := rustTypeParamTraitNames(caller.Meta["type_params"], param)
+	if len(owners) == 0 {
+		return ""
+	}
+	var hit string
+	for _, owner := range owners {
+		var methods []*graph.Node
+		if idx.typeAliases != nil {
+			resolvedOwner, _, ok := idx.typeAliases.resolve(caller, owner)
+			if !ok {
+				return ""
+			}
+			owner = resolvedOwner
+		}
+		if idx.traitTargets != nil {
+			traitID := idx.traitTargets.resolve(caller, owner)
+			if traitID == "" {
+				// A qualified path may name an external trait. Never degrade it
+				// to a same-named local basename merely because one exists.
+				continue
+			}
+			methods = idx.traitMethodsByID[traitID]
+		} else {
+			// Compatibility for small synthetic indexes that predate concrete
+			// trait nodes: use only the exact parsed bound key. An explicit
+			// crate:: root is proven local, so its crate-relative exact key is
+			// also safe; arbitrary qualified paths never degrade to basename.
+			methods = idx.methodsByOwner[rustOwnerKey{repo: repo, owner: owner}]
+			if len(methods) == 0 && strings.HasPrefix(owner, "crate::") {
+				crateRelative := strings.TrimPrefix(owner, "crate::")
+				methods = idx.methodsByOwner[rustOwnerKey{repo: repo, owner: crateRelative}]
+			}
+		}
+		for _, method := range methods {
+			if method == nil || method.Name != name || method.Meta == nil {
+				continue
+			}
+			if traitDecl, _ := method.Meta["trait_decl"].(string); traitDecl != "true" {
+				continue
+			}
+			if hit != "" && hit != method.ID {
+				return ""
+			}
+			hit = method.ID
+		}
 	}
 	return hit
 }

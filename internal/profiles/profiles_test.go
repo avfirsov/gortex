@@ -16,9 +16,9 @@ import (
 // gets slack for its longer surface description only; localization is
 // the diet profile and must stay under 2 KiB (~0.45k tokens).
 var bodyByteCeilings = map[string]int{
-	"core":         6656,
+	"core":         3072,
 	"full":         6912,
-	"localization": 2304, // explore opener + row joined at the explore-branch consolidation
+	"localization": 2304,
 }
 
 func TestProfileBodyByteCeilings(t *testing.T) {
@@ -40,23 +40,18 @@ func TestProfileBodyByteCeilings(t *testing.T) {
 }
 
 // positioningCues are the load-bearing fragments EVERY profile must
-// keep, lean ones included: the mandatory-rule sentinel, the deny-hook
+// keep, lean ones included: the mandatory-rule sentinel, the hook-posture
 // warning, the one-shot opener, the memory triggers, the discovery
-// path, the CLI fallback, and the switch-back line. Trimming any of
+// path, the configurable hook posture, and the switch-back line. Trimming any of
 // these is what costs tool adoption — the diet only ever removes
 // elaboration around them.
 var positioningCues = []string{
 	"## MANDATORY: Use Gortex MCP tools", // idempotency sentinel + the rule itself
 	"MUST prefer graph queries",
-	"deny",
-	"smart_context",
-	"distill_session",
-	"surface_memories",
-	"save_note",
-	"store_memory",
-	"tools_search",
-	"gortex://guide",
-	"gortex call",
+	"Hook posture is configurable",
+	"explore",
+	"Gortex MCP integration failure",
+	"Do not start a daemon",
 	"gortex instructions switch",
 	"NEW sessions only",
 }
@@ -72,16 +67,14 @@ func TestEveryProfileKeepsPositioningCues(t *testing.T) {
 	}
 }
 
-// TestLocalizationEagerToolsAllCued is the no-drift gate between the
-// localization tool preset and the localization instructions body:
-// every eager tool must be documented (table row or prose cue), and
-// every table row must correspond to an eager tool.
-func TestLocalizationEagerToolsAllCued(t *testing.T) {
+// TestLocalizationPresetRowsStayInSync keeps the optional legacy
+// localization preset table internally consistent. The active localization
+// instruction profile now describes the compact public surface instead.
+func TestLocalizationPresetRowsStayInSync(t *testing.T) {
 	p, ok := ByName("localization")
 	if !ok {
 		t.Fatal("localization profile missing from the table")
 	}
-	body := p.Body()
 	rowTools := map[string]bool{}
 	for _, r := range localizationRows {
 		rowTools[r.tool] = true
@@ -89,9 +82,6 @@ func TestLocalizationEagerToolsAllCued(t *testing.T) {
 	for _, tool := range p.EagerTools {
 		if !rowTools[tool] && !localizationNonTableTools[tool] {
 			t.Errorf("eager tool %q has neither a table row nor a prose cue — add one", tool)
-		}
-		if !strings.Contains(body, tool) {
-			t.Errorf("eager tool %q does not appear in the localization body", tool)
 		}
 	}
 	eager := map[string]bool{}
@@ -239,25 +229,39 @@ var relocatedContentMarkers = []string{
 // carry — the machine-level single home for the full memory-workflow
 // triggers. The localization profile intentionally keeps only the
 // positioning cues (TestEveryProfileKeepsPositioningCues).
-var fullPolicyTokens = []string{
+var preCompactFullPolicyTokens = []string{
 	"search_symbols", "find_usages", "get_callers", "get_call_chain",
 	"get_symbol_source", "get_editing_context", "read_file",
 	"smart_context", "edit_file", "rename_symbol", "compress_bodies",
 	"distill_session", "surface_memories", "save_note", "store_memory",
 	"query_notes", "query_memories",
-	"tools_search", "gortex://guide", "gortex daemon start",
+	"tools_search", "gortex://guide", "MCP startup manages daemon availability",
 }
 
 func TestBodies_PolicyCoreAndSingleHome(t *testing.T) {
-	for _, name := range []string{"core", "full"} {
-		p, ok := ByName(name)
-		if !ok {
+	full, ok := ByName("full")
+	if !ok {
+		t.Fatal("full profile missing")
+	}
+	for _, token := range preCompactFullPolicyTokens {
+		if !strings.Contains(full.Body(), token) {
+			t.Errorf("full body no longer mentions %q — pre-compact opt-in policy regression", token)
+		}
+	}
+
+	for _, name := range []string{"core", "localization"} {
+		p, found := ByName(name)
+		if !found {
 			t.Fatalf("profile %q missing", name)
 		}
-		body := p.Body()
-		for _, token := range fullPolicyTokens {
-			if !strings.Contains(body, token) {
-				t.Errorf("%s body no longer mentions %q — policy core regression", name, token)
+		for _, token := range []string{"explore", "search", "read", "relations", "trace", "change", "edit", "refactor", "capabilities", "recall", "remember"} {
+			if !strings.Contains(p.Body(), token) {
+				t.Errorf("%s body no longer mentions compact tool %q", name, token)
+			}
+		}
+		for _, banned := range []string{"facade-v1", "search_symbols", "get_symbol_source", "tools_search", "while these tools are available"} {
+			if strings.Contains(p.Body(), banned) {
+				t.Errorf("%s body exposes implementation detail %q", name, banned)
 			}
 		}
 	}

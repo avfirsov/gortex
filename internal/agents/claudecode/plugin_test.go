@@ -129,6 +129,30 @@ func TestEmitPluginBundle_MCPJSONShape(t *testing.T) {
 	}
 }
 
+func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
+	for _, want := range []string{
+		"21 tools",
+		"`explore`",
+		"`search` / `read` / `relations` / `trace`",
+		"`edit` / `refactor`",
+		"`capabilities`",
+		"`gortex call`",
+	} {
+		if !strings.Contains(pluginReadmeBody, want) {
+			t.Errorf("plugin README must contain %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"52 tools", "search_symbols", "find_usages", "get_call_chain",
+		"rename_symbol", "preview_edit", "simulate_chain", "facade-v1",
+		"gortex daemon start",
+	} {
+		if strings.Contains(pluginReadmeBody, forbidden) {
+			t.Errorf("plugin README must not expose %q", forbidden)
+		}
+	}
+}
+
 func TestEmitPluginBundle_HooksShape(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := EmitPluginBundle(PluginBundleSpec{

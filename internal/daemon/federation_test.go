@@ -434,3 +434,15 @@ func TestFederator_WriteToolNeverFederated(t *testing.T) {
 		}
 	}
 }
+
+// TestFederationReadAllowlistIsEffectFree makes the fan-out allowlist and the
+// canonical effect registry a two-key gate. A future session/control writer
+// must not become remotely fan-out eligible merely because it is intentionally
+// excluded from the planning-mode IsMutating set.
+func TestFederationReadAllowlistIsEffectFree(t *testing.T) {
+	for tool := range federationReadTools {
+		if effect := EffectOf(tool); effect != EffectNone {
+			t.Errorf("federation read allowlist contains effectful tool %q (effect=%d)", tool, effect)
+		}
+	}
+}

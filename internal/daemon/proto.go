@@ -39,6 +39,12 @@ type Handshake struct {
 	CWD        string         `json:"cwd,omitempty"`
 	ClientName string         `json:"client,omitempty"` // e.g. "claude-code", "kiro", "cli"
 	PID        int            `json:"pid,omitempty"`
+	// LogicalSessionID is a proxy-owned opaque token that survives socket
+	// reconnects. The daemon rebinds an existing MCP session with this token
+	// when the originating proxy PID is still alive, preserving per-session
+	// planning, localization, subscriptions, and client metadata. Empty keeps
+	// the traditional connection-scoped lifecycle.
+	LogicalSessionID string `json:"logical_session_id,omitempty"`
 	// Tools / ToolsMode carry the client-side tool-surface preference
 	// (GORTEX_TOOLS / --tools and GORTEX_TOOLS_MODE / --tools-mode of the
 	// `gortex mcp` proxy). The daemon serves a shared graph, so a per-client
@@ -66,7 +72,8 @@ type HandshakeAck struct {
 	ActiveProject string `json:"active_project,omitempty"`
 
 	// For clients that want to compare before trusting the connection.
-	DaemonVersion string `json:"daemon_version,omitempty"`
+	DaemonVersion  string `json:"daemon_version,omitempty"`
+	DaemonInstance string `json:"daemon_instance,omitempty"` // changes on every daemon process start
 
 	// Warming is true when the handshake completed but the daemon has not
 	// finished its warmup pipeline — the graph is still filling, so tool

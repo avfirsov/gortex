@@ -123,6 +123,45 @@ func TestAnalyzeImpact_ReachKeysPersistAcrossLookups(t *testing.T) {
 	}
 }
 
+// TestAnalyzeImpact_IncompleteReachRecordNeverLooksSafe reproduces the
+// false-safe regression where a concurrent reach build exposed its generation
+// stamp before its tier slices. The first query establishes the real blast
+// radius; the test then replaces that cache with the exact partially-published
+// shape and repeats the query. Lookup must reject the incomplete record and
+// recompute, never turn a known impact into LOW / zero affected.
+func TestAnalyzeImpact_IncompleteReachRecordNeverLooksSafe(t *testing.T) {
+	g := newFanInChain(18)
+	const seed = "sink"
+
+	first := AnalyzeImpact(g, []string{seed}, nil, nil)
+	if first.TotalAffected != 18 || first.Risk == RiskLow {
+		t.Fatalf("fixture must establish a non-trivial impact; got risk=%s affected=%d", first.Risk, first.TotalAffected)
+	}
+
+	n := g.GetNode(seed)
+	if n == nil {
+		t.Fatal("seed disappeared from graph")
+	}
+	partial := *n
+	partial.Meta = make(map[string]any, len(n.Meta))
+	for key, value := range n.Meta {
+		if len(key) >= len("reach_") && key[:len("reach_")] == "reach_" {
+			continue
+		}
+		partial.Meta[key] = value
+	}
+	// This was the unsafe publication order: the current generation was
+	// visible while reach_d1/d2/d3 had not been written yet.
+	partial.Meta[reach.MetaReachBuild] = reach.BuildCounter()
+	g.AddNode(&partial)
+
+	second := AnalyzeImpact(g, []string{seed}, nil, nil)
+	if second.TotalAffected != first.TotalAffected || second.Risk != first.Risk {
+		t.Fatalf("repeated impact under-reported after partial cache publication: first risk=%s affected=%d, second risk=%s affected=%d",
+			first.Risk, first.TotalAffected, second.Risk, second.TotalAffected)
+	}
+}
+
 // idSet returns a sorted ID slice for set comparison.
 func idSet(entries []ImpactEntry) []string {
 	out := make([]string, len(entries))
@@ -147,37 +186,25 @@ func setsEqual(a, b []string) bool {
 
 // TestAnalyzeImpact_FastPathSubMillisecond commits to the claim
 // that a precomputed AnalyzeImpact call on a 1000-caller fan-in
-// completes well inside a single-digit-ms p99 budget AND is
-// substantially faster than the live BFS walk.
+// completes well inside a single-digit-ms p99 budget and does not become
+// pathologically slower than the batched live BFS walk.
 //
-// The test gates on two signals so it stays meaningful on noisy
-// CI runners (where absolute wall-time can be 10x slower than a
-// developer laptop without indicating a real regression):
-//
-//  1. A relative speedup gate: fast path average must be at least
-//     1.5x faster than the live walk measured on the same fixture
-//     in the same process. This captures the "precomputation paid
-//     off" intent and is immune to CI clock noise — both paths
-//     experience the same overhead.
-//  2. A loose absolute ceiling (15 ms) as a backstop against a
-//     pathological regression that doesn't ruin the live walk too.
-//
-// Failing the speedup gate means a regression slipped a live walk
-// (or equivalent overhead) into the fast path.
+// The absolute ceiling is deliberately loose enough for noisy CI runners
+// (where wall-time can be 10x slower than a developer laptop) but catches a
+// regression that makes either path non-interactive. The relative ratio is
+// logged as a diagnostic, not gated: stripReachIndex makes only the first
+// iteration cold because Lookup immediately rebuilds its lazy cache, so the
+// two long loops mostly measure identical indexed work and GC/scheduler noise
+// can swing their ratio substantially.
 func TestAnalyzeImpact_FastPathSubMillisecond(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf gate skipped under -short")
 	}
 	if raceEnabled {
-		// Race instrumentation adds per-memory-op overhead to both the
-		// fast path and the live walk equally, but it compresses the
-		// ratio toward 1.0 — the live walk's BFS is small enough that
-		// race overhead dominates its wall time, while the fast path's
-		// map lookups gain almost no headroom. Under -race the
-		// observed speedup collapses below the 1.3x gate even though
-		// the precomputed index still saves real work; this test
-		// belongs to the non-race build only.
-		t.Skip("perf gate skipped under -race (race instrumentation distorts the ratio)")
+		// Race instrumentation makes this wall-clock latency ceiling a
+		// measurement of instrumentation overhead rather than user-visible
+		// query latency. Concurrency correctness has dedicated -race tests.
+		t.Skip("perf gate skipped under -race (instrumentation distorts latency)")
 	}
 	g := newFanInChain(1000)
 	reach.BuildIndex(g)
@@ -226,13 +253,6 @@ func TestAnalyzeImpact_FastPathSubMillisecond(t *testing.T) {
 	// backends (SQLite), where each per-node query the batching
 	// eliminates is a disk round-trip, not a map read.
 	//
-	// We therefore keep the absolute sub-ms guarantee (the user-facing
-	// contract: a blast-radius query stays interactive) and a loose
-	// regression guard that the fast path is not materially SLOWER than
-	// the batched live walk — without re-asserting the obsolete
-	// in-memory speedup premise.
-	const minSpeedup = 0.9
-
 	speedup := float64(avgLive) / float64(avgFast)
 	t.Logf("AnalyzeImpact on 1000-caller fan-in: fast=%v live=%v speedup=%.2fx (over %d iters)",
 		avgFast, avgLive, speedup, iters)
@@ -242,9 +262,6 @@ func TestAnalyzeImpact_FastPathSubMillisecond(t *testing.T) {
 	}
 	if avgLive > absoluteCeiling {
 		t.Errorf("live-walk AnalyzeImpact too slow: avg=%v (absolute ceiling=%v)", avgLive, absoluteCeiling)
-	}
-	if speedup < minSpeedup {
-		t.Errorf("fast-path is materially slower than the live walk: %.2fx (want >= %.2fx)", speedup, minSpeedup)
 	}
 }
 

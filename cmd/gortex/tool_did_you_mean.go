@@ -11,11 +11,10 @@ import (
 
 // maybeToolInvocationHint intercepts the `gortex <tool>` misuse: an agent that
 // saw a bare MCP tool name and tried to run it as a top-level verb (e.g.
-// `gortex read_file foo.go`). There is no such verb — the tool is reachable
-// only as `gortex call <tool> --arg …`. Cobra would print a bare "unknown
-// command" with no recovery path; instead, when the first positional argument
-// names a registered MCP tool that is NOT already a cobra subcommand/alias,
-// print a did-you-mean and return true so the caller exits nonzero.
+// `gortex read_file foo.go`). There is no such verb: every tool uses `gortex
+// call <tool>`, which selects the correct legacy or compact surface for that
+// connection. Cobra would otherwise print a bare "unknown command" with no
+// recovery path.
 //
 // Cheap and daemon-free: the fast rejects (flag, known verb) run first, so the
 // tool registry is only consulted for an argument that is otherwise an unknown
@@ -28,10 +27,15 @@ func maybeToolInvocationHint(w io.Writer, args []string) bool {
 	if isKnownRootCommand(verb) {
 		return false // a real cobra verb — let cobra route it
 	}
+	if gortexmcp.IsFacadeToolName(verb) {
+		fmt.Fprintf(w, "gortex: %q is a compact Gortex MCP tool, not a bare command.\n", verb)
+		fmt.Fprintf(w, "Run it from a shell with:\n  %s\n", cliInvocationForTool(verb))
+		fmt.Fprintln(w, "The argument object is the same as the compact MCP schema; use `gortex call capabilities --arg domain=<tool>` to discover operations.")
+		return true
+	}
 	if gortexmcp.IsRegisteredToolName(verb) {
-		fmt.Fprintf(w, "gortex: %q is not a gortex command, but it is a Gortex MCP tool.\n", verb)
-		fmt.Fprintf(w, "Run it from a shell with:\n  %s\n", toolref.CLIFallback(verb))
-		fmt.Fprintln(w, "General form: gortex call <tool> --arg k=v  (there is no bare `gortex <tool>` verb).")
+		fmt.Fprintf(w, "gortex: %q is a legacy Gortex MCP name, not a bare command.\n", verb)
+		fmt.Fprintf(w, "Use the public operation, or discover its exact schema first:\n  %s\n", cliInvocationForTool(verb))
 		return true
 	}
 
@@ -45,10 +49,38 @@ func maybeToolInvocationHint(w io.Writer, args []string) bool {
 	}
 	fmt.Fprintf(w, "gortex: unknown command %q. The closest Gortex MCP tools:\n", verb)
 	for _, c := range candidates {
-		fmt.Fprintf(w, "  %s\n", toolref.CLIFallback(c))
+		fmt.Fprintf(w, "  %s\n", cliInvocationForTool(c))
 	}
 	fmt.Fprintln(w, "General form: gortex call <tool> --arg k=v  (there is no bare `gortex <tool>` verb).")
 	return true
+}
+
+func cliInvocationForTool(tool string) string {
+	if gortexmcp.IsFacadeToolName(tool) {
+		switch tool {
+		case "analyze":
+			return "gortex call analyze --arg kind='<kind>'"
+		case "ask":
+			return "gortex call ask --arg question='<question>'"
+		case "capabilities":
+			return "gortex call capabilities --arg domain='<tool>'"
+		case "explore":
+			return "gortex call explore --arg task='<request>'"
+		case "read":
+			return `gortex call read --arg target='{"file":"<file>"}'`
+		case "search":
+			return "gortex call search --arg operation=symbols --arg query='<name>'"
+		default:
+			return "gortex call " + tool + " --arg operation='<operation>'"
+		}
+	}
+	if example, ok := toolref.ConcreteCLIFallback(tool); ok {
+		return example
+	}
+	if domain, operation, ok := gortexmcp.PublicOperationForLegacy(tool); ok {
+		return "gortex call capabilities --arg domain='" + domain + "' --arg operation='" + operation + "' --arg detail=schema"
+	}
+	return toolref.CLIFallback(tool)
 }
 
 // fuzzyMinVerbLen gates the fuzzy tool match: shorter fragments are too

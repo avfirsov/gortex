@@ -10,6 +10,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/zzet/gortex/internal/daemon"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
 
 var (
@@ -20,12 +23,23 @@ var (
 	callFormat   string
 	callDry      bool
 	callQuiet    bool
+	callLegacy   bool
 )
 
 // callDaemonTool is the daemon-tool relay seam. It is indirected through a
 // package var so a test can stub the daemon call (and the catalog fetch used
 // for name validation) without a running daemon.
 var callDaemonTool = requireDaemonTool
+
+// callFacadeDaemonTool uses the same shell argument lowering and output path as
+// callDaemonTool, but negotiates the compact facade surface for this one daemon
+// connection. Kept as a separate seam so tests prove surface selection without
+// a running daemon.
+var callFacadeDaemonTool = func(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
+	return requireDaemonToolWithSurface(
+		repoPath, tool, args, gortexmcp.FacadeSurfaceVersion, "hide",
+	)
+}
 
 var callCmd = &cobra.Command{
 	Use:   "call <tool>",
@@ -48,6 +62,14 @@ Use --dry to print the lowered argument object and the target tool without
 calling the daemon (works with no daemon running). Use --format to pick the
 wire format the tool renders (json|gcx|toon|text).
 
+When <tool> is one of the compact public tool names, this command automatically
+selects the compact surface for that connection and accepts the exact MCP
+argument object. Other names explicitly use the legacy-compatible surface.
+Use --legacy to preserve the old handler contract for shared names such as
+analyze, explore, review, and ask.
+Discover compact operations with:
+  gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema
+
 Requires a running daemon that tracks the repo (except for --dry).`,
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true, // a tool/daemon error should read cleanly, not dump usage
@@ -63,6 +85,7 @@ func init() {
 	callCmd.Flags().StringVar(&callFormat, "format", "json", "output / wire format forwarded to the tool: json|gcx|toon|text")
 	callCmd.Flags().BoolVar(&callDry, "dry", false, "print the lowered argument object and target tool without calling the daemon")
 	callCmd.Flags().BoolVar(&callQuiet, "quiet", false, "suppress the stderr note when calling a mutating tool")
+	callCmd.Flags().BoolVar(&callLegacy, "legacy", false, "use the legacy MCP contract for a shared tool name")
 	rootCmd.AddCommand(callCmd)
 }
 
@@ -75,34 +98,62 @@ func runCall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	compactCall := gortexmcp.IsFacadeToolName(tool) && !callLegacy
+	formatExplicit := callFormat != "json"
+	if flag := cmd.Flags().Lookup("format"); flag != nil && flag.Changed {
+		formatExplicit = true
+	}
+	// Legacy handlers historically receive the CLI's json default. Compact
+	// calls mirror the supplied MCP object exactly unless --format was explicit.
+	if compactCall {
+		if formatExplicit {
+			if err := mergeCompactOutputFormat(argObj, callFormat); err != nil {
+				return err
+			}
+		}
+	} else if callFormat != "" {
+		argObj["format"] = callFormat
+	}
 	if callDry {
 		return printCallDry(cmd, tool, argObj)
+	}
+	facadeEffectful := compactCall && daemon.IsEffectful(tool)
+	if facadeEffectful && !callQuiet {
+		fmt.Fprintf(cmd.ErrOrStderr(), "note: %s can change %s\n", tool, describeToolEffects(daemon.EffectOf(tool)))
 	}
 
 	// Best-effort name validation against the live daemon's catalog. When no
 	// daemon is reachable this is skipped entirely so the call below returns
 	// the normal daemonRequiredErr instead of a confusing "unknown tool".
-	if cat, ok := fetchToolCatalog(callIndex); ok {
-		if !cat.has(tool) {
-			return unknownToolErr(tool, cat)
-		}
-		if cat.mutating(tool) && !callQuiet {
-			fmt.Fprintf(cmd.ErrOrStderr(), "note: %s writes to your working tree / graph\n", tool)
+	if !compactCall {
+		if cat, ok := fetchToolCatalog(callIndex); ok {
+			if !cat.has(tool) {
+				return unknownToolErr(tool, cat)
+			}
+			if cat.mutating(tool) && !callQuiet {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: %s writes to your working tree / graph\n", tool)
+			}
 		}
 	}
 
-	// Forward the chosen wire format to the tool. The executor pins
-	// format=json by default; an explicit format here overrides it.
-	if callFormat != "" {
-		argObj["format"] = callFormat
+	relay := callDaemonTool
+	if compactCall {
+		relay = callFacadeDaemonTool
 	}
-
-	raw, err := callDaemonTool(callIndex, tool, argObj)
+	raw, err := relay(callIndex, tool, argObj)
 	if err != nil {
 		return err
 	}
 
-	switch callFormat {
+	responseFormat := callFormat
+	if compactCall && !formatExplicit {
+		if output, ok := argObj["output"].(map[string]any); ok {
+			if requested, ok := output["format"].(string); ok && requested != "" {
+				responseFormat = requested
+			}
+		}
+	}
+	switch responseFormat {
 	case "gcx", "toon":
 		// Compact wire formats are printed verbatim — re-indenting would
 		// corrupt them.
@@ -111,6 +162,47 @@ func runCall(cmd *cobra.Command, args []string) error {
 	default: // json | text
 		return emitDaemonJSON(cmd, raw)
 	}
+}
+
+func describeToolEffects(effect daemon.ToolEffect) string {
+	var boundaries []string
+	if effect&daemon.EffectFilesystemWrite != 0 {
+		boundaries = append(boundaries, "local files")
+	}
+	if effect&daemon.EffectGraphWrite != 0 {
+		boundaries = append(boundaries, "the indexed graph")
+	}
+	if effect&daemon.EffectConfigWrite != 0 {
+		boundaries = append(boundaries, "configuration")
+	}
+	if effect&daemon.EffectSessionWrite != 0 {
+		boundaries = append(boundaries, "session state")
+	}
+	if effect&daemon.EffectExternalWrite != 0 {
+		boundaries = append(boundaries, "external systems")
+	}
+	if len(boundaries) == 0 {
+		return "state"
+	}
+	return strings.Join(boundaries, ", ")
+}
+
+func mergeCompactOutputFormat(args map[string]any, format string) error {
+	if format == "" {
+		return nil
+	}
+	delete(args, "format") // an explicit CLI flag normalizes the legacy spelling
+	raw, exists := args["output"]
+	if !exists || raw == nil {
+		args["output"] = map[string]any{"format": format}
+		return nil
+	}
+	output, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("compact output must be a JSON object, got %T", raw)
+	}
+	output["format"] = format
+	return nil
 }
 
 // printCallDry prints the lowered argument object (indented JSON) and the

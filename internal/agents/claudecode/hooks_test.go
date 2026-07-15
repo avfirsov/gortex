@@ -387,8 +387,18 @@ func TestUpgradeGortexMatcher_RewritesPreviousCurrent(t *testing.T) {
 	assert.True(t, upgradeGortexMatcher(hooks), "previous-current matcher should upgrade")
 	got := hooks["PreToolUse"].([]any)[0].(map[string]any)["matcher"].(string)
 	assert.Equal(t, CurrentPreToolUseMatcher, got)
-	assert.Contains(t, got, "mcp__gortex__read_file",
-		"upgraded matcher must include the gortex read tools")
+	assert.Contains(t, got, "mcp__gortex__read",
+		"upgraded matcher must include the compact gortex read tool")
+	assert.NotContains(t, got, "mcp__gortex__read_file")
+}
+
+func TestUpgradeGortexMatcher_RewritesV060MCPReadMatcher(t *testing.T) {
+	hooks := map[string]any{
+		"PreToolUse": []any{makeHookEntry(v060PreToolUseMatcher, "/opt/gortex hook")},
+	}
+	assert.True(t, upgradeGortexMatcher(hooks))
+	got := hooks["PreToolUse"].([]any)[0].(map[string]any)["matcher"].(string)
+	assert.Equal(t, CurrentPreToolUseMatcher, got)
 }
 
 func TestUpgradeGortexMatcher_NoOpOnCurrent(t *testing.T) {

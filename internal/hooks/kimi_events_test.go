@@ -32,7 +32,7 @@ func TestRunKimiPreToolUseReadIndexedDenies(t *testing.T) {
 	if !strings.Contains(out, `"permissionDecision":"deny"`) {
 		t.Fatalf("expected a Kimi permission-decision deny, got: %q", out)
 	}
-	if !strings.Contains(out, "get_symbol_source") {
+	if !strings.Contains(out, "read(operation") {
 		t.Fatalf("deny reason should name graph tools, got: %q", out)
 	}
 	if strings.Contains(out, "additionalContext") {
@@ -52,7 +52,7 @@ func TestRunKimiPreToolUseReadUnindexedSoftStdout(t *testing.T) {
 	if strings.Contains(out, "permissionDecision") || strings.Contains(out, "hookSpecificOutput") {
 		t.Fatalf("an unindexed Read should be soft plain-stdout guidance, not a deny: %q", out)
 	}
-	if !strings.Contains(out, "get_symbol_source") {
+	if !strings.Contains(out, "read(operation") {
 		t.Fatalf("expected soft graph guidance, got: %q", out)
 	}
 }
@@ -122,8 +122,8 @@ func TestRunKimiSubagentStartBriefsWithTask(t *testing.T) {
 	if strings.Contains(out, "hookSpecificOutput") {
 		t.Fatalf("subagent briefing must be plain stdout, got JSON: %q", out)
 	}
-	if !strings.Contains(out, "Use Gortex MCP tools") {
-		t.Fatalf("expected the tool-swap table, got: %q", out)
+	if !strings.Contains(out, "MUST use Gortex MCP tools") || !strings.Contains(out, "`explore`") {
+		t.Fatalf("expected the compact mandatory workflow, got: %q", out)
 	}
 	if !strings.Contains(out, "FooHandler") {
 		t.Fatalf("expected smart_context symbols in the briefing, got: %q", out)
@@ -137,8 +137,8 @@ func TestRunKimiSubagentStartFallbackWithoutTask(t *testing.T) {
 	out := captureStdout(t, func() {
 		runKimi([]byte(`{"hook_event_name":"SubagentStart","cwd":`+strconv.Quote(cwd)+`}`), 0, ModeDeny)
 	})
-	if !strings.Contains(out, "Use Gortex MCP tools") {
-		t.Fatalf("expected the static tool-swap fallback briefing, got: %q", out)
+	if !strings.Contains(out, "MUST use Gortex MCP tools") || !strings.Contains(out, "`change`") {
+		t.Fatalf("expected the static compact fallback briefing, got: %q", out)
 	}
 }
 

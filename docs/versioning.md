@@ -98,6 +98,22 @@ v, err := version.Parse("v1.2.3-rc.1+abc1234")
 
 The daemon exposes its running version in the handshake ACK as `DaemonVersion` and on the control surface's `status` response — clients can feature-gate or warn on mismatch.
 
+## Agent-integration migration fingerprints
+
+Exact `v0.60.0` configuration and generated-artifact fingerprints are retained
+through the complete `v0.62.x` line so upgrades can replace untouched Gortex
+output without overwriting user customizations. Their earliest removal is
+`v0.63.0`, and removal is permitted only when both conditions hold:
+
+1. The supported direct-upgrade floor is `v0.61.0` or newer.
+2. The `v0.63.0` release notes tell `v0.60.x` users to upgrade through an
+   intermediate `v0.61.x` or `v0.62.x` release.
+
+Versioned identifiers such as `v060AlwaysAllow` and `v060GlobalSkillHashes`
+make this temporary compatibility scope visible. Long-lived compatibility
+types and fields (for example the MCP facade's `Legacy` handler mapping) are
+not governed by this retirement gate.
+
 ## 0.x caveat
 
 Until Gortex reaches `v1.0.0`, the MAJOR rule relaxes slightly: breaking changes may ship in a MINOR bump when they fall under a clearly-communicated rework (with changelog entry). That's the standard SemVer 0.x behavior. From `v1.0.0` onward, the rules above apply strictly.

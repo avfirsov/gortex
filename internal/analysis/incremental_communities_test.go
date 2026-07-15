@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -110,8 +111,14 @@ func TestDetectCommunitiesLeidenIncremental(t *testing.T) {
 				if stats.FullRecomputeReason == "" {
 					t.Error("first run should carry a full-recompute reason")
 				}
-				if cache == nil || cache.part == nil || len(cache.nodeComm) == 0 {
+				if cache == nil || len(cache.nodeComm) == 0 {
 					t.Fatal("first run did not populate the cache")
+				}
+				// The long-lived cache must keep assignments only. Retaining the
+				// raw partition also pins weighted adjacency, degree, and symbol
+				// maps — a second copy of the graph for the server lifetime.
+				if _, retained := reflect.TypeOf(*cache).FieldByName("part"); retained {
+					t.Fatal("Leiden cache retains the full topology partition")
 				}
 				if len(cache.pkgFingerprint) == 0 {
 					t.Error("first run cached no package fingerprints")

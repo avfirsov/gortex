@@ -55,6 +55,10 @@ func newArchHierarchyTestServer(t *testing.T) *Server {
 			"Save": "community-1", "Load": "community-1",
 		},
 	}
+	token := s.currentCommunityToken()
+	s.communitiesToken = token
+	s.adjacencyToken = token
+	s.analysisEpoch = 1
 	s.analysisMu.Unlock()
 	return s
 }

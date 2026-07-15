@@ -28,7 +28,11 @@ const momentumEscalateStreak = 10
 // momentum note. Edit and verify tools never count — the note is about
 // evidence-gathering loops, not about acting.
 var momentumReadTools = map[string]bool{
-	"explore": true, "search_symbols": true, "search_text": true,
+	// Stable facade-v1 read/navigation dispatchers. These are counted by the
+	// outer middleware exactly once per facade call.
+	"explore": true, "search": true, "read": true, "relations": true, "trace": true,
+	// Legacy read/navigation tools.
+	"search_symbols": true, "search_text": true,
 	"get_symbol_source": true, "batch_symbols": true, "get_file_summary": true,
 	"get_editing_context": true, "read_file": true, "find_usages": true,
 	"get_callers": true, "get_call_chain": true, "find_implementations": true,

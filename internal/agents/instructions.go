@@ -29,6 +29,10 @@ import (
 // like AGENTS.md) we skip to stay idempotent.
 const InstructionsSentinel = "## MANDATORY: Use Gortex MCP tools"
 
+// BashInstructionsSentinel identifies the separate policy installed only by
+// harness adapters that have no native MCP transport.
+const BashInstructionsSentinel = "## MANDATORY: Use the Gortex public CLI mirror"
+
 // CommunitiesStartMarker / CommunitiesEndMarker fence the generated
 // community-routing block that `gortex init` writes into per-repo
 // instructions files. Fenced (not just start-only) because this block
@@ -66,36 +70,43 @@ func GlobalPointerBody(instructionsDir string) string {
 		"Switch guidance depth with `gortex instructions switch <core|localization|full>` (`list` shows all) — applies to NEW sessions only.\n"
 }
 
-// InstructionsBody is the shared rule block every adapter writes to
-// its agent's instructions file. Tool names in the tables (Read, Grep)
-// are Claude-Code-specific flavour; models outside Claude Code read
-// them as "any file-reading tool" — the principle stays the same so
-// we keep one body rather than branch by agent.
+// InstructionsBody is the shared, agent-neutral rule block every doc-aware
+// adapter writes. It names only the compact public tools and treats a missing
+// callable handle as an integration failure; transport versions,
+// implementation aliases, and cross-transport fallbacks do not belong in an
+// MCP-capable agent's working context.
 const InstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
-Gortex runs as an MCP server for this repository. You MUST prefer graph queries over file reads on every task — PreToolUse hooks deny ` + "`" + `Read` + "`" + ` / ` + "`" + `Grep` + "`" + ` / ` + "`" + `Glob` + "`" + ` against indexed source, and the deny message names the right tool.
+For every coding task:
 
-**Start every task with ` + "`" + `explore` + "`" + `.** Describe the request in plain words (paste the whole issue — it is distilled server-side; you do not have to hand-craft a query) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the source it returned is already in context, so do not re-open those files with ` + "`" + `Read` + "`" + ` / ` + "`" + `Glob` + "`" + ` — read more of a listed symbol with ` + "`" + `get_symbol_source` + "`" + ` / ` + "`" + `batch_symbols` + "`" + ` on its ` + "`" + `id:` + "`" + `.
+1. Call ` + "`" + `explore` + "`" + ` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
+2. Inspect indexed code only with ` + "`" + `search` + "`" + `, ` + "`" + `read` + "`" + `, ` + "`" + `relations` + "`" + `, and ` + "`" + `trace` + "`" + `. Never use Read/Grep/Glob or shell equivalents for indexed source.
+3. Before mutation, call ` + "`" + `change(operation:"impact")` + "`" + `; for a signature change, also call ` + "`" + `change(operation:"verify")` + "`" + ` with the proposed signature. Mutate only with ` + "`" + `edit` + "`" + ` or ` + "`" + `refactor` + "`" + `. After mutation, call ` + "`" + `change(operation:"detect")` + "`" + `, then use its symbol IDs with ` + "`" + `change(operation:"tests")` + "`" + `, ` + "`" + `change(operation:"guards")` + "`" + `, and ` + "`" + `change(operation:"contract")` + "`" + `.
+4. Call ` + "`" + `capabilities` + "`" + ` only when you need the exact fields for an operation.
 
-| Instead of...                       | Use...                                   |
-|-------------------------------------|------------------------------------------|
-| Localizing a task / bug / "where is X" | ` + "`" + `explore` + "`" + ` (one call: ranked neighborhood + source + call paths) |
-| ` + "`" + `Grep` + "`" + ` for a symbol                 | ` + "`" + `search_symbols` + "`" + ` (BM25 + camelCase-aware) |
-| ` + "`" + `Grep` + "`" + ` for references               | ` + "`" + `find_usages` + "`" + ` (zero false positives)     |
-| Reading / grepping to find callers  | ` + "`" + `get_callers` + "`" + ` / ` + "`" + `get_call_chain` + "`" + `         |
-| ` + "`" + `Read` + "`" + ` a file for one symbol        | ` + "`" + `get_symbol_source` + "`" + ` (` + "`" + `compress_bodies:true` + "`" + ` for the signature only) |
-| ` + "`" + `Read` + "`" + ` to understand a file         | ` + "`" + `get_file_summary` + "`" + ` / ` + "`" + `get_editing_context` + "`" + ` |
-| ` + "`" + `Read` + "`" + ` a non-indexed / raw file     | ` + "`" + `read_file` + "`" + `                              |
-| ` + "`" + `Read` + "`" + ` several symbols' bodies at once | ` + "`" + `batch_symbols` + "`" + ` (one call, many bodies)   |
-| ` + "`" + `Edit` + "`" + ` / ` + "`" + `Write` + "`" + ` source             | ` + "`" + `edit_file` + "`" + ` / ` + "`" + `write_file` + "`" + ` / ` + "`" + `edit_symbol` + "`" + ` / ` + "`" + `rename_symbol` + "`" + ` / ` + "`" + `batch_edit` + "`" + ` |
+Common calls:
 
-**CLI fallback (no MCP):** every tool above is reachable from a shell as ` + "`" + `gortex call <tool> --arg k=v` + "`" + ` (e.g. ` + "`" + `gortex call read_file --arg path=<file>` + "`" + `) — there is no bare ` + "`" + `gortex <tool>` + "`" + ` verb.
+- ` + "`" + `search({operation:"symbols", query:"<name or concept>"})` + "`" + `
+- ` + "`" + `read({target:{symbol:"<file>::<Name|Recv.Name>"}})` + "`" + `
+- ` + "`" + `relations({operation:"usages", target:{symbol:"<id>"}})` + "`" + `
+- ` + "`" + `edit({target:{file:"<path>"}, match:"<old>", replacement:"<new>"})` + "`" + `
 
-The graph narrows scope; read the real body with ` + "`" + `get_symbol_source` + "`" + ` before you change or depend on a symbol — especially behavior-critical code (migrations, retry / fallback, concurrency), where ` + "`" + `compress_bodies:true` + "`" + ` would elide the risky branches. ` + "`" + `format:"gcx"` + "`" + ` and ` + "`" + `compress_bodies:true` + "`" + ` exist on the read / list tools — the parameter legend is in the MCP server instructions.
+If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
 
-**Memory workflow** (behavior-critical; the full triggers live in the global ` + "`" + `~/.claude/CLAUDE.md` + "`" + ` policy and in ` + "`" + `gortex://guide` + "`" + `): ` + "`" + `distill_session` + "`" + ` at session start; ` + "`" + `surface_memories` + "`" + ` right after ` + "`" + `smart_context` + "`" + `; ` + "`" + `save_note tags:"decision"` + "`" + ` at each decision; ` + "`" + `store_memory` + "`" + ` for durable invariants / gotchas the team should inherit; ` + "`" + `query_notes` + "`" + ` / ` + "`" + `query_memories` + "`" + ` before re-touching a symbol.
+Use ` + "`" + `recall` + "`" + ` before revisiting prior work and ` + "`" + `remember` + "`" + ` immediately for durable decisions, invariants, or gotchas.
+`
 
-**Reference:** ` + "`" + `gortex://guide` + "`" + ` (or ` + "`" + `gortex guide [topic]` + "`" + `) carries the full detail — provider matrix, capabilities, analyze / search_ast catalogs, token-economy, MCP resources. The server publishes a lean tool preset eagerly; call ` + "`" + `tools_search` + "`" + ` to discover and load any other tool by keyword.
+// BashInstructionsBody is used only by harnesses that genuinely have no MCP
+// transport. It mirrors the same compact public surface through the CLI rather
+// than teaching MCP-capable agents to silently change transports.
+const BashInstructionsBody = BashInstructionsSentinel + ` instead of raw source reads/searches
+
+This harness has no native MCP transport. Invoke public Gortex tools only as ` + "`" + `gortex call <tool>` + "`" + `; never invent a bare ` + "`" + `gortex <tool>` + "`" + ` command.
+
+1. Start every coding task with ` + "`" + `gortex call explore --arg task="<task>"` + "`" + `.
+2. Inspect with ` + "`" + `gortex call search` + "`" + `, ` + "`" + `gortex call read` + "`" + `, ` + "`" + `gortex call relations` + "`" + `, or ` + "`" + `gortex call trace` + "`" + ` instead of Read/Grep/Glob or shell equivalents.
+3. Before mutation call ` + "`" + `gortex call change --arg operation=impact` + "`" + `. Mutate only through ` + "`" + `gortex call edit` + "`" + ` or ` + "`" + `gortex call refactor` + "`" + `; afterward run change operations ` + "`" + `detect` + "`" + `, ` + "`" + `tests` + "`" + `, ` + "`" + `guards` + "`" + `, and ` + "`" + `contract` + "`" + `.
+4. Use ` + "`" + `gortex call capabilities` + "`" + ` only when exact operation fields are unknown.
 `
 
 // AppendInstructions appends body to path, creating the file if

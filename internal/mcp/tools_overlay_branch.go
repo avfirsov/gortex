@@ -24,7 +24,7 @@ import (
 // before the next tools/call's view is built, not be re-evaluated
 // against the branch about to be switched away).
 func (s *Server) registerOverlayBranchTools() {
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_fork",
 			mcp.WithDescription("Clone the current session's overlay state into a named branch. Branches let an agent hold N simultaneous speculative states off one baseline so it can apply different edit strategies to each, compare outcomes via compare_branches, and promote the winner with overlay_merge. The implicit base branch is `main`; every new fork inherits its parent's file map by deep copy. Pass activate:true to make the new branch the session's active branch immediately."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Branch name (alphanumeric + dash/underscore, max 64 chars).")),
@@ -33,20 +33,20 @@ func (s *Server) registerOverlayBranchTools() {
 		),
 		s.handleOverlayFork,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_branches",
 			mcp.WithDescription("List every overlay branch the calling MCP session holds, including the implicit `main` branch. Each entry carries the branch name, whether it is currently active, the number of files attached, the number of files that carry a base_sha drift anchor, the parent branch name (empty for `main`), and the creation timestamp."),
 		),
 		s.handleOverlayBranches,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_switch",
 			mcp.WithDescription("Make the named branch the active overlay for the calling MCP session. All existing overlay tools (overlay_push, overlay_list, overlay_delete, overlay_drop, compare_with_overlay, preview_edit, simulate_chain) operate against the active branch after the switch."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Branch name to activate.")),
 		),
 		s.handleOverlaySwitch,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_merge",
 			mcp.WithDescription("Merge a branch's edits into another branch or write them to disk. With to_disk:false (default) the from branch's files are folded into the into branch (default: main); with to_disk:true the from branch's overlay files are written to the filesystem using the same atomic-write + base_sha drift-guard machinery as edit_file, then the from branch is dropped from the session. Conflict policy: a path that exists in both branches with different content is a conflict; without force:true the merge aborts and the response carries a conflicts list. force:true resolves conflicts last-writer-wins (from wins) and notes the resolution in the response."),
 			mcp.WithString("from", mcp.Required(), mcp.Description("Source branch to merge.")),
@@ -56,14 +56,14 @@ func (s *Server) registerOverlayBranchTools() {
 		),
 		s.handleOverlayMerge,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_drop_branch",
 			mcp.WithDescription("Delete a named overlay branch from the calling session. Refuses to drop the implicit `main` branch (drop the whole session instead with overlay_drop) and refuses to drop the currently active branch (call overlay_switch first)."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Branch name to delete.")),
 		),
 		s.handleOverlayDropBranch,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("compare_branches",
 			mcp.WithDescription("Run a graph query against two overlay branches in the calling session and report the delta. Each branch is materialised as its own shadow-graph view (no shared state). Useful when an agent has applied different edit strategies to two branches and wants to know which strategy actually changes the dependency graph in the desired direction. Supported `kind` values: find_usages, get_callers, get_call_chain, get_dependencies, get_dependents."),
 			mcp.WithString("a", mcp.Required(), mcp.Description("First branch name.")),

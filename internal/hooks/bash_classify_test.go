@@ -44,6 +44,32 @@ func TestClassifyBashCommand(t *testing.T) {
 		{"cat .json", `cat package.json`, BashActionPassthrough, ""},
 		{"cat .go | grep", `cat /repo/x.go | grep foo`, BashActionReadSource, "/repo/x.go"},
 
+		// --- conservative file-list shapes ---
+		{"fd", `fd '\\.go$' internal`, BashActionFileList, ""},
+		{"fd exec stays passthrough", `fd '\\.go$' -x rm`, BashActionPassthrough, ""},
+		{"fd custom format stays passthrough", `fd --format '{/}' internal`, BashActionPassthrough, ""},
+		{"ls", `ls /repo`, BashActionFileList, ""},
+		{"ls explicit single column", `ls -1A /repo`, BashActionFileList, ""},
+		{"ls long stays passthrough", `ls -la /repo`, BashActionPassthrough, ""},
+		{"ls columns stay passthrough", `ls -C /repo`, BashActionPassthrough, ""},
+		{"tree full paths no indent", `tree -fi internal`, BashActionFileList, ""},
+		{"tree metadata stays passthrough", `tree -fip internal`, BashActionPassthrough, ""},
+		{"tree decorative stays passthrough", `tree internal`, BashActionPassthrough, ""},
+		{"git ls-files", `git ls-files '*.go'`, BashActionFileList, ""},
+		{"git ls-files nul stays passthrough", `git ls-files -z`, BashActionPassthrough, ""},
+		{"git ls-files eol stays passthrough", `git ls-files --eol`, BashActionPassthrough, ""},
+		{"git ls-files unmerged stays passthrough", `git ls-files -u`, BashActionPassthrough, ""},
+
+		// --- bounded source reads ---
+		{"sed line range", `sed -n '20,80p' internal/x.go`, BashActionReadRange, "internal/x.go"},
+		{"sed high bounded range", `sed -n '5000,5050p' internal/x.go`, BashActionReadRange, "internal/x.go"},
+		{"sed default printing is not bounded", `sed '20,80p' internal/x.go`, BashActionPassthrough, ""},
+		{"sed oversized range stays passthrough", `sed -n '1,5000p' internal/x.go`, BashActionPassthrough, ""},
+		{"sed in-place stays passthrough", `sed -i 's/a/b/' internal/x.go`, BashActionPassthrough, ""},
+		{"awk line range", `awk 'NR>=20 && NR<=80 {print}' internal/x.go`, BashActionReadRange, "internal/x.go"},
+		{"awk oversized range stays passthrough", `awk 'NR>=1 && NR<=5000 {print}' internal/x.go`, BashActionPassthrough, ""},
+		{"awk system stays passthrough", `awk '{system($0)}' internal/x.go`, BashActionPassthrough, ""},
+
 		// --- quoting ---
 		{"single-quoted pattern", `grep -rn 'foo bar' .`, BashActionGrepLike, "foo bar"},
 		{"double-quoted pattern", `grep -rn "foo bar" .`, BashActionGrepLike, "foo bar"},
@@ -52,7 +78,6 @@ func TestClassifyBashCommand(t *testing.T) {
 		// --- passthroughs ---
 		{"empty", ``, BashActionPassthrough, ""},
 		{"whitespace only", `   `, BashActionPassthrough, ""},
-		{"ls", `ls /repo`, BashActionPassthrough, ""},
 		{"go build", `go build ./...`, BashActionPassthrough, ""},
 		{"echo", `echo hello`, BashActionPassthrough, ""},
 	}
@@ -68,12 +93,28 @@ func TestClassifyBashCommand(t *testing.T) {
 				if got.Pattern != tt.wantExtra {
 					t.Errorf("pattern = %q, want %q", got.Pattern, tt.wantExtra)
 				}
-			case BashActionReadSource:
+			case BashActionReadSource, BashActionReadRange:
 				if got.Path != tt.wantExtra {
 					t.Errorf("path = %q, want %q", got.Path, tt.wantExtra)
 				}
 			}
 		})
+	}
+}
+
+func TestSimpleBashCommand(t *testing.T) {
+	for _, command := range []string{`cat internal/x.go`, `cat 'internal/a b.go'`} {
+		if !simpleBashCommand(command) {
+			t.Errorf("expected simple command: %q", command)
+		}
+	}
+	for _, command := range []string{
+		`cat internal/x.go | head`, `cat internal/x.go > /tmp/x`, `cd . && cat internal/x.go`,
+		`cat $(pwd)/x.go`, "cat internal/x.go\ncat internal/y.go",
+	} {
+		if simpleBashCommand(command) {
+			t.Errorf("compound command must not be rewrite-safe: %q", command)
+		}
 	}
 }
 

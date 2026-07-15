@@ -331,7 +331,10 @@ func TestLazyRegistration_PromotedToolsDispatchNormally(t *testing.T) {
 func TestLazyRegistration_HitsSpecTarget(t *testing.T) {
 	t.Setenv("GORTEX_LAZY_TOOLS", "1")
 	srv, _ := setupTestServer(t)
-	eager := len(srv.mcpServer.ListTools())
+	// Count the effective initial tools/list, not the process-global live map:
+	// facade-v1 dispatchers are registered live for Codex but session-filtered
+	// out of the legacy/default surface.
+	eager := len(srv.sessionLiveToolNames(context.Background()))
 	deferred := srv.lazy.CountDeferred()
 
 	// Spec target: deferred ≥ 30 (the gap-analysis floor for the row

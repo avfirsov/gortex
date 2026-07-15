@@ -537,6 +537,12 @@ type Graph struct {
 	// (the files sidecar feeding index_health). Guarded by fileMetasMu.
 	fileMetasMu sync.Mutex
 	fileMetas   map[string]map[string]FileMetaRow
+
+	// mutationReceipts backs the optional, in-memory-only mutation receipt
+	// capability used to bound post-enrichment resolution. It is intentionally
+	// absent from disk stores until they can provide the same completeness
+	// guarantee.
+	mutationReceipts mutationReceiptState
 }
 
 // cloneShingleEntry is one in-memory clone_shingles row: the owning
@@ -659,8 +665,52 @@ func (g *Graph) ReindexEdges(batch []EdgeReindex) {
 		if r.Edge == nil {
 			continue
 		}
-		g.ReindexEdge(r.Edge, r.OldTo)
+		if !r.RefreshIdentity {
+			g.ReindexEdge(r.Edge, r.OldTo)
+			continue
+		}
+		g.refreshEdgeIdentity(r.Edge, r.OldTo, r.OldFilePath, r.OldLine)
 	}
+}
+
+// refreshEdgeIdentity replaces an existing edge in place while repairing the
+// out/in identity sidecars. Keeping the stored pointer preserves AllEdges cache
+// coherence; the watcher uses this for source-span/meta refreshes that must not
+// discard a resolver-selected target.
+func (g *Graph) refreshEdgeIdentity(e *Edge, oldTo, oldFilePath string, oldLine int) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	g.markMutationReceiptsIncomplete()
+	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
+	defer unlock()
+
+	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: e.Kind, FilePath: oldFilePath, Line: oldLine})
+	newKey := hashEdgeKey(keyOf(e))
+	sFrom := g.shardFor(e.From)
+	fromIdx := sFrom.outEdgeIdx[e.From]
+	pos, ok := fromIdx[oldKey]
+	if !ok || pos >= len(sFrom.outEdges[e.From]) {
+		return
+	}
+	stored := sFrom.outEdges[e.From][pos]
+
+	if oldKey != newKey || oldTo != e.To {
+		delete(fromIdx, oldKey)
+		fromIdx[newKey] = pos
+		if keys := sFrom.outEdgeKeys[e.From]; pos < len(keys) {
+			keys[pos] = newKey
+		}
+		sOld := g.shardFor(oldTo)
+		removeEdgeFromBucket(sOld.inEdges, sOld.inEdgeKeys, sOld.inEdgeIdx, oldTo, oldKey)
+		*stored = *e
+		sNew := g.shardFor(e.To)
+		addEdgeToBucket(sNew.inEdges, sNew.inEdgeKeys, sNew.inEdgeIdx, e.To, stored)
+		g.edgeIdentityRevisions.Add(1)
+		return
+	}
+	*stored = *e
 }
 
 // BulkSetCloneShingles is the in-memory implementation of
@@ -2011,10 +2061,26 @@ func (g *Graph) unlockAllRead() {
 // are migrated from the old bucket to the new one atomically under the
 // shard lock.
 func (g *Graph) AddNode(n *Node) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	s := g.shardFor(n.ID)
 	s.mu.Lock()
+	old := s.nodes[n.ID]
 	g.addNodeLocked(s, n)
 	s.mu.Unlock()
+
+	if old == nil {
+		g.recordAddedNodeForReceipts(n, IsReferenceableSymbol(n.Kind), true)
+		return
+	}
+	// Replacing an existing definition with a different identity surface is
+	// uncommon in deferred passes and cannot be represented as an add-only
+	// receipt. Fail closed rather than claiming a precise frontier.
+	if old.Name != n.Name || old.QualName != n.QualName || old.FilePath != n.FilePath || old.Kind != n.Kind || old.RepoPrefix != n.RepoPrefix {
+		g.markMutationReceiptsIncomplete()
+	}
 }
 
 // addNodeLocked is AddNode's body, expecting the caller to already hold
@@ -2099,6 +2165,10 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	nodesByShard := make([][]*Node, g.shardCount)
 	outEdgesByShard := make([][]*Edge, g.shardCount)
 	inEdgesByShard := make([][]*Edge, g.shardCount)
@@ -2117,6 +2187,9 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		inEdgesByShard[g.shardIdx(e.To)] = append(inEdgesByShard[g.shardIdx(e.To)], e)
 	}
 
+	var addedNodes []*Node
+	var addedEdges []*Edge
+	incompleteReceipt := false
 	for i := range g.shards {
 		if len(nodesByShard[i]) == 0 && len(outEdgesByShard[i]) == 0 && len(inEdgesByShard[i]) == 0 {
 			continue
@@ -2124,7 +2197,13 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		s := g.shards[i]
 		s.mu.Lock()
 		for _, n := range nodesByShard[i] {
+			old := s.nodes[n.ID]
 			g.addNodeLocked(s, n)
+			if old == nil {
+				addedNodes = append(addedNodes, n)
+			} else if old.Name != n.Name || old.QualName != n.QualName || old.FilePath != n.FilePath || old.Kind != n.Kind || old.RepoPrefix != n.RepoPrefix {
+				incompleteReceipt = true
+			}
 		}
 		// Out-side writes own the "was this a new insert?" signal that
 		// drives the per-repo edge counter and the "did Origin change?"
@@ -2132,23 +2211,49 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		// write is bookkeeping only and charges neither (mirrors
 		// AddEdge's behaviour).
 		for _, e := range outEdgesByShard[i] {
+			var old *Edge
+			h := hashEdgeKey(keyOf(e))
+			if positions := s.outEdgeIdx[e.From]; positions != nil {
+				if pos, ok := positions[h]; ok && pos < len(s.outEdges[e.From]) {
+					old = s.outEdges[e.From][pos]
+				}
+			}
 			inserted, originChanged := addEdgeToBucket(s.outEdges, s.outEdgeKeys, s.outEdgeIdx, e.From, e)
 			if originChanged {
 				g.edgeIdentityRevisions.Add(1)
 			}
 			if inserted {
 				g.edgeMutGen.Add(1)
+				addedEdges = append(addedEdges, e)
 				var srcRepo string
 				if src, ok := s.nodes[e.From]; ok && src != nil {
 					srcRepo = src.RepoPrefix
 				}
 				s.repoEdgeAdd(srcRepo, e)
+			} else if old != nil && old.Alias != e.Alias {
+				incompleteReceipt = true
 			}
 		}
 		for _, e := range inEdgesByShard[i] {
 			addEdgeToBucket(s.inEdges, s.inEdgeKeys, s.inEdgeIdx, e.To, e)
 		}
 		s.mu.Unlock()
+	}
+
+	if incompleteReceipt {
+		g.markMutationReceiptsIncomplete()
+	}
+	for _, n := range addedNodes {
+		g.recordAddedNodeForReceipts(n, IsReferenceableSymbol(n.Kind), true)
+	}
+	for _, e := range addedEdges {
+		file := e.FilePath
+		if file == "" {
+			if src := g.GetNode(e.From); src != nil {
+				file = src.FilePath
+			}
+		}
+		g.recordAddedEdgeForReceipts(e, file)
 	}
 }
 
@@ -2160,10 +2265,20 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
 	unlock := g.lockTwoWrite(e.From, e.To)
-	defer unlock()
 	sFrom := g.shardFor(e.From)
 	sTo := g.shardFor(e.To)
+	var old *Edge
+	h := hashEdgeKey(keyOf(e))
+	if positions := sFrom.outEdgeIdx[e.From]; positions != nil {
+		if pos, ok := positions[h]; ok && pos < len(sFrom.outEdges[e.From]) {
+			old = sFrom.outEdges[e.From][pos]
+		}
+	}
 	// Only charge the source-repo counter on a brand-new insert.
 	// Idempotent re-adds (same edgeKey) replace the slot in place and
 	// would otherwise double-count. addEdgeToBucket reports inserted ==
@@ -2185,6 +2300,19 @@ func (g *Graph) AddEdge(e *Edge) {
 			srcRepo = src.RepoPrefix
 		}
 		sFrom.repoEdgeAdd(srcRepo, e)
+	}
+	unlock()
+
+	if inserted {
+		file := e.FilePath
+		if file == "" {
+			if src := g.GetNode(e.From); src != nil {
+				file = src.FilePath
+			}
+		}
+		g.recordAddedEdgeForReceipts(e, file)
+	} else if old != nil && old.Alias != e.Alias {
+		g.markMutationReceiptsIncomplete()
 	}
 }
 
@@ -2306,6 +2434,11 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 	if oldTo == e.To {
 		return
 	}
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	g.markMutationReceiptsIncomplete()
 	// Must lock the From shard too — we mutate sFrom.outEdgeIdx below,
 	// and without its lock a concurrent AddEdge on From panics the
 	// runtime with "concurrent map read and map write".
@@ -2587,6 +2720,11 @@ func (g *Graph) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 // path. Nodes for one file can span many shards (different IDs hash
 // differently), so we lock all shards for this multi-shard operation.
 func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()
 
@@ -2698,6 +2836,11 @@ func (g *Graph) evictEdgesLocked(evictedIDs map[string]string) int {
 // (same from/to/kind but different file/line — rare but possible),
 // removes the first one encountered.
 func (g *Graph) RemoveEdge(from, to string, kind EdgeKind) bool {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	g.markMutationReceiptsIncomplete()
 	unlock := g.lockTwoWrite(from, to)
 	defer unlock()
 
@@ -2986,6 +3129,11 @@ func (g *Graph) GetRepoEdges(repoPrefix string) []*Edge {
 // EvictRepo removes all nodes with matching RepoPrefix and all edges
 // referencing those nodes. Returns counts of removed nodes and edges.
 func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	g.markMutationReceiptsIncomplete()
 	g.lockAllWrite()
 	defer g.unlockAllWrite()
 

@@ -112,10 +112,11 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 // stays decoupled from the concrete *indexer.Watcher behind the server's
 // watcher field.
 func (s *Server) watchDegradedReason() string {
-	if s.watcher == nil {
+	watcher := s.currentWatcher()
+	if watcher == nil {
 		return ""
 	}
-	if dr, ok := s.watcher.(interface{ DegradedReason() string }); ok {
+	if dr, ok := watcher.(interface{ DegradedReason() string }); ok {
 		return dr.DegradedReason()
 	}
 	return ""

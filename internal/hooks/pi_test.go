@@ -23,11 +23,8 @@ func TestHandlePi_SessionStartReturnsOrientation(t *testing.T) {
 	}
 }
 
-func TestHandlePi_ToolCallBlocksGreedyGlob(t *testing.T) {
-	// Greedy source glob denies only when the daemon is reachable.
-	prev := daemonReachableFn
-	daemonReachableFn = func() bool { return true }
-	t.Cleanup(func() { daemonReachableFn = prev })
+func TestHandlePi_ToolCallBlocksTrackedGreedyGlob(t *testing.T) {
+	stubTrackedScope(t, true)
 
 	d := handlePi([]byte(`{"event":"tool_call","tool_name":"Glob","tool_input":{"pattern":"**/*.go"},"cwd":"/tmp/repo"}`), 0, ModeDeny)
 	if !d.Block {
@@ -39,9 +36,7 @@ func TestHandlePi_ToolCallBlocksGreedyGlob(t *testing.T) {
 }
 
 func TestHandlePi_EnrichModeDowngradesBlockToContext(t *testing.T) {
-	prev := daemonReachableFn
-	daemonReachableFn = func() bool { return true }
-	t.Cleanup(func() { daemonReachableFn = prev })
+	stubTrackedScope(t, true)
 
 	d := handlePi([]byte(`{"event":"tool_call","tool_name":"Glob","tool_input":{"pattern":"**/*.go"},"cwd":"/tmp/repo"}`), 0, ModeEnrich)
 	if d.Block {
@@ -53,9 +48,7 @@ func TestHandlePi_EnrichModeDowngradesBlockToContext(t *testing.T) {
 }
 
 func TestHandlePi_GortexToolNeverBlocks(t *testing.T) {
-	prev := daemonReachableFn
-	daemonReachableFn = func() bool { return true }
-	t.Cleanup(func() { daemonReachableFn = prev })
+	stubTrackedScope(t, true)
 
 	// Even a name that would otherwise classify as a fallback is allowed
 	// when flagged as a Gortex graph tool.

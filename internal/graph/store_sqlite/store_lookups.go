@@ -1,6 +1,9 @@
 package store_sqlite
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -25,6 +28,12 @@ const lookupNodeCols = `id, kind, name, qual_name, file_path, start_line, end_li
 // transfers or decodes a single blob. Derived, not hand-duplicated, so it
 // can never drift out of sync with lookupNodeCols / scanNode.
 var lookupNodeColsLight = strings.TrimSuffix(lookupNodeCols, ", meta")
+
+// lookupNodeSummaryCols is the identity/location prefix consumed by
+// graph.NodeLightScanner. Unlike lookupNodeColsLight it deliberately excludes
+// promoted metadata columns too, so whole-graph algorithms do not allocate a
+// Meta map (or retain docs/signatures) for every node.
+var lookupNodeSummaryCols = strings.SplitN(lookupNodeCols, ", signature", 2)[0]
 
 const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason`
 
@@ -136,8 +145,183 @@ func (s *Store) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 }
 
 // GetInEdgesByNodeIDs is the incoming-edge twin of GetOutEdgesByNodeIDs.
+// GetNodeContext returns one node while allowing callers to cancel a blocked
+// SQLite read. It intentionally remains an optional extension of graph.Store
+// so in-memory and third-party stores keep their existing contract.
+func (s *Store) GetNodeContext(ctx context.Context, id string) (*graph.Node, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := s.stmtGetNode.QueryRowContext(ctx, id)
+	n, err := scanNode(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get node %q: %w", id, err)
+	}
+	return n, nil
+}
+
+// GetNodesByIDsContext batch-loads nodes with cancellable SQLite queries.
+// Partial results are returned with an error so safety-sensitive callers can
+// retain evidence while marking their result incomplete.
+func (s *Store) GetNodesByIDsContext(ctx context.Context, ids []string) (map[string]*graph.Node, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	uniq := dedupeNonEmpty(ids)
+	out := make(map[string]*graph.Node, len(uniq))
+	for i := 0; i < len(uniq); i += lookupChunkSize {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		end := minInt(i+lookupChunkSize, len(uniq))
+		chunk := uniq[i:end]
+		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `)`
+		rows, err := s.db.QueryContext(ctx, q, toAnyArgs(chunk)...)
+		if err != nil {
+			return out, fmt.Errorf("get nodes by ids: %w", err)
+		}
+		for rows.Next() {
+			n, scanErr := scanNode(rows)
+			if scanErr != nil {
+				_ = rows.Close()
+				return out, fmt.Errorf("scan node by id: %w", scanErr)
+			}
+			if n != nil {
+				out[n.ID] = n
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return out, fmt.Errorf("get nodes by ids: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return s.edgesByNodeIDs(ids, "to_id", func(e *graph.Edge) string { return e.To })
+}
+
+// GetInEdgesByNodeIDsContext is the bounded, cancellable incoming-edge read
+// used by reachability analysis. The ordinary Store interface intentionally
+// stays unchanged; reach detects this optional capability and falls back to
+// the in-memory batch read on backends that do not implement it.
+//
+// limit is a total row budget across every IN-list chunk. One extra row is
+// requested only to prove truncation, and QueryContext lets an expired impact
+// request interrupt SQLite instead of monopolising its single connection.
+// GetOutEdgesByNodeIDsContext returns at most limit outgoing edges and reports
+// whether additional rows exist. Every SQLite query observes ctx cancellation.
+func (s *Store) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+	uniq := dedupeNonEmpty(ids)
+	if len(uniq) == 0 {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		return nil, true, nil
+	}
+
+	out := make(map[string][]*graph.Edge, len(uniq))
+	total := 0
+	for i := 0; i < len(uniq); i += lookupChunkSize {
+		if err := ctx.Err(); err != nil {
+			return out, true, err
+		}
+		end := minInt(i+lookupChunkSize, len(uniq))
+		chunk := uniq[i:end]
+		remaining := limit - total
+		queryLimit := remaining + 1
+		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE from_id IN (` + inPlaceholders(len(chunk)) + `) LIMIT ?`
+		args := toAnyArgs(chunk)
+		args = append(args, queryLimit)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return out, true, err
+		}
+		for rows.Next() {
+			e, scanErr := scanEdgeLight(rows)
+			if scanErr != nil {
+				_ = rows.Close()
+				return out, true, scanErr
+			}
+			if total >= limit {
+				_ = rows.Close()
+				return out, true, nil
+			}
+			if e != nil {
+				out[e.From] = append(out[e.From], e)
+				total++
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return out, true, fmt.Errorf("bounded outgoing-edge query: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return out, true, err
+		}
+	}
+	return out, false, nil
+}
+
+func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+	uniq := dedupeNonEmpty(ids)
+	if len(uniq) == 0 {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		return nil, true, nil
+	}
+
+	out := make(map[string][]*graph.Edge, len(uniq))
+	total := 0
+	for i := 0; i < len(uniq); i += lookupChunkSize {
+		if err := ctx.Err(); err != nil {
+			return out, true, err
+		}
+		end := minInt(i+lookupChunkSize, len(uniq))
+		chunk := uniq[i:end]
+		remaining := limit - total
+		// remaining may be zero: fetch one proof row from later chunks so
+		// exactly-limit and greater-than-limit are distinguishable.
+		queryLimit := remaining + 1
+		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) LIMIT ?`
+		args := toAnyArgs(chunk)
+		args = append(args, queryLimit)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return out, true, err
+		}
+		for rows.Next() {
+			e, scanErr := scanEdgeLight(rows)
+			if scanErr != nil {
+				_ = rows.Close()
+				return out, true, scanErr
+			}
+			if total >= limit {
+				_ = rows.Close()
+				return out, true, nil
+			}
+			if e != nil {
+				out[e.To] = append(out[e.To], e)
+				total++
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return out, true, fmt.Errorf("bounded incoming-edge query: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return out, true, err
+		}
+	}
+	return out, false, nil
 }
 
 // edgesByNodeIDs runs the chunked IN-list edge fetch keyed on the given

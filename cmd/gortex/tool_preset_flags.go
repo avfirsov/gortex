@@ -15,6 +15,7 @@ func applyToolPresetFlags(cfg *config.Config, flagTools, flagMode string) {
 		return
 	}
 	if flagTools != "" {
+		cfg.MCP.Tools.Explicit = true
 		preset, allow, deny := gortexmcp.ParseToolSpec(flagTools)
 		if preset != "" {
 			cfg.MCP.Tools.Preset = preset
@@ -23,6 +24,7 @@ func applyToolPresetFlags(cfg *config.Config, flagTools, flagMode string) {
 		cfg.MCP.Tools.Deny = append(cfg.MCP.Tools.Deny, deny...)
 	}
 	if flagMode != "" {
+		cfg.MCP.Tools.Explicit = true
 		cfg.MCP.Tools.Mode = flagMode
 	}
 }

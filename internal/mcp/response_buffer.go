@@ -14,7 +14,10 @@ import (
 
 // defaultResponseBufferCap is how many recent tool responses a session
 // keeps available for post-filter re-cutting.
-const defaultResponseBufferCap = 8
+const (
+	defaultResponseBufferCap   = 8
+	defaultResponseBufferBytes = 8 << 20
+)
 
 // minCapturedResponseBytes is the capture floor: responses smaller
 // than this are cheap to re-fetch, so they never displace a ring slot.
@@ -43,15 +46,20 @@ type bufferedResponse struct {
 // It backs the post-filter tools (ctx_grep, ctx_slice, …) so an agent
 // can re-cut a prior result without re-issuing the original query.
 type responseBuffer struct {
-	mu      sync.Mutex
-	entries []bufferedResponse
-	seq     int
+	mu         sync.Mutex
+	entries    []bufferedResponse
+	totalBytes int
+	seq        int
 }
 
-// capture stores a response and returns its handle ID. The oldest
-// entry is evicted, and its backing memory released, once the ring is
-// full.
+// capture stores a response and returns its handle ID. The oldest entries are
+// evicted, and their strings released, once either the count or byte budget is
+// full. A single response larger than the whole budget is not retained.
 func (b *responseBuffer) capture(tool, text string) string {
+	if len(text) > defaultResponseBufferBytes {
+		return ""
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.seq++
@@ -62,10 +70,11 @@ func (b *responseBuffer) capture(tool, text string) string {
 		Text:       text,
 		CapturedAt: time.Now(),
 	})
-	if len(b.entries) > defaultResponseBufferCap {
-		trimmed := make([]bufferedResponse, defaultResponseBufferCap)
-		copy(trimmed, b.entries[len(b.entries)-defaultResponseBufferCap:])
-		b.entries = trimmed
+	b.totalBytes += len(text)
+	for len(b.entries) > defaultResponseBufferCap || b.totalBytes > defaultResponseBufferBytes {
+		b.totalBytes -= len(b.entries[0].Text)
+		b.entries[0] = bufferedResponse{}
+		b.entries = b.entries[1:]
 	}
 	return id
 }
@@ -120,8 +129,12 @@ func (s *Server) captureResponse(ctx context.Context, tool string, res *mcp.Call
 	if res == nil || res.IsError || postFilterTools[tool] {
 		return
 	}
-	text := normalizeForBuffer(toolResultText(res))
-	if len(text) < minCapturedResponseBytes {
+	raw := toolResultText(res)
+	if len(raw) < minCapturedResponseBytes || len(raw) > defaultResponseBufferBytes {
+		return
+	}
+	text := normalizeForBuffer(raw)
+	if len(text) > defaultResponseBufferBytes {
 		return
 	}
 	s.responseBufferFor(ctx).capture(tool, text)

@@ -174,6 +174,7 @@ func Modified() {}
 
 func TestWatcher_SymbolChangeCallback_Delete(t *testing.T) {
 	dir, _, w := setupWatcher(t)
+	require.NotEmpty(t, w.snapshotSymbols("main.go"), "setup must index Original before watching deletion")
 
 	type callbackData struct {
 		filePath   string
@@ -198,6 +199,69 @@ func TestWatcher_SymbolChangeCallback_Delete(t *testing.T) {
 	require.Len(t, calls, 1)
 
 	// Old symbols should have entries, new should be nil (deleted).
-	assert.NotEmpty(t, calls[0].oldSymbols)
+	assert.NotEmpty(t, calls[0].oldSymbols, "callback=%+v", calls[0])
 	assert.Nil(t, calls[0].newSymbols)
+}
+
+func TestWatcher_DirScanDeleteOverlapPublishesPrimaryOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	writeTestFile(t, path, `package main
+
+func Original() {}
+`)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	cfg := config.Default()
+	cfg.Index.Workers = 1
+	idx := New(g, reg, cfg.Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 50}, zap.NewNop())
+	require.NoError(t, err)
+
+	type callbackData struct {
+		oldSymbols []*graph.Node
+		newSymbols []*graph.Node
+	}
+	var calls []callbackData
+	w.OnSymbolChange(func(_ string, oldSymbols, newSymbols []*graph.Node) {
+		calls = append(calls, callbackData{oldSymbols: oldSymbols, newSymbols: newSymbols})
+	})
+
+	// Force the bad ordering deterministically: the file disappears, a
+	// new-directory discovery scan observes that absence first, and the real
+	// file event is delivered only afterward. Discovery must not consume the
+	// deletion or its pre-delete symbol snapshot.
+	require.NoError(t, os.Remove(path))
+	w.runDirScan(map[string]struct{}{dir: {}}, nil)
+	require.NotEmpty(t, g.FindNodesByName("Original"))
+
+	w.patchGraph(path, ChangeDeleted)
+	w.patchGraph(path, ChangeDeleted) // redundant producer is suppressed
+
+	require.Len(t, calls, 1)
+	require.NotEmpty(t, calls[0].oldSymbols)
+	oldNames := make([]string, 0, len(calls[0].oldSymbols))
+	for _, symbol := range calls[0].oldSymbols {
+		oldNames = append(oldNames, symbol.Name)
+	}
+	assert.Contains(t, oldNames, "Original")
+	assert.Nil(t, calls[0].newSymbols)
+
+	select {
+	case ev := <-w.Events():
+		assert.Equal(t, ChangeDeleted, ev.Kind)
+		assert.Positive(t, ev.NodesRemoved)
+	default:
+		t.Fatal("primary delete event was not published")
+	}
+	select {
+	case ev := <-w.Events():
+		t.Fatalf("duplicate delete event published: %+v", ev)
+	default:
+	}
 }

@@ -103,7 +103,7 @@ func TestEnrichGrep_SymbolMiss_FallsThrough(t *testing.T) {
 	if result.deny {
 		t.Fatal("miss should not deny")
 	}
-	if !strings.Contains(result.context, "PREFER graph tools") {
+	if !strings.Contains(result.context, `search(operation:"symbols"`) {
 		t.Error("miss should return soft guidance")
 	}
 	recs := readDecisions(t, logPath)
@@ -154,7 +154,7 @@ func TestEnrichGrep_DaemonUnreachable_NoTelemetry(t *testing.T) {
 	if result.deny {
 		t.Fatal("daemon unreachable should not deny")
 	}
-	if !strings.Contains(result.context, "PREFER graph tools") {
+	if !strings.Contains(result.context, `search(operation:"symbols"`) {
 		t.Error("daemon unreachable should still return soft guidance")
 	}
 	if recs := readDecisions(t, logPath); len(recs) != 0 {

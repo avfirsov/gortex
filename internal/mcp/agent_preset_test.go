@@ -27,32 +27,62 @@ func TestAgentPreset_Membership(t *testing.T) {
 	require.Equal(t, "agent", newToolPolicy(ToolPolicyConfig{Preset: "coding-agent"}, nil).preset)
 }
 
-// TestAgentPreset_ClientAwareDefault: a known coding-agent client gets the
-// lean agent surface with no configuration; an editor / unknown client
-// keeps the server's global core default; an explicit forwarded preset
-// overrides the client default.
-func TestAgentPreset_ClientAwareDefault(t *testing.T) {
+// TestClientAwareDefault: every identified client gets the same compact closed
+// surface; a pre-initialize session keeps the compatibility default; and an
+// explicit forwarded preset still wins.
+func TestClientAwareDefault(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 
-	// Known coding-agent client → agent surface (analyze deferred out).
+	// Known coding-agent client → compact domain surface.
 	srv.NoteSessionClient("sess_cc", "claude-code", "1.0")
 	cc := listToolNamesForSession(t, srv, "sess_cc")
-	require.True(t, cc["search_symbols"])
-	require.True(t, cc["edit_file"])
-	require.False(t, cc["analyze"], "analyze is not in the lean agent surface")
+	require.Equal(t, mapKeysAsSet(facadeToolNames()), cc)
+	require.True(t, cc["read"])
+	require.False(t, cc["read_file"])
 
-	// Editor / unknown client → the server's global core default (analyze in).
+	// An unknown editor is still an identified MCP client and gets the same
+	// JSON-safe compact surface.
 	srv.NoteSessionClient("sess_ed", "some-editor", "1.0")
 	ed := listToolNamesForSession(t, srv, "sess_ed")
-	require.True(t, ed["analyze"], "unknown client keeps the core default")
-	require.Greater(t, len(ed), len(cc), "core is wider than the lean agent surface")
+	require.Equal(t, mapKeysAsSet(facadeToolNames()), ed)
+	require.True(t, ed["read"])
+	require.False(t, ed["read_file"])
+
+	// Before initialize supplies clientInfo, the server global remains in force.
+	anonymous := listToolNamesForSession(t, srv, "sess_anonymous")
+	require.True(t, anonymous["read_file"])
+	require.False(t, anonymous["read"])
+	require.Greater(t, len(anonymous), len(cc), "core is wider than the compact surface")
 
 	// A forwarded GORTEX_TOOLS spec overrides the client-aware default.
 	srv.NoteSessionClient("sess_ov", "claude-code", "1.0")
 	srv.NoteSessionToolPolicy("sess_ov", "full", "")
 	ov := listToolNamesForSession(t, srv, "sess_ov")
-	require.True(t, ov["analyze"], "forwarded full overrides the agent default")
+	require.True(t, ov["analyze"], "forwarded full overrides the coding-client default")
 	require.True(t, ov["get_architecture"])
+	require.True(t, ov["read_file"])
+	require.False(t, ov["read"])
+}
+
+func TestExplicitCoreDeferPolicyOverridesNamedClientDefault(t *testing.T) {
+	srv := setupPresetServer(t, ToolPolicyConfig{
+		Preset: "core", Mode: "defer", OperatorPinned: true,
+	})
+	srv.NoteSessionClient("sess_rollback", "any-agent", "1.0")
+	tools := listToolNamesForSession(t, srv, "sess_rollback")
+	require.True(t, tools["read_file"])
+	require.False(t, tools["read"])
+}
+
+func TestCompactSurfaceIgnoresDeltasToKeepListAndGateAligned(t *testing.T) {
+	cfg := parseToolSpec("facade-v1,+read_file,-read")
+	p := newToolPolicy(cfg, nil)
+	require.True(t, p.allows("read"))
+	require.False(t, p.allows("read_file"))
+
+	srv := setupPresetServer(t, cfg)
+	srv.NoteSessionClient("sess_closed", "any-agent", "1.0")
+	require.Equal(t, mapKeysAsSet(facadeToolNames()), listToolNamesForSession(t, srv, "sess_closed"))
 }
 
 // paramDescLen returns the length of a parameter's description in one tool's

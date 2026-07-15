@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"sync"
 	"time"
@@ -17,10 +21,14 @@ import (
 // socket connection closes. The daemon routes every inbound frame to its
 // session by looking up the net.Conn in the session registry.
 type Session struct {
-	ID         string
-	Mode       ConnectionMode
-	CWD        string
-	ClientName string
+	ID string
+	// LogicalSessionID is non-empty for an MCP proxy session that may detach
+	// from one socket and rebind to another while its proxy PID remains alive.
+	// ID equals this token so all daemon/MCP state continues using one key.
+	LogicalSessionID string
+	Mode             ConnectionMode
+	CWD              string
+	ClientName       string
 	// ClientVersion is the version reported by the MCP client in its
 	// `initialize` request (`params.clientInfo.version`). Empty until
 	// the daemon dispatcher sees that frame; the env-var sniff in
@@ -59,6 +67,15 @@ type Session struct {
 	SymHistory   any
 	TokenStats   any
 
+	// responseMu serializes logical-session MCP dispatch and protects the
+	// bounded response cache. Caching before socket write gives reconnect
+	// replay at-least-once response semantics without repeating side effects.
+	responseMu       sync.Mutex
+	responseCache    map[string]cachedMCPResponse
+	responseOrder    []string
+	responseInFlight map[mcpResponseFlightKey]*mcpResponseFlight
+	responseBytes    int
+
 	// remoteOverrides is the per-session enable/disable layer over the
 	// global roster: slug -> enabled. An absent slug means "no
 	// override" (the global Enabled state wins). It is ephemeral by
@@ -72,6 +89,186 @@ type Session struct {
 	// remoteOverrides, which can be updated by the dispatcher and the
 	// proxy-toggle tools mid-session.
 	mu sync.RWMutex
+}
+
+const (
+	sessionResponseCacheEntries       = 64
+	sessionResponseCacheBytes         = 8 << 20
+	MCPResponseCacheMaxIDBytes        = 4 << 10
+	sessionResponseCacheEntryOverhead = sha256.Size + 64
+)
+
+type cachedMCPResponse struct {
+	requestDigest [sha256.Size]byte
+	response      []byte
+	size          int
+}
+
+type mcpResponseFlightKey struct {
+	id     string
+	digest [sha256.Size]byte
+}
+
+type mcpResponseFlight struct {
+	done     chan struct{}
+	response []byte
+	err      error
+}
+
+// dispatchMCPOnce returns a cached serialized response when the same logical
+// dispatchMCPOnce returns a response already produced for an identical request
+// in the same logical session. Identical concurrent requests share one dispatch,
+// while unrelated requests remain independent even if one handler blocks.
+func (s *Session) dispatchMCPOnce(request []byte, dispatch func() ([]byte, error)) ([]byte, bool, error) {
+	return s.dispatchMCPOnceContext(context.Background(), request, dispatch)
+}
+
+func (s *Session) dispatchMCPOnceContext(ctx context.Context, request []byte, dispatch func() ([]byte, error)) ([]byte, bool, error) {
+	if s == nil || s.LogicalSessionID == "" {
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
+		return reply, false, err
+	}
+	identity, cacheable := parseMCPReplayIdentity(request)
+	if !cacheable {
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
+		return reply, false, err
+	}
+	key, digest := identity.key, identity.digest
+	if len(key) > MCPResponseCacheMaxIDBytes {
+		reply, err := dispatchMCPWithContext(ctx, dispatch)
+		return reply, false, err
+	}
+
+	flightKey := mcpResponseFlightKey{id: key, digest: digest}
+
+retryFlight:
+	s.responseMu.Lock()
+	if cached, ok := s.responseCache[key]; ok && cached.requestDigest == digest {
+		reply := append([]byte(nil), cached.response...)
+		s.responseMu.Unlock()
+		signalMCPDispatchAdmission(ctx)
+		return reply, true, nil
+	}
+	if existing, ok := s.responseInFlight[flightKey]; ok {
+		s.responseMu.Unlock()
+		signalMCPDispatchAdmission(ctx)
+		select {
+		case <-existing.done:
+			if existing.err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, false, ctxErr
+				}
+				goto retryFlight
+			}
+			return append([]byte(nil), existing.response...), true, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+	if s.responseInFlight == nil {
+		s.responseInFlight = make(map[mcpResponseFlightKey]*mcpResponseFlight)
+	}
+	flight := &mcpResponseFlight{done: make(chan struct{})}
+	s.responseInFlight[flightKey] = flight
+	s.responseMu.Unlock()
+
+	reply, err := dispatchMCPWithContext(ctx, dispatch)
+	copyReply := append([]byte(nil), reply...)
+
+	s.responseMu.Lock()
+	current, ownsFlight := s.responseInFlight[flightKey]
+	if !ownsFlight || current != flight {
+		s.responseMu.Unlock()
+		return reply, false, err
+	}
+	flight.response = copyReply
+	flight.err = err
+	if err == nil && len(copyReply) > 0 {
+		entrySize := len(key) + len(copyReply) + sessionResponseCacheEntryOverhead
+		if entrySize <= sessionResponseCacheBytes {
+			if s.responseCache == nil {
+				s.responseCache = make(map[string]cachedMCPResponse)
+			}
+			if previous, ok := s.responseCache[key]; ok {
+				s.responseBytes -= previous.size
+				delete(s.responseCache, key)
+				for i, ordered := range s.responseOrder {
+					if ordered == key {
+						s.responseOrder = append(s.responseOrder[:i], s.responseOrder[i+1:]...)
+						break
+					}
+				}
+			}
+			for len(s.responseOrder) > 0 &&
+				(len(s.responseOrder) >= sessionResponseCacheEntries || s.responseBytes+entrySize > sessionResponseCacheBytes) {
+				oldest := s.responseOrder[0]
+				s.responseOrder = s.responseOrder[1:]
+				if evicted, ok := s.responseCache[oldest]; ok {
+					s.responseBytes -= evicted.size
+					delete(s.responseCache, oldest)
+				}
+			}
+			s.responseOrder = append(s.responseOrder, key)
+			s.responseCache[key] = cachedMCPResponse{
+				requestDigest: digest,
+				response:      copyReply,
+				size:          entrySize,
+			}
+			s.responseBytes += entrySize
+		}
+	}
+	delete(s.responseInFlight, flightKey)
+	close(flight.done)
+	s.responseMu.Unlock()
+	return reply, false, err
+}
+
+type mcpReplayIdentity struct {
+	key    string
+	digest [sha256.Size]byte
+}
+
+func parseMCPReplayIdentity(request []byte) (mcpReplayIdentity, bool) {
+	trimmed := bytes.TrimSpace(request)
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &envelope) != nil {
+		return mcpReplayIdentity{}, false
+	}
+	var method string
+	if raw, ok := envelope["method"]; !ok || json.Unmarshal(raw, &method) != nil || method == "" {
+		return mcpReplayIdentity{}, false
+	}
+	rawID, present := envelope["id"]
+	if !present {
+		return mcpReplayIdentity{}, false // notification
+	}
+	rawID = bytes.TrimSpace(rawID)
+	canonicalID, valid := canonicalMCPRequestID(rawID)
+	if !valid {
+		return mcpReplayIdentity{}, false
+	}
+
+	// Normalize only the request ID representation before hashing. The digest
+	// still distinguishes different methods, params, and extension fields, while
+	// equivalent JSON string escapes share replay and singleflight state.
+	normalizedID, err := json.Marshal(canonicalID)
+	if err != nil {
+		return mcpReplayIdentity{}, false
+	}
+	envelope["id"] = normalizedID
+	normalizedRequest, err := json.Marshal(envelope)
+	if err != nil {
+		return mcpReplayIdentity{}, false
+	}
+	return mcpReplayIdentity{
+		key:    canonicalID,
+		digest: sha256.Sum256(normalizedRequest),
+	}, true
+}
+
+func mcpResponseCacheIdentity(request []byte) (string, [sha256.Size]byte, bool) {
+	identity, ok := parseMCPReplayIdentity(request)
+	return identity.key, identity.digest, ok
 }
 
 // SetClientInfo updates the session's client metadata from the MCP
@@ -168,8 +365,46 @@ func NewSessionRegistry() *SessionRegistry {
 // Register creates and stores a new session for the given connection.
 // Called after a successful handshake. Generates the session ID.
 func (r *SessionRegistry) Register(conn net.Conn, h Handshake) *Session {
+	logicalID := ""
+	if h.Mode == ModeMCP && h.PID > 0 {
+		logicalID = h.LogicalSessionID
+	}
+
+	r.mu.Lock()
+	if logicalID != "" {
+		if existing := r.sessions[logicalID]; existing != nil &&
+			existing.LogicalSessionID == logicalID &&
+			existing.Mode == h.Mode &&
+			existing.ClientPID == h.PID &&
+			existing.CWD == h.CWD &&
+			existing.ToolSpec == h.Tools &&
+			existing.ToolMode == h.ToolsMode {
+			oldConn := existing.Conn
+			if oldConn != nil {
+				delete(r.byConn, oldConn)
+			}
+			existing.Conn = conn
+			r.byConn[conn] = existing
+			r.mu.Unlock()
+			if oldConn != nil && oldConn != conn {
+				_ = oldConn.Close()
+			}
+			return existing
+		}
+		// Never overwrite a non-logical session that happens to share the
+		// requested token. Fall back to an ordinary generated ID instead.
+		if r.sessions[logicalID] != nil {
+			logicalID = ""
+		}
+	}
+
+	id := newSessionID()
+	if logicalID != "" {
+		id = logicalID
+	}
 	s := &Session{
-		ID:               newSessionID(),
+		ID:               id,
+		LogicalSessionID: logicalID,
 		Mode:             h.Mode,
 		CWD:              h.CWD,
 		ClientName:       h.ClientName,
@@ -180,7 +415,6 @@ func (r *SessionRegistry) Register(conn net.Conn, h Handshake) *Session {
 		StartedAt:        time.Now(),
 		Conn:             conn,
 	}
-	r.mu.Lock()
 	r.sessions[s.ID] = s
 	r.byConn[conn] = s
 	r.mu.Unlock()
@@ -244,6 +478,16 @@ func (r *SessionRegistry) GetByID(id string) *Session {
 	return r.sessions[id]
 }
 
+// IsAttached reports whether id currently owns a live socket. It is the safe
+// observation point for reconnect coordination; callers must not read
+// Session.Conn directly while Register/Remove may rebind it.
+func (r *SessionRegistry) IsAttached(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s := r.sessions[id]
+	return s != nil && s.Conn != nil
+}
+
 // Remove deletes the session for a connection. Idempotent — safe to call
 // from both the accept-loop's defer and the shutdown path.
 func (r *SessionRegistry) Remove(conn net.Conn) *Session {
@@ -254,6 +498,18 @@ func (r *SessionRegistry) Remove(conn net.Conn) *Session {
 		return nil
 	}
 	delete(r.byConn, conn)
+	if s.LogicalSessionID != "" && s.Conn == conn {
+		// Keep the logical session and its MCP-owned state while the proxy
+		// process lives. A later handshake rebinds it; SweepDead performs the
+		// final removal and SessionEnded cleanup after the proxy PID exits.
+		s.Conn = nil
+		return nil
+	}
+	if s.Conn != conn {
+		// This was an old socket that lost a rebind race. The new connection
+		// owns the session and must not be torn down by the old handler.
+		return nil
+	}
 	delete(r.sessions, s.ID)
 	return s
 }

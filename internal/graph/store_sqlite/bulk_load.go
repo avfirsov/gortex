@@ -153,6 +153,9 @@ func (s *Store) BeginBulkLoad() {
 	s.bulkConn = conn
 	s.bulkPrevSync = prevSync
 	s.bulkPrevCacheSize = prevCache
+	// The bulk path changes durability and secondary-index maintenance outside
+	// the ordinary row mutation protocol. Active receipts therefore fail closed.
+	s.markMutationReceiptsIncompleteLocked()
 }
 
 // FlushBulk exits the bulk-load fast path: it rebuilds every index
@@ -174,6 +177,10 @@ func (s *Store) FlushBulk() error {
 	}
 	// Detach first: the fast path is over regardless of the outcome below.
 	s.bulkConn = nil
+	// A receipt may have started after BeginBulkLoad. Rebuilding the dropped
+	// indexes is outside the ordinary row protocol, so that window also fails
+	// closed even when restoration later returns an error.
+	s.markMutationReceiptsIncompleteLocked()
 
 	ctx := context.Background()
 	defer func() {

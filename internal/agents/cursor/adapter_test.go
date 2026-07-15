@@ -3,11 +3,28 @@ package cursor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
 )
+
+func TestWorkflowRuleUsesCompactMCPTools(t *testing.T) {
+	for _, required := range []string{"explore", "search", "read", "relations", "trace", "change", "edit", "refactor", "capabilities"} {
+		if !strings.Contains(workflowRuleBody, required) {
+			t.Errorf("workflow rule missing compact tool %q", required)
+		}
+	}
+	for _, legacy := range []string{"smart_context", "search_symbols", "get_symbol_source", "find_usages", "get_callers", "verify_change", "read_file"} {
+		if strings.Contains(workflowRuleBody, legacy) {
+			t.Errorf("workflow rule contains legacy MCP tool %q", legacy)
+		}
+	}
+	if strings.Contains(workflowRuleBody, "facade-v1") {
+		t.Error("workflow rule should not expose an implementation version")
+	}
+}
 
 // TestCursorCreatesMergesAndSkips covers the three behavioural
 // phases every adapter must honour:

@@ -39,8 +39,8 @@ func newImpactTestServer(t *testing.T) *Server {
 	}
 	s.analysisMu.Lock()
 	s.pageRank = analysis.ComputePageRank(g)
-	s.communities = analysis.DetectCommunities(g)
 	s.analysisMu.Unlock()
+	installCommunitiesForTest(s, analysis.DetectCommunities(g))
 	// Consume the co-change once-guard so ensureCoChange does not
 	// shell out to git during the test.
 	s.cochangeOnce.Do(func() {})

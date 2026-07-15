@@ -423,7 +423,7 @@ func (e *RustExtractor) emitFunction(m parser.QueryResult, filePath, fileID stri
 
 	doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash)
 	visibility := rustVisibility(def.Node, src)
-	typeParams := rustTypeParams(def.Node, src)
+	typeParams := rustEffectiveTypeParams(def.Node, src)
 	complexity, cognitive, loopDepth := 0, 0, 0
 	if def.Node != nil {
 		if body := def.Node.ChildByFieldName("body"); body != nil {
@@ -594,6 +594,214 @@ func rustTypeParams(item *sitter.Node, src []byte) []map[string]string {
 		}
 	}
 	return out
+}
+
+// rustEffectiveTypeParams returns the generic parameters visible inside a
+// function. Methods inherit parameters declared on their enclosing impl block,
+// and both impl/function where clauses refine those parameters. Keeping the
+// effective bounds on the emitted function node lets the scope resolver bind a
+// call such as `matcher.is_match()` when `matcher: M` and `M: Matcher`.
+func rustEffectiveTypeParams(fn *sitter.Node, src []byte) []map[string]string {
+	var out []map[string]string
+	if impl := rustEnclosingImplItem(fn); impl != nil {
+		out = rustMergeTypeParams(out, rustTypeParams(impl, src))
+		out = rustApplyWhereBounds(out, rustWhereBounds(impl, src))
+	}
+	out = rustMergeTypeParams(out, rustTypeParams(fn, src))
+	return rustApplyWhereBounds(out, rustWhereBounds(fn, src))
+}
+
+func rustEnclosingImplItem(fn *sitter.Node) *sitter.Node {
+	if fn == nil {
+		return nil
+	}
+	parent := fn.Parent()
+	if parent == nil || parent.Type() != "declaration_list" {
+		return nil
+	}
+	impl := parent.Parent()
+	if impl == nil || impl.Type() != "impl_item" {
+		return nil
+	}
+	return impl
+}
+
+func rustMergeTypeParams(dst, src []map[string]string) []map[string]string {
+	positions := make(map[string]int, len(dst)+len(src))
+	out := make([]map[string]string, 0, len(dst)+len(src))
+	for _, entry := range dst {
+		if name := entry["name"]; name != "" {
+			positions[name] = len(out)
+			out = append(out, rustCloneTypeParam(entry))
+		}
+	}
+	for _, entry := range src {
+		name := entry["name"]
+		if name == "" {
+			continue
+		}
+		copy := rustCloneTypeParam(entry)
+		if pos, ok := positions[name]; ok {
+			out[pos] = copy
+			continue
+		}
+		positions[name] = len(out)
+		out = append(out, copy)
+	}
+	return out
+}
+
+func rustCloneTypeParam(entry map[string]string) map[string]string {
+	copy := make(map[string]string, len(entry))
+	for key, value := range entry {
+		copy[key] = value
+	}
+	return copy
+}
+
+func rustApplyWhereBounds(params []map[string]string, bounds map[string]string) []map[string]string {
+	if len(params) == 0 || len(bounds) == 0 {
+		return params
+	}
+	for _, entry := range params {
+		bound := bounds[entry["name"]]
+		if bound == "" {
+			continue
+		}
+		if existing := strings.TrimSpace(entry["bound"]); existing != "" {
+			entry["bound"] = existing + " + " + bound
+		} else {
+			entry["bound"] = bound
+		}
+	}
+	return params
+}
+
+// rustWhereBounds extracts the common `where M: Matcher + Send` shape. It is
+// intentionally conservative: only predicates whose left side is a simple
+// generic identifier are retained; lifetime and associated-type predicates are
+// ignored rather than guessed.
+func rustWhereBounds(item *sitter.Node, src []byte) map[string]string {
+	if item == nil {
+		return nil
+	}
+	var clause *sitter.Node
+	for i, n := 0, int(item.ChildCount()); i < n; i++ {
+		child := item.Child(i)
+		if child != nil && child.Type() == "where_clause" {
+			clause = child
+			break
+		}
+	}
+	if clause == nil {
+		return nil
+	}
+	text := strings.TrimSpace(clause.Content(src))
+	text = strings.TrimSpace(strings.TrimPrefix(text, "where"))
+	out := map[string]string{}
+	for _, predicate := range rustSplitTopLevel(text, ',') {
+		left, right, ok := rustSplitWherePredicate(predicate)
+		if !ok || !rustSimpleIdentifier(left) {
+			continue
+		}
+		if prior := out[left]; prior != "" {
+			out[left] = prior + " + " + right
+		} else {
+			out[left] = right
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func rustSplitWherePredicate(predicate string) (string, string, bool) {
+	predicate = strings.TrimSpace(predicate)
+	angle, paren, bracket := 0, 0, 0
+	for i := 0; i < len(predicate); i++ {
+		switch predicate[i] {
+		case '<':
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		case ':':
+			if angle != 0 || paren != 0 || bracket != 0 ||
+				(i > 0 && predicate[i-1] == ':') ||
+				(i+1 < len(predicate) && predicate[i+1] == ':') {
+				continue
+			}
+			left := strings.TrimSpace(predicate[:i])
+			right := strings.TrimSpace(predicate[i+1:])
+			return left, right, left != "" && right != ""
+		}
+	}
+	return "", "", false
+}
+
+func rustSplitTopLevel(text string, separator byte) []string {
+	var out []string
+	start := 0
+	angle, paren, bracket := 0, 0, 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '<':
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		default:
+			if text[i] == separator && angle == 0 && paren == 0 && bracket == 0 {
+				out = append(out, strings.TrimSpace(text[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(text[start:]); tail != "" {
+		out = append(out, tail)
+	}
+	return out
+}
+
+func rustSimpleIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // emitRustThrowsEdges inspects a function's return type for a Result
@@ -944,6 +1152,24 @@ func (e *RustExtractor) emitTrait(m parser.QueryResult, filePath, fileID string,
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	bounds := def.Node.ChildByFieldName("bounds")
+	if bounds == nil {
+		for child := range def.Node.NamedChildren() {
+			if child.Type() == "trait_bounds" {
+				bounds = child
+				break
+			}
+		}
+	}
+	if bounds != nil {
+		for _, parentPath := range rustPositiveTraitBounds(bounds.Content(src)) {
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: id, To: "unresolved::extends::" + parentPath,
+				Kind: graph.EdgeExtends, FilePath: filePath, Line: def.StartLine + 1,
+				Meta: map[string]any{"rust_trait_path": parentPath},
+			})
+		}
+	}
 	emitRustAnnotationEdges(rustCollectAttributes(def.Node), id, filePath, src, result, annotationSeen)
 	emitRustGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 }

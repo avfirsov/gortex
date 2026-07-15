@@ -84,6 +84,14 @@ func languageFiles(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) [
 		if !langs[n.Language] || n.RepoPrefix != repoPrefix {
 			continue
 		}
+		// Match the manager/LSP enrichment policy: vendored and generated
+		// sources are intentionally outside semantic coverage. Without this
+		// gate, one real source file can make the provider reparse an entire
+		// dependency or generated tree that did not count as language-presence
+		// evidence in the first place.
+		if semantic.IsLowValueForEnrichment(n.FilePath, nil) {
+			continue
+		}
 		ref, ok := fileRefFor(n, repoRoot)
 		if !ok {
 			continue
@@ -153,6 +161,18 @@ type applier struct {
 	// adaptations, built in the alias phase and consulted when a call's
 	// method name is not a direct or inherited member.
 	aliases map[string][]resolvedAlias
+	// languages is the immutable set served by spec. Keeping it once per
+	// pass avoids rebuilding the same map for every receiver-type fact.
+	languages map[string]bool
+	// typeCandidatesCache memoizes the store's name lookup. The apply phase
+	// never creates nodes, so the candidate set is immutable for its lifetime;
+	// only edges and metadata change between its ordered phases.
+	typeCandidatesCache map[typeCandidateKey][]*graph.Node
+	// methodCache memoizes the inheritance/member walk after the supertype
+	// phase has completed. The depth belongs in the key because the walk is
+	// intentionally bounded and a lookup reached near the bound can differ
+	// from the same lookup started at the root.
+	methodCache map[methodLookupKey]*graph.Node
 	// extensions indexes the language's extension functions by
 	// (receiver-type-name, method-name). An extension `fun Foo.ext()` is
 	// callable as `recv.ext()` on any Foo receiver but is declared at file
@@ -173,13 +193,34 @@ type extKey struct {
 	method   string
 }
 
+type typeCandidateKey struct {
+	repoPrefix string
+	name       string
+}
+
+type methodLookupKey struct {
+	typeID   string
+	method   string
+	argCount int
+	depth    int
+}
+
 func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
+	languages := make(map[string]bool)
+	if spec != nil {
+		for _, language := range spec.Languages {
+			languages[language] = true
+		}
+	}
 	return &applier{
-		g:            g,
-		spec:         spec,
-		provider:     provider,
-		stampedNodes: make(map[string]*graph.Node),
-		aliases:      make(map[string][]resolvedAlias),
+		g:                   g,
+		spec:                spec,
+		provider:            provider,
+		stampedNodes:        make(map[string]*graph.Node),
+		aliases:             make(map[string][]resolvedAlias),
+		languages:           languages,
+		typeCandidatesCache: make(map[typeCandidateKey][]*graph.Node),
+		methodCache:         make(map[methodLookupKey]*graph.Node),
 	}
 }
 
@@ -344,11 +385,15 @@ func (a *applier) resolveNodeOfKinds(idx *fileIndex, name string, sameFile map[s
 }
 
 func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.NodeKind]bool) []*graph.Node {
-	var raw []*graph.Node
-	if idx.facts.repoPrefix != "" {
-		raw = a.g.FindNodesByNameInRepo(name, idx.facts.repoPrefix)
-	} else {
-		raw = a.g.FindNodesByName(name)
+	key := typeCandidateKey{repoPrefix: idx.facts.repoPrefix, name: name}
+	raw, ok := a.typeCandidatesCache[key]
+	if !ok {
+		if idx.facts.repoPrefix != "" {
+			raw = a.g.FindNodesByNameInRepo(name, idx.facts.repoPrefix)
+		} else {
+			raw = a.g.FindNodesByName(name)
+		}
+		a.typeCandidatesCache[key] = raw
 	}
 	lang := a.languageSet()
 	var out []*graph.Node
@@ -365,11 +410,7 @@ func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.No
 }
 
 func (a *applier) languageSet() map[string]bool {
-	set := make(map[string]bool, len(a.spec.Languages))
-	for _, l := range a.spec.Languages {
-		set[l] = true
-	}
-	return set
+	return a.languages
 }
 
 // importMatches reports whether a candidate definition file plausibly
@@ -415,10 +456,16 @@ func pathSegSuffix(cand, want string) bool {
 // argument count (argCount) may still pick a unique target by arity;
 // argCount < 0 means the arity is unknown, in which case an overload
 // set stays untouched rather than half-guessed.
-func (a *applier) methodOn(typeNode *graph.Node, method string, argCount, depth int) *graph.Node {
+func (a *applier) methodOn(typeNode *graph.Node, method string, argCount, depth int) (result *graph.Node) {
 	if typeNode == nil || depth > extendsWalkDepth {
 		return nil
 	}
+	key := methodLookupKey{typeID: typeNode.ID, method: method, argCount: argCount, depth: depth}
+	if cached, ok := a.methodCache[key]; ok {
+		return cached
+	}
+	defer func() { a.methodCache[key] = result }()
+
 	var fromIDs []string
 	for _, e := range a.g.GetInEdges(typeNode.ID) {
 		if e.Kind == graph.EdgeMemberOf {
@@ -1148,14 +1195,17 @@ func (a *applier) confirmAST(e *graph.Edge) bool {
 	// a non-empty Origin here would wrongly let those edges through and
 	// clobber both their tier and their semantic_source — so the only
 	// gate is the effective-rank comparison.
-	if graph.OriginRank(effectiveOrigin(e)) >= graph.OriginRank(graph.OriginASTResolved) {
+	origin := effectiveOrigin(e)
+	if graph.OriginRank(origin) >= graph.OriginRank(graph.OriginASTResolved) {
 		// Origin is already AST-or-better — never downgrade it. But an edge the
-		// extractor emitted carries OriginASTResolved with NO semantic_source
-		// (e.g. an AST-level extends/implements reference form); the engine
-		// grounded this relation, so still credit the provider and raise
-		// confidence to the AST ceiling when those are missing, without
-		// touching the origin/tier.
+		// extractor emitted may carry that provenance only implicitly (for
+		// example, a structural extends edge with no Origin field). Materialize
+		// the effective tier while crediting the provider and raising confidence.
 		changed := false
+		if e.Origin == "" && origin == graph.OriginASTResolved {
+			e.Origin = origin
+			changed = true
+		}
 		if e.Meta == nil {
 			e.Meta = make(map[string]any)
 		}

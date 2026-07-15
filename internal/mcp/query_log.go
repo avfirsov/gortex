@@ -37,6 +37,10 @@ import (
 type queryLogRecord struct {
 	TS            string  `json:"ts"`
 	Tool          string  `json:"tool"`
+	Surface       string  `json:"surface,omitempty"`
+	Facade        string  `json:"facade,omitempty"`
+	Operation     string  `json:"operation,omitempty"`
+	CanonicalTool string  `json:"canonical_tool,omitempty"`
 	Repo          string  `json:"repo,omitempty"`
 	Project       string  `json:"project,omitempty"`
 	Question      string  `json:"question"`
@@ -81,6 +85,13 @@ var retrievalToolSpecs = map[string]queryToolSpec{
 	"suggest_queries":         {questionKeys: []string{"query", "task"}, corpus: "suggest"},
 	"search_artifacts":        {questionKeys: []string{"query"}, corpus: "artifacts"},
 	"graph_completion_search": {questionKeys: []string{"query", "prefix"}, corpus: "completion"},
+}
+
+var facadeRetrievalTools = map[string]bool{
+	"explore": true, "search": true, "read": true, "relations": true,
+	"trace": true, "analyze": true, "ask": true, "change": true,
+	"review": true, "pr": true, "recall": true, "workspace": true,
+	"response": true,
 }
 
 // countResultKeys are the JSON array keys a retrieval response is most
@@ -144,7 +155,7 @@ func (q *queryLogger) shouldLog(tool string) bool {
 		return false
 	}
 	_, ok := retrievalToolSpecs[tool]
-	return ok
+	return ok || facadeRetrievalTools[tool]
 }
 
 // Path returns the resolved log file path ("" when disabled).
@@ -164,11 +175,17 @@ func (q *queryLogger) record(s *Server, ctx context.Context, req mcp.CallToolReq
 	}
 	tool := req.Params.Name
 	spec, ok := retrievalToolSpecs[tool]
-	if !ok {
+	if !ok && !facadeRetrievalTools[tool] {
 		return
+	}
+	if !ok {
+		spec = queryToolSpec{questionKeys: []string{"query", "task", "question", "symbol", "id", "name"}, corpus: "facade"}
 	}
 	args := req.GetArguments()
 	question := firstStringArg(args, spec.questionKeys)
+	if question == "" {
+		question = nestedFacadeQuestion(args)
+	}
 	corpus := spec.corpus
 	if spec.corpusKey != "" {
 		if c := stringArg(args, spec.corpusKey); c != "" {
@@ -200,6 +217,20 @@ func (q *queryLogger) record(s *Server, ctx context.Context, req mcp.CallToolReq
 	if s != nil {
 		rec.Repo, rec.Project = s.sessionLocality(ctx)
 		rec.Session = SessionIDFromContext(ctx)
+		if p := s.effectiveSessionPolicy(ctx); p != nil && p.preset == FacadeSurfaceVersion && isFacadeToolName(tool) {
+			rec.Surface = FacadeSurfaceVersion
+			rec.Facade = tool
+			rec.Operation = normalizeFacadeOperation(stringArg(args, "operation"))
+			if tool == "analyze" {
+				rec.Operation = normalizeFacadeOperation(stringArg(args, "kind"))
+			}
+			if rec.Operation == "" {
+				rec.Operation = defaultFacadeOperation(tool)
+			}
+			if op, found := s.facades.operation(tool, rec.Operation); found {
+				rec.CanonicalTool = op.Legacy
+			}
+		}
 	}
 	if !okCall {
 		if hErr != nil {
@@ -217,6 +248,19 @@ func (q *queryLogger) record(s *Server, ctx context.Context, req mcp.CallToolReq
 		return
 	}
 	q.append(line)
+}
+
+func nestedFacadeQuestion(args map[string]any) string {
+	for _, field := range []string{"target", "source", "arguments", "options"} {
+		obj, ok := args[field].(map[string]any)
+		if !ok {
+			continue
+		}
+		if value := firstStringArg(obj, []string{"query", "task", "question", "symbol", "file", "id", "name"}); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // append writes one JSONL line, opening (and rotating) the file lazily.

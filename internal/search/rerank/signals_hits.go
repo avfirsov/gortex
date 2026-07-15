@@ -23,17 +23,14 @@ type HITSSignal struct{}
 func (HITSSignal) Name() string { return SignalHITS }
 
 func (HITSSignal) Contribute(_ string, c *Candidate, ctx *Context) float64 {
-	if ctx == nil || ctx.AuthorityOf == nil || c == nil || c.Node == nil {
+	if ctx == nil || c == nil || c.Node == nil {
 		return 0
 	}
-	authority := ctx.AuthorityOf(c.Node.ID)
-	if authority <= 0 {
+	authority, available := ctx.authorityFor(c.Node.ID)
+	if !available || authority <= 0 {
 		return 0
 	}
-	var hub float64
-	if ctx.HubOf != nil {
-		hub = ctx.HubOf(c.Node.ID)
-	}
+	hub, _ := ctx.hubFor(c.Node.ID)
 	// authority is already normalised into [0, 1] by buildRerankContext;
 	// hub likewise. The hub penalty divides by (1 + hub), so a pure
 	// authority (hub == 0) keeps its full score while a strong hub

@@ -64,11 +64,9 @@ func TestSurprising_CrossCommunityFires(t *testing.T) {
 	s.graph.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls})
 
 	// Two different communities so cross_community fires.
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(s, &analysis.CommunityResult{
 		NodeToComm: map[string]string{"a": "c1", "b": "c2"},
-	}
-	s.analysisMu.Unlock()
+	})
 
 	out := callSurprisingHandler(t, s, map[string]any{"min_score": 0.1})
 	row := findEdgeRow(out, "a", "b")
@@ -151,9 +149,9 @@ func TestSurprising_MinScoreFilters(t *testing.T) {
 	s.graph.AddNode(&graph.Node{ID: "a", Name: "a", Kind: graph.KindFunction, FilePath: "p/a.go", Language: "go"})
 	s.graph.AddNode(&graph.Node{ID: "b", Name: "b", Kind: graph.KindFunction, FilePath: "p/b.go", Language: "go"})
 	s.graph.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls})
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{NodeToComm: map[string]string{"a": "c1", "b": "c1"}}
-	s.analysisMu.Unlock()
+	installCommunitiesForTest(s, &analysis.CommunityResult{
+		NodeToComm: map[string]string{"a": "c1", "b": "c1"},
+	})
 
 	out := callSurprisingHandler(t, s, map[string]any{"min_score": 0.3})
 	conns, _ := out["connections"].([]any)
@@ -183,9 +181,9 @@ func TestSurprising_CompositeScoreStacks(t *testing.T) {
 	s.graph.AddNode(&graph.Node{ID: "a", Name: "a", Kind: graph.KindFunction, FilePath: "p/a.go", Language: "go"})
 	s.graph.AddNode(&graph.Node{ID: "b", Name: "b", Kind: graph.KindFunction, FilePath: "p/b.test.ts", Language: "typescript"})
 	s.graph.AddEdge(&graph.Edge{From: "a", To: "b", Kind: graph.EdgeCalls})
-	s.analysisMu.Lock()
-	s.communities = &analysis.CommunityResult{NodeToComm: map[string]string{"a": "c1", "b": "c2"}}
-	s.analysisMu.Unlock()
+	installCommunitiesForTest(s, &analysis.CommunityResult{
+		NodeToComm: map[string]string{"a": "c1", "b": "c2"},
+	})
 
 	out := callSurprisingHandler(t, s, map[string]any{"min_score": 0.1})
 	row := findEdgeRow(out, "a", "b")

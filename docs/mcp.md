@@ -2,6 +2,7 @@
 
 Gortex exposes a knowledge-graph query surface over the [Model Context Protocol](https://modelcontextprotocol.io): **100+ tools, 18 resources, 3 prompts**. Agents call the same surface from stdio, the daemon Unix socket, or the MCP 2026 Streamable HTTP endpoint.
 
+- [Compact MCP surface](#compact-mcp-surface)
 - [Tool discovery (lazy mode)](#tool-discovery-lazy-mode)
 - [Restricting the tool surface (presets)](#restricting-the-tool-surface-presets)
 - [Core navigation](#core-navigation)
@@ -25,9 +26,34 @@ Gortex exposes a knowledge-graph query surface over the [Model Context Protocol]
 - [MCP resources (18)](#mcp-resources-18)
 - [MCP prompts (3)](#mcp-prompts-3)
 
+## Compact MCP surface
+
+The compact surface consolidates the legacy catalogue into 21 domain tools with compact, stable schemas. Every MCP connection with a non-empty `clientInfo.name` selects it automatically in `hide` mode unless a higher-precedence forwarded, operator, or instruction-profile policy overrides it. Empty and pre-initialize sessions retain the server default. Select it explicitly with the neutral `compact` preset alias:
+
+```bash
+GORTEX_TOOLS=compact gortex mcp
+```
+
+With that surface, the client receives all 21 names in its first `tools/list`: `explore`, `search`, `read`, `relations`, `trace`, `analyze`, `ask`, `change`, `review`, `pr`, `recall`, `workspace`, `response`, `capabilities`, `edit`, `refactor`, `remember`, `workspace_admin`, `overlay`, `session`, and `publish_review`. They are static for the session—there is no `tools_search` promotion or `tools/list_changed` dependency. `capabilities` discovers operation schemas, not additional tool names. Session-lifetime controls use `session`, for example `{"operation":"subscribe","channel":"diagnostics"}`; durable workspace changes remain under `workspace_admin`.
+
+```jsonc
+// Read a source file.
+{"name":"read","arguments":{"target":{"file":"internal/mcp/server.go"}}}
+
+// Preview a file edit; omit dry_run (or set false) to apply it.
+{"name":"edit","arguments":{"target":{"file":"internal/mcp/server.go"},"match":"old text","replacement":"new text","dry_run":true}}
+
+// Fetch the exact schema for a read operation.
+{"name":"capabilities","arguments":{"domain":"read","operation":"file","detail":"schema"}}
+```
+
+The compact surface delegates to the existing handlers. Existing `agent`, `core`, `full`, and specialist presets retain their legacy schemas; the CLI, HTTP routes, and legacy MCP names remain compatible. Names shared by both surfaces (such as `explore`, `analyze`, and `review`) advertise the compact schema only in a compact session. See the [compact MCP surface specification](mcp-facade-v1.md) for effects, schemas, migration, and acceptance gates.
+
+Authorization follows observable effects. `analyze` is strictly read-only: `blame`, coverage enrichment, SQL rebuild, and Temporal verification are exposed through `workspace_admin`; model-assisted concepts/search and lazy graph enrichment are fixed off on local read operations. Stateful `nav` is exposed as `session(operation="cursor")`. `change.contract` cannot acknowledge risk; durable acknowledgement is explicit through `remember(operation="risk_ack")`.
+
 ## Tool discovery (lazy mode)
 
-By default the server ships a curated **`core`** preset in **`defer`** mode (see [presets](#restricting-the-tool-surface-presets)): ~34 dev-cycle workhorse tools are published eagerly in the initial `tools/list`, and the rest of the ~180-tool catalogue is deferred — fetched on demand through `tools_search`. A cold session therefore pays for the workhorse schemas, not the whole surface. Opt back into the full eager surface with preset `full` (`GORTEX_TOOLS=full`).
+The fallback server default is a curated **`core`** preset in **`defer`** mode (see [presets](#restricting-the-tool-surface-presets)): ~34 dev-cycle workhorse tools are published eagerly in the initial `tools/list`, and the rest of the ~180-tool catalogue is deferred—fetched on demand through `tools_search`. Named MCP clients instead default to the static compact surface described above. Opt into the full eager surface with preset `full` (`GORTEX_TOOLS=full`).
 
 `tools_search` returns each deferred tool's schema **inline** (in a `<functions>{…}</functions>` block) and promotes it into `tools/list`, firing `notifications/tools/list_changed`. Clients that honour that notification (or read the inline schema) reach deferred tools transparently. `GORTEX_LAZY_TOOLS=1` is the older, all-or-nothing switch that defers everything except a hard-coded hot set regardless of preset; the `core`/`defer` default supersedes it for the common case.
 
@@ -54,28 +80,29 @@ Returned tools are auto-promoted (`promote:false` opts out) and the server fires
 
 The full ~180-tool surface is more than many agents need. A **tool preset** picks what the server publishes — the basis both for the lean shipped default and for a minimal, headless editing harness (an agent on a trusted box driving a remote daemon through a small, fixed tool set).
 
-Seven built-in presets:
+Eight built-in presets:
 
 | Preset | Surface |
 |--------|---------|
-| `agent` (**default for known coding-agent clients**) | the lean coding-agent working set (~20 tools): `explore` (the one-shot localization verb) + search/navigate + read (incl. `batch_symbols`) + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
-| `core` (**default for editors / unknown clients**) | the curated dev-cycle set (~35 tools): orient (incl. `explore`) + search/navigate + read + edit + verify/test + `analyze` + review + the memory workflow. Aliases: `default`, `classic` |
+| `facade-v1` (**default for named MCP clients**) | Stable config identifier for the 21 static, effect-homogeneous domain tools; operation schemas are discovered through `capabilities`, with no tool promotion. Aliases: `compact`, `facade`, `agent-v2` |
+| `agent` | Legacy lean coding-agent working set (~20 tools): `explore` (the one-shot localization verb) + search/navigate + read (incl. `batch_symbols`) + orient + edit/verify. Parameter descriptions are compacted (the full prose is one `tools_search` / `full` hop away). Aliases: `coding-agent` |
+| `core` (**fallback server default**) | the curated dev-cycle set (~35 tools): orient (incl. `explore`) + search/navigate + read + edit + verify/test + `analyze` + review + the memory workflow. Aliases: `default`, `classic` |
 | `full` | every tool (the pre-`core` behaviour — opt back in here) |
 | `readonly` | everything except the mutating tools (`edit_file`, `write_file`, `index_repository`, …) |
 | `edit` | the minimal headless editing set — orient + navigate + mutate + verify (`smart_context`, `search_symbols`, `find_files`, `edit_file`, `verify_change`, `get_test_targets`, …) |
 | `nav` | read-only navigation / exploration; no editors |
 | `localization` | the diet "where is the code that does X" set (~10 tools, read-only, compacted descriptions): `smart_context` + search + trace + read. The eager list is sourced from the instruction-profile table, so this surface and the `localization` profile's instructions body cannot drift. Aliases: `locate`, `find` |
 
-`tool_profile` and `tools_search` are always kept. Layer per-tool deltas on any preset with `allow` / `deny`.
+For legacy presets, `tool_profile` and `tools_search` are always kept. The compact surface uses `capabilities` instead and is closed: it always contains exactly its 21 public tools, so `allow` / `deny` deltas are ignored for `facade-v1`. Select a legacy or custom surface when per-tool deltas are required.
 
-**Client-aware default.** With no `GORTEX_TOOLS` / config preset, the server picks the default per connection: a **known coding-agent client** (the same set that defaults the wire format to GCX — `claude-code`, `cursor`, `vscode`, `zed`, `aider`, `kilocode`, `opencode`, `openclaw`, `codex`, `omp-coding-agent`) gets `agent`; every other client keeps `core`. `GORTEX_TOOLS` always overrides. The `gortex mcp` proxy forwards its `GORTEX_TOOLS` / `--tools` to the daemon in the handshake, so a client's preset applies over the shared daemon (it can both narrow and widen the surface, not just subtract).
+**Client-aware default.** With no higher-precedence selection, every connection with a non-empty MCP `clientInfo.name` gets the compact 21-tool surface in `hide` mode. Empty and pre-initialize sessions retain the server default. Client identity and wire format are separate: an unknown named client still gets the compact tools but remains on JSON unless it is independently GCX-capable. `GORTEX_TOOLS` always overrides. The `gortex mcp` proxy forwards its `GORTEX_TOOLS` / `--tools` to the daemon in the handshake, so a client's preset applies over the shared daemon (it can both narrow and widen the surface, not just subtract).
 
 **Instruction profiles.** The machine's active instruction profile (`gortex instructions switch <core|localization|full>` — see [`cli.md`](cli.md#gortex-instructions--instruction-profiles)) can carry a tool preset; sessions pick it up between the forwarded spec and the client-aware default. Full precedence: **forwarded spec (`GORTEX_TOOLS` / `--tools`) > operator-pinned `mcp.tools` config > active instruction profile > client-aware default > server default**. The shipped `core` profile carries no preset, so nothing changes until a machine explicitly switches; profile changes apply to new sessions only.
 
 **Two modes** (`mode`):
 
 - `defer` (the default mode for `core`) — non-allowed tools are kept out of the cold `tools/list` but stay reachable through `tools_search`, which returns their schema inline and promotes them (firing `notifications/tools/list_changed`). The lean-but-complete surface: nothing is lost, the rare tool is one discovery call away.
-- `hide` (the default mode for the explicit `edit` / `nav` / `readonly` harness presets) — non-allowed tools are removed from `tools/list` **and** calls to them are hard-blocked. The locked-down surface; works identically on every client.
+- `hide` (the default for `facade-v1` and the explicit `edit` / `nav` / `readonly` harness presets) — non-allowed tools are removed from `tools/list` **and** calls to them are hard-blocked. The locked-down surface; works identically on every client.
 
 Select a preset three ways (precedence: **env > flag > config > default**):
 
@@ -83,7 +110,7 @@ Select a preset three ways (precedence: **env > flag > config > default**):
 # .gortex.yaml — config file
 mcp:
   tools:
-    preset: full          # agent | core (default) | full | readonly | edit | nav
+    preset: full          # compact | agent | core (default) | full | readonly | edit | nav
     mode: defer           # defer | hide
     allow: [find_files]   # add tools on top of the preset
     deny: [write_file]    # remove tools from the preset

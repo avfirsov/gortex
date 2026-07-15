@@ -46,7 +46,7 @@ const (
 // without re-deriving them.
 const (
 	pluginName        = "gortex"
-	pluginDescription = "Your AI's live map of your codebase — every call, dependency, and contract indexed across your repos, shared across every running agent via a local daemon. Gives Claude Code, Cursor, and any MCP-aware client 52 graph-aware tools so they answer \"what calls this?\", \"what breaks if I rename UserStore?\", or \"which services consume this endpoint?\" in one call instead of grepping for minutes. Real AST parsing across 92 languages — deterministic, zero LLM calls during indexing. Useful before refactoring, when tracing bugs across services, exploring unfamiliar code, or any time your agent reaches for Grep or Read. Returns precise answers tagged with confidence tiers (compiler-grade vs heuristic). Local-first, Apache 2.0 licensed."
+	pluginDescription = "Your AI's live map of your codebase — every call, dependency, and contract indexed across repositories and shared through a local daemon. Exposes 21 focused MCP tools for exploration, graph navigation, change safety, editing, refactoring, and review without flooding the agent with one schema per operation. Works with Claude Code and any MCP-aware client. Real AST parsing across 92 languages is deterministic and local-first, with confidence-tagged results and no LLM calls during indexing. Apache 2.0 licensed."
 	pluginAuthorName  = "Andrey Kumanyaev"
 	pluginAuthorEmail = "support@gortex.dev"
 	pluginHomepage    = "https://gortex.dev"
@@ -94,7 +94,7 @@ const pluginHooksJSON = `{
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
             "timeout": 3000,
-            "statusMessage": "Enriching with Gortex graph context..."
+            "statusMessage": "Enforcing Gortex graph access policy..."
           }
         ]
       }
@@ -165,10 +165,10 @@ exec gortex hook "$@"
 
 const pluginReadmeBody = `# Gortex — Claude Code Plugin
 
-Gortex is a graph-based code intelligence engine. This plugin gives Claude
-Code 52 MCP tools for navigation, refactoring, contracts, impact analysis,
-and search across 92 languages — backed by a shared-graph daemon that
-keeps multiple agents and editor sessions in sync.
+Gortex is a graph-based code intelligence engine. This plugin connects Claude
+Code to 21 focused MCP tools for exploration, navigation, change safety,
+editing, refactoring, and review across 92 languages. A shared graph daemon
+keeps agents, harnesses, and editor sessions in sync.
 
 ## Install
 
@@ -186,21 +186,21 @@ installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `), and runs `
 
 | Surface | What you get |
 |---------|--------------|
-| **MCP server** | 52 tools (` + "`search_symbols`" + `, ` + "`find_usages`" + `, ` + "`get_call_chain`" + `, ` + "`explain_change_impact`" + `, ` + "`rename_symbol`" + `, ` + "`scaffold`" + `, ` + "`contracts`" + `, …) over stdio via ` + "`gortex mcp --proxy`" + ` |
+| **MCP server** | 21 tools over stdio via ` + "`gortex mcp`" + `: begin with ` + "`explore`" + `, inspect with ` + "`search`" + ` / ` + "`read`" + ` / ` + "`relations`" + ` / ` + "`trace`" + `, assess with ` + "`analyze`" + ` / ` + "`change`" + ` / ` + "`review`" + `, and mutate with ` + "`edit`" + ` / ` + "`refactor`" + `. ` + "`capabilities`" + ` returns an operation's exact schema on demand. |
 | **Slash commands** | Discovery: ` + "`/gortex-guide`" + `, ` + "`/gortex-explore`" + `, ` + "`/gortex-debug`" + `, ` + "`/gortex-impact`" + `, ` + "`/gortex-dataflow-trace`" + `, ` + "`/gortex-cross-repo-usage`" + `, ` + "`/gortex-co-change`" + `, ` + "`/gortex-onboarding`" + ` · Edit & refactor: ` + "`/gortex-refactor`" + `, ` + "`/gortex-safe-edit`" + `, ` + "`/gortex-rename`" + `, ` + "`/gortex-extract-function`" + `, ` + "`/gortex-fix-all`" + `, ` + "`/gortex-add-test`" + ` · Review & operate: ` + "`/gortex-pr-review`" + `, ` + "`/gortex-pr-review-agent`" + `, ` + "`/gortex-architecture-review`" + `, ` + "`/gortex-quality-audit`" + `, ` + "`/gortex-incident-investigation`" + `, ` + "`/gortex-episode-replay`" + ` |
-| **Skills** | Twenty model-invoked skills that activate by task-shape. Discovery (7): architecture exploration, debugging, blast-radius analysis, dataflow tracing, cross-repo usage, co-change analysis, onboarding tour. Edit & refactor (6): general refactor, safe-edit (` + "`preview_edit`" + ` / ` + "`simulate_chain`" + ` before disk), cross-file rename, LSP-driven extract function, LSP ` + "`source.fixAll`" + `, coverage-led add-test. Review & operate (6): PR review, PR review as a sub-agent (shell ` + "`gortex review --audience agent`" + `), architecture review, quality audit, incident investigation, episode replay. Plus the tool-reference guide. The edit skills enforce the speculative-execution + LSP code-actions order so agents do not bypass safety steps; the review & operate skills wrap the discovery + impact + memory surfaces into ordered playbooks so postmortems and reviews are graph-grounded. |
-| **Hooks** | PreToolUse routing (Read → ` + "`get_symbol_source`" + `, Grep → ` + "`search_symbols`" + ` / ` + "`find_usages`" + `), PreCompact orientation snapshot, Stop post-task diagnostics, SessionStart cold briefing |
+| **Skills** | Twenty model-invoked, task-shaped workflows require callable native MCP, start with ` + "`explore`" + `, gate mutations with ` + "`change`" + `, write through ` + "`edit`" + ` / ` + "`refactor`" + `, and verify the result. The separate CLI skill mirrors those names through ` + "`gortex call`" + ` only for a harness with no MCP transport by design. |
+| **Hooks** | PreToolUse graph routing, PreCompact orientation, Stop post-task diagnostics, and SessionStart briefing. Hook guidance uses the same public MCP tool names. |
 
 ## First run
 
 After install, point Claude Code at any code repository and ask a task that
 involves understanding code structure ("how does authentication work?",
-"what breaks if I rename ` + "`UserStore`" + `?"). The hooks redirect Read/Grep/Glob
-toward graph queries; the slash commands give you guided workflows.
+"what breaks if I rename ` + "`UserStore`" + `?"). Begin with ` + "`explore`" + `; the
+slash commands provide short, ordered workflows for common tasks.
 
-If ` + "`gortex daemon`" + ` is running (` + "`gortex daemon start --detach`" + ` to start it),
-all your editor sessions share one in-memory graph. Otherwise this plugin
-spawns a one-shot MCP server per session — same tools, slower cold start.
+The MCP server owns graph startup and should expose the tools without a manual
+daemon step. If configured tools are missing or unreachable, report an MCP
+integration failure; do not start a daemon manually or switch to a CLI fallback.
 
 ## Links
 

@@ -6,12 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // resolvedTempDir wraps t.TempDir() with EvalSymlinks because on macOS
@@ -104,19 +106,19 @@ func TestGoAnalysis_FindContainingFunc_PicksSmallest(t *testing.T) {
 	})
 
 	pos := token.Position{Filename: "/repo/main.go", Line: 17}
-	got := findContainingFunc(g, nil, nil, "/repo", pos)
+	got := findContainingFunc(g, nil, nil, "/repo", pos, "")
 	require.NotNil(t, got)
 	assert.Equal(t, "main.go::Inner", got.ID)
 
 	// Line 25 is inside Outer only.
 	pos.Line = 25
-	got = findContainingFunc(g, nil, nil, "/repo", pos)
+	got = findContainingFunc(g, nil, nil, "/repo", pos, "")
 	require.NotNil(t, got)
 	assert.Equal(t, "main.go::Outer", got.ID)
 
 	// Line 5 is in neither.
 	pos.Line = 5
-	got = findContainingFunc(g, nil, nil, "/repo", pos)
+	got = findContainingFunc(g, nil, nil, "/repo", pos, "")
 	assert.Nil(t, got)
 }
 
@@ -406,4 +408,119 @@ func F() (int, error) {
 	assert.Contains(t, retType, "error")
 
 	assert.Equal(t, "go-types", node.Meta["semantic_source"])
+}
+
+func TestProviderEnrichRepoScopesGraphPathsForMultiRepoStore(t *testing.T) {
+	root := resolvedTempDir(t)
+	writeGoMod(t, root, "example.com/sample")
+	writeFile(t, root, "sample.go", `package sample
+
+func BuildWidget() int { return 1 }
+
+func UseWidget() int { return BuildWidget() }
+`)
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	const (
+		repoPrefix = "sample-repo"
+		graphPath  = repoPrefix + "/sample.go"
+		buildID    = graphPath + "::BuildWidget"
+		useID      = graphPath + "::UseWidget"
+	)
+	store.AddBatch([]*graph.Node{
+		{ID: buildID, Kind: graph.KindFunction, Name: "BuildWidget", FilePath: graphPath, StartLine: 3, EndLine: 3, Language: "go", RepoPrefix: repoPrefix},
+		{ID: useID, Kind: graph.KindFunction, Name: "UseWidget", FilePath: graphPath, StartLine: 5, EndLine: 5, Language: "go", RepoPrefix: repoPrefix},
+		// Decoys reproduce the ambiguity that hid the bug: go/types yields
+		// repo-relative paths while a multi-repo graph stores prefixed paths.
+		{ID: "sample.go::BuildWidget", Kind: graph.KindFunction, Name: "BuildWidget", FilePath: "sample.go", StartLine: 3, EndLine: 3, Language: "go"},
+		{ID: "sample.go::UseWidget", Kind: graph.KindFunction, Name: "UseWidget", FilePath: "sample.go", StartLine: 5, EndLine: 5, Language: "go"},
+	}, nil)
+
+	provider := newTestProvider(t)
+	t.Cleanup(func() {
+		require.NoError(t, provider.Close())
+	})
+
+	result, err := provider.EnrichRepo(store, repoPrefix, root)
+	require.NoError(t, err)
+	require.Equal(t, 2, result.SymbolsTotal)
+	require.Equal(t, result.SymbolsTotal, result.SymbolsCovered,
+		"all repo-scoped symbols should match their prefixed graph nodes")
+
+	build := store.GetNode(buildID)
+	require.NotNil(t, build)
+	require.NotEmpty(t, build.Meta["semantic_type"])
+	decoy := store.GetNode("sample.go::BuildWidget")
+	require.NotNil(t, decoy)
+	assert.Empty(t, decoy.Meta["semantic_type"],
+		"an unprefixed node outside this repo must not be enriched")
+
+	var call *graph.Edge
+	for _, edge := range store.GetOutEdges(useID) {
+		if edge.To == buildID && edge.Kind == graph.EdgeCalls {
+			call = edge
+			break
+		}
+	}
+	require.NotNil(t, call, "semantic call edge should use prefixed node IDs")
+	assert.Equal(t, graphPath, call.FilePath)
+}
+
+func TestReleaseRepoStateDropsOnlyCompletedRepository(t *testing.T) {
+	provider := newTestProvider(t)
+	t.Cleanup(func() {
+		require.NoError(t, provider.Close())
+	})
+
+	rootA := resolvedTempDir(t)
+	rootB := resolvedTempDir(t)
+	provider.stashes = map[string]*goStash{
+		rootA: {absRoot: rootA, lastUsed: time.Now()},
+		rootB: {absRoot: rootB, lastUsed: time.Now()},
+	}
+
+	require.True(t, provider.ReleaseRepoState(rootA))
+	provider.stateMu.RLock()
+	_, retainedA := provider.stashes[rootA]
+	_, retainedB := provider.stashes[rootB]
+	retainedCount := len(provider.stashes)
+	provider.stateMu.RUnlock()
+	assert.False(t, retainedA)
+	assert.True(t, retainedB)
+	assert.Equal(t, 1, retainedCount)
+	assert.False(t, provider.ReleaseRepoState(rootA), "release should be idempotent")
+}
+
+func TestRetainedRepoStateSurvivesEvictionUntilRelease(t *testing.T) {
+	provider := newTestProvider(t)
+	t.Cleanup(func() {
+		require.NoError(t, provider.Close())
+	})
+
+	root := resolvedTempDir(t)
+	provider.stashTTL = time.Nanosecond
+	provider.maxStashes = 1
+	provider.stashes = map[string]*goStash{
+		root: {absRoot: root, lastUsed: time.Now().Add(-time.Hour)},
+	}
+
+	require.True(t, provider.RetainRepoState(root))
+	provider.stateMu.Lock()
+	provider.evictLocked()
+	_, survived := provider.stashes[root]
+	provider.stateMu.Unlock()
+	require.True(t, survived, "an active deferred-contract lease must defeat TTL eviction")
+
+	require.True(t, provider.ReleaseRepoState(root))
+	provider.stateMu.RLock()
+	_, survived = provider.stashes[root]
+	_, leased := provider.retained[root]
+	provider.stateMu.RUnlock()
+	assert.False(t, survived)
+	assert.False(t, leased)
 }

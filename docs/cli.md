@@ -171,20 +171,78 @@ The generic relay: invoke any tool the daemon's MCP surface registers, even one 
 | `--format json\|gcx\|toon\|text` | wire format forwarded to the tool (default `json`) |
 | `--dry` | print the lowered argument object + target tool **without** calling the daemon (works offline) |
 | `--quiet` | suppress the mutating-tool stderr note |
+| `--legacy` | use the historical handler contract for a name shared by the compact and legacy surfaces (`analyze`, `explore`, `review`, `ask`) |
+
+### Compact-surface mirror for Bash-only harnesses
+
+Use this path only when a coding harness exposes Bash but does not
+expose Gortex MCP functions natively. An MCP-capable host MUST call the
+compact MCP tools directly. A Bash-only harness MUST use `gortex call`,
+which accepts the same compact tool names and argument objects without
+translating them to legacy names.
+
+The 21 public names select the compact contract by default. Existing scripts
+that call a shared legacy name can retain its historical schema with
+`gortex call --legacy analyze ...`; dedicated legacy names already select the
+legacy-compatible connection automatically.
 
 ```bash
-gortex call explore --arg task="login handler 500s when the session cookie is expired"
+# Read an uncompressed source file.
+gortex call read \
+  --arg target='{"file":"internal/mcp/server.go"}'
+
+# Search for a symbol.
+gortex call search \
+  --arg operation=symbols \
+  --arg query=Server.addTool
+
+# Discover the exact schema for one operation.
+gortex call capabilities \
+  --arg domain=read \
+  --arg operation=file \
+  --arg detail=schema
+
+# Preview an edit without writing the file.
+gortex call edit \
+  --arg target='{"file":"README.md"}' \
+  --arg 'match=old text' \
+  --arg 'replacement=new text' \
+  --arg dry_run=true
+```
+
+Because `target` starts with `{`, normal `--arg` coercion parses it as
+a JSON object. `--json` can supply the whole argument object instead.
+The edit example's `--arg dry_run=true` calls the tool and asks the
+tool to preview the mutation. CLI `--dry` is different: it only prints
+the lowered request and never contacts the daemon.
+
+Non-dry calls require a running daemon that tracks the repository. Use
+the shared `--index`/`--repo <path>` selector when the target repository
+is not the current directory. The direct mirror covers all 21 compact
+names listed in [`mcp.md`](mcp.md#compact-mcp-surface) and negotiates
+the compact surface for that daemon connection without changing global
+configuration. Operations under `session` are connection-scoped; a
+one-shot `gortex call` connection closes after the result, so use a
+persistent native MCP session when later calls must observe that state
+or receive subscriptions.
+
+### Legacy and full-catalog examples
+
+The same relay can call a legacy or deferred tool explicitly when a
+compatibility workflow requires it:
+
+```bash
 gortex call smart_context --arg task="add rate limiting to the login handler"
 gortex call find_usages --arg id="internal/auth/login.go::Login" --format gcx
 gortex call overlay_push --json-file ./buffer.json          # reach a deferred tool by name
-gortex call edit_file --arg path=README.md --arg old_string=foo --arg new_string=bar --dry
+gortex call edit_file --arg path=README.md --arg old_string=foo --arg new_string=bar --arg dry_run=true
 ```
 
 ### `gortex tools …` — discover & describe the surface
 
 | Verb | MCP tool | Key flags |
 |---|---|---|
-| `tools list` | `tool_profile` | `--category <c>`, `--mutating`, `--preset core\|edit\|nav\|readonly`, `--format text\|json` |
+| `tools list` | `tool_profile` | `--category <c>`, `--mutating`, `--preset compact\|core\|edit\|nav\|readonly`, `--format text\|json` |
 | `tools search <q>` | `tools_search` | `--limit <n>` (default 10) — ranks the deferred surface |
 | `tools describe <name>` | `tools_search select:<name>` | prints the tool's full parameter schema |
 | `tools receipt` | `tool_profile` | `--format yaml\|json` (default `yaml`) |

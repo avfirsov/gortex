@@ -40,23 +40,37 @@ func (s *Server) editingToolsHidden(ctx context.Context) bool {
 
 func (s *Server) toolSurfaceFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
 	if s.editingToolsHidden(ctx) {
-		kept := make([]mcp.Tool, 0, len(tools))
-		for _, t := range tools {
-			if daemon.MutatingTools[t.Name] {
-				continue
-			}
-			kept = append(kept, t)
-		}
-		tools = kept
+		tools = withoutMutatingTools(tools)
 	}
 	// Per-session tool-surface preset: narrow (and, for a client asking for
 	// a wider surface than the daemon's eager set, widen) the list to the
 	// policy resolved for THIS connection (forwarded GORTEX_TOOLS / --tools,
 	// else the client-aware default, else the server's global preset).
 	tools = s.applySessionPreset(ctx, tools)
+	// Negotiate the versioned facade surface. Legacy sessions do not see the
+	// new dispatcher names; facade-v1 sessions receive exactly the compact,
+	// static definitions and never depend on lazy promotion.
+	tools = s.applyFacadeSurface(ctx, tools)
+	// Session preset shaping can widen from the lazy catalogue. Re-apply the
+	// planning/workflow boundary after widening so tools/list never advertises
+	// an edit that the hard call gate will refuse.
+	if s.editingToolsHidden(ctx) {
+		tools = withoutMutatingTools(tools)
+	}
 	// Per-host adaptation: drop tools the host duplicates and apply any
 	// host-specific description overrides (see host_context.go).
 	return s.sessionHostContext(ctx).apply(tools)
+}
+
+func withoutMutatingTools(tools []mcp.Tool) []mcp.Tool {
+	kept := make([]mcp.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if daemon.MutatingTools[tool.Name] {
+			continue
+		}
+		kept = append(kept, tool)
+	}
+	return kept
 }
 
 // applySessionPreset shapes the tool list to the surface in force for this
@@ -141,7 +155,14 @@ func (s *Server) sessionAllows(p *toolPolicy, name string) bool {
 	if p.allows(name) {
 		return true
 	}
-	return p.lean && s.isLearnedPromoted(name)
+	// facade-v1 is a static versioned contract: learned legacy promotions
+	// must not leak back into its compact surface.
+	return p.lean && p.preset != FacadeSurfaceVersion && s.isLearnedPromoted(name)
+}
+
+func (s *Server) usesFacadeSurface(ctx context.Context) bool {
+	p := s.effectiveSessionPolicy(ctx)
+	return p != nil && p.preset == FacadeSurfaceVersion
 }
 
 // narrowToPolicy keeps only the tools the policy allows, preserving order.
@@ -160,6 +181,9 @@ func narrowToPolicy(tools []mcp.Tool, p *toolPolicy) []mcp.Tool {
 // proceed. This is the hard guarantee behind planning mode: even a
 // client that never re-read tools/list cannot slip an edit through.
 func (s *Server) checkToolGate(ctx context.Context, toolName string) *mcp.CallToolResult {
+	if blocked := s.checkFacadeSurfaceGate(ctx, toolName); blocked != nil {
+		return blocked
+	}
 	if blocked := s.checkPlanningModeGate(ctx, toolName); blocked != nil {
 		return blocked
 	}
@@ -170,6 +194,42 @@ func (s *Server) checkToolGate(ctx context.Context, toolName string) *mcp.CallTo
 		return blocked
 	}
 	return nil
+}
+
+// checkFacadeSurfaceGate keeps the additive facade protocol behind explicit
+// session negotiation. Dedicated facade names are registered process-wide so
+// facade-v1 sessions can receive a complete static first tools/list, but a
+// legacy defer-mode session must not be able to hard-call one that its own
+// tools/list and tool_profile both classify as unavailable. Reused names such
+// as analyze/explore/review/ask retain their legacy behavior outside facade-v1.
+func (s *Server) checkFacadeSurfaceGate(ctx context.Context, toolName string) *mcp.CallToolResult {
+	facadeOnly := isDedicatedFacadeTool(toolName)
+	if toolName == "ask" {
+		// ask is a reused legacy name only when an LLM handler was actually
+		// configured. Otherwise the process-global registration is the facade's
+		// unavailable-operation stub and must stay behind facade negotiation.
+		_, legacyAvailable := s.facades.legacy("ask")
+		facadeOnly = !legacyAvailable
+	}
+	if !facadeOnly || s.usesFacadeSurface(ctx) {
+		return nil
+	}
+	currentPreset := "full"
+	if p := s.effectiveSessionPolicy(ctx); p != nil && p.preset != "" {
+		currentPreset = p.preset
+	}
+	return NewStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeToolBlockedByMode,
+		Message: fmt.Sprintf("%q belongs to the %q MCP surface, but this session is using a legacy tool surface. "+
+			"Use the advertised legacy tools or reconnect with GORTEX_TOOLS=%s.",
+			toolName, FacadeSurfaceVersion, FacadeSurfaceVersion),
+		Data: map[string]any{
+			"tool":             toolName,
+			"required_preset":  FacadeSurfaceVersion,
+			"current_preset":   currentPreset,
+			"recovery_setting": "GORTEX_TOOLS=" + FacadeSurfaceVersion,
+		},
+	})
 }
 
 // checkToolPresetGate hard-blocks calls to tools outside the active
@@ -185,11 +245,22 @@ func (s *Server) checkToolPresetGate(ctx context.Context, toolName string) *mcp.
 	if !p.hideMode() || p.allows(toolName) {
 		return nil
 	}
+	guidance := "Call tool_profile to see the available tools."
+	recovery := "tool_profile"
+	if p.preset == FacadeSurfaceVersion {
+		guidance = "Call capabilities to see the available public operations and their schemas."
+		recovery = "capabilities"
+		return NewStructuredErrorResult(StructuredError{
+			ErrorCode: ErrCodeToolBlockedByMode,
+			Message:   fmt.Sprintf("%q is not part of the active public Gortex tool surface. %s", toolName, guidance),
+			Data:      map[string]any{"tool": toolName, "preset": p.preset, "recovery_tool": recovery},
+		})
+	}
 	return NewStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeToolBlockedByMode,
 		Message: fmt.Sprintf("%q is not part of the active tool preset %q — it has been removed from this "+
-			"server's tool surface. Call tool_profile to see the available tools.", toolName, p.preset),
-		Data: map[string]any{"tool": toolName, "preset": p.preset},
+			"server's tool surface. %s", toolName, p.preset, guidance),
+		Data: map[string]any{"tool": toolName, "preset": p.preset, "recovery_tool": recovery},
 	})
 }
 
@@ -202,12 +273,24 @@ func (s *Server) checkPlanningModeGate(ctx context.Context, toolName string) *mc
 	if !s.sessionPlanningMode(ctx) {
 		return nil
 	}
+	guidance := "Call set_planning_mode with mode \"editing\" to enable edits."
+	recovery := map[string]any{"tool": "set_planning_mode", "arguments": map[string]any{"mode": "editing"}}
+	if s.usesFacadeSurface(ctx) {
+		guidance = "Call session with operation \"planning_mode\" and arguments {\"mode\":\"editing\"} to enable edits."
+		recovery = map[string]any{
+			"tool": "session",
+			"arguments": map[string]any{
+				"operation": "planning_mode",
+				"arguments": map[string]any{"mode": "editing"},
+			},
+		}
+	}
 	return NewStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeToolBlockedByMode,
 		Message: fmt.Sprintf("%q is an editing tool and this session is in planning mode — no writes are "+
-			"permitted. Call set_planning_mode with mode \"editing\" to enable edits.", toolName),
+			"permitted. %s", toolName, guidance),
 		Retriable: true,
-		Data:      map[string]any{"tool": toolName, "mode": "planning"},
+		Data:      map[string]any{"tool": toolName, "mode": "planning", "recovery": recovery},
 	})
 }
 

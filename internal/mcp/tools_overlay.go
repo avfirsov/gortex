@@ -20,20 +20,21 @@ import (
 // subsequent tools/call from the same MCP session sees the overlaid
 // view (see overlay.go::wrapToolHandler).
 //
-// The functions are intentionally not routed through s.addTool: the
+// The functions are intentionally routed through addControlTool rather than
+// addTool: the
 // overlay middleware MUST NOT apply overlays before an overlay_push
 // runs (or the new buffer would be re-evicted by the revert pass
 // before it ever reached the user-facing query). So they register
-// directly via s.mcpServer.AddTool.
+// without bypassing safety gates, capture, or telemetry.
 func (s *Server) registerOverlayTools() {
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_register",
 			mcp.WithDescription("Register an editor-overlay session bound to the current MCP session. Subsequent overlay_push calls attach in-flight editor buffers; every tools/call from this session then sees the overlay merged on top of the saved-buffer graph view. Idempotent — calling twice with the same workspace is a no-op."),
 			mcp.WithString("workspace_id", mcp.Description("Workspace slug the overlay belongs to. Optional; defaults to the session's bound workspace.")),
 		),
 		s.handleOverlayRegister,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_push",
 			mcp.WithDescription("Push (or update) a single file overlay onto the current MCP session's overlay. The file at `path` is treated as if it contained `content` for the duration of every subsequent tools/call. Set `deleted: true` to mark a tombstone (queries see the file as missing). Drift detection: when `base_sha` is set, the daemon compares it to the on-disk git blob SHA at apply time and returns an overlay-drift error if they disagree."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute file path.")),
@@ -43,26 +44,26 @@ func (s *Server) registerOverlayTools() {
 		),
 		s.handleOverlayPush,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_list",
 			mcp.WithDescription("List every overlay file currently attached to the calling MCP session. Returns workspace_id, the count of files, and each overlay's path / content length / deleted flag / base_sha. The path and metadata are returned; content bytes are not, to keep the response small."),
 		),
 		s.handleOverlayList,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_delete",
 			mcp.WithDescription("Remove a single overlay file from the calling MCP session's overlay. The next tools/call will see the saved-buffer view for that path."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Repo-relative or absolute path of the overlay to remove.")),
 		),
 		s.handleOverlayDelete,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_drop",
 			mcp.WithDescription("Tear down the calling MCP session's overlay entirely. Equivalent to calling overlay_delete on every attached path. The session remains live; a subsequent overlay_register / overlay_push starts a fresh overlay."),
 		),
 		s.handleOverlayDrop,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("overlay_keepalive",
 			mcp.WithDescription("Refresh the calling MCP session's overlay idle timer without changing any overlay content. Cheaper than re-pushing buffer content when the editor needs to extend the lease (e.g. the user is debugging or paused on a breakpoint and won't push for a while). Returns the resulting expires_at / idle_seconds so the editor can schedule the next keepalive. The MCP session disconnect path already drops the overlay synchronously, so keepalive is only needed for genuine idle gaps below the disconnect-detection threshold."),
 		),

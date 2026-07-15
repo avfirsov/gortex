@@ -58,8 +58,10 @@ func TestRouter_DisabledRemoteRefused(t *testing.T) {
 	}
 }
 
-// TestRouter_WriteGateRefusesRemote asserts a mutating tool routed to an
-// enabled remote is refused before any outbound HTTP.
+// TestRouter_WriteGateRefusesRemote asserts every effectful tool routed to an
+// enabled remote is refused before any outbound HTTP. Session-only effects are
+// intentionally not IsMutating (so planning-mode recovery remains possible),
+// but they must still stay machine-local.
 func TestRouter_WriteGateRefusesRemote(t *testing.T) {
 	srv, hit := recordingRemote(t)
 	cfg := &ServersConfig{Server: []ServerEntry{{Slug: "r2", URL: srv.URL, Default: true}}}
@@ -72,7 +74,18 @@ func TestRouter_WriteGateRefusesRemote(t *testing.T) {
 			return []byte(`{}`), 200, nil
 		},
 	})
-	for _, tool := range []string{"edit_file", "batch_edit", "rename_symbol", "track_repository"} {
+	tools := []string{
+		// Durable legacy writers.
+		"edit_file", "batch_edit", "rename_symbol", "track_repository",
+		// Facade-v1 session writers.
+		"session", "overlay",
+		// Legacy session writer.
+		"proxy_enable",
+	}
+	for _, tool := range tools {
+		if !IsEffectful(tool) {
+			t.Fatalf("test fixture %q must be classified as effectful", tool)
+		}
 		out, status, err := router.RouteToolCall(context.Background(), tool, []byte(`{}`), RouteContext{})
 		if err != nil {
 			t.Fatalf("%s: %v", tool, err)
@@ -116,7 +129,7 @@ func TestRouter_LocalWriteAllowed(t *testing.T) {
 // and ignore a session override for a slug not in the roster.
 func TestRouter_EffectiveEnabledRemotes(t *testing.T) {
 	cfg := &ServersConfig{Server: []ServerEntry{
-		{Slug: "r2", URL: "https://r2:4747"},                   // global on (nil)
+		{Slug: "r2", URL: "https://r2:4747"},                        // global on (nil)
 		{Slug: "r3", URL: "https://r3:4747", Enabled: boolp(false)}, // global off
 	}}
 	router := NewRouter(RouterConfig{Servers: cfg, LocalSlug: LocalServerSentinel})

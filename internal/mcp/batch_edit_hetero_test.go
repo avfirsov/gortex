@@ -15,6 +15,9 @@ import (
 // helper's handler map does not register batch_edit.
 func callBatchEdit(t *testing.T, srv *Server, args map[string]any) *mcplib.CallToolResult {
 	t.Helper()
+	if os.Getenv(batchTransactionDirEnv) == "" {
+		t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
+	}
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "batch_edit"
 	req.Params.Arguments = args

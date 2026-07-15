@@ -139,9 +139,9 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	// 3. User-level skills — the master `gortex` guide plus the
 	//    per-task routing playbooks (explore / impact / refactor / …),
-	//    mirroring the Claude Code user-level skill set. Each is skipped
-	//    when it already exists so user edits survive a re-install.
-	masterAction, err := agents.WriteIfNotExists(env.Stderr, skillPath(env.Home, SkillName), SkillBody(), opts)
+	//    mirroring the Claude Code user-level skill set. User-authored files are
+	//    preserved; exact legacy Gortex vocabulary is migrated in place.
+	masterAction, err := writeHermesSkillArtifact(env.Stderr, skillPath(env.Home, SkillName), SkillBody(), opts)
 	if err != nil {
 		return res, fmt.Errorf("hermes skill: %w", err)
 	}
@@ -149,7 +149,7 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	routing := RoutingSkills()
 	for _, name := range RoutingSkillNames() {
-		action, rerr := agents.WriteIfNotExists(env.Stderr, skillPath(env.Home, name), routing[name], opts)
+		action, rerr := writeHermesSkillArtifact(env.Stderr, skillPath(env.Home, name), routing[name], opts)
 		if rerr != nil {
 			internalutil.Warnf(env.Stderr, "hermes skill %s: %v", name, rerr)
 			continue
@@ -159,6 +159,28 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	res.Configured = true
 	return res, nil
+}
+
+func writeHermesSkillArtifact(w io.Writer, path, content string, opts agents.ApplyOpts) (agents.FileAction, error) {
+	if existing, err := os.ReadFile(path); err == nil && isLegacyHermesSkill(string(existing)) {
+		return agents.WriteOwnedFile(w, path, content, opts)
+	}
+	return agents.WriteIfNotExists(w, path, content, opts)
+}
+
+func isLegacyHermesSkill(body string) bool {
+	if !strings.HasPrefix(body, "---\nname: gortex") {
+		return false
+	}
+	for _, legacy := range []string{
+		"smart_context", "search_symbols", "get_symbol_source", "get_editing_context",
+		"find_usages", "get_callers", "verify_change", "detect_changes", "tools_search",
+	} {
+		if strings.Contains(body, legacy) {
+			return true
+		}
+	}
+	return false
 }
 
 // upsertGortexServer merges the gortex stdio stanza into the

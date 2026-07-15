@@ -48,6 +48,10 @@ func newClustersTestServer(t *testing.T) *Server {
 	// recomputes from the graph through the incremental path.
 	s.analysisMu.Lock()
 	s.communities = analysis.DetectCommunities(g)
+	token := s.currentCommunityToken()
+	s.communitiesToken = token
+	s.adjacencyToken = token
+	s.analysisEpoch = 1
 	s.analysisMu.Unlock()
 	return s
 }

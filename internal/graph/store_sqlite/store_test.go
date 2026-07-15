@@ -20,3 +20,30 @@ func TestSQLiteStoreConformance(t *testing.T) {
 		return s
 	})
 }
+
+func TestAddNodeUpdatePreservesIncidentEdges(t *testing.T) {
+	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	a := &graph.Node{ID: "a", Kind: graph.KindFunction, Name: "a"}
+	b := &graph.Node{ID: "b", Kind: graph.KindFunction, Name: "b"}
+	s.AddBatch([]*graph.Node{a, b}, []*graph.Edge{{From: "a", To: "b", Kind: graph.EdgeCalls}})
+	if got := s.EdgeCount(); got != 1 {
+		t.Fatalf("edge count before metadata update = %d, want 1", got)
+	}
+
+	b.Meta = map[string]any{"reach_build": uint64(7)}
+	s.AddNode(b)
+	if got := s.EdgeCount(); got != 1 {
+		t.Fatalf("edge count after node upsert = %d, want 1", got)
+	}
+	if got := len(s.GetInEdges("b")); got != 1 {
+		t.Fatalf("incoming edges after node upsert = %d, want 1", got)
+	}
+	if got := len(s.GetOutEdges("a")); got != 1 {
+		t.Fatalf("outgoing edges after node upsert = %d, want 1", got)
+	}
+}

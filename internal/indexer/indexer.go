@@ -116,6 +116,10 @@ type IndexResult struct {
 	// outcome read it from here. Populated by the multi-repo track and
 	// reconcile paths; empty in single-repo mode.
 	RepoPrefix string `json:"repo_prefix,omitempty"`
+	// DerivedInvalidation is the exact bounded frontier produced by an
+	// incremental reconcile. A zero plan proves that no graph-wide derived
+	// pass is required; callers must not infer work merely from stale count.
+	DerivedInvalidation DerivedInvalidationPlan `json:"derived_invalidation,omitempty"`
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -390,10 +394,19 @@ type Indexer struct {
 	// LSH live across single-file edits, so a steady-state reindex
 	// updates EdgeSimilarTo edges in O(edited file) instead of the
 	// whole-graph detectClonesAndEmitEdges recompute. Constructed empty
-	// (built=false) — a batch/global clone pass calls Rebuild to seed it,
-	// after which indexFile drives EvictFuncs/UpdateFuncs. While un-built
-	// indexFile falls back to the whole-graph pass.
+	// (built=false) — a batch/global clone pass calls Rebuild to seed it.
+	// A watcher edit never seeds it synchronously: until an explicit
+	// clone-consuming/global pass rebuilds it, clone completeness is marked
+	// pending and the edit hot path stays bounded to the changed file.
 	cloneIndex *incrementalCloneIndex
+
+	// prepared caches the watcher's one-shot parsed graph delta until
+	// indexFile consumes it. This avoids parsing a structural edit twice
+	// (once to classify it and once to apply it); byte equality in
+	// takePreparedExtraction prevents stale reuse when another save lands
+	// between the probe and graph patch.
+	preparedMu sync.Mutex
+	prepared   map[string]*preparedExtraction
 
 	// affectedByPasses / affectedByFilesResolved / affectedByDropped
 	// count the affected-by re-resolution activity (see affected_by.go):
@@ -492,7 +505,10 @@ func searchIndexFields(n *graph.Node, projectName string) []string {
 		body, _ := n.Meta["section_text"].(string)
 		return []string{n.Name, indexedPath, body}
 	}
-	sig, _ := n.Meta["signature"].(string)
+	// Retrieval-only fields are normalized at the shared extraction boundary.
+	// The graph-owned accessor keeps search, embeddings, and MCP presentation
+	// on the same fallback contract without exposing metadata keys.
+	retrieval := n.RetrievalMetadata()
 	// A symbol's doc comment is the natural-language statement of what it
 	// does — precisely the vocabulary a task-intent query carries ("union
 	// the two sequences", "performs matching on the ignore files") when it
@@ -503,8 +519,7 @@ func searchIndexFields(n *graph.Node, projectName string) []string {
 	// can't dilute the name/signature tokens under BM25 length
 	// normalisation. Empty doc → empty field, dropped by the caller, so a
 	// symbol with no doc indexes exactly as before.
-	doc, _ := n.Meta["doc"].(string)
-	return []string{n.Name, indexedPath, sig, docSummary(doc)}
+	return []string{n.Name, indexedPath, retrieval.QualName, retrieval.Signature, docSummary(retrieval.Doc)}
 }
 
 // docSummaryMaxRunes bounds how much of a doc comment enters the search
@@ -621,15 +636,9 @@ func lessEdgeKey(a, b *graph.Edge) bool {
 // same recall against either backend. Joined with spaces so the
 // downstream COPY FROM sees a single STRING column value.
 func ftsTokensFor(n *graph.Node, projectName string) string {
+	// searchIndexFields includes the resolver qualifier or its retrieval-only
+	// replacement, so both BM25 backends and embeddings see the same token bag.
 	fields := searchIndexFields(n, projectName)
-	if n.QualName != "" {
-		// QualName carries the dotted form (`pkg.Sub.Type.Method`)
-		// that adds qualifier-hop recall ("auth" matching
-		// "auth.ValidateToken"). searchIndexFields omits it for
-		// the legacy BM25 path (which folds qual into the
-		// name-token bag separately), so we add it explicitly here.
-		fields = append(fields, n.QualName)
-	}
 	tokens := make([]string, 0, 16)
 	for _, f := range fields {
 		if f == "" {
@@ -1016,7 +1025,7 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 	tphase = time.Now()
 
 	reporter.Report("extracting contracts", 0, 0)
-	idx.runDeferredContracts()
+	idx.runDeferredContractsAndReleaseSemanticState()
 	dContract = time.Since(tphase)
 	idx.logger.Info("DEFERRED-TIMING per-repo",
 		zap.String("repo", idx.repoPrefix),
@@ -1063,6 +1072,10 @@ func (idx *Indexer) runDeferredEnrich() {
 		idx.logger.Info("deferred enrichment forced despite no pending changes",
 			zap.String("repo", idx.repoPrefix))
 	}
+	// Lease compiler-backed provider state before enrichment creates it. The
+	// matching release runs after this repo's contract pass, including failure
+	// unwinding, so a slow sibling in the batch cannot trigger TTL eviction.
+	idx.retainDeferredSemanticState()
 	// Key by the repo prefix so a repo-scoped provider can scope file
 	// selection to this repo (empty in single-repo mode).
 	roots := map[string]string{idx.repoPrefix: idx.rootPath}
@@ -1174,6 +1187,52 @@ func (idx *Indexer) runDeferredContracts() {
 	idx.extractDIContracts(idx.pendingContractReg)
 	idx.commitContracts(idx.pendingContractReg)
 	idx.pendingContractReg = nil
+}
+
+// runDeferredContractsAndReleaseSemanticState keeps the compiler program alive
+// through every contract consumer and releases it on every return path. The
+// defer also prevents a contract-extraction panic from stranding a multi-GB
+// stash while the panic unwinds.
+func (idx *Indexer) runDeferredContractsAndReleaseSemanticState() {
+	defer idx.releaseDeferredSemanticState()
+	idx.runDeferredContracts()
+}
+
+// repoSemanticStateRetainer leases repository-scoped compiler state across the
+// enrichment-to-contract batch barrier so TTL/LRU cleanup cannot evict it while
+// another repository in the same batch is still enriching.
+type repoSemanticStateRetainer interface {
+	RetainRepoState(repoRoot string) bool
+}
+
+// repoSemanticStateReleaser is implemented by semantic providers that retain
+// repository-scoped state solely for the deferred contract consumer.
+type repoSemanticStateReleaser interface {
+	ReleaseRepoState(repoRoot string) bool
+}
+
+func (idx *Indexer) retainDeferredSemanticState() {
+	if idx.semanticMgr == nil {
+		return
+	}
+	for _, provider := range idx.semanticMgr.AllProviders() {
+		if retainer, ok := provider.(repoSemanticStateRetainer); ok {
+			retainer.RetainRepoState(idx.rootPath)
+		}
+	}
+}
+
+// releaseDeferredSemanticState runs only after this repository's contract pass
+// has returned. Providers not retaining contract-only state are untouched.
+func (idx *Indexer) releaseDeferredSemanticState() {
+	if idx.semanticMgr == nil {
+		return
+	}
+	for _, provider := range idx.semanticMgr.AllProviders() {
+		if releaser, ok := provider.(repoSemanticStateReleaser); ok {
+			releaser.ReleaseRepoState(idx.rootPath)
+		}
+	}
 }
 
 // RootPath returns the root path used for relative path computation.
@@ -3481,6 +3540,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
+	indexFileStarted := time.Now()
+	var snapshotDuration, commitDuration, resolveDuration time.Duration
+	var refFactsDuration, affectedDuration, enrichDuration time.Duration
 
 	// Parse-then-swap: we must NOT evict the file's existing nodes/edges
 	// and search entries until we hold a usable parse result. Evicting
@@ -3563,9 +3625,13 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	if idx.crashIsolationEnabled() {
 		pool, quarantine = idx.sharedParsePool()
 	}
-	result, skipped, err := idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
-	if quarantine != nil && quarantine.Len() > 0 {
-		_ = quarantine.Save()
+	result, prepared := idx.takePreparedExtraction(absPath, relPath, lang, src)
+	skipped := false
+	if !prepared {
+		result, skipped, err = idx.extractFile(pool, quarantine, absPath, relPath, lang, ext, src)
+		if quarantine != nil && quarantine.Len() > 0 {
+			_ = quarantine.Save()
+		}
 	}
 	if result == nil {
 		// No usable parse result (transient parse failure, quarantine,
@@ -3603,6 +3669,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
 	if resolve && !idx.deferGlobalPasses && !skipped {
+		snapshotStarted := time.Now()
 		abSnap = idx.snapshotAffectedBy(graphPath)
 		// Snapshot the file's outgoing edges before eviction: resolved ones so
 		// the re-parse recovers unchanged resolutions (reuseIdx), and the ones
@@ -3610,17 +3677,25 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// (priorUnresolved). Together this makes a save re-resolve only the
 		// references it actually changed instead of the whole file.
 		reuseIdx, priorUnresolved = captureIncrementalState(idx.graph, graphPath)
+		snapshotDuration = time.Since(snapshotStarted)
 	}
 
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
+	commitStarted := time.Now()
 	evictExisting()
 
-	// Coverage extractors (todos, licenses, ownership). Same call
-	// site exists in the bulk IndexCtx worker pool — see
-	// applyCoverageDomains. Skipped for a quarantined / timed-out file.
+	// Coverage extractors (todos, licenses, ownership). A prepared watcher
+	// delta already ran this exact pipeline; reusing it avoids both a second
+	// parse and duplicate coverage artifacts.
 	if !skipped {
-		idx.applyCoverageDomains(relPath, lang, src, result)
+		if !prepared {
+			idx.applyCoverageDomains(relPath, lang, src, result)
+		}
+		// Persist the canonical raw-extraction identity on the file node.
+		// Future watcher probes compare against it and skip only when every
+		// graph artifact — nodes, edges, locations and metadata — is equal.
+		stampExtractionGraphFingerprint(result)
 	}
 
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -3680,6 +3755,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			}
 		}
 	}
+	commitDuration = time.Since(commitStarted)
 
 	if resolve {
 		// Forward pass (this file's outgoing references) plus the
@@ -3696,7 +3772,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// incoming pass, so a small edit to a reference-heavy file no longer
 		// re-runs the candidate cascade on thousands of stdlib/external calls.
 		idx.resolver.SetIncrementalSkip(priorUnresolved)
+		resolveStarted := time.Now()
 		idx.resolver.ResolveFileAndIncoming(graphPath)
+		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
@@ -3716,19 +3794,22 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// Skipped under deferGlobalPasses — a batch caller (ReconcileAll,
 		// warmup) runs the global pass once at the end.
 		if !idx.deferGlobalPasses {
-			if idx.cloneIndex != nil {
-				// Seed the incremental clone index on first use — e.g. after a
-				// warm restart that loaded the graph from disk without a full
-				// re-index, `built` is false. Without this we'd fall to the
-				// whole-graph recompute on EVERY save; instead pay it once and
-				// then run the O(edited file) update.
-				if !idx.cloneIndex.built {
-					idx.cloneIndex.Rebuild(idx.graph, idx.repoPrefix)
+			newCloneFuncs := cloneFuncNodes(result.Nodes)
+			// A file with no old or new function nodes cannot change clone
+			// topology. In particular, do not make the first JSON/Markdown/data
+			// watcher event after a warm load seed the graph-wide clone index.
+			// The first real function edit still performs the normal one-time
+			// rebuild before its incremental update.
+			if len(oldFuncIDs) > 0 || len(newCloneFuncs) > 0 {
+				if idx.cloneIndex != nil && idx.cloneIndex.Ready() {
+					idx.cloneIndex.EvictFuncs(idx.graph, oldFuncIDs)
+					idx.cloneIndex.UpdateFuncs(idx.graph, idx.repoPrefix, newCloneFuncs, idx.cloneThreshold())
+				} else if idx.cloneIndex != nil {
+					// Never turn the first edit after a warm restart into a hidden
+					// whole-repo clone scan. Mark the clone view incomplete; an
+					// explicit clone-consuming/global pass rebuilds it later.
+					idx.cloneIndex.MarkPending()
 				}
-				idx.cloneIndex.EvictFuncs(idx.graph, oldFuncIDs)
-				idx.cloneIndex.UpdateFuncs(idx.graph, idx.repoPrefix, cloneFuncNodes(result.Nodes), idx.cloneThreshold())
-			} else {
-				detectClonesAndEmitEdges(idx.graph, idx.repoPrefix, idx.cloneThreshold())
 			}
 		}
 		// in-memory backend. Skipped for a quarantined / timed-out /
@@ -3738,12 +3819,16 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// reparse — abSnap is nil here too, so the affected-by pass that
 		// would also fan out is already a no-op.
 		if !skipped {
+			refFactsStarted := time.Now()
 			idx.persistRefFactsForFiles([]string{graphPath})
+			refFactsDuration = time.Since(refFactsStarted)
 			// Affected-by re-resolution: if this save changed a symbol's
 			// signature or kind, or removed a symbol, re-resolve the files
 			// that referenced it — bounded, synchronous, and gated on the
 			// signature delta so a body-only edit fans out to nothing.
+			affectedStarted := time.Now()
 			idx.reresolveAffectedBy(graphPath, abSnap, result.Nodes)
+			affectedDuration = time.Since(affectedStarted)
 
 			// Incremental semantic enrichment for this single file. Mirrors the
 			// full-index EnrichAll call but scoped to the saved file, so a
@@ -3754,6 +3839,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
 			reEnriched := false
 			if providersPresent {
+				enrichStarted := time.Now()
 				if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
 					idx.logger.Debug("indexer: incremental semantic enrichment failed",
 						zap.String("file", graphPath),
@@ -3761,6 +3847,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 				} else {
 					reEnriched = idx.semanticMgr.EnrichesOnWatch()
 				}
+				enrichDuration = time.Since(enrichStarted)
 			}
 			// Record whether this live re-parse left the file below the
 			// enrichment tier: providers exist (so there IS an lsp/ast tier to
@@ -3778,6 +3865,18 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
 	idx.recordFileMtime(mtimeKey, absPath)
+	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
+		idx.logger.Warn("indexer: slow incremental stages",
+			zap.String("file", graphPath),
+			zap.Duration("total", elapsed),
+			zap.Duration("snapshot_capture", snapshotDuration),
+			zap.Duration("commit_fts", commitDuration),
+			zap.Duration("resolver", resolveDuration),
+			zap.Duration("ref_facts", refFactsDuration),
+			zap.Duration("affected_by", affectedDuration),
+			zap.Duration("enrich_file", enrichDuration),
+		)
+	}
 
 	return nil
 }
@@ -4900,8 +4999,25 @@ func (idx *Indexer) SetRootPath(root string) {
 // When paths is empty the call degrades to IncrementalReindex(root) —
 // callers can therefore pass an optional path list unconditionally.
 func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*IndexResult, error) {
+	return idx.incrementalReindexPaths(root, paths, true)
+}
+
+// incrementalDiscoverPaths discovers and refreshes files beneath paths without
+// treating absent tracked files as deletions. Watcher directory-create scans
+// use this mode because their job is to recover creates that happened before a
+// nested watch was attached. A concurrent file-delete event must remain the
+// sole owner of eviction so it can publish the pre-delete symbol snapshot.
+func (idx *Indexer) incrementalDiscoverPaths(root string, paths []string) (*IndexResult, error) {
+	return idx.incrementalReindexPaths(root, paths, false)
+}
+
+func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectDeletions bool) (*IndexResult, error) {
 	if len(paths) == 0 {
-		return idx.IncrementalReindex(root)
+		// An empty scope means the repository root. detectDeletions decides
+		// whether absent persisted paths are evicted; keeping that choice here
+		// lets IncrementalReindex share this bounded implementation without a
+		// recursive wrapper call.
+		paths = []string{root}
 	}
 
 	start := time.Now()
@@ -5018,44 +5134,61 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		}
 	}
 
-	// Deletion detection, bounded to the scoped subtree. A file tracked
-	// in fileMtimes that sits under one of the requested paths but is
-	// absent from this scoped discovery walk is a deletion candidate;
-	// the same stat-before-evict guard as IncrementalReindex applies so
-	// a newly-excluded or transiently-unreachable file is preserved.
-	idx.mtimeMu.RLock()
-	var candidates []string
-	for relPath := range idx.fileMtimes {
-		if diskFiles[relPath] {
-			continue
-		}
-		if relPathInScope(relPath, scopeRels) {
-			candidates = append(candidates, relPath)
-		}
-	}
-	idx.mtimeMu.RUnlock()
-
 	var deletedFiles []string
-	for _, relPath := range candidates {
-		absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
-		_, statErr := os.Stat(absPath)
-		if statErr == nil {
-			continue
+	if detectDeletions {
+		// Deletion detection is deliberately opt-in. General scoped
+		// reconciles need it, while directory-create discovery must never
+		// consume a concurrent delete before the watcher can notify clients.
+		idx.mtimeMu.RLock()
+		var candidates []string
+		for relPath := range idx.fileMtimes {
+			if diskFiles[relPath] {
+				continue
+			}
+			if relPathInScope(relPath, scopeRels) {
+				candidates = append(candidates, relPath)
+			}
 		}
-		if errors.Is(statErr, os.ErrNotExist) {
-			deletedFiles = append(deletedFiles, relPath)
-			continue
+		idx.mtimeMu.RUnlock()
+
+		for _, relPath := range candidates {
+			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
+			_, statErr := os.Stat(absPath)
+			if statErr == nil {
+				continue
+			}
+			if errors.Is(statErr, os.ErrNotExist) {
+				deletedFiles = append(deletedFiles, relPath)
+				continue
+			}
+			idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
+				zap.String("rel", relPath), zap.Error(statErr))
 		}
-		idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
-			zap.String("rel", relPath), zap.Error(statErr))
 	}
 
+	var invalidation DerivedInvalidationPlan
 	for _, relPath := range deletedFiles {
 		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
 		// keys nodes under OS-native separators, so convert before the
 		// evict or a deleted file's nodes leak on Windows. FromSlash is
 		// a no-op on POSIX.
 		graphPath := idx.prefixPath(filepath.FromSlash(relPath))
+		priorNodes := idx.graph.GetFileNodes(graphPath)
+		for _, node := range priorNodes {
+			if node != nil && node.Kind != graph.KindFile && node.Kind != graph.KindImport {
+				idx.search.Remove(node.ID)
+			}
+		}
+		priorDerived := storedDerivedFingerprints(priorNodes)
+		deletedPlan := derivedPlanForDelta(
+			priorDerived, derivedFingerprints{}, true,
+			graphPath, priorNodes, nil,
+		)
+		// A known fingerprinted deletion is conservatively all-family but not
+		// a legacy uncertainty. Missing persisted fingerprints mean this is an
+		// upgraded database and must retain the wide safety fallback once.
+		deletedPlan.LegacyFallback = !priorDerived.complete()
+		invalidation.Merge(deletedPlan)
 		idx.restubIncomingRefs(graphPath)
 		idx.evictEnrichment(graphPath)
 		idx.graph.EvictFile(graphPath)
@@ -5063,88 +5196,103 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 		delete(idx.fileMtimes, relPath)
 		idx.mtimeMu.Unlock()
 	}
-	// Prune the persisted mtime rows for deleted files too, so the next
-	// warm restart does not see them as phantom deletions (the in-memory
-	// delete above does not reach the store's sidecar table).
 	idx.pruneDeletedFileMtimes(deletedFiles)
 
-	// Re-index stale files with the same one-shot retry as the
-	// whole-root path — a file locked or mid-write when the walk caught
-	// it gets a second chance before landing on FailedFiles.
+	reindexOne := func(filePath string) error {
+		mtimeKey := idx.relKey(filePath)
+		graphPath := idx.prefixPath(idx.graphRelKey(filePath))
+		priorNodes := idx.graph.GetFileNodes(graphPath)
+		storedGraph := storedExtractionGraphFingerprints(priorNodes)
+		storedDerived := storedDerivedFingerprints(priorNodes)
+		probe, probeOK := idx.prepareFileDelta(filePath)
+
+		if probeOK && storedGraph.semantic != "" {
+			switch {
+			case probe.fingerprints.semantic == storedGraph.semantic && probe.fingerprints.metadata == storedGraph.metadata:
+				idx.discardPreparedExtraction(filePath)
+				idx.recordFileMtime(mtimeKey, filePath)
+				invalidation.InertFiles++
+				return nil
+			case probe.fingerprints.semantic == storedGraph.semantic:
+				if _, refreshed := idx.applyPreparedMetadataRefresh(filePath, priorNodes); refreshed {
+					invalidation.MetadataOnlyFiles++
+					invalidation.Files = appendUniqueSorted(invalidation.Files, graphPath)
+					return nil
+				}
+			}
+		}
+
+		if err := idx.IndexFile(filePath); err != nil {
+			idx.discardPreparedExtraction(filePath)
+			return err
+		}
+		freshNodes := idx.graph.GetFileNodes(graphPath)
+		freshDerived := storedDerivedFingerprints(freshNodes)
+		if probeOK && probe.derived.complete() {
+			freshDerived = probe.derived
+		}
+		semanticChanged := !probeOK || storedGraph.semantic == "" || probe.fingerprints.semantic != storedGraph.semantic
+		invalidation.Merge(derivedPlanForDelta(
+			storedDerived, freshDerived, semanticChanged, graphPath, priorNodes, freshNodes,
+		))
+		return nil
+	}
+
 	var failedFiles []string
-	for _, f := range staleFiles {
-		if err := idx.IndexFile(f); err != nil {
+	for _, filePath := range staleFiles {
+		if err := reindexOne(filePath); err != nil {
 			idx.logger.Debug("incremental reindex: failed to index file",
-				zap.String("file", f), zap.Error(err))
-			failedFiles = append(failedFiles, f)
+				zap.String("file", filePath), zap.Error(err))
+			failedFiles = append(failedFiles, filePath)
 		}
 	}
 	if len(failedFiles) > 0 {
 		retry := failedFiles
 		failedFiles = nil
-		for _, f := range retry {
-			if err := idx.IndexFile(f); err != nil {
+		for _, filePath := range retry {
+			if err := reindexOne(filePath); err != nil {
 				idx.logger.Warn("incremental reindex: file failed after retry",
-					zap.String("file", f), zap.Error(err))
-				failedFiles = append(failedFiles, f)
+					zap.String("file", filePath), zap.Error(err))
+				failedFiles = append(failedFiles, filePath)
 			}
 		}
 	}
 
-	// Re-infer interface implementations and re-run stub-call passes —
-	// eviction may have dropped edges. Skipped under deferGlobalPasses
-	// so a batch caller runs one global pass at the end.
-	if !idx.deferGlobalPasses && (len(staleFiles) > 0 || len(deletedFiles) > 0) {
-		// Scoped inference passes re-derive only the affected types/interfaces
-		// (add-parity with the full pass); fall back to whole-graph when
-		// scoping is disabled.
-		if !idx.runScopedInferencePasses(staleFiles) {
-			idx.resolver.InferImplements()
-			idx.resolver.InferOverrides()
-		}
-		// Capability (reads_env / executes_process / accesses_field) and
-		// framework-dispatch synthesis derive from code structure; skip them
-		// when the reconcile touched only non-code files (docs/config) and
-		// removed nothing — they cannot change any edge in that case, and
-		// eviction already handled any deletion. Same idempotent re-derive
-		// RunGlobalGraphPasses runs at full index.
-		if len(deletedFiles) > 0 || idx.staleFilesAffectDerivedEdges(staleFiles) {
-			synthesizeCapabilityEdges(idx.graph)
-			resolver.RunFrameworkSynthesizers(idx.graph)
-		}
-		// Incremental: synthesize external calls only for the reindexed
-		// files (O(edited files)), not a full-graph recompute.
-		resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), idx.graphFilePaths(staleFiles))
-	}
-
-	// Skip the search-index rebuild on a zero-change reconcile when the
-	// backend already persists its search structures (the on-disk
-	// backend keeps its FTS index and vector embeddings on disk).
-	// buildSearchIndex re-reads every node (GetRepoNodes) and re-embeds
-	// them, then BulkUpsertEmbeddings re-writes the embedding rows. On a
-	// warm restart that work is pure recompute of already-persisted data.
-	// When nothing changed there is nothing to re-embed, so skip it
-	// entirely — the persisted index is authoritative. The in-memory
-	// backends (BM25 / Bleve) must still rebuild from the replayed
-	// snapshot, so they keep the unconditional path.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 || !isSymbolSearcherBackend(idx.search) {
+	// Structural and metadata refreshes maintain both the in-memory search
+	// backend and persistent FTS one symbol at a time; deletions remove the
+	// prior symbols above. Rebuilding the whole corpus after a tiny edit would
+	// re-embed every unchanged symbol. The only rebuild retained here is the
+	// zero-delta bootstrap for a non-persistent backend restored beside an
+	// already-populated graph.
+	if len(staleFiles) == 0 && len(deletedFiles) == 0 && !isSymbolSearcherBackend(idx.search) {
 		idx.buildSearchIndex()
 	}
 
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
-		idx.extractContracts()
+		// Contract extraction is file-bounded even for body-only and metadata
+		// deltas: endpoint literals, response envelopes and source locations can
+		// change without changing declaration/call topology. Only an effective
+		// contract-set change requests the workspace reconciliation pass.
+		contractsChanged, contractFallback := idx.refreshContractsForFiles(invalidation.Files)
+		if contractsChanged {
+			invalidation.Flags |= DerivedInvalidatesContracts
+		}
+		if contractFallback {
+			invalidation.LegacyFallback = true
+		}
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	result := &IndexResult{
-		NodeCount:        nodes,
-		EdgeCount:        edges,
-		FileCount:        len(diskFiles),
-		StaleFileCount:   len(staleFiles),
-		DeletedFileCount: len(deletedFiles),
-		FailedFiles:      failedFiles,
-		DurationMs:       time.Since(start).Milliseconds(),
+		NodeCount:           nodes,
+		EdgeCount:           edges,
+		FileCount:           len(diskFiles),
+		StaleFileCount:      len(staleFiles),
+		DeletedFileCount:    len(deletedFiles),
+		FailedFiles:         failedFiles,
+		DurationMs:          time.Since(start).Milliseconds(),
+		DerivedInvalidation: invalidation,
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// An incremental pass that re-indexed or evicted at least one file did

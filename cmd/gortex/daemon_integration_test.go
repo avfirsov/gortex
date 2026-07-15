@@ -113,6 +113,8 @@ func TestDaemon_EndToEnd_GraphStatsOverMCPProxy(t *testing.T) {
 		Mode:       daemon.ModeMCP,
 		CWD:        trackedRoot,
 		ClientName: "integration-test",
+		Tools:      cliLegacyToolSurface,
+		ToolsMode:  cliLegacyToolMode,
 	})
 	require.NoError(t, err)
 	defer client.Close()
@@ -268,6 +270,23 @@ func TestDaemon_EndToEnd_TrackPersistsToConfig(t *testing.T) {
 	}
 	assert.Contains(t, foundPaths, absSecond,
 		"tracked repo must be persisted to the global config; got %v", foundPaths)
+}
+
+func TestUntrackedBootstrapCallsAreNarrow(t *testing.T) {
+	capabilities := []byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"capabilities","arguments":{}}}`)
+	track := []byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"workspace_admin","arguments":{"operation":"track","arguments":{"path":"."}}}}`)
+	reindex := []byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"workspace_admin","arguments":{"operation":"reindex"}}}`)
+	read := []byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"read","arguments":{"operation":"file","target":{"file":"main.go"}}}}`)
+	require.True(t, untrackedBootstrapCall(capabilities))
+	require.True(t, untrackedBootstrapCall(track))
+	require.False(t, untrackedBootstrapCall(reindex))
+	require.False(t, untrackedBootstrapCall(read))
+	require.False(t, untrackedBootstrapCall([]byte(`not-json`)))
+}
+
+func TestUntrackedToolsListPreservesFacadeSurface(t *testing.T) {
+	response := []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"capabilities"},{"name":"read"},{"name":"workspace_admin"}]}}`)
+	require.Equal(t, response, rewriteUntrackedResponse("tools/list", response, "/tmp/untracked", []string{"/tmp/tracked"}))
 }
 
 // silence unused-import noise when gofmt reorders during edits.

@@ -1,5 +1,20 @@
 package resolver
 
+import (
+	"os"
+	"strings"
+	"time"
+)
+
+const (
+	// LSPResolvePassBudgetEnv overrides the total wall-clock budget for the
+	// deferred resolve-time LSP batch in ResolveAll. A zero/off/none value
+	// preserves the pre-budget unlimited behaviour.
+	LSPResolvePassBudgetEnv = "GORTEX_LSP_RESOLVE_PASS_BUDGET"
+
+	defaultLSPResolvePassBudget = 15 * time.Second
+)
+
 // LSPHelper drives resolve-time LSP queries from the cross-file
 // resolver. The resolver consults it for TS/JS/JSX/TSX edges before
 // falling back to AST/name heuristics — letting the type-aware
@@ -38,7 +53,33 @@ func (r *Resolver) SetLSPHelper(h LSPHelper) {
 	r.lspHelper = h
 }
 
+// SetLSPResolvePassBudget overrides the cumulative deferred-LSP budget used
+// by ResolveAll. Zero disables the cumulative bound (the helper's per-call
+// timeout still applies); negative values are normalised to zero. Like
+// SetLSPHelper, it must be configured before a resolve pass starts.
+func (r *Resolver) SetLSPResolvePassBudget(budget time.Duration) {
+	if budget < 0 {
+		budget = 0
+	}
+	r.lspResolvePassBudget = budget
+}
+
 // LSPHelper returns the currently installed helper, or nil.
 func (r *Resolver) LSPHelper() LSPHelper {
 	return r.lspHelper
+}
+
+func lspResolvePassBudgetFromEnv() time.Duration {
+	switch raw := strings.TrimSpace(os.Getenv(LSPResolvePassBudgetEnv)); raw {
+	case "":
+		return defaultLSPResolvePassBudget
+	case "0", "off", "none":
+		return 0
+	default:
+		budget, err := time.ParseDuration(raw)
+		if err != nil || budget < 0 {
+			return defaultLSPResolvePassBudget
+		}
+		return budget
+	}
 }

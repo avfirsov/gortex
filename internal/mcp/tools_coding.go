@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -172,7 +173,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("rename_symbol",
-			mcp.WithDescription("Plans a coordinated multi-file rename for a symbol. Plan-only — this call never writes to disk. Returns {file, line, old_text, new_text, confidence, reason} for the definition, every graph usage (calls / references / instantiates), receiver-line edits when renaming a type, and test-function names that embed the old identifier. Apply the returned edits with batch_edit (preferred — dependency-ordered, atomic), edit_file, or edit_symbol."),
+			mcp.WithDescription("Plans a coordinated multi-file rename for a symbol. Plan-only — this call never writes to disk. Returns {file, line, old_text, new_text, confidence, reason} for the definition, every graph usage (calls / references / instantiates), receiver-line edits when renaming a type, and test-function names that embed the old identifier. Apply the returned edits with batch_edit (preferred — preflighted and dependency-ordered), edit_file, or edit_symbol."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Symbol ID to rename (e.g. auth/token.go::validateToken)")),
 			mcp.WithString("new_name", mcp.Required(), mcp.Description("New name for the symbol")),
 		),
@@ -733,7 +734,8 @@ func (s *Server) handleFindImportPath(ctx context.Context, req mcp.CallToolReque
 }
 
 func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if s.watcher == nil {
+	watcher := s.currentWatcher()
+	if watcher == nil {
 		return mcp.NewToolResultError("watch mode is not active"), nil
 	}
 
@@ -745,7 +747,7 @@ func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolReq
 		if err != nil {
 			return mcp.NewToolResultError("invalid timestamp: " + sinceStr), nil
 		}
-		for _, ev := range s.watcher.HistorySince(t) {
+		for _, ev := range watcher.HistorySince(t) {
 			changes = append(changes, map[string]any{
 				"file":          ev.FilePath,
 				"kind":          ev.Kind,
@@ -755,7 +757,7 @@ func (s *Server) handleGetRecentChanges(ctx context.Context, req mcp.CallToolReq
 			})
 		}
 	} else {
-		for _, ev := range s.watcher.History() {
+		for _, ev := range watcher.History() {
 			changes = append(changes, map[string]any{
 				"file":          ev.FilePath,
 				"kind":          ev.Kind,
@@ -1079,15 +1081,49 @@ func extractLinesFromContent(content string, startLine, endLine, contextLines in
 	return strings.Join(picked, "\n"), from, totalChars, nil
 }
 
-func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	idsStr, err := req.RequireString("ids")
-	if err != nil {
-		return mcp.NewToolResultError("ids is required"), nil
+func parseBatchSymbolIDs(raw any) ([]string, bool) {
+	var ids []string
+	switch value := raw.(type) {
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if strings.HasPrefix(trimmed, "[") {
+			// Facade arrays cross the legacy string schema as JSON so commas in
+			// generic parameter lists remain part of one opaque symbol ID.
+			if err := json.Unmarshal([]byte(trimmed), &ids); err != nil {
+				return nil, false
+			}
+		} else {
+			// Backward compatibility for the original CLI/MCP shorthand. Scalar
+			// values are the only shape where commas mean multiple IDs.
+			ids = strings.Split(value, ",")
+		}
+	case []string:
+		ids = append(ids, value...)
+	case []any:
+		ids = make([]string, 0, len(value))
+		for _, item := range value {
+			id, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			ids = append(ids, id)
+		}
+	default:
+		return nil, false
 	}
-
-	ids := strings.Split(idsStr, ",")
 	for i := range ids {
 		ids[i] = strings.TrimSpace(ids[i])
+		if ids[i] == "" {
+			return nil, false
+		}
+	}
+	return ids, len(ids) > 0
+}
+
+func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ids, ok := parseBatchSymbolIDs(req.GetArguments()["ids"])
+	if !ok {
+		return mcp.NewToolResultError("ids is required"), nil
 	}
 
 	includeSource := false
@@ -2639,6 +2675,11 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	// Read the entire file ONCE — both the drift check and the
 	// patch operate on the same byte snapshot so a concurrent
@@ -2768,15 +2809,19 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	// Write the file.
-	if err := os.WriteFile(absPath, newContentBytes, 0o644); err != nil {
+	// Write the file atomically while holding the path mutation lock.
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(absPath); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
 	}
 	sess := s.sessionFor(ctx)
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	// Count lines changed.
 	oldLines := strings.Count(oldSource, "\n") + 1
@@ -2789,15 +2834,15 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		"lines_after":  newLines,
 		"start_line":   node.StartLine,
 		"status":       "applied",
-		"reindexed":    reindexed,
 		"new_sha":      gitBlobSHA(newContentBytes),
 	}
 	if regionMatches.normalized {
 		resp["eol_normalized"] = true
 	}
-	if health := s.fileSyntaxHealth(node.FilePath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 

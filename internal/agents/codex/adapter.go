@@ -18,23 +18,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
+	"github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/version"
 )
 
-const Name = "codex"
-const DocsURL = "https://developers.openai.com/codex/mcp"
+const (
+	Name    = "codex"
+	DocsURL = "https://developers.openai.com/codex/mcp"
+)
+
+const (
+	codexGortexToolNamespace            = "mcp__gortex"
+	codexGortexNonPrefixedToolNamespace = "gortex"
+	codexMCPStartupTimeoutSeconds       = 90
+	codexDirectToolNamespacesMinMinor   = 142
+)
 
 const codexSessionStartMatcher = "startup|resume|clear|compact"
-const codexSessionStartMessage = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
-const codexSessionStartCommand = "printf '%s\\n' '" + codexSessionStartMessage + "'"
-const codexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + codexSessionStartMessage + "'\""
-const codexPreToolUseMatcher = "^Bash$"
-const codexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
-const codexPostToolUseMatcher = "^Bash$"
-const codexHookTimeoutSeconds = 5
+
+// v060CodexSessionStart* fingerprints the static hook shipped by gortex
+// v0.60.0 so an upgrade replaces it instead of installing a duplicate. The
+// concrete retirement gate is documented in docs/versioning.md.
+const (
+	v060CodexSessionStartMessage        = "IMPORTANT: Prefer Gortex MCP tools (search_symbols, get_callers, get_file_summary, edit_file) over Read/Grep/Glob/Edit."
+	v060CodexSessionStartCommand        = "printf '%s\\n' '" + v060CodexSessionStartMessage + "'"
+	v060CodexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + v060CodexSessionStartMessage + "'\""
+	codexPreToolUseMatcher              = "^Bash$"
+	codexMCPReadPreToolUseMatcher       = "^mcp__gortex__read$"
+	codexPostToolUseMatcher             = "^(Bash|apply_patch)$"
+	codexHookTimeoutSeconds             = 5
+	codexHookModeEnvVar                 = "GORTEX_CODEX_HOOK_MODE"
+)
 
 type Adapter struct{}
 
@@ -59,7 +79,7 @@ func (a *Adapter) Detect(env agents.Env) (bool, error) {
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 	p := &agents.Plan{}
 	if env.Home != "" {
-		keys := []string{"mcp_servers"}
+		keys := []string{"mcp_servers", "features.code_mode"}
 		if env.InstallHooks {
 			keys = append(keys, "hooks")
 		}
@@ -93,21 +113,13 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 
 	path := filepath.Join(env.Home, ".codex", "config.toml")
 	action, err := agents.MergeTOML(env.Stderr, path, func(root map[string]any, _ bool) (bool, error) {
-		changed := false
-		servers, ok := root["mcp_servers"].(map[string]any)
-		if !ok {
-			servers = make(map[string]any)
-		}
-		if _, exists := servers["gortex"]; !exists || opts.Force {
-			servers["gortex"] = map[string]any{
-				"command": "gortex",
-				"args":    []string{"mcp"},
-				"env": map[string]any{
-					"GORTEX_INDEX_WORKERS": "8",
-				},
+		changed := upsertCodexMCPServer(root, opts)
+		if supported, detectedVersion := codexSupportsDirectToolNamespaces(); supported || codexHasDirectToolNamespaces(root) {
+			if upsertCodexDirectToolNamespaces(root) {
+				changed = true
 			}
-			root["mcp_servers"] = servers
-			changed = true
+		} else {
+			internalutil.Warnf(env.Stderr, "Codex %s does not support direct MCP namespaces; upgrade to Codex 0.%d+ to keep Gortex tools eager", detectedVersion, codexDirectToolNamespacesMinMinor)
 		}
 
 		if env.InstallHooks {
@@ -140,8 +152,282 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	return res, nil
 }
 
-func upsertSessionStartHook(root map[string]any, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "SessionStart", codexHookEntryIsGortexSessionStart, codexSessionStartHookEntry(), opts)
+func codexHasDirectToolNamespaces(root map[string]any) bool {
+	features, ok := root["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, exists := codeMode["direct_only_tool_namespaces"]
+	return exists
+}
+
+// upsertCodexMCPServer makes Gortex a required Codex dependency and gives its
+// first-start daemon path enough time to publish the initial snapshot. Codex's
+// default MCP startup timeout can expire before that path's 60-second wait.
+// Existing Gortex-authored launch, environment, approval, and tool-timeout
+// settings are preserved; only these two availability invariants are managed.
+func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
+	servers, ok := root["mcp_servers"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+	desired := map[string]any{
+		"command":             "gortex",
+		"args":                []string{"mcp"},
+		"required":            true,
+		"startup_timeout_sec": codexMCPStartupTimeoutSeconds,
+		"env": map[string]any{
+			"GORTEX_INDEX_WORKERS": "8",
+		},
+	}
+	existing, exists := servers["gortex"]
+	if !exists || opts.Force {
+		servers["gortex"] = desired
+		root["mcp_servers"] = servers
+		return true
+	}
+	if !agents.IsGortexAuthoredMCPEntry(existing) {
+		return false
+	}
+	entry, ok := existing.(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := migrateCodexFacadeToolApprovals(entry)
+	if required, _ := entry["required"].(bool); !required {
+		entry["required"] = true
+		changed = true
+	}
+	if !codexStartupTimeoutAtLeast(entry["startup_timeout_sec"], codexMCPStartupTimeoutSeconds) {
+		entry["startup_timeout_sec"] = codexMCPStartupTimeoutSeconds
+		changed = true
+	}
+	if changed {
+		servers["gortex"] = entry
+		root["mcp_servers"] = servers
+	}
+	return changed
+}
+
+// migrateCodexFacadeToolApprovals upgrades per-tool approval entries from the
+// legacy one-tool-per-operation surface to the compact public facade. Entries
+// for current facade tools, unknown extension tools, and user-defined fields
+// are preserved. Several legacy tools can collapse into one facade tool; when
+// their approval modes disagree, prompt is the conservative merged posture.
+func migrateCodexFacadeToolApprovals(entry map[string]any) bool {
+	tools, ok := entry["tools"].(map[string]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+
+	legacyNames := make([]string, 0, len(tools))
+	for name := range tools {
+		facade, _, recognized := mcp.PublicOperationForLegacy(name)
+		if recognized && facade != name {
+			legacyNames = append(legacyNames, name)
+		}
+	}
+	if len(legacyNames) == 0 {
+		return false
+	}
+	slices.Sort(legacyNames)
+
+	changed := false
+	for _, legacyName := range legacyNames {
+		facade, _, _ := mcp.PublicOperationForLegacy(legacyName)
+		legacyValue := tools[legacyName]
+		legacyTable, validTable := legacyValue.(map[string]any)
+		if !validTable {
+			// Do not delete malformed or future config shapes that we cannot
+			// migrate without losing user intent.
+			continue
+		}
+
+		if currentValue, exists := tools[facade]; !exists {
+			tools[facade] = cloneCodexToolApproval(legacyTable)
+		} else if currentTable, ok := currentValue.(map[string]any); ok {
+			mergeCodexToolApproval(currentTable, legacyTable)
+		} else {
+			// A non-table public entry is not a documented Codex shape. Keep it
+			// and the legacy entry rather than guessing which one the user owns.
+			continue
+		}
+		delete(tools, legacyName)
+		changed = true
+	}
+	return changed
+}
+
+func cloneCodexToolApproval(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func mergeCodexToolApproval(current, incoming map[string]any) {
+	for key, value := range incoming {
+		if key == "approval_mode" {
+			continue
+		}
+		if _, exists := current[key]; !exists {
+			current[key] = value
+		}
+	}
+
+	incomingMode, incomingHasMode := incoming["approval_mode"]
+	currentMode, currentHasMode := current["approval_mode"]
+	switch {
+	case !currentHasMode && incomingHasMode:
+		current["approval_mode"] = incomingMode
+	case currentHasMode && incomingHasMode && !reflect.DeepEqual(currentMode, incomingMode):
+		current["approval_mode"] = "prompt"
+	}
+}
+
+func codexStartupTimeoutAtLeast(value any, minimum int) bool {
+	switch n := value.(type) {
+	case int:
+		return n >= minimum
+	case int8:
+		return int(n) >= minimum
+	case int16:
+		return int(n) >= minimum
+	case int32:
+		return int(n) >= minimum
+	case int64:
+		return n >= int64(minimum)
+	case uint:
+		return n >= uint(minimum)
+	case uint8:
+		return uint(n) >= uint(minimum)
+	case uint16:
+		return uint(n) >= uint(minimum)
+	case uint32:
+		return uint(n) >= uint(minimum)
+	case uint64:
+		return n >= uint64(minimum)
+	case float32:
+		return n >= float32(minimum)
+	case float64:
+		return n >= float64(minimum)
+	default:
+		return false
+	}
+}
+
+// codexVersionOutput is a seam for hermetic adapter tests.
+var codexVersionOutput = func() ([]byte, error) {
+	path, err := exec.LookPath("codex")
+	if err != nil {
+		return nil, err
+	}
+	return exec.Command(path, "--version").Output()
+}
+
+func codexSupportsDirectToolNamespaces() (supported bool, detectedVersion string) {
+	out, err := codexVersionOutput()
+	if err != nil {
+		// Codex App and IDE installs do not necessarily put their bundled
+		// CLI on PATH. Treat an unknown install as current so those surfaces
+		// retain automatic direct exposure; only a positively identified old
+		// CLI is gated below.
+		return true, ""
+	}
+	for _, token := range strings.Fields(string(out)) {
+		token = strings.Trim(token, "(),")
+		parsed, parseErr := version.Parse(token)
+		if parseErr != nil {
+			continue
+		}
+		detectedVersion = strings.TrimPrefix(token, "v")
+		return parsed.Major > 0 || (parsed.Major == 0 && parsed.Minor >= codexDirectToolNamespacesMinMinor), detectedVersion
+	}
+	return true, ""
+}
+
+// upsertCodexDirectToolNamespaces keeps Gortex's compact MCP facade in the
+// model-facing tool manifest. Codex 0.142+ can otherwise defer MCP tools
+// behind tool search when the active model supports it. The namespace list is
+// additive so user-selected direct namespaces and all other code-mode fields
+// survive; the old boolean feature form is upgraded without changing its value.
+// Both exact namespace spellings are installed because Codex's opt-in
+// non_prefixed_mcp_tool_names feature changes `mcp__gortex` to `gortex`.
+func upsertCodexDirectToolNamespaces(root map[string]any) bool {
+	changed := false
+	for _, namespace := range []string{codexGortexToolNamespace, codexGortexNonPrefixedToolNamespace} {
+		if upsertCodexDirectToolNamespace(root, namespace) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func upsertCodexDirectToolNamespace(root map[string]any, namespace string) bool {
+	features, ok := root["features"].(map[string]any)
+	if !ok {
+		if _, exists := root["features"]; exists {
+			return false
+		}
+		features = make(map[string]any)
+	}
+
+	var codeMode map[string]any
+	switch existing := features["code_mode"].(type) {
+	case nil:
+		codeMode = make(map[string]any)
+	case bool:
+		codeMode = map[string]any{"enabled": existing}
+	case map[string]any:
+		codeMode = existing
+	default:
+		return false
+	}
+
+	const field = "direct_only_tool_namespaces"
+	namespaces, valid := codexStringList(codeMode[field])
+	if !valid {
+		return false
+	}
+	for _, existing := range namespaces {
+		if existing == namespace {
+			return false
+		}
+	}
+	codeMode[field] = append(namespaces, namespace)
+	features["code_mode"] = codeMode
+	root["features"] = features
+	return true
+}
+
+func codexStringList(value any) ([]string, bool) {
+	switch list := value.(type) {
+	case nil:
+		return nil, true
+	case []string:
+		return append([]string(nil), list...), true
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, value := range list {
+			s, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func upsertSessionStartHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
+	return upsertCodexHookSet(root, "SessionStart", codexHookEntryIsGortexSessionStart, []map[string]any{codexSessionStartHookEntry(env)}, opts)
 }
 
 func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
@@ -153,11 +439,11 @@ func upsertPreToolUseHook(root map[string]any, env agents.Env, opts agents.Apply
 }
 
 func upsertPostToolUseHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "PostToolUse", codexHookEntryIsGortexPostToolUse, codexPostToolUseHookEntry(env), opts)
+	return upsertCodexHookSet(root, "PostToolUse", codexHookEntryIsGortexPostToolUse, []map[string]any{codexPostToolUseHookEntry(env)}, opts)
 }
 
 func upsertUserPromptSubmitHook(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	return upsertCodexHook(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, codexUserPromptSubmitHookEntry(env), opts)
+	return upsertCodexHookSet(root, "UserPromptSubmit", codexHookEntryIsGortexUserPromptSubmit, []map[string]any{codexUserPromptSubmitHookEntry(env)}, opts)
 }
 
 // InstallHooksOnly refreshes the Codex lifecycle hooks in configPath without
@@ -176,45 +462,11 @@ func InstallHooksOnly(w io.Writer, configPath string, env agents.Env, opts agent
 }
 
 func upsertCodexHooks(root map[string]any, env agents.Env, opts agents.ApplyOpts) bool {
-	sessionChanged := upsertSessionStartHook(root, opts)
+	sessionChanged := upsertSessionStartHook(root, env, opts)
 	preChanged := upsertPreToolUseHook(root, env, opts)
 	postChanged := upsertPostToolUseHook(root, env, opts)
 	promptChanged := upsertUserPromptSubmitHook(root, env, opts)
 	return sessionChanged || preChanged || postChanged || promptChanged
-}
-
-func upsertCodexHook(root map[string]any, event string, isGortex func(any) bool, desired map[string]any, opts agents.ApplyOpts) bool {
-	hooks, ok := root["hooks"].(map[string]any)
-	if !ok {
-		if _, exists := root["hooks"]; exists {
-			return false
-		}
-		hooks = make(map[string]any)
-	}
-
-	entries, ok := codexHookList(hooks[event])
-	if !ok {
-		return false
-	}
-
-	found := false
-	kept := make([]any, 0, len(entries)+1)
-	for _, entry := range entries {
-		if isGortex(entry) {
-			found = true
-			if opts.Force {
-				continue
-			}
-		}
-		kept = append(kept, entry)
-	}
-	if found && !opts.Force {
-		return false
-	}
-
-	hooks[event] = append(kept, desired)
-	root["hooks"] = hooks
-	return true
 }
 
 func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bool, desired []map[string]any, opts agents.ApplyOpts) bool {
@@ -233,22 +485,30 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 
 	found := make([]bool, len(desired))
 	kept := make([]any, 0, len(entries)+len(desired))
+	changed := false
 	for _, entry := range entries {
 		if isGortex(entry) {
 			if opts.Force {
 				continue
 			}
+			matched := false
 			for i, want := range desired {
 				if !found[i] && codexHookEntryMatchesDesired(entry, want) {
 					found[i] = true
+					matched = true
 					break
 				}
+			}
+			if !matched {
+				// This is a Gortex-authored hook with a stale matcher, command,
+				// or posture. Replace it instead of accumulating duplicate hooks.
+				changed = true
+				continue
 			}
 		}
 		kept = append(kept, entry)
 	}
 
-	changed := false
 	for i, want := range desired {
 		if opts.Force || !found[i] {
 			kept = append(kept, want)
@@ -266,7 +526,30 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 
 func codexHookEntryMatchesDesired(entry any, desired map[string]any) bool {
 	matcher, _ := desired["matcher"].(string)
-	return codexHookEntryHasMatcher(entry, matcher) && codexHookEntryInvokesCodexHook(entry)
+	if !codexHookEntryHasMatcher(entry, matcher) {
+		return false
+	}
+	want := codexHookEntryCommand(desired)
+	return want != "" && codexHookEntryCommand(entry) == want
+}
+
+func codexHookEntryCommand(entry any) string {
+	group, ok := entry.(map[string]any)
+	if !ok {
+		return ""
+	}
+	handlers, ok := codexHookList(group["hooks"])
+	if !ok {
+		return ""
+	}
+	for _, handler := range handlers {
+		if fields, ok := handler.(map[string]any); ok {
+			if command, _ := fields["command"].(string); strings.TrimSpace(command) != "" {
+				return command
+			}
+		}
+	}
+	return ""
 }
 
 func codexHookEntryHasMatcher(entry any, matcher string) bool {
@@ -310,10 +593,10 @@ func codexHookEntryIsGortexSessionStart(entry any) bool {
 		if !ok {
 			continue
 		}
-		if cmd, _ := hm["command"].(string); cmd == codexSessionStartCommand {
+		if cmd, _ := hm["command"].(string); cmd == v060CodexSessionStartCommand || codexCommandInvokesCodexHook(cmd) {
 			return true
 		}
-		if cmd, _ := hm["command_windows"].(string); cmd == codexSessionStartWindowsCommand {
+		if cmd, _ := hm["command_windows"].(string); cmd == v060CodexSessionStartWindowsCommand {
 			return true
 		}
 	}
@@ -365,16 +648,15 @@ func codexCommandInvokesCodexHook(cmd string) bool {
 	return strings.Contains(cmd, "--agent=codex") || strings.Contains(cmd, "--agent codex")
 }
 
-func codexSessionStartHookEntry() map[string]any {
+func codexSessionStartHookEntry(env agents.Env) map[string]any {
 	return map[string]any{
 		"matcher": codexSessionStartMatcher,
 		"hooks": []any{
 			map[string]any{
-				"type":            "command",
-				"command":         codexSessionStartCommand,
-				"command_windows": codexSessionStartWindowsCommand,
-				"timeout":         codexHookTimeoutSeconds,
-				"statusMessage":   "Loading Gortex graph orientation...",
+				"type":          "command",
+				"command":       codexHookCommand(env),
+				"timeout":       codexHookTimeoutSeconds,
+				"statusMessage": "Loading Gortex graph orientation...",
 			},
 		},
 	}
@@ -416,7 +698,7 @@ func codexPostToolUseHookEntry(env agents.Env) map[string]any {
 				"type":          "command",
 				"command":       codexHookCommand(env),
 				"timeout":       codexHookTimeoutSeconds,
-				"statusMessage": "Loading Gortex Bash output context...",
+				"statusMessage": "Loading Gortex post-tool context...",
 			},
 		},
 	}
@@ -449,5 +731,23 @@ func codexHookCommand(env agents.Env) string {
 	if base == "" {
 		base = "gortex hook"
 	}
-	return base + " --agent=codex --mode=enrich"
+	return base + " --agent=codex --mode=" + codexHookMode()
+}
+
+// codexHookMode keeps the shipped posture advisory while allowing a team to
+// opt into current Codex capabilities without changing the generic Claude hook
+// posture. Supported values: enrich, deny, rewrite, suppress. Suppress uses
+// PostToolUse result replacement because Codex does not yet implement the
+// suppressOutput field itself.
+func codexHookMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(codexHookModeEnvVar))) {
+	case "deny", "hard-deny":
+		return "deny"
+	case "rewrite", "input-rewrite":
+		return "rewrite"
+	case "suppress", "replace-output", "output-suppression":
+		return "suppress"
+	default:
+		return "enrich"
+	}
 }

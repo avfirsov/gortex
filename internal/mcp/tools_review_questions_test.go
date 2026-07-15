@@ -80,13 +80,13 @@ func reviewQuestionsTestServer(t *testing.T) *Server {
 	for _, m := range bigMembers {
 		nodeToComm[m] = "c-big"
 	}
-	s.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(s, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "c-big", Label: "big", Size: len(bigMembers)},
 			{ID: "c-lonely", Label: "lonely", Size: 1},
 		},
 		NodeToComm: nodeToComm,
-	}
+	})
 	return s
 }
 

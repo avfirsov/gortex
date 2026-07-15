@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
@@ -248,6 +249,9 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	if repoRoot == "" {
 		repoRoot = "."
 	}
+	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); freshnessErr != nil {
+		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil
+	}
 
 	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
@@ -289,6 +293,18 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	return s.respondJSONOrTOON(ctx, req, detectResult)
 }
 
+// tryImpactAnalysisSnapshots reads optional cached enrichments without waiting
+// behind a background community/process rebuild. Impact is a mandatory safety
+// gate; cached labels must never determine whether the core blast radius can
+// return within its deadline.
+func (s *Server) tryImpactAnalysisSnapshots() (*analysis.CommunityResult, *analysis.ProcessResult) {
+	if !s.analysisMu.TryRLock() {
+		return nil, nil
+	}
+	defer s.analysisMu.RUnlock()
+	return s.communities, s.processes
+}
+
 // handleEnhancedChangeImpact replaces the original explain_change_impact with risk tiering
 // and cross-community warnings.
 func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -302,11 +318,24 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
-	impact := analysis.AnalyzeImpact(s.graph, ids, s.getCommunities(), s.getProcesses())
+	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, s.mutationReposForSymbolIDs(ctx, ids)...); freshnessErr != nil {
+		return mcp.NewToolResultError("change impact refused a stale graph: " + freshnessErr.Error()), nil
+	}
+
+	// Keep the mandatory pre-edit safety gate well below host transport
+	// timeouts. Every lower layer receives this deadline and must return a
+	// conservative truncated result rather than leaving the daemon busy after
+	// the client has already abandoned the call.
+	impactCtx, cancelImpact := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelImpact()
+	communities, processes := s.tryImpactAnalysisSnapshots()
+	impact := analysis.AnalyzeImpactContext(impactCtx, s.graph, ids, communities, processes)
 
 	result := map[string]any{
 		"risk":                 impact.Risk,
 		"summary":              impact.Summary,
+		"complete":             impactComplete(impact),
+		"truncated":            impact.Truncated,
 		"by_depth":             impact.ByDepth,
 		"affected_processes":   impact.AffectedProcesses,
 		"affected_communities": impact.AffectedCommunities,
@@ -343,34 +372,42 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	// safe-to-change symbols apart from symbols the extractor never
 	// wired up. Classify each input so a safety gate is not disarmed
 	// by a false "0 affected".
-	if impact.TotalAffected == 0 {
-		var caveats []graph.ZeroImpactCaveat
-		for _, id := range ids {
-			if id == "" {
-				continue
+	if impact.TotalAffected == 0 && !impact.Truncated {
+		if _, inMemory := s.graph.(*graph.Graph); inMemory {
+			var caveats []graph.ZeroImpactCaveat
+			for _, id := range ids {
+				if id == "" {
+					continue
+				}
+				if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
+					caveats = append(caveats, graph.ZeroImpactCaveat{
+						ID:      id,
+						Class:   c.Class,
+						Message: c.Message,
+					})
+				}
 			}
-			if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
-				caveats = append(caveats, graph.ZeroImpactCaveat{
-					ID:      id,
-					Class:   c.Class,
-					Message: c.Message,
-				})
+			if len(caveats) > 0 {
+				result["zero_impact_caveat"] = caveats
 			}
-		}
-		if len(caveats) > 0 {
-			result["zero_impact_caveat"] = caveats
+		} else {
+			// Detailed extraction-gap classification performs additional graph
+			// reads. Keep the disk-backed safety gate deadline strict and state
+			// the uncertainty directly instead of risking another SQLite wait.
+			result["zero_impact_warning"] = "zero observed dependents is not proof of zero impact; extraction or resolution gaps may exist"
 		}
 	}
 
 	// Cross-community warning
 	if len(impact.AffectedCommunities) >= 2 {
-		communities := s.getCommunities()
 		warning := s.computeCrossCommunityWarning(impact.AffectedCommunities, communities)
 		result["cross_community_warning"] = warning
 	} else {
 		result["cross_community_warning"] = nil
-		if len(impact.AffectedCommunities) == 1 {
+		if len(impact.AffectedCommunities) == 1 && !impact.LowerBound {
 			result["community_note"] = "change is community-local"
+		} else if len(impact.AffectedCommunities) == 1 {
+			result["community_scope"] = "incomplete — the bounded impact result cannot prove community locality"
 		}
 	}
 
@@ -380,11 +417,13 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	// before the edit lands. Live validate pass runs on the affected
 	// contracts so existing breaking drift is reported alongside the
 	// pending-change blast radius.
-	if ci := s.computeContractImpact(ids); ci != nil {
-		result["contract_impact"] = ci
-		if impact.Risk == analysis.RiskLow && ci.Breaking > 0 {
-			result["risk"] = analysis.RiskHigh
-			result["contract_risk_upgrade"] = "risk raised to HIGH — type is a contract boundary with breaking drift"
+	if impactCtx.Err() == nil {
+		if ci := s.computeContractImpactContext(impactCtx, ids); ci != nil {
+			result["contract_impact"] = ci
+			if impact.Risk == analysis.RiskLow && ci.Breaking > 0 {
+				result["risk"] = analysis.RiskHigh
+				result["contract_risk_upgrade"] = "risk raised to HIGH — type is a contract boundary with breaking drift"
+			}
 		}
 	}
 
@@ -400,6 +439,10 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	}
 
 	return s.respondJSONOrTOON(ctx, req, result)
+}
+
+func impactComplete(impact *analysis.ImpactResult) bool {
+	return impact != nil && !impact.LowerBound
 }
 
 // -----------------------------------------------------------------------------
@@ -430,11 +473,30 @@ type contractImpactEntry struct {
 // registry and returns the ones whose request_type or response_type
 // matches any of the changed symbol IDs. Returns nil when nothing
 // matches so the JSON payload stays compact.
+type contractImpactNodeContextGetter interface {
+	GetNodeContext(context.Context, string) (*graph.Node, error)
+}
+
+// computeContractImpact keeps non-interactive callers bounded while the MCP
+// impact handler supplies its stricter request-scoped deadline below.
 func (s *Server) computeContractImpact(changedIDs []string) *contractImpact {
-	reg := s.effectiveContractRegistry()
-	if reg == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return s.computeContractImpactContext(ctx, changedIDs)
+}
+
+func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []string) *contractImpact {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
 		return nil
 	}
+	reg := s.effectiveContractRegistry()
+	if reg == nil || ctx.Err() != nil {
+		return nil
+	}
+	allContracts := reg.All()
 	changed := make(map[string]struct{}, len(changedIDs))
 	for _, id := range changedIDs {
 		changed[id] = struct{}{}
@@ -442,7 +504,10 @@ func (s *Server) computeContractImpact(changedIDs []string) *contractImpact {
 
 	var entries []contractImpactEntry
 	affectedIDs := make(map[string]struct{})
-	for _, c := range reg.All() {
+	for _, c := range allContracts {
+		if ctx.Err() != nil {
+			return nil
+		}
 		reqType := impactMetaString(c.Meta, "request_type")
 		respType := impactMetaString(c.Meta, "response_type")
 		if _, hit := changed[reqType]; hit && reqType != "" {
@@ -467,13 +532,42 @@ func (s *Server) computeContractImpact(changedIDs []string) *contractImpact {
 	// Validate the affected subset only — Validate on the full
 	// registry would drown the payload in unrelated drift.
 	sub := contracts.NewRegistry()
-	for _, c := range reg.All() {
+	for _, c := range allContracts {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if _, ok := affectedIDs[c.ID]; ok {
 			sub.Add(c)
 		}
 	}
+	aborted := false
 	lookup := contracts.ShapeLookup(func(id string) *contracts.Shape {
-		n := s.graph.GetNode(id)
+		if ctx.Err() != nil || s.graph == nil {
+			aborted = true
+			return nil
+		}
+		var n *graph.Node
+		if getter, ok := s.graph.(contractImpactNodeContextGetter); ok {
+			var err error
+			n, err = getter.GetNodeContext(ctx, id)
+			if err != nil {
+				aborted = true
+				return nil
+			}
+		} else {
+			// Third-party and in-memory stores retain the existing Store
+			// contract. Check cancellation immediately around the fallback;
+			// production SQLite implements GetNodeContext above.
+			if ctx.Err() != nil {
+				aborted = true
+				return nil
+			}
+			n = s.graph.GetNode(id)
+			if ctx.Err() != nil {
+				aborted = true
+				return nil
+			}
+		}
 		if n == nil || n.Meta == nil {
 			return nil
 		}
@@ -486,6 +580,9 @@ func (s *Server) computeContractImpact(changedIDs []string) *contractImpact {
 		return nil
 	})
 	issues := contracts.Validate(sub, lookup)
+	if aborted || ctx.Err() != nil {
+		return nil
+	}
 
 	out := &contractImpact{Affected: entries}
 	for _, is := range issues {
@@ -530,72 +627,76 @@ type CrossCommunityWarning struct {
 }
 
 func (s *Server) computeCrossCommunityWarning(affectedCommunities []string, communities *analysis.CommunityResult) *CrossCommunityWarning {
-	warning := &CrossCommunityWarning{
-		AffectedCommunities: affectedCommunities,
-	}
-
-	if communities == nil {
+	warning := &CrossCommunityWarning{AffectedCommunities: affectedCommunities}
+	if communities == nil || len(affectedCommunities) < 2 {
 		return warning
 	}
 
-	// Build community label lookup
-	commLabels := make(map[string]string)
-	commMembers := make(map[string]map[string]bool)
+	// Impact is an interactive safety gate. Never materialise SQLite's entire
+	// edge table here: the previous implementation did that once per community
+	// pair, turning a small impact query into O(E*C²) database work and starving
+	// every other daemon request. Preserve the detailed score only for bounded
+	// in-memory graphs; disk-backed callers still receive the actionable list of
+	// affected communities and can request the dedicated coupling analysis.
+	const (
+		maxImpactCouplingCommunities = 8
+		maxImpactCouplingEdges       = 50_000
+	)
+	memoryGraph, ok := s.graph.(*graph.Graph)
+	if !ok || len(affectedCommunities) > maxImpactCouplingCommunities || memoryGraph.EdgeCount() > maxImpactCouplingEdges {
+		return warning
+	}
+
+	commLabels := make(map[string]string, len(communities.Communities))
+	commMembers := make(map[string]map[string]bool, len(affectedCommunities))
+	affected := make(map[string]bool, len(affectedCommunities))
+	for _, id := range affectedCommunities {
+		affected[id] = true
+	}
 	for _, c := range communities.Communities {
+		if !affected[c.ID] {
+			continue
+		}
 		commLabels[c.ID] = c.Label
 		memberSet := make(map[string]bool, len(c.Members))
-		for _, m := range c.Members {
-			memberSet[m] = true
+		for _, member := range c.Members {
+			memberSet[member] = true
 		}
 		commMembers[c.ID] = memberSet
 	}
 
-	// For each pair of affected communities, compute coupling score
+	// Materialise the already-bounded in-memory edge set once, not once per
+	// pair. This keeps the compatibility detail inexpensive in tests and small
+	// embedded graphs while leaving the production SQLite path read-light.
+	edges := memoryGraph.AllEdges()
 	for i := 0; i < len(affectedCommunities); i++ {
 		for j := i + 1; j < len(affectedCommunities); j++ {
-			cA := affectedCommunities[i]
-			cB := affectedCommunities[j]
-
-			membersA := commMembers[cA]
-			membersB := commMembers[cB]
-
+			cA, cB := affectedCommunities[i], affectedCommunities[j]
+			membersA, membersB := commMembers[cA], commMembers[cB]
 			if len(membersA) == 0 || len(membersB) == 0 {
 				continue
 			}
-
-			// Count edges crossing the boundary and total edges in both communities
-			crossBoundary := 0
-			totalEdges := 0
-
-			edges := s.graph.AllEdges()
-			for _, e := range edges {
-				inA := membersA[e.From] || membersA[e.To]
-				inB := membersB[e.From] || membersB[e.To]
-
+			crossBoundary, totalEdges := 0, 0
+			for _, edge := range edges {
+				inA := membersA[edge.From] || membersA[edge.To]
+				inB := membersB[edge.From] || membersB[edge.To]
 				if inA || inB {
 					totalEdges++
 				}
-				// Cross-boundary: one end in A, other in B
-				if (membersA[e.From] && membersB[e.To]) || (membersB[e.From] && membersA[e.To]) {
+				if (membersA[edge.From] && membersB[edge.To]) || (membersB[edge.From] && membersA[edge.To]) {
 					crossBoundary++
 				}
 			}
-
-			var couplingScore float64
+			var score float64
 			if totalEdges > 0 {
-				couplingScore = math.Round(float64(crossBoundary)/float64(totalEdges)*10000) / 100
+				score = math.Round(float64(crossBoundary)/float64(totalEdges)*10_000) / 100
 			}
-
 			warning.Couplings = append(warning.Couplings, CommunityCoupling{
-				CommunityA:     cA,
-				CommunityB:     cB,
-				LabelA:         commLabels[cA],
-				LabelB:         commLabels[cB],
-				CouplingScore:  couplingScore,
-				TightlyCoupled: couplingScore > 15,
+				CommunityA: cA, CommunityB: cB,
+				LabelA: commLabels[cA], LabelB: commLabels[cB],
+				CouplingScore: score, TightlyCoupled: score > 15,
 			})
 		}
 	}
-
 	return warning
 }

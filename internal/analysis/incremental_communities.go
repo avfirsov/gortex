@@ -15,8 +15,10 @@ import (
 // changed since the last run that is wasteful: the partition of the
 // untouched 95% of the graph is bit-for-bit what it was before.
 //
-// The incremental path keeps the last partition in a cache keyed by
-// a per-package content fingerprint. On the next request it diffs
+// The incremental path keeps the last node-to-community assignments in a cache
+// keyed by a per-package content fingerprint. It deliberately does not retain
+// the prior weighted adjacency: the current graph is rebuilt for every run.
+// On the next request it diffs
 // the current fingerprints against the cached ones; packages whose
 // fingerprint is unchanged keep their cached community assignment,
 // and only the changed packages — plus their immediate cross-package
@@ -77,7 +79,7 @@ type leidenGraph struct {
 // clustering-relevant edges — the caller then yields an empty
 // partition.
 func buildLeidenGraph(g graph.Store) *leidenGraph {
-	nodes := g.AllNodes()
+	nodes := graph.AllNodesLight(g)
 	// Meta-less scan (see LightEdgeScanner): the Leiden weighting keys only off
 	// e.Kind (via edgeWeight) and endpoints. No kind argument — edgeWeight scores
 	// ~14 kinds, so the kind set is pushed down here rather than duplicated at the
@@ -138,8 +140,10 @@ func buildLeidenGraph(g graph.Store) *leidenGraph {
 	}
 }
 
-// LeidenPartitionCache holds the last Leiden partition so a later
-// run can recompute only the packages that changed. It is opaque to
+// LeidenPartitionCache holds the last Leiden assignment map so a later run can
+// recompute only the packages that changed. It intentionally omits the prior
+// adjacency/degree graph, which would duplicate the store's largest topology
+// structures for the lifetime of the server. It is opaque to
 // callers: hand a *LeidenPartitionCache (or nil on the first call)
 // to DetectCommunitiesLeidenIncremental and store the cache it
 // returns for next time. A nil cache is always safe — it simply
@@ -157,10 +161,6 @@ type LeidenPartitionCache struct {
 	// community key. Reused wholesale for unchanged packages and as
 	// the seed for the restricted re-optimization of changed ones.
 	nodeComm map[string]string
-	// part is the adjacency + weights the cached partition was
-	// computed on; needed to evaluate modularity gain during the
-	// restricted local-moves pass and to relabel the merged result.
-	part *leidenPartition
 	// edgeIdentityRevisions snapshots the graph's monotonic
 	// provenance-revision counter at cache time. A mismatch means
 	// in-place edge provenance changed under the cache; per-package
@@ -234,8 +234,8 @@ func packageKey(filePath string) string {
 // fingerprint of every package it touches and leaves all others
 // bit-identical.
 func fingerprintPackages(g graph.Store) map[string]uint64 {
-	nodes := g.AllNodes()
-	edges := g.AllEdges()
+	nodes := graph.AllNodesLight(g)
+	edges := graph.EdgesForKindsLight(g)
 
 	// Symbol-node filter + each node's package, mirroring
 	// buildLeidenGraph so the fingerprint and the partition agree on
@@ -347,15 +347,19 @@ func DetectCommunitiesLeidenIncremental(
 			edgeIdentityRevisions: edgeRev,
 		}
 		if part != nil {
+			// Retain only the assignment map needed to seed later incremental
+			// runs. The full partition also owns weighted adjacency, degree, and
+			// symbol-node maps; keeping it here duplicates the graph for the
+			// lifetime of the MCP server even though incrementalLeiden rebuilds
+			// current adjacency before every run.
 			newCache.nodeComm = part.comm
-			newCache.part = part
 		}
 		return result, newCache, stats
 	}
 
 	// No cache, or a cache whose partition never materialized
 	// (previous graph had no clustering edges): nothing to reuse.
-	if cache == nil || cache.part == nil || len(cache.nodeComm) == 0 {
+	if cache == nil || len(cache.nodeComm) == 0 {
 		return fullRecompute("no cached partition")
 	}
 
@@ -393,7 +397,6 @@ func DetectCommunitiesLeidenIncremental(
 	newCache := &LeidenPartitionCache{
 		pkgFingerprint:        curFP,
 		nodeComm:              newPart.partition.comm,
-		part:                  newPart.partition,
 		edgeIdentityRevisions: edgeRev,
 	}
 	return result, newCache, stats
@@ -422,7 +425,7 @@ func incrementalLeiden(
 ) (*CommunityResult, incrementalResult) {
 	// Package of every current symbol node.
 	pkgOf := make(map[string]string, len(lg.symbolNodes))
-	for _, n := range g.AllNodes() {
+	for _, n := range graph.AllNodesLight(g) {
 		if lg.symbolNodes[n.ID] {
 			pkgOf[n.ID] = packageKey(n.FilePath)
 		}

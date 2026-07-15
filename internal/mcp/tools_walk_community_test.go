@@ -25,8 +25,7 @@ func seedWalkCommunityGraph(t *testing.T, srv *Server) {
 	g.AddEdge(&graph.Edge{From: "x.go::X", To: "y.go::Y", Kind: graph.EdgeCalls, FilePath: "x.go", Line: 1})
 	g.AddEdge(&graph.Edge{From: "y.go::Y", To: "z.go::Z", Kind: graph.EdgeCalls, FilePath: "y.go", Line: 1})
 
-	srv.analysisMu.Lock()
-	srv.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(srv, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "c-alpha", Label: "alpha"},
 			{ID: "c-beta", Label: "beta"},
@@ -36,8 +35,7 @@ func seedWalkCommunityGraph(t *testing.T, srv *Server) {
 			"y.go::Y": "c-alpha",
 			"z.go::Z": "c-beta",
 		},
-	}
-	srv.analysisMu.Unlock()
+	})
 }
 
 func walkResultIDs(t *testing.T, out map[string]any) map[string]bool {

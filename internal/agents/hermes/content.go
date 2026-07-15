@@ -76,18 +76,11 @@ const SkillName = "gortex"
 // skillCategory so the on-disk folder and the frontmatter agree.
 const masterSkillCategory = "code-intelligence"
 
-// masterSkillRaw is the static body of the user-level Hermes master
-// skill: it teaches the agent to prefer gortex graph tools over raw file
-// reads / text search, mirrors the Claude Code / Antigravity user-level
-// instruction surface, and documents multi-repo scoping. It follows the
-// Hermes SKILL.md frontmatter schema (name / description / version /
-// metadata.hermes) and the documented section order. SkillBody() wraps
-// it with the dynamic frontmatter fields (platforms, related_skills) and
-// the slash-command index, both derived from RoutingSkillNames() so they
-// never drift from the installed routing set.
+// masterSkillRaw is the lean, operation-oriented master guide emitted for
+// every new Hermes integration.
 const masterSkillRaw = `---
 name: gortex
-description: "Use for any task on a codebase indexed by the gortex daemon — searching symbols, finding usages/callers, reading code, tracing impact, refactoring, and multi-repo navigation. Prefer these graph tools over raw file reads or text search."
+description: "Use Gortex for indexed-code exploration, reads, relationships, impact checks, edits, and refactors."
 version: 1.0.0
 metadata:
   hermes:
@@ -95,92 +88,20 @@ metadata:
     category: code-intelligence
 ---
 
-# Gortex Code Intelligence
+# Gortex code intelligence
 
-Gortex indexes repositories into an in-memory knowledge graph and serves it over MCP. On any indexed codebase its graph tools are faster, cheaper, and more accurate than reading whole files or grepping — they return exactly the symbol, caller set, or blast radius you asked for, with zero false positives.
+Use Gortex MCP tools for indexed code. This is mandatory.
 
-## When to Use
+1. Start every coding task with ` + "`explore`" + ` using ` + "`operation: \"task\"`" + ` and the task text.
+2. Use ` + "`search`" + ` for symbols, text, files, or AST shapes. Use ` + "`read`" + ` for source, summaries, files, or editing context.
+3. Use ` + "`relations`" + ` for usages, callers, dependencies, dependents, and implementations. Use ` + "`trace`" + ` for call chains and dataflow.
+4. Before mutation, call ` + "`change`" + ` with ` + "`operation: \"impact\"`" + `; for a signature change, also call operation ` + "`verify`" + ` with the proposed signature.
+5. Mutate only with ` + "`edit`" + ` or ` + "`refactor`" + `. After mutation, call ` + "`change`" + ` operations ` + "`detect`" + `, ` + "`tests`" + `, ` + "`guards`" + `, and ` + "`contract`" + `.
+6. Call ` + "`capabilities`" + ` with ` + "`domain`" + `, ` + "`operation`" + `, and ` + "`detail: \"schema\"`" + ` when exact arguments are not visible.
 
-- Searching for a symbol, function, type, or where something is referenced.
-- Reading a single function/method without pulling its whole file.
-- Understanding architecture, tracing call chains, or checking what a change breaks.
-- Refactoring: renames, extractions, and multi-file edits that must stay consistent.
-- Working across more than one repository from a single session.
+Do not replace graph reads or searches with terminal commands. If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop; do not start a daemon or use a CLI/shell fallback.
 
-## Prerequisites
-
-- The ` + "`gortex`" + ` MCP server is registered in ` + "`~/.hermes/config.yaml`" + ` under ` + "`mcp_servers.gortex`" + ` (gortex's installer wires this for you).
-- The gortex daemon is running and tracking the repo: check with ` + "`gortex daemon status`" + ` in a terminal, start it with ` + "`gortex daemon start --detach`" + `, and track a repo with ` + "`gortex init`" + ` (or ` + "`gortex track <path>`" + `).
-- Confirm the graph is live at the start of a task by calling the ` + "`graph_stats`" + ` tool. If ` + "`total_nodes`" + ` is 0, call ` + "`index_repository`" + ` with ` + "`path: \".\"`" + ` first.
-
-## How to Run
-
-Call the gortex MCP tools directly. Translate the instinct to read or grep into the matching graph query. If you only have the terminal (no MCP tools), every tool below is reachable as ` + "`gortex call <tool> --arg k=v`" + ` (e.g. ` + "`gortex call read_file --arg path=<file>`" + `) — there is no bare ` + "`gortex <tool>`" + ` verb.
-
-### Search and navigation
-
-| Instead of...                            | Use the gortex tool...                       |
-|------------------------------------------|----------------------------------------------|
-| Grepping for a symbol                    | ` + "`search_symbols`" + ` (BM25 + camelCase-aware)         |
-| Grepping for references                  | ` + "`find_usages`" + ` (zero false positives)             |
-| Hunting for callers                      | ` + "`get_callers`" + ` / ` + "`get_call_chain`" + `                     |
-| Globbing source files (` + "`**/*.go`" + `)         | ` + "`get_repo_outline`" + ` / ` + "`search_symbols`" + `                |
-| Many file reads to orient on a task      | ` + "`smart_context`" + ` (one call assembles the working set) |
-| Literal / regex text the symbol index misses | ` + "`search_text`" + ` (trigram-accelerated grep)         |
-
-### Reading source
-
-| Instead of...                            | Use the gortex tool...                       |
-|------------------------------------------|----------------------------------------------|
-| Reading a whole file for one function    | ` + "`get_symbol_source`" + ` (≈80% fewer tokens)          |
-| Reading a file to understand it          | ` + "`get_file_summary`" + ` / ` + "`get_editing_context`" + `           |
-| Reading a file to check a signature      | ` + "`get_symbol`" + ` (signature in ` + "`meta.signature`" + `)         |
-| Reading a non-indexed / raw file         | ` + "`read_file`" + ` (atomic, overlay-aware)              |
-
-### Editing and refactoring
-
-| Instead of...                            | Use the gortex tool...                       |
-|------------------------------------------|----------------------------------------------|
-| A whole-file string-match edit           | ` + "`edit_file`" + ` (no pre-read; atomic; auto-reindex)  |
-| A read→edit roundtrip for one symbol     | ` + "`edit_symbol`" + ` (edit by ID)                       |
-| Manual find-and-replace for a rename     | ` + "`rename_symbol`" + ` (updates cross-file references)  |
-| Sequencing multi-file edits by hand      | ` + "`batch_edit`" + ` (dependency-ordered, atomic)        |
-| Guessing what a change breaks            | ` + "`verify_change`" + ` / ` + "`get_dependents`" + ` (blast radius)    |
-
-### Analysis
-
-` + "`analyze`" + ` is a unified dispatcher — pass ` + "`kind`" + ` for one of ` + "`dead_code`" + `, ` + "`hotspots`" + `, ` + "`cycles`" + `, ` + "`coverage_gaps`" + `, ` + "`todos`" + `, ` + "`sast`" + `, ` + "`impact`" + `, ` + "`cross_repo`" + `, and ~50 more. ` + "`get_architecture`" + ` gives a one-call architectural snapshot.
-
-## Multi-repo scoping
-
-The daemon can track several repositories at once. Scope your queries so results come from the right project:
-
-- Call ` + "`get_active_project`" + ` to see the current scope and ` + "`set_active_project`" + ` to switch the session default.
-- Most list/search tools accept a ` + "`repo`" + ` or ` + "`project`" + ` argument to target one repository for a single call without changing the session default.
-- ` + "`list_repos`" + ` enumerates everything the daemon tracks; ` + "`track_repository`" + ` adds a new one.
-- ` + "`analyze kind: \"cross_repo\"`" + ` and a ` + "`find_usages`" + ` partitioned by repo answer "who consumes this across all our services?".
-
-## Quick Reference
-
-1. ` + "`index_health`" + ` — confirm the daemon is up and oriented (` + "`graph_stats`" + ` for node/edge counts).
-2. ` + "`smart_context`" + ` with the task description — assemble the minimal working set.
-3. ` + "`search_symbols`" + ` / ` + "`find_usages`" + ` / ` + "`get_symbol_source`" + ` — navigate and read.
-4. ` + "`get_editing_context`" + ` then ` + "`edit_symbol`" + ` / ` + "`edit_file`" + ` / ` + "`rename_symbol`" + ` / ` + "`batch_edit`" + ` — edit safely.
-5. ` + "`verify_change`" + ` / ` + "`get_test_targets`" + ` — check the blast radius before and after.
-
-## Token economy
-
-For list-shaped responses (` + "`search_symbols`" + `, ` + "`find_usages`" + `, ` + "`analyze`" + `, ` + "`get_callers`" + `, ` + "`get_editing_context`" + `, ` + "`smart_context`" + `, …) pass ` + "`format: \"gcx\"`" + ` for the GCX1 compact wire format — round-trippable, ~27% fewer tokens. For reading source, pass ` + "`compress_bodies: true`" + ` to ` + "`read_file`" + ` / ` + "`get_symbol_source`" + ` / ` + "`get_editing_context`" + ` to elide function bodies to signatures (~30–40% of original tokens).
-
-## Pitfalls
-
-- Don't fall back to raw file reads / shell grep on an indexed repo "just to be quick" — the graph tools are both faster and more precise, and they keep your context budget intact.
-- An empty result from ` + "`search_symbols`" + ` usually means the daemon hasn't finished warming or isn't tracking this repo — check ` + "`graph_stats`" + ` / ` + "`index_health`" + ` rather than assuming the symbol is absent.
-- In a multi-repo session, an unexpected result set is often a scoping issue — verify ` + "`get_active_project`" + ` or pass an explicit ` + "`repo`" + ` argument.
-
-## Verification
-
-After edits, call ` + "`verify_change`" + ` (broken callers + interface implementors, cross-repo) and ` + "`get_test_targets`" + ` (the tests that cover what you touched) before declaring the task done.
+Use ` + "`workspace`" + ` for local index, repository, and project state. Use ` + "`workspace_admin`" + ` only when the user asks to change that state. Use ` + "`recall`" + ` before editing known code and ` + "`remember`" + ` for durable decisions or invariants.
 `
 
 // SkillBody renders the master gortex skill: the static guide

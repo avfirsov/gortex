@@ -105,6 +105,10 @@ func TestArchitecture_CommunitiesIncludedWhenAnalysisCached(t *testing.T) {
 		},
 		Modularity: 0.5,
 	}
+	token := s.currentCommunityToken()
+	s.communitiesToken = token
+	s.adjacencyToken = token
+	s.analysisEpoch = 1
 	s.analysisMu.Unlock()
 
 	out := callArchitectureHandler(t, s, map[string]any{})
@@ -209,6 +213,10 @@ func TestArchitecture_TopCommunitiesCap(t *testing.T) {
 	}
 	s.analysisMu.Lock()
 	s.communities = &analysis.CommunityResult{Communities: comms}
+	token := s.currentCommunityToken()
+	s.communitiesToken = token
+	s.adjacencyToken = token
+	s.analysisEpoch = 1
 	s.analysisMu.Unlock()
 
 	out := callArchitectureHandler(t, s, map[string]any{"top_communities": 3})

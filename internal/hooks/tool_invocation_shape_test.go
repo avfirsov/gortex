@@ -17,11 +17,14 @@ func collectHookGuidance(t *testing.T) map[string]string {
 
 	prevIndexed := fileIndexedFn
 	prevReach := daemonReachableFn
+	prevScope := scopeTrackedFn
 	t.Cleanup(func() {
 		fileIndexedFn = prevIndexed
 		daemonReachableFn = prevReach
+		scopeTrackedFn = prevScope
 	})
 	daemonReachableFn = func() bool { return true }
+	scopeTrackedFn = func(string, string) bool { return true }
 
 	out := map[string]string{}
 
@@ -69,9 +72,9 @@ func collectHookGuidance(t *testing.T) map[string]string {
 // the REAL MCP tool registry (daemon-free) and asserts that no hook / adapter
 // guidance template ever renders a bare `gortex <tool>` shell shape — the
 // invalid form (`gortex read_file <path>`) agents invented from guidance that
-// named a tool without an invocation shape. The correct shell fallback is
-// `gortex call <tool> --arg …`, which this regex allows (the `call` token sits
-// between `gortex` and the tool name).
+// named a tool without an invocation shape. Hook guidance for an MCP-configured
+// profile must not emit any shell transport; CLI-only renderers are tested in
+// their own packages.
 func TestGuidanceNeverEmitsBareToolVerb(t *testing.T) {
 	names := mcp.RegisteredToolNames()
 	if len(names) < 50 {
@@ -96,29 +99,31 @@ func TestGuidanceNeverEmitsBareToolVerb(t *testing.T) {
 	}
 }
 
-// TestGuidanceTeachesCLIFallbackShape is the positive counterpart: the
-// tool-listing guidance messages must actually teach the shell fallback shape,
-// so the fix is not merely the absence of the bad shape but the presence of the
-// good one. Scoped to the messages that enumerate graph tools (a bare
-// consult-unlock reason legitimately names no tool to invoke).
-func TestGuidanceTeachesCLIFallbackShape(t *testing.T) {
+// TestGuidanceRequiresNativeMCP is the positive counterpart: every rendered
+// redirect must identify a missing callable handle as a host integration
+// failure, never reinterpret it as permission to start infrastructure or use
+// the Bash mirror.
+func TestGuidanceRequiresNativeMCP(t *testing.T) {
 	guidance := collectHookGuidance(t)
-	const want = "gortex call "
-	mustTeach := []string{
+	const want = "Native Gortex MCP is mandatory"
+	mustRequire := []string{
 		"defaultGrepGuidance", "defaultGlobGuidance", "formatGrepDeny",
 		"nudgeReason_empty", "gortexReadAdvisory", "kimiSubagentFallbackBriefing",
 		"rulePreamble", "enrichRead_deny", "enrichBash_readSource_deny",
 		"enrichEdit_deny", "enrichWrite_deny", "enrichGlob_deny",
 		"enrichRead_soft", "enrichBash_readSource_soft",
 	}
-	for _, label := range mustTeach {
+	for _, label := range mustRequire {
 		text, ok := guidance[label]
 		if !ok {
 			t.Errorf("guidance %q did not render — the collector or emitter changed", label)
 			continue
 		}
 		if !strings.Contains(text, want) {
-			t.Errorf("guidance %q never teaches the `%s<tool> --arg …` shell shape:\n%s", label, want, text)
+			t.Errorf("guidance %q does not require native MCP:\n%s", label, text)
+		}
+		if strings.Contains(text, "gortex call ") {
+			t.Errorf("guidance %q advertises a CLI fallback in an MCP-configured profile:\n%s", label, text)
 		}
 	}
 }

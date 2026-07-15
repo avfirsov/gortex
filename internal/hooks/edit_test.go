@@ -71,7 +71,7 @@ func TestEnrichEdit_IndexedSource_Denies(t *testing.T) {
 	if !result.deny {
 		t.Fatal("expected deny for Edit on indexed source")
 	}
-	for _, want := range []string{"BLOCKED", "edit_symbol", "edit_file", "rename_symbol"} {
+	for _, want := range []string{"BLOCKED", "choose `edit` operation `symbol`, `file`, or `batch`", `refactor(operation:"rename")`} {
 		if !strings.Contains(result.reason, want) {
 			t.Errorf("reason missing %q:\n%s", want, result.reason)
 		}
@@ -86,8 +86,8 @@ func TestEnrichWrite_IndexedSource_Denies(t *testing.T) {
 	if !result.deny {
 		t.Fatal("expected deny for Write on indexed source")
 	}
-	if !strings.Contains(result.reason, "write_file") {
-		t.Errorf("reason should mention write_file, got:\n%s", result.reason)
+	if !strings.Contains(result.reason, `edit(operation:"write")`) {
+		t.Errorf("reason should mention edit(operation=write), got:\n%s", result.reason)
 	}
 }
 

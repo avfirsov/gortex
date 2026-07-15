@@ -1,10 +1,15 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func TestCountFromResultText(t *testing.T) {
@@ -138,7 +143,7 @@ func TestShouldLogToolSet(t *testing.T) {
 	t.Setenv("GORTEX_QUERY_LOG", filepath.Join(t.TempDir(), "q.jsonl"))
 	t.Setenv("GORTEX_QUERY_LOG_DISABLE", "")
 	q := newQueryLogger()
-	for _, tool := range []string{"search_symbols", "smart_context", "find_usages", "search_text"} {
+	for _, tool := range []string{"search_symbols", "smart_context", "find_usages", "search_text", "search", "read", "relations"} {
 		if !q.shouldLog(tool) {
 			t.Fatalf("%s should be logged", tool)
 		}
@@ -147,5 +152,38 @@ func TestShouldLogToolSet(t *testing.T) {
 		if q.shouldLog(tool) {
 			t.Fatalf("%s should NOT be logged", tool)
 		}
+	}
+}
+
+func TestQueryLoggerRecordsFacadeMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "facade.jsonl")
+	t.Setenv("GORTEX_QUERY_LOG", path)
+	t.Setenv("GORTEX_QUERY_LOG_DISABLE", "")
+	q := newQueryLogger()
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	srv.NoteSessionClient("facade_query", "codex", "1")
+	ctx := WithSessionID(context.Background(), "facade_query")
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "search"
+	req.Params.Arguments = map[string]any{
+		"operation": "symbols",
+		"query":     "FacadeSurfaceVersion",
+	}
+	q.record(srv, ctx, req, mcp.NewToolResultText(`{"results":[]}`), nil, time.Now().Add(-time.Millisecond))
+	q.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record queryLogRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Surface != FacadeSurfaceVersion || record.Facade != "search" || record.Operation != "symbols" {
+		t.Fatalf("facade metadata = surface:%q facade:%q operation:%q", record.Surface, record.Facade, record.Operation)
+	}
+	if record.CanonicalTool != "search_symbols" {
+		t.Fatalf("canonical_tool = %q, want search_symbols", record.CanonicalTool)
 	}
 }

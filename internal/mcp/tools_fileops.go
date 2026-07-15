@@ -15,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -611,21 +612,25 @@ func (s *Server) repoRelative(absPath string) string {
 // reindexFile refreshes the graph for a single file after a write. Best-effort:
 // non-source files or files outside any indexed repo are silently skipped.
 func (s *Server) reindexFile(absPath string) bool {
+	reindex := func(idx *indexer.Indexer) bool {
+		finishTopologyMutation := reach.BeginTopologyMutation(s.graph)
+		// Conservatively invalidate reachability after every reindex attempt:
+		// an error may still follow a partial topology mutation.
+		defer finishTopologyMutation(true)
+		return idx.IndexFile(absPath) == nil
+	}
+
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {
-				if err := idx.IndexFile(absPath); err == nil {
-					return true
-				}
+			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil && reindex(idx) {
+				return true
 			}
 		}
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
-				if err := s.indexer.IndexFile(absPath); err == nil {
-					return true
-				}
+			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") && reindex(s.indexer) {
+				return true
 			}
 		}
 	}
@@ -695,6 +700,11 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
@@ -797,14 +807,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	resp := map[string]any{
 		"path":          relPath,
 		"status":        "applied",
 		"replacements":  replacements,
 		"bytes_written": len(newContentBytes),
-		"reindexed":     reindexed,
 		"new_sha":       newSHA,
 	}
 	if matches.normalized {
@@ -813,9 +822,10 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info := parseGateInfo(gate, allowParseErrors); info != nil {
 		resp["parse_gate"] = info
 	}
-	if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -835,6 +845,11 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
+	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	if lockErr != nil {
+		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
+	}
+	defer releaseMutation()
 
 	status := "created"
 	perm := os.FileMode(0o644)
@@ -914,21 +929,21 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexed := s.reindexFile(absPath)
+	reindexOutcome := s.mutationReindexState(ctx, absPath)
 
 	resp := map[string]any{
 		"path":          relPath,
 		"status":        status,
 		"bytes_written": len(contentBytes),
-		"reindexed":     reindexed,
 		"new_sha":       newSHA,
 	}
 	if info := parseGateInfo(gate, allowParseErrors); info != nil {
 		resp["parse_gate"] = info
 	}
-	if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
-		resp["syntax_health"] = health
+	if reindexOutcome.Err != nil {
+		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
+	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -1045,6 +1060,19 @@ func windowFileLines(content []byte, offset, limit int) (out []byte, applied boo
 	return []byte(strings.Join(lines[start-1:end], "\n")), true, start, end, total
 }
 
+func capReadFileContent(content []byte, maxChars int, binary bool) ([]byte, bool) {
+	if maxChars <= 0 || len(content) <= maxChars {
+		return content, false
+	}
+	prefix := content[:maxChars]
+	if binary {
+		return prefix, true
+	}
+	// max_chars is an encoded-response budget. If the byte boundary falls
+	// inside a multi-byte rune, discard only that incomplete trailing rune.
+	return []byte(strings.ToValidUTF8(string(prefix), "")), true
+}
+
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	rawPath, err := req.RequireString("path")
 	if err != nil {
@@ -1152,12 +1180,19 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 	}
 
+	maxChars := req.GetInt("max_chars", 0)
+	content, contentTruncated := capReadFileContent(content, maxChars, isBinary)
+
 	result := map[string]any{
 		"path":           relPath,
 		"language":       language,
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if contentTruncated {
+		result["content_truncated"] = true
+		result["max_chars"] = maxChars
 	}
 	if secretsRedacted {
 		result["secrets_redacted"] = true
@@ -1201,6 +1236,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		omissions = append(omissions, omission("truncated",
 			"oversized source reduced toward its control-flow skeleton; runs of leaf statements collapsed"))
 	}
+	if contentTruncated {
+		omissions = append(omissions, omission("content_truncated",
+			fmt.Sprintf("content limited to max_chars=%d encoded bytes at a valid UTF-8 boundary", maxChars)))
+	}
 	if windowed {
 		omissions = append(omissions, omission("windowed",
 			fmt.Sprintf("returned lines %d-%d of %d; the rest of the file was not included (offset/limit window)", winStart, winEnd, winTotal)))
@@ -1229,7 +1268,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		contentStr := string(content)
 		returned := tokens.CachedCountInt64(contentStr)
 		fullFile := returned
-		if bodiesElided || salienceTruncated || windowed {
+		if bodiesElided || salienceTruncated || windowed || contentTruncated {
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
 		s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)

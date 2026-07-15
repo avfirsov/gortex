@@ -55,11 +55,7 @@ func newGapsTestServer(t *testing.T) *Server {
 }
 
 func setCommunitiesForTest(s *Server, communities []analysis.Community) {
-	s.analysisMu.Lock()
-	defer s.analysisMu.Unlock()
-	s.communities = &analysis.CommunityResult{
-		Communities: communities,
-	}
+	installCommunitiesForTest(s, &analysis.CommunityResult{Communities: communities})
 }
 
 func callGapsHandler(t *testing.T, s *Server, args map[string]any) map[string]any {

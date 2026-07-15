@@ -58,6 +58,7 @@ type Provider struct {
 	// back to its tree-sitter type tier, the intended graceful degradation.
 	stateMu    sync.RWMutex
 	stashes    map[string]*goStash // absRoot → loaded package state
+	retained   map[string]int      // absRoot → active deferred-contract leases
 	maxStashes int                 // count ceiling (env GORTEX_GOTYPES_MAX_STASHES)
 	stashTTL   time.Duration       // idle release window (env GORTEX_GOTYPES_STASH_TTL)
 	sweepOnce  sync.Once
@@ -78,7 +79,10 @@ type goStash struct {
 // Stash-retention bounds. Both overridable via env for operators who want
 // a different memory/recompute trade-off.
 const (
-	defaultMaxStashes = 8
+	// Multi-repo enrichment runs at most four repositories concurrently.
+	// Explicit batch-boundary release keeps the live set at that ceiling;
+	// this count limit remains the fallback for interrupted callers.
+	defaultMaxStashes = 4
 	defaultStashTTL   = 3 * time.Minute
 )
 
@@ -88,6 +92,7 @@ func NewProvider(mode LoadMode, includeTest bool, logger *zap.Logger) *Provider 
 		mode:        mode,
 		includeTest: includeTest,
 		logger:      logger,
+		retained:    make(map[string]int),
 		maxStashes:  envPositiveInt("GORTEX_GOTYPES_MAX_STASHES", defaultMaxStashes),
 		stashTTL:    envPositiveDuration("GORTEX_GOTYPES_STASH_TTL", defaultStashTTL),
 		stopSweep:   make(chan struct{}),
@@ -109,8 +114,52 @@ func (p *Provider) Close() error {
 	}
 	p.stateMu.Lock()
 	p.stashes = nil
+	p.retained = nil
 	p.stateMu.Unlock()
 	return nil
+}
+
+// RetainRepoState leases repoRoot's compiler program for the deferred contract
+// consumer. The lease may be acquired before EnrichRepo creates the stash; TTL
+// and count eviction must ignore it until the matching release.
+func (p *Provider) RetainRepoState(repoRoot string) bool {
+	absRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return false
+	}
+	p.stateMu.Lock()
+	if p.retained == nil {
+		p.retained = make(map[string]int)
+	}
+	p.retained[absRoot]++
+	p.stateMu.Unlock()
+	return true
+}
+
+// ReleaseRepoState drops the type-checked program retained for repoRoot after
+// its deferred contract pass has finished. The idle TTL and count ceiling are
+// fallback protection for interrupted/non-batch callers; the normal indexing
+// lifecycle should release this multi-gigabyte state deterministically.
+//
+// Deleting the map entry is safe alongside LookupTypeAtLine: a lookup snapshots
+// the *goStash under stateMu, so an already-running lookup retains its own
+// reference until it returns while future lookups stop discovering the repo.
+func (p *Provider) ReleaseRepoState(repoRoot string) bool {
+	absRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return false
+	}
+	p.stateMu.Lock()
+	if leases := p.retained[absRoot]; leases > 1 {
+		p.retained[absRoot] = leases - 1
+		p.stateMu.Unlock()
+		return false
+	}
+	delete(p.retained, absRoot)
+	_, removed := p.stashes[absRoot]
+	delete(p.stashes, absRoot)
+	p.stateMu.Unlock()
+	return removed
 }
 
 // goToolchainOnce caches the one-time probe for the `go` command. The
@@ -213,10 +262,11 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 			if relPath == "" {
 				continue
 			}
+			graphPath := scopedGraphPath(repoPrefix, relPath)
 
-			node := semantic.MatchNodeByFileLine(g, relPath, pos.Line)
+			node := semantic.MatchNodeByFileLine(g, graphPath, pos.Line)
 			if node == nil {
-				node = semantic.MatchNodeByNameInFile(g, ident.Name, relPath)
+				node = semantic.MatchNodeByNameInFile(g, ident.Name, graphPath)
 			}
 			if node != nil {
 				objID := objectID(obj)
@@ -269,9 +319,10 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 			if relPath == "" {
 				continue
 			}
+			graphPath := scopedGraphPath(repoPrefix, relPath)
 
 			// Find the containing Gortex node (the caller).
-			callerNode := findContainingFunc(g, pkgs, fset, absRoot, pos)
+			callerNode := findContainingFunc(g, pkgs, fset, absRoot, pos, repoPrefix)
 			if callerNode == nil {
 				continue
 			}
@@ -310,7 +361,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 				kind := inferEdgeKindFromObj(obj)
 				if kind != "" {
 					semantic.AddSemanticEdge(g, callerNode.ID, targetNodeID, kind,
-						relPath, pos.Line, p.Name())
+						graphPath, pos.Line, p.Name())
 					result.EdgesAdded++
 				}
 				continue
@@ -328,7 +379,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 				kind := inferEdgeKindFromObj(obj)
 				if kind != "" {
 					semantic.AddSemanticEdge(g, callerNode.ID, targetNodeID, kind,
-						relPath, pos.Line, p.Name())
+						graphPath, pos.Line, p.Name())
 					result.EdgesAdded++
 				}
 			}
@@ -389,7 +440,7 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	}
 	var stampedNodes []*graph.Node
 	for rel := range relSet {
-		for _, node := range g.GetFileNodes(rel) {
+		for _, node := range g.GetFileNodes(scopedGraphPath(repoPrefix, rel)) {
 			if node.Kind == graph.KindFile || node.Kind == graph.KindImport || node.Name == "" {
 				continue
 			}
@@ -522,6 +573,9 @@ func (p *Provider) evictLocked() {
 	}
 	now := time.Now()
 	for root, st := range p.stashes {
+		if p.retained[root] > 0 {
+			continue
+		}
 		if now.Sub(st.lastUsed) > ttl {
 			delete(p.stashes, root)
 		}
@@ -534,6 +588,9 @@ func (p *Provider) evictLocked() {
 		var lruRoot string
 		var lruTime time.Time
 		for root, st := range p.stashes {
+			if p.retained[root] > 0 {
+				continue
+			}
 			if lruRoot == "" || st.lastUsed.Before(lruTime) {
 				lruRoot, lruTime = root, st.lastUsed
 			}
@@ -905,13 +962,13 @@ func (p *Provider) addMissingImplements(g graph.Store, pkgs []*packages.Package,
 }
 
 // findContainingFunc finds the Gortex function/method node that contains the given position.
-func findContainingFunc(g graph.Store, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position) *graph.Node {
+func findContainingFunc(g graph.Store, pkgs []*packages.Package, fset *token.FileSet, absRoot string, pos token.Position, repoPrefix string) *graph.Node {
 	relPath := relativePath(pos.Filename, absRoot)
 	if relPath == "" {
 		return nil
 	}
 
-	nodes := g.GetFileNodes(relPath)
+	nodes := g.GetFileNodes(scopedGraphPath(repoPrefix, relPath))
 	var best *graph.Node
 	bestSize := int(^uint(0) >> 1)
 	for _, n := range nodes {
@@ -964,6 +1021,16 @@ func relativePath(absPath, repoRoot string) string {
 		return ""
 	}
 	return filepath.ToSlash(rel)
+}
+
+// scopedGraphPath converts a repository-relative source path into the path
+// stored by a multi-repo graph. Single-repo graphs intentionally retain the
+// unprefixed form used by Provider.Enrich.
+func scopedGraphPath(repoPrefix, relPath string) string {
+	if repoPrefix == "" || relPath == "" {
+		return relPath
+	}
+	return repoPrefix + "/" + relPath
 }
 
 // Ensure ast is used.

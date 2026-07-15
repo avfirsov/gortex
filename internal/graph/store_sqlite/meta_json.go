@@ -416,6 +416,8 @@ const (
 	metaTagMapSlice = 0x09 // uvarint count, then count map bodies
 	metaTagAnySlice = 0x0A // uvarint count, then count tagged values
 	metaTagShape    = 0x0B // uvarint len, len bytes of JSON-encoded *contracts.Shape
+	metaTagUint64   = 0x0C // unsigned varint
+	metaTagF64Slice = 0x0D // uvarint count, then count little-endian float64 values
 )
 
 var errMetaTruncated = errors.New("store_sqlite: truncated meta blob")
@@ -484,9 +486,19 @@ func appendMetaValue(buf []byte, v any) ([]byte, bool) {
 	case int64:
 		buf = append(buf, metaTagInt64)
 		return binary.AppendVarint(buf, vv), true
+	case uint64:
+		buf = append(buf, metaTagUint64)
+		return binary.AppendUvarint(buf, vv), true
 	case float64:
 		buf = append(buf, metaTagFloat64)
 		return binary.LittleEndian.AppendUint64(buf, math.Float64bits(vv)), true
+	case []float64:
+		buf = append(buf, metaTagF64Slice)
+		buf = binary.AppendUvarint(buf, uint64(len(vv)))
+		for _, f := range vv {
+			buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(f))
+		}
+		return buf, true
 	case []string:
 		buf = append(buf, metaTagStrSlice)
 		buf = binary.AppendUvarint(buf, uint64(len(vv)))
@@ -664,12 +676,28 @@ func (d *metaDecoder) readValue() (any, error) {
 			return nil, err
 		}
 		return v, nil
+	case metaTagUint64:
+		return d.uvarint()
 	case metaTagFloat64:
 		b, err := d.readBytes(8)
 		if err != nil {
 			return nil, err
 		}
 		return math.Float64frombits(binary.LittleEndian.Uint64(b)), nil
+	case metaTagF64Slice:
+		count, err := d.readCount()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]float64, count)
+		for i := range out {
+			b, err := d.readBytes(8)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = math.Float64frombits(binary.LittleEndian.Uint64(b))
+		}
+		return out, nil
 	case metaTagStrSlice:
 		count, err := d.readCount()
 		if err != nil {

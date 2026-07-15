@@ -28,6 +28,14 @@ const (
 // does not reveal (or actively misleads about) their family — e.g.
 // edit_memory starts with "edit_" but belongs to the memory family.
 var toolCategoryOverrides = map[string]string{
+	// facade-v1 dispatchers
+	"explore": toolCatNav, "search": toolCatNav, "relations": toolCatNav, "trace": toolCatNav,
+	"read": toolCatRead, "edit": toolCatEdit, "refactor": toolCatEdit,
+	"change": toolCatOverlay, "overlay": toolCatOverlay,
+	"publish_review": toolCatReview, "pr": toolCatPR,
+	"recall": toolCatMemory, "remember": toolCatMemory,
+	"workspace": toolCatWorkspace, "workspace_admin": toolCatWorkspace,
+	"session": toolCatAdmin, "capabilities": toolCatAdmin, "response": toolCatOther,
 	// nav (no find_/search_ prefix)
 	"smart_context": toolCatNav, "nav": toolCatNav, "walk_graph": toolCatNav,
 	"graph_query": toolCatNav, "trace_path": toolCatNav, "flow_between": toolCatNav,

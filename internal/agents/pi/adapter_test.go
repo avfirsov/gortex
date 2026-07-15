@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -75,7 +77,7 @@ func TestPiApplyWritesExtensionAndRouting(t *testing.T) {
 	src := string(data)
 
 	// Sentinels must be fully substituted — no template left behind.
-	for _, sentinel := range []string{sentinelBin, sentinelArgv, sentinelEnforce, sentinelToolsPreset} {
+	for _, sentinel := range []string{sentinelBin, sentinelArgv, sentinelEnforce, sentinelInstructions} {
 		if strings.Contains(src, sentinel) {
 			t.Errorf("unsubstituted sentinel %q remains in extension", sentinel)
 		}
@@ -234,36 +236,56 @@ func parseArgv(t *testing.T, src string) []string {
 	return argv
 }
 
-func TestPiRendersSearchToolAndPreset(t *testing.T) {
+func TestPiRendersCompactPublicTools(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
-	// Render-time default must not depend on the caller's environment.
-	t.Setenv("GORTEX_TOOLS", "")
 	src := renderExtension(env)
 
-	// B: the on-demand discovery meta-tool that mirrors tools_search.
-	if !strings.Contains(src, "registerSearchTool(pi)") {
-		t.Error("expected registerSearchTool to be wired into the entry point")
-	}
-	if !strings.Contains(src, `"tools", "search", query`) {
-		t.Error("expected the meta-tool to shell `gortex tools search`")
-	}
-
-	// Every Gortex tool (incl. the meta-tool) is namespaced under gortex_ so
-	// it can't silently clobber a user's own tool of the same name.
+	// Every Gortex tool is namespaced under gortex_ so it cannot clobber a
+	// Pi built-in such as read or edit. The CLI still receives the bare public
+	// name and the model's exact request object.
 	if !strings.Contains(src, `const TOOL_PREFIX = "gortex_"`) {
 		t.Error("expected a gortex_ tool-name prefix")
 	}
-	if !strings.Contains(src, `piToolName("tools_search")`) {
-		t.Error("expected the search meta-tool name to be derived via the gortex_ prefix")
+	if !strings.Contains(src, `"call",
+          bare,
+          "--json",
+          JSON.stringify(params ?? {}),`) {
+		t.Error("expected each Pi tool to forward the exact request object through gortex call")
 	}
 
-	// C: the eager preset is configurable; the baked default is core and
-	// the runtime honours GORTEX_TOOLS.
-	if !strings.Contains(src, `const TOOLS_PRESET: string = ((process.env && process.env.GORTEX_TOOLS) || "core").trim();`) {
-		t.Error("expected TOOLS_PRESET to default to \"core\" and honour GORTEX_TOOLS at runtime")
+	for _, legacy := range []string{"tools_search", "TOOLS_PRESET", `"tools", "list"`, `"tools", "search"`} {
+		if strings.Contains(src, legacy) {
+			t.Errorf("Pi compact surface must not contain legacy discovery vocabulary %q", legacy)
+		}
 	}
-	if strings.Contains(src, `"--preset", "core", "--format"`) {
-		t.Error("discovery must no longer hardcode --preset core; it should route through presetListArgs()")
+	if strings.Contains(src, `"--format"`) {
+		t.Error("Pi must not rewrite the request by forcing an output format")
+	}
+
+	blockStart := strings.Index(src, "const PUBLIC_TOOLS: ToolDescriptor[] = [")
+	if blockStart < 0 {
+		t.Fatal("PUBLIC_TOOLS roster missing")
+	}
+	block := src[blockStart:]
+	if end := strings.Index(block, "];"); end >= 0 {
+		block = block[:end]
+	}
+	matches := regexp.MustCompile(`\{ name: "([^"]+)"`).FindAllStringSubmatch(block, -1)
+	got := make([]string, 0, len(matches))
+	for _, match := range matches {
+		got = append(got, match[1])
+	}
+	want := []string{
+		"explore", "search", "read", "relations", "trace", "analyze", "ask",
+		"change", "edit", "refactor", "review", "publish_review", "pr", "recall",
+		"remember", "workspace", "workspace_admin", "overlay", "session", "response",
+		"capabilities",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("public Pi tools = %v, want %v", got, want)
+	}
+	if !strings.Contains(src, agents.BashInstructionsSentinel) {
+		t.Error("rendered Pi extension must carry the mandatory Bash-only public workflow")
 	}
 }
 
@@ -287,7 +309,7 @@ func TestPiRegistersToolsPerSession(t *testing.T) {
 	if end := strings.Index(body, "pi.on(\"before_agent_start\""); end > 0 {
 		body = body[:end]
 	}
-	for _, want := range []string{"gortexToolNames.clear()", "registerGortexTools(pi)", "registerSearchTool(pi)", "ensureDaemon()"} {
+	for _, want := range []string{"gortexToolNames.clear()", "registerGortexTools(pi)", "ensureDaemon()"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q inside the session_start handler (per-session re-registration)", want)
 		}

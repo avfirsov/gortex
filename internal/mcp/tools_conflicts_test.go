@@ -134,12 +134,12 @@ func conflictsTestServer(t *testing.T) (*Server, string, string) {
 	g.AddNode(&graph.Node{ID: idB, Kind: graph.KindFunction, Name: "DoB", FilePath: fileB, StartLine: 1, EndLine: 5})
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
-	srv.communities = &analysis.CommunityResult{
+	installCommunitiesForTest(srv, &analysis.CommunityResult{
 		Communities: []analysis.Community{
 			{ID: "comm-shared", Size: 7, Members: []string{idA, idB}},
 		},
 		NodeToComm: map[string]string{idA: "comm-shared", idB: "comm-shared"},
-	}
+	})
 	return srv, fileA, fileB
 }
 
@@ -271,7 +271,7 @@ func conflictsBudgetServer(t *testing.T) (*Server, map[string][]string, []forge.
 	for c := 0; c < 3; c++ {
 		comms[c] = analysis.Community{ID: "comm" + string(rune('A'+c)), Size: 5 + c, Members: members3[c]}
 	}
-	srv.communities = &analysis.CommunityResult{Communities: comms, NodeToComm: nodeToComm}
+	installCommunitiesForTest(srv, &analysis.CommunityResult{Communities: comms, NodeToComm: nodeToComm})
 	return srv, files, prs
 }
 

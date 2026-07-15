@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 2
+const currentSchemaVersion = 4
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -56,6 +56,28 @@ type schemaMigration struct {
 // entries for version 2 and up as the schema evolves.
 var schemaMigrations = []schemaMigration{
 	{version: 2, name: "dedupe fn-value placeholder edges", inPlace: dedupeFnValuePlaceholderEdges},
+	// Versions through v2 wrote node updates with INSERT OR REPLACE. REPLACE
+	// has delete semantics and can invalidate incident-edge integrity when
+	// foreign-key enforcement is enabled by a host/connection. Deleted edges
+	// cannot be reconstructed from the remaining graph rows, so this is an
+	// explicit source-reindex boundary rather than a misleading in-place fix.
+	{version: 3, name: "restore topology after node replace writes", rebuild: true},
+	{version: 4, name: "add normalized analysis generations", inPlace: createAnalysisGenerationTables},
+}
+
+// createAnalysisGenerationTables is the explicit v4 in-place migration.
+// schemaSQL runs first and is intentionally idempotent, so this is a no-op on
+// fresh stores and a defensive create on older stores opened by migration
+// tests or future alternate open paths.
+func createAnalysisGenerationTables(tx *sql.Tx) error {
+	if _, err := tx.Exec(analysisGenerationSchemaSQL); err != nil {
+		return err
+	}
+	// Builds used during development briefly created a blob-only cache under
+	// schema v3. It was never released; remove the artifact instead of carrying
+	// a conversion or compatibility API into v4.
+	_, err := tx.Exec(`DROP TABLE IF EXISTS analysis_cache`)
+	return err
 }
 
 // dedupeFnValuePlaceholderEdges collapses duplicate function-as-value gate

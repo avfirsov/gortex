@@ -81,7 +81,7 @@ func BuildAutoConcepts(g graph.Reader) *AutoConcepts {
 	// the per-symbol token sets for the pair-counting pass.
 	docFreq := map[string]int{}
 	var docs [][]string
-	for _, n := range g.AllNodes() {
+	for _, n := range graph.AllNodesLight(g) {
 		if !autoConceptEligible(n.Kind) {
 			continue
 		}

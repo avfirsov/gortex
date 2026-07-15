@@ -20,14 +20,11 @@ import (
 func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.Context {
 	repo, project := s.sessionLocality(ctx)
 	rctx := &rerank.Context{
-		Graph:      s.graph,
-		RepoPrefix: repo,
-		ProjectID:  project,
-	}
-
-	if cr := s.getCommunities(); cr != nil && cr.NodeToComm != nil {
-		nodeToComm := cr.NodeToComm
-		rctx.CommunityOf = func(id string) string { return nodeToComm[id] }
+		Graph:             s.graph,
+		RepoPrefix:        repo,
+		ProjectID:         project,
+		AnalysisMetricsOf: s.rerankAnalysisMetrics,
+		BatchedCentrality: s.rerankBoundedCentrality,
 	}
 
 	if s.combo != nil {
@@ -77,38 +74,9 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 		}
 	}
 
-	// HITS authority / hub scores feed the authority rerank signal.
-	// Both closures normalise against the graph maxima so the signal
-	// receives values already in [0, 1].
-	if h := s.getHITS(); h != nil {
-		hits := h
-		maxAuth, maxHub := hits.MaxAuth, hits.MaxHub
-		rctx.AuthorityOf = func(id string) float64 {
-			if maxAuth <= 0 {
-				return 0
-			}
-			return hits.AuthorityOf(id) / maxAuth
-		}
-		rctx.HubOf = func(id string) float64 {
-			if maxHub <= 0 {
-				return 0
-			}
-			return hits.HubOf(id) / maxHub
-		}
-	}
-
-	// Centrality: a per-query Random-Walk-with-Restart (Personalized
-	// PageRank) over the call/reference graph, seeded from the query's
-	// strongest candidate matches, feeds ProximitySignal — the graph-
-	// centrality spine of retrieval. The walk runs against the
-	// immutable adjacency snapshot built by RunAnalysis; nil until then
-	// (the signal then sits at 0). The actual walk fires once per
-	// Rerank inside Context.prepare, after the seeds are chosen.
-	if snap := s.getAdjacency(); snap != nil {
-		rctx.Centrality = func(seeds []string) map[string]float64 {
-			return s.personalizedPageRank(snap, seeds)
-		}
-	}
+	// Centrality is built from a capped candidate-seeded neighborhood when
+	// Prepare knows the complete result batch. This avoids restoring the
+	// whole-graph CSR for every interactive search.
 
 	// Co-change feeds the rerank pipeline once the git-history mine
 	// has run (lazily, on the first find_co_changing_symbols call, or

@@ -72,10 +72,28 @@ func (s *Server) OverlayManager() *daemon.OverlayManager { return s.overlays }
 // wired, this is a transparent pass-through (one map lookup, zero
 // parsing) — non-overlay traffic pays no cost.
 func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
+	return s.wrapToolHandlerMode(h, true)
+}
+
+// wrapControlToolHandler applies the normal safety, telemetry, logging, and
+// response middleware without pre-building the caller's overlay view. Overlay
+// lifecycle/simulation handlers compose their own views and must run through
+// this path rather than bypassing gates with a bare MCP AddTool.
+func (s *Server) wrapControlToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
+	return s.wrapToolHandlerMode(h, false)
+}
+
+func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay bool) mcpserver.ToolHandlerFunc {
 	// Prompt-injection screening sits closest to the handler so it
 	// sees the real arguments and the real result (see sanitize.go).
 	h = s.sanitizeToolHandler(h)
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		beginMCPToolCall()
+		defer func() {
+			endMCPToolCall(s.logger, req.Params.Name)
+			s.releaseTransientAnalysisIfIdle()
+		}()
+
 		// Last-resort panic firewall around EVERY tool handler. A Go
 		// panic in any handler (e.g. when the store surfaces a fatal
 		// engine error) would otherwise unwind past the mcp-go server
@@ -109,16 +127,18 @@ func (s *Server) wrapToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHand
 		// tool call (GORTEX_AUTOINDEX=1). Cheap getenv + sync.Once on the
 		// request path; all real work runs on a background goroutine.
 		s.maybeAutoIndexCWD()
-		view, err := s.buildOverlayViewForCtx(ctx)
-		if err != nil {
-			// Drift surfaces as a structured tool error result so the
-			// client knows to re-read and resubmit. Return (result,
-			// nil) so the JSON-RPC framing carries the message rather
-			// than a transport error.
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		if view != nil {
-			ctx = WithOverlayView(ctx, view)
+		if injectOverlay {
+			view, err := s.buildOverlayViewForCtx(ctx)
+			if err != nil {
+				// Drift surfaces as a structured tool error result so the
+				// client knows to re-read and resubmit. Return (result,
+				// nil) so the JSON-RPC framing carries the message rather
+				// than a transport error.
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if view != nil {
+				ctx = WithOverlayView(ctx, view)
+			}
 		}
 		// Warmup fast path: when the daemon is still warming up and
 		// this is a graph-querying tool, the handler still runs (so

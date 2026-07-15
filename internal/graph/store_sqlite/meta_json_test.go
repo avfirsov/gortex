@@ -158,6 +158,20 @@ func TestEncodeMetaEmpty(t *testing.T) {
 	}
 }
 
+func TestMetaRoundTripReachExactTypes(t *testing.T) {
+	wantConf := []float64{0, 0.625, 1}
+	got := roundTrip(t, map[string]any{
+		"reach_build":   uint64(1<<63 + 17),
+		"reach_d1_conf": wantConf,
+	})
+	if build, ok := got["reach_build"].(uint64); !ok || build != uint64(1<<63+17) {
+		t.Fatalf("reach_build type/value = %T(%v), want uint64", got["reach_build"], got["reach_build"])
+	}
+	if conf, ok := got["reach_d1_conf"].([]float64); !ok || !reflect.DeepEqual(conf, wantConf) {
+		t.Fatalf("reach_d1_conf type/value = %T(%v), want []float64(%v)", got["reach_d1_conf"], got["reach_d1_conf"], wantConf)
+	}
+}
+
 func assertType[T comparable](t *testing.T, m map[string]any, key string, want T) {
 	t.Helper()
 	v, ok := m[key]

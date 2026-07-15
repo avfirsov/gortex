@@ -54,13 +54,11 @@ import (
 // are registered without the overlay-injecting middleware (they
 // manage their own simulation views) but they DO honour an existing
 // session overlay when `inherit_overlay: true` is set on the chain
-// form. We register through s.mcpServer.AddTool directly — the
-// addTool wrapper would build the caller's overlay view and stash it
-// on ctx, but the simulation tools layer their own view on top of
-// base (or on top of the caller's), so we want to keep that
-// composition explicit rather than fight the middleware.
+// form. We register through addControlTool: it keeps safety, gating, and
+// telemetry middleware but skips automatic overlay injection because these
+// tools compose their own simulation views explicitly.
 func (s *Server) registerSimulationTools() {
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("preview_edit",
 			mcp.WithDescription("Speculatively apply one WorkspaceEdit (LSP-shaped: `changes` or `documentChanges`) to a fresh shadow view on top of the base graph, then return the impact — touched files, before/after symbol surfaces, broken callers, broken interface implementors, suggested test targets, and (when the LSP server for the language is running) the diagnostics that the change would produce. Disk is never written; the base graph is never mutated. The shadow view is built per call and discarded with the response. Useful when you want to know if a refactor is safe before staging it."),
 			mcp.WithString("workspace_edit", mcp.Required(), mcp.Description("LSP WorkspaceEdit as a JSON string. Either `{\"changes\": {uri: [TextEdit, ...], ...}}` or `{\"documentChanges\": [{\"textDocument\": {\"uri\": \"...\"}, \"edits\": [TextEdit, ...]}, ...]}`. TextEdit is `{\"range\": {\"start\": {\"line\": N, \"character\": M}, \"end\": {...}}, \"newText\": \"...\"}` with 0-indexed line/char. URIs can be `file://`, absolute paths, or repo-relative paths.")),
@@ -70,7 +68,7 @@ func (s *Server) registerSimulationTools() {
 		),
 		s.handlePreviewEdit,
 	)
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("simulate_chain",
 			mcp.WithDescription("Apply an ordered sequence of WorkspaceEdits to a fresh shadow view, accumulating overlay state between steps. Returns per-step impact (touched files, broken callers, broken implementors, diagnostics delta vs the previous step) and a cumulative impact rollup at the end. Disk is never written. Useful for previewing multi-step refactors where each step depends on the previous step's result (rename → fix callers → adjust signature, etc.). Pass `keep: true` to persist the final state as an editor overlay session — the response then includes `overlay_session_id` and the caller can `overlay_push` / `overlay_drop` / `compare_with_overlay` from there, or eventually write the changes to disk."),
 			mcp.WithString("steps", mcp.Required(), mcp.Description("JSON array of LSP WorkspaceEdit objects, applied in order. Each step's edits are layered on top of the prior step's simulated state. An empty array is rejected; pass a single-element array for trivial chains.")),
@@ -115,19 +113,19 @@ func (s *Server) handlePreviewEdit(ctx context.Context, req mcp.CallToolRequest)
 	step := sim.steps[0]
 
 	result := map[string]any{
-		"touched_files":     step.touchedFiles,
-		"new_files":         step.newFiles,
-		"deleted_files":     step.deletedFiles,
-		"missing_files":     step.missingFiles,
-		"symbols_added":     step.symbolsAdded,
-		"symbols_removed":   step.symbolsRemoved,
-		"symbols_renamed":   step.symbolsRenamed,
-		"broken_callers":    step.brokenCallers,
+		"touched_files":       step.touchedFiles,
+		"new_files":           step.newFiles,
+		"deleted_files":       step.deletedFiles,
+		"missing_files":       step.missingFiles,
+		"symbols_added":       step.symbolsAdded,
+		"symbols_removed":     step.symbolsRemoved,
+		"symbols_renamed":     step.symbolsRenamed,
+		"broken_callers":      step.brokenCallers,
 		"broken_implementors": step.brokenImplementors,
-		"impact":            step.impact,
-		"test_targets":      step.testTargets,
-		"overlay_paths":     sim.coveredPaths,
-		"summary":           step.summary,
+		"impact":              step.impact,
+		"test_targets":        step.testTargets,
+		"overlay_paths":       sim.coveredPaths,
+		"summary":             step.summary,
 	}
 
 	if wantDiag {
@@ -228,14 +226,14 @@ func (s *Server) handleSimulateChain(ctx context.Context, req mcp.CallToolReques
 	}
 
 	result := map[string]any{
-		"steps":            stepsOut,
-		"total_steps":      len(sim.steps),
-		"applied_steps":    len(stepsOut),
-		"stopped_at":       stoppedAt,
-		"overlay_paths":    sim.coveredPaths,
-		"cumulative":       sim.cumulative,
-		"inherit_overlay":  inherit,
-		"kept":             false,
+		"steps":           stepsOut,
+		"total_steps":     len(sim.steps),
+		"applied_steps":   len(stepsOut),
+		"stopped_at":      stoppedAt,
+		"overlay_paths":   sim.coveredPaths,
+		"cumulative":      sim.cumulative,
+		"inherit_overlay": inherit,
+		"kept":            false,
 	}
 
 	if keep {

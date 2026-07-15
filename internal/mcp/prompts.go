@@ -99,7 +99,7 @@ func (s *Server) handlePromptPreCommit(ctx context.Context, req mcp.GetPromptReq
 	for i, cs := range diff.ChangedSymbols {
 		symbolIDs[i] = cs.ID
 	}
-	impact := analysis.AnalyzeImpact(s.graph, symbolIDs, s.getCommunities(), s.getProcesses())
+	impact := s.analyzeImpactLazy(ctx, symbolIDs)
 
 	fmt.Fprintf(&b, "**Risk: %s**\n\n", impact.Risk)
 	fmt.Fprintf(&b, "Changed: %d symbols in %d files\n\n", len(diff.ChangedSymbols), len(diff.ChangedFiles))
@@ -203,56 +203,30 @@ func (s *Server) handlePromptOrientation(ctx context.Context, _ mcp.GetPromptReq
 		b.WriteString("\n")
 	}
 
-	comms := s.getCommunities()
-	if comms != nil && len(comms.Communities) > 0 {
-		var shown []analysis.Community
-		for _, c := range comms.Communities {
-			if inScope == nil {
-				shown = append(shown, c)
-				continue
-			}
-			for _, m := range c.Members {
-				if inScope[m] {
-					shown = append(shown, c)
-					break
-				}
-			}
-		}
-		if len(shown) > 0 {
-			b.WriteString("### Functional Areas (Communities)\n")
-			for _, c := range shown {
-				fmt.Fprintf(&b, "- **%s** — %d symbols, %d files (cohesion: %.2f)\n",
-					c.Label, c.Size, len(c.Files), c.Cohesion)
-			}
-			b.WriteString("\n")
+	scopedIDs := make([]string, 0, len(scoped))
+	for _, node := range scoped {
+		if node != nil {
+			scopedIDs = append(scopedIDs, node.ID)
 		}
 	}
+	communities := s.communitySummariesForNodes(scopedIDs, bound, 10)
+	if len(communities) > 0 {
+		b.WriteString("### Functional Areas (Communities)\n")
+		for _, community := range communities {
+			fmt.Fprintf(&b, "- **%s** — %d symbols, %d files (cohesion: %.2f)\n",
+				community.Label, community.Size, len(community.Files), community.Cohesion)
+		}
+		b.WriteString("\n")
+	}
 
-	procs := s.getProcesses()
-	if procs != nil && len(procs.Processes) > 0 {
-		// A process is in scope when its entry point is — entry points
-		// are real symbol IDs and must not leak across the boundary.
-		var shown []analysis.Process
-		for _, p := range procs.Processes {
-			if inScope == nil || inScope[p.EntryPoint] {
-				shown = append(shown, p)
-			}
+	processes := s.processSummariesForEntries(inScope, bound, 10)
+	if len(processes) > 0 {
+		b.WriteString("### Execution Flows (Processes)\n")
+		for _, process := range processes {
+			fmt.Fprintf(&b, "- **%s** — %d steps, entry: `%s`\n",
+				process.Name, process.StepCount, process.EntryPoint)
 		}
-		if len(shown) > 0 {
-			b.WriteString("### Execution Flows (Processes)\n")
-			limit := len(shown)
-			if limit > 10 {
-				limit = 10
-			}
-			for _, p := range shown[:limit] {
-				fmt.Fprintf(&b, "- **%s** — %d steps, entry: `%s`\n",
-					p.Name, p.StepCount, p.EntryPoint)
-			}
-			if len(shown) > 10 {
-				fmt.Fprintf(&b, "- ... and %d more\n", len(shown)-10)
-			}
-			b.WriteString("\n")
-		}
+		b.WriteString("\n")
 	}
 
 	topRefs := s.findTopReferenced(ctx, 10)
@@ -303,7 +277,7 @@ func (s *Server) handlePromptSafeToChange(ctx context.Context, req mcp.GetPrompt
 		return promptError("No valid symbols found"), nil
 	}
 
-	impact := analysis.AnalyzeImpact(s.graph, validIDs, s.getCommunities(), s.getProcesses())
+	impact := s.analyzeImpactLazy(ctx, validIDs)
 
 	fmt.Fprintf(&b, "**Risk: %s**\n\n", impact.Risk)
 	fmt.Fprintf(&b, "Symbols to change: %s\n\n", strings.Join(validIDs, ", "))

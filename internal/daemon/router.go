@@ -196,7 +196,8 @@ func (r *Router) RouteToolCall(ctx context.Context, toolName string, body []byte
 	// any bearer token leaves the process, for BOTH explicit
 	// single-remote routing and (later) federation fan-out:
 	//   1. enabled-set gate — a disabled remote is never queried.
-	//   2. write-gate — a mutating tool never routes to any remote.
+	//   2. effect-gate — only effect-free reads route to a remote. Durable
+	//      writes and volatile session controls both stay machine-local.
 	slug := lookup.Server.Slug
 	// Audit every remote-routed call (cross-daemon access record),
 	// emitted before the gates so a refusal is auditable too.
@@ -214,7 +215,7 @@ func (r *Router) RouteToolCall(ctx context.Context, toolName string, body []byte
 	if !remoteEnabledIn(enabled, slug) {
 		return remoteDisabledRefusal(slug)
 	}
-	if IsMutating(toolName) {
+	if IsEffectful(toolName) {
 		return remoteReadOnlyRefusal(toolName, slug)
 	}
 
@@ -249,16 +250,17 @@ func remoteDisabledRefusal(slug string) ([]byte, int, error) {
 	return b, http.StatusForbidden, nil
 }
 
-// remoteReadOnlyRefusal is the structured envelope returned when a
-// mutating tool resolves to a remote. In v1 no write ever routes to a
-// remote, regardless of flags. Fires before any outbound HTTP.
+// remoteReadOnlyRefusal is the structured envelope returned when an
+// effectful tool resolves to a remote. In v1 neither durable writes nor
+// volatile session controls route to a remote, regardless of flags. Fires
+// before any outbound HTTP.
 func remoteReadOnlyRefusal(tool, slug string) ([]byte, int, error) {
 	b, _ := json.Marshal(map[string]any{
 		"error":       "remote_read_only",
 		"error_code":  "remote_read_only",
 		"tool":        tool,
 		"target_slug": slug,
-		"message":     fmt.Sprintf("%q is a write tool and remote %q is read-only — writes never route to a remote", tool, slug),
+		"message":     fmt.Sprintf("%q changes state and remote %q is read-only — effectful tools never route to a remote", tool, slug),
 	})
 	return b, http.StatusForbidden, nil
 }

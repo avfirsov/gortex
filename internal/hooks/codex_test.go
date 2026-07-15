@@ -5,12 +5,46 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
+
+func TestParseCodexModeDefaultsAdvisory(t *testing.T) {
+	tests := map[string]CodexMode{
+		"": CodexModeEnrich, "unknown": CodexModeEnrich, "enrich": CodexModeEnrich,
+		"deny": CodexModeDeny, "hard-deny": CodexModeDeny,
+		"rewrite": CodexModeRewrite, "input-rewrite": CodexModeRewrite,
+		"suppress": CodexModeSuppress, "replace-output": CodexModeSuppress,
+	}
+	for input, want := range tests {
+		if got := ParseCodexMode(input); got != want {
+			t.Errorf("ParseCodexMode(%q)=%v want %v", input, got, want)
+		}
+	}
+}
 
 func TestRunCodexMalformedJSONNoop(t *testing.T) {
 	out := captureStdout(t, func() { runCodex([]byte(`{`), 0) })
 	if out != "" {
 		t.Fatalf("malformed JSON should be silent, got %q", out)
+	}
+}
+
+func TestRunCodexSessionStartUsesManagedOrientationHook(t *testing.T) {
+	withFakeStatus(t, func() (*daemon.StatusResponse, error) {
+		return nil, errDaemonUnreachable
+	})
+	data := []byte(`{"hook_event_name":"SessionStart","cwd":"/tmp/gortex","source":"startup"}`)
+	out := captureStdout(t, func() { runCodex(data, 0) })
+	if out == "" {
+		t.Fatal("expected managed SessionStart orientation")
+	}
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil || hso.HookEventName != "SessionStart" {
+		t.Fatalf("invalid SessionStart hook output: %s", out)
+	}
+	if !strings.Contains(hso.AdditionalContext, "Call `explore` first") {
+		t.Fatalf("mandatory compact-tool orientation missing: %q", hso.AdditionalContext)
 	}
 }
 
@@ -52,7 +86,8 @@ func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 	if hso.HookEventName != "PreToolUse" {
 		t.Fatalf("hookEventName=%q want PreToolUse", hso.HookEventName)
 	}
-	if !strings.Contains(hso.AdditionalContext, "PREFER graph tools over Grep") {
+	if !strings.Contains(hso.AdditionalContext, "Do not Grep indexed source") ||
+		!strings.Contains(hso.AdditionalContext, `search(operation:"symbols"`) {
 		t.Fatalf("additionalContext missing graph guidance: %q", hso.AdditionalContext)
 	}
 	if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
@@ -63,22 +98,30 @@ func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 	withForceCompress(t, false)
 	tests := []struct {
-		name string
-		tool string
+		name  string
+		tool  string
+		input string
 	}{
 		{
-			name: "read file",
-			tool: gortexReadFileTool,
+			name:  "compact read file",
+			tool:  gortexCompactReadTool,
+			input: `{"operation":"file","target":{"file":"internal/a.go"}}`,
 		},
 		{
-			name: "editing context",
-			tool: gortexEditingContextTool,
+			name:  "read file compatibility",
+			tool:  gortexReadFileTool,
+			input: `{"path":"internal/a.go"}`,
+		},
+		{
+			name:  "editing context compatibility",
+			tool:  gortexEditingContextTool,
+			input: `{"path":"internal/a.go"}`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data := codexPreToolPayload(tt.tool, `{"path":"internal/a.go"}`)
+			data := codexPreToolPayload(tt.tool, tt.input)
 			out := captureStdout(t, func() { runCodex(data, 0) })
 			if out == "" {
 				t.Fatal("expected Codex MCP read PreToolUse guidance, got empty output")
@@ -90,15 +133,116 @@ func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 			if hso.HookEventName != "PreToolUse" {
 				t.Fatalf("hookEventName=%q want PreToolUse", hso.HookEventName)
 			}
-			for _, want := range []string{"compress_bodies", "search_text", "keep"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
 				if !strings.Contains(hso.AdditionalContext, want) {
 					t.Fatalf("additionalContext missing %q: %q", want, hso.AdditionalContext)
 				}
+			}
+			if strings.Contains(hso.AdditionalContext, "gortex call ") {
+				t.Fatalf("MCP read advisory must not advertise CLI fallback: %q", hso.AdditionalContext)
 			}
 			if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 				t.Fatalf("Codex MCP read nudge must not deny: %#v", hso)
 			}
 		})
+	}
+}
+
+func TestRunCodexPreToolUseHardDenyAndRewrite(t *testing.T) {
+	data := codexPreToolPayload(gortexCompactReadTool, `{"target":{"file":"internal/a.go"}}`)
+
+	denied := captureStdout(t, func() { runCodex(data, 0, CodexModeDeny) })
+	deny := decodeHookOutput(t, denied).HookSpecificOutput
+	if deny == nil || deny.PermissionDecision != "deny" || !strings.Contains(deny.PermissionDecisionReason, "compress_bodies") {
+		t.Fatalf("hard-deny output=%s", denied)
+	}
+	if deny.UpdatedInput != nil {
+		t.Fatalf("deny must not include updatedInput: %#v", deny)
+	}
+
+	rewritten := captureStdout(t, func() { runCodex(data, 0, CodexModeRewrite) })
+	rewrite := decodeHookOutput(t, rewritten).HookSpecificOutput
+	if rewrite == nil || rewrite.PermissionDecision != "allow" {
+		t.Fatalf("rewrite output=%s", rewritten)
+	}
+	options, ok := rewrite.UpdatedInput["options"].(map[string]any)
+	if !ok || options["compress_bodies"] != true {
+		t.Fatalf("rewrite updatedInput=%#v", rewrite.UpdatedInput)
+	}
+	target := rewrite.UpdatedInput["target"].(map[string]any)
+	if target["file"] != "internal/a.go" {
+		t.Fatalf("rewrite lost target: %#v", rewrite.UpdatedInput)
+	}
+}
+
+func TestRunCodexHardDenyCoversPureTextAlternation(t *testing.T) {
+	oldReachable := daemonReachableFn
+	daemonReachableFn = func() bool { return true }
+	t.Cleanup(func() { daemonReachableFn = oldReachable })
+	oldTextSearch := codexTextSearchHitFn
+	codexTextSearchHitFn = func(int, string) bool { return true }
+	t.Cleanup(func() { codexTextSearchHitFn = oldTextSearch })
+	data := codexBashPayload(`rg 'Phase 5|world-map' .`)
+	out := captureStdout(t, func() { runCodex(data, 0, CodexModeDeny) })
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil || hso.PermissionDecision != "deny" {
+		t.Fatalf("pure-text alternation was not denied: %s", out)
+	}
+	if !strings.Contains(hso.PermissionDecisionReason, "operation `text`") {
+		t.Fatalf("deny did not route to public text search: %s", hso.PermissionDecisionReason)
+	}
+}
+
+func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
+	oldReachable := daemonReachableFn
+	daemonReachableFn = func() bool { return true }
+	t.Cleanup(func() { daemonReachableFn = oldReachable })
+	oldTextSearch := codexTextSearchHitFn
+	codexTextSearchHitFn = func(int, string) bool { return false }
+	t.Cleanup(func() { codexTextSearchHitFn = oldTextSearch })
+
+	noHit := captureStdout(t, func() {
+		runCodex(codexBashPayload(`rg 'Phase 5|world-map' .`), 0, CodexModeDeny)
+	})
+	noHitHSO := decodeHookOutput(t, noHit).HookSpecificOutput
+	if noHitHSO == nil || noHitHSO.PermissionDecision != "" || noHitHSO.AdditionalContext == "" {
+		t.Fatalf("unmatched text search must remain advisory: %s", noHit)
+	}
+
+	oldProbe := grepProbe
+	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+		return []grepSymbolHit{{Name: "Foo", FilePath: "internal/a.go", Line: 1}}, nil
+	}
+	t.Cleanup(func() { grepProbe = oldProbe })
+	external := []byte(`{"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":"/repo","tool_input":{"command":"rg Foo /tmp/external"}}`)
+	externalOut := captureStdout(t, func() { runCodex(external, 0, CodexModeDeny) })
+	externalHSO := decodeHookOutput(t, externalOut).HookSpecificOutput
+	if externalHSO == nil || externalHSO.PermissionDecision != "" || externalHSO.AdditionalContext == "" {
+		t.Fatalf("external search target must never be hard-denied: %s", externalOut)
+	}
+}
+
+func TestRunCodexBashRewriteOnlyForSimpleIndexedCat(t *testing.T) {
+	oldIndexed := fileIndexedFn
+	fileIndexedFn = func(_, path string) (bool, int) { return path == "internal/a.go", 3 }
+	t.Cleanup(func() { fileIndexedFn = oldIndexed })
+
+	data := codexBashPayload("cat internal/a.go")
+	out := captureStdout(t, func() { runCodex(data, 0, CodexModeRewrite) })
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil || hso.PermissionDecision != "allow" {
+		t.Fatalf("rewrite output=%s", out)
+	}
+	command, _ := hso.UpdatedInput["command"].(string)
+	if !strings.Contains(command, "gortex call read --json") || strings.Contains(command, "cat internal/a.go") {
+		t.Fatalf("rewritten command=%q", command)
+	}
+
+	compound := codexBashPayload("cat internal/a.go | head")
+	compoundOut := captureStdout(t, func() { runCodex(compound, 0, CodexModeRewrite) })
+	compoundHSO := decodeHookOutput(t, compoundOut).HookSpecificOutput
+	if compoundHSO == nil || compoundHSO.UpdatedInput != nil || compoundHSO.PermissionDecision != "" {
+		t.Fatalf("compound command must remain advisory: %s", compoundOut)
 	}
 }
 
@@ -146,6 +290,16 @@ func TestRunCodexPreToolUseGortexMCPReadSilentShapes(t *testing.T) {
 		tool  string
 		input string
 	}{
+		{
+			name:  "compact source is already narrow",
+			tool:  gortexCompactReadTool,
+			input: `{"operation":"source","target":{"symbol":"internal/a.go::A"}}`,
+		},
+		{
+			name:  "compact read compressed",
+			tool:  gortexCompactReadTool,
+			input: `{"operation":"file","target":{"file":"internal/a.go"},"options":{"compress_bodies":true}}`,
+		},
 		{
 			name:  "read_file compressed",
 			tool:  gortexReadFileTool,
@@ -217,6 +371,47 @@ func TestRunCodexPostToolUseBashGrepOutputAdditionalContext(t *testing.T) {
 	}
 	if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 		t.Fatalf("Codex PostToolUse enrichment must not deny: %#v", hso)
+	}
+}
+
+func TestRunCodexPostToolUseSuppressUsesSupportedReplacement(t *testing.T) {
+	port := stubBridge(t, nil,
+		map[string]struct{ ID, Name, Kind string }{
+			"internal/a.go:7": {ID: "internal/a.go::MyType", Name: "MyType", Kind: "type"},
+		}, nil)
+	data := codexPostBashPayload("rg -n MyType", "internal/a.go:7:type MyType struct{}\n")
+	out := captureStdout(t, func() { runCodex(data, port, CodexModeSuppress) })
+	decision := decodeHookOutput(t, out)
+	if decision.Decision != "block" || !strings.Contains(decision.Reason, "type MyType") {
+		t.Fatalf("suppress replacement output=%s", out)
+	}
+	if strings.Contains(out, "suppressOutput") || strings.Contains(out, "updatedMCPToolOutput") {
+		t.Fatalf("must not emit Codex fields that are parsed but unsupported: %s", out)
+	}
+}
+
+func TestRunCodexPostToolUseApplyPatchMutationPipeline(t *testing.T) {
+	changed := `{"changed_files":["internal/a.go"],"changed_symbols":[{"id":"internal/a.go::A"}],"risk":"MEDIUM"}`
+	srv := newFakeServer(map[string]string{
+		"detect_changes":   changed,
+		"get_test_targets": "internal/a_test.go::TestA",
+		"check_guards":     "boundary layering violated",
+		"contracts":        "orphan provider GET /a",
+	})
+	defer srv.Close()
+	payload := []byte(`{"hook_event_name":"PostToolUse","tool_name":"apply_patch","cwd":"/repo","tool_input":{"command":"*** Begin Patch"},"tool_response":"Done!"}`)
+	out := captureStdout(t, func() { runCodex(payload, portFromURL(t, srv.URL), CodexModeEnrich) })
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil {
+		t.Fatalf("missing apply_patch context: %s", out)
+	}
+	for _, want := range []string{"mutation follow-up", "internal/a.go::A", "Tests", "TestA", "Guards", "layering", "Contracts", "orphan provider"} {
+		if !strings.Contains(hso.AdditionalContext, want) {
+			t.Fatalf("apply_patch context missing %q: %s", want, hso.AdditionalContext)
+		}
+	}
+	if hso.PermissionDecision != "" {
+		t.Fatalf("post-mutation advisory must not deny: %#v", hso)
 	}
 }
 
@@ -346,6 +541,7 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 		name     string
 		command  string
 		response string
+		want     string
 	}{
 		{
 			name:     "grep with no path line output stays quiet",
@@ -373,9 +569,10 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 			response: "internal/a.go:7:type MyType struct{}\n",
 		},
 		{
-			name:     "sed source read stays quiet",
+			name:     "sed source read is enriched",
 			command:  `sed -n '1,20p' internal/a.go`,
 			response: "package hooks\n",
+			want:     "Graph footprint for internal/a.go",
 		},
 		{
 			name:     "unsupported awk source scan stays quiet",
@@ -383,19 +580,27 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 			response: "internal/a.go:7:type MyType struct{}\n",
 		},
 		{
-			name:     "awk source read stays quiet",
+			name:     "awk unbounded source read stays quiet",
 			command:  `awk '{print}' internal/a.go`,
 			response: "package hooks\n",
 		},
 		{
-			name:     "ls stays quiet",
-			command:  "ls /repo",
-			response: "internal/a.go\n",
+			name:     "awk bounded source read is enriched",
+			command:  `awk 'NR>=1 && NR<=20 {print}' internal/a.go`,
+			response: "package hooks\n",
+			want:     "Graph footprint for internal/a.go",
 		},
 		{
-			name:     "fd stays quiet",
+			name:     "ls file list is enriched",
+			command:  "ls /repo",
+			response: "internal/a.go\n",
+			want:     "Glob match(es)",
+		},
+		{
+			name:     "fd file list is enriched",
 			command:  `fd '\.go$' internal`,
 			response: "internal/a.go\n",
+			want:     "Glob match(es)",
 		},
 		{
 			name:     "tree stays quiet",
@@ -403,9 +608,16 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 			response: "internal/a.go\n",
 		},
 		{
-			name:     "git ls-files stays quiet",
+			name:     "tree full-path list is enriched",
+			command:  "tree -fi internal",
+			response: "internal/a.go\n",
+			want:     "Glob match(es)",
+		},
+		{
+			name:     "git ls-files is enriched",
 			command:  "git ls-files '*.go'",
 			response: "internal/a.go\n",
+			want:     "Glob match(es)",
 		},
 	}
 
@@ -418,8 +630,14 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 
 			data := codexPostBashPayload(tt.command, tt.response)
 			out := captureStdout(t, func() { runCodex(data, port) })
-			if out != "" {
-				t.Fatalf("expected silent no-op, got %q", out)
+			if tt.want == "" {
+				if out != "" {
+					t.Fatalf("expected silent no-op, got %q", out)
+				}
+				return
+			}
+			if !strings.Contains(out, tt.want) {
+				t.Fatalf("expected enrichment containing %q, got %q", tt.want, out)
 			}
 		})
 	}
@@ -434,7 +652,7 @@ func TestRunCodexPostToolUseIgnoresNonBash(t *testing.T) {
 }
 
 func TestRunCodexPostToolUseMalformedJSONNoop(t *testing.T) {
-	out := captureStdout(t, func() { runCodexPostToolUse([]byte(`{`)) })
+	out := captureStdout(t, func() { runCodexPostToolUse([]byte(`{`), 0, CodexModeEnrich) })
 	if out != "" {
 		t.Fatalf("malformed JSON should be silent, got %q", out)
 	}

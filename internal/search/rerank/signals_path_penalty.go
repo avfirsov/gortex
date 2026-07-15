@@ -9,7 +9,7 @@ import (
 )
 
 // PathPenaltySignal applies a multiplicative penalty to candidates
-// whose file path falls into one of six "supporting cast" buckets —
+// whose file path falls into one of seven "supporting cast" buckets —
 // test files, compatibility shims, examples, type declarations,
 // re-export barrels, and generated files that shadow a real
 // implementation. The intuition: when an agent asks for the
@@ -34,8 +34,10 @@ import (
 //   - Examples         → 0.5 (demo code; useful but never the truth)
 //   - Type declarations → 0.7 (`.d.ts`, `.pyi`, `.h` headers — the
 //     interface, not the implementation)
-//   - Re-export barrels → 0.7 (`index.ts`, `__init__.py`, `mod.rs`,
-//     `lib.rs` — a forwarding hop, not the source)
+//   - Re-export barrels → 0.7 (`index.js`, `__init__.py` — normally a
+//     forwarding hop, not the source)
+//   - Module entries    → 0.9 (`index.ts[x]`, `mod.rs`, `lib.rs` — often
+//     both a public API surface and real implementation)
 //   - Generated files  → 0.4 (`foo.pb.go`, `mock_x.go`, `x_pb2.py` —
 //     ONLY when a real same-named hand-written peer exists in the
 //     graph; a generated file that is the sole definition is left at
@@ -113,9 +115,10 @@ const (
 	PathPenaltyGenerated = 0.4
 	PathPenaltyCompat    = 0.5
 	PathPenaltyExamples  = 0.5
-	PathPenaltyTypeDecl  = 0.7
-	PathPenaltyReexport  = 0.7
-	PathPenaltyUncatched = 1.0
+	PathPenaltyTypeDecl    = 0.7
+	PathPenaltyReexport    = 0.7
+	PathPenaltyModuleEntry = 0.9
+	PathPenaltyUncatched   = 1.0
 )
 
 // Pre-compiled patterns. Built at package init so the rubric stays
@@ -182,18 +185,24 @@ var (
 	// in include/ or directly named like a type-only declaration.
 	pathRETypeDecl = regexp.MustCompile(`(?i)\.(d\.ts|d\.cts|d\.mts|pyi|hpp|hxx|hh)$|(^|/)include/.*\.h$`)
 
-	// Re-export filenames — barrels that just forward symbols from
-	// other modules. The canonical names across ecosystems.
-	reexportNames = map[string]struct{}{
-		"index.js":  {},
-		"index.jsx": {},
+	// Module-entry filenames are commonly both implementation surfaces and
+	// re-export hubs. Keep a mild tie-breaker so canonical leaf definitions
+	// still win, but do not bury Rust crate/module roots or TypeScript barrels.
+	moduleEntryNames = map[string]struct{}{
 		"index.ts":  {},
 		"index.tsx": {},
-		"index.mjs": {},
-		"index.cjs": {},
+		"mod.rs":    {},
+		"lib.rs":    {},
+	}
+
+	// Generic re-export filenames — barrels that normally only forward
+	// symbols from other modules. These retain the stronger demotion.
+	reexportNames = map[string]struct{}{
+		"index.js":    {},
+		"index.jsx":   {},
+		"index.mjs":   {},
+		"index.cjs":   {},
 		"__init__.py": {},
-		"mod.rs": {},
-		"lib.rs": {},
 	}
 )
 
@@ -264,8 +273,11 @@ func classifyPathPenalty(fp string) float64 {
 	if pathRETypeDecl.MatchString(norm) {
 		return PathPenaltyTypeDecl
 	}
-	base := path.Base(norm)
-	if _, ok := reexportNames[strings.ToLower(base)]; ok {
+	base := strings.ToLower(path.Base(norm))
+	if _, ok := moduleEntryNames[base]; ok {
+		return PathPenaltyModuleEntry
+	}
+	if _, ok := reexportNames[base]; ok {
 		return PathPenaltyReexport
 	}
 	return PathPenaltyUncatched

@@ -236,7 +236,7 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 		changedIDs:   ids,
 		nodes:        nodes,
 		step:         &step,
-		impact:       analysis.AnalyzeImpact(s.graph, ids, s.getCommunities(), s.getProcesses()),
+		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: step.touchedFiles,
 	}, nil
 }
@@ -286,7 +286,7 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 		changed:      changed,
 		changedIDs:   ids,
 		nodes:        s.nodesForIDs(ids),
-		impact:       analysis.AnalyzeImpact(s.graph, ids, s.getCommunities(), s.getProcesses()),
+		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: dedupeStrings(files),
 	}, nil
 }
@@ -309,7 +309,7 @@ func (s *Server) lowerSymbolSource(ctx context.Context, req mcp.CallToolRequest)
 		changed:      changed,
 		changedIDs:   ids,
 		nodes:        nodes,
-		impact:       analysis.AnalyzeImpact(s.graph, ids, s.getCommunities(), s.getProcesses()),
+		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: dedupeStrings(files),
 	}, nil
 }
@@ -343,7 +343,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 		changed:      changed,
 		changedIDs:   ids,
 		nodes:        s.nodesForIDs(ids),
-		impact:       analysis.AnalyzeImpact(s.graph, ids, s.getCommunities(), s.getProcesses()),
+		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: diff.ChangedFiles,
 	}, nil
 }
@@ -419,16 +419,16 @@ func (s *Server) scoreChangeRisk(p *prediction) changeRisk {
 		impactRisk = p.impact.Risk
 	}
 	var maxPR float64
-	if s.pageRank != nil {
-		for _, id := range p.changedIDs {
-			if pr := s.pageRank.ScoreOf(id); pr > maxPR {
-				maxPR = pr
+	if metrics, err := s.analysisNodeMetricsBatched(p.changedIDs); err == nil {
+		for _, metric := range metrics {
+			if metric.PageRank > maxPR {
+				maxPR = metric.PageRank
 			}
 		}
 	}
 	prNorm := 0.0
-	if s.pageRank != nil && s.pageRank.Max > 0 {
-		prNorm = maxPR / s.pageRank.Max
+	if globalMax := s.topAnalysisMetricValue(graph.AnalysisMetricPageRank); globalMax > 0 {
+		prNorm = maxPR / globalMax
 	}
 	score := int(100 * (0.6*saturate(float64(blast), 30) + 0.4*prNorm))
 	if score > 100 {

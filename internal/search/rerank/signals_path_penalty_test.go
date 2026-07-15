@@ -63,13 +63,15 @@ func TestClassifyPathPenalty_Tiers(t *testing.T) {
 		{"include header", "src/include/foo.h", PathPenaltyTypeDecl},
 		{"cpp header .hpp", "core.hpp", PathPenaltyTypeDecl},
 
-		// --- Re-export barrel tier (×0.7) ---
+		// --- Generic re-export barrel tier (×0.7) ---
 		{"js index", "src/index.js", PathPenaltyReexport},
-		{"ts index", "src/index.ts", PathPenaltyReexport},
-		{"tsx index", "src/Layout/index.tsx", PathPenaltyReexport},
 		{"py __init__", "pkg/__init__.py", PathPenaltyReexport},
-		{"rust mod", "src/auth/mod.rs", PathPenaltyReexport},
-		{"rust lib", "src/lib.rs", PathPenaltyReexport},
+
+		// --- Rust / TypeScript module-entry tier (×0.9) ---
+		{"ts index", "src/index.ts", PathPenaltyModuleEntry},
+		{"tsx index", "src/Layout/index.tsx", PathPenaltyModuleEntry},
+		{"rust mod", "src/auth/mod.rs", PathPenaltyModuleEntry},
+		{"rust lib", "src/lib.rs", PathPenaltyModuleEntry},
 
 		// --- Uncatched / neutral (×1.0) ---
 		{"plain go", "auth/token.go", PathPenaltyUncatched},
@@ -97,10 +99,12 @@ func TestClassifyPathPenalty_TestBeatsExample(t *testing.T) {
 }
 
 func TestClassifyPathPenalty_NormalizesBackslashes(t *testing.T) {
-	// Windows-style separators should still trip the regex.
-	got := classifyPathPenalty(`src\__tests__\comp.js`)
-	if got != PathPenaltyTest {
+	// Windows-style separators should still trip path-specific tiers.
+	if got := classifyPathPenalty(`src\__tests__\comp.js`); got != PathPenaltyTest {
 		t.Errorf("windows-path test got %v, want %v", got, PathPenaltyTest)
+	}
+	if got := classifyPathPenalty(`crates\ignore\src\mod.rs`); got != PathPenaltyModuleEntry {
+		t.Errorf("windows-path module entry got %v, want %v", got, PathPenaltyModuleEntry)
 	}
 }
 

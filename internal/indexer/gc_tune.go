@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // Cold-index GC tuning.
@@ -104,6 +106,21 @@ func indexMemoryBudget(hostRAM, cgroupLimit uint64) int64 {
 		return 0
 	}
 	return budget
+}
+
+// boundedIndexMemoryBudget prevents the cold-index window from weakening an
+// already-lower process memory limit (the daemon standing limit or GOMEMLIMIT).
+// A non-positive calculated budget means "leave the runtime untouched". The
+// runtime's default effectively-unbounded MaxInt64 value naturally selects the
+// calculated budget, while a configured lower ceiling is preserved exactly.
+func boundedIndexMemoryBudget(calculated, current int64) int64 {
+	if calculated <= 0 {
+		return 0
+	}
+	if current > 0 && current < calculated {
+		return current
+	}
+	return calculated
 }
 
 // cgroupMemoryLimit returns the active cgroup memory ceiling in bytes, or 0
@@ -315,6 +332,7 @@ func applyIndexGCTuning(logger *zap.Logger) func() {
 		// the restore is exact.
 		gcTunePrevPct = debug.SetGCPercent(gcPct)
 		gcTunePrevLim = debug.SetMemoryLimit(-1)
+		budget = boundedIndexMemoryBudget(budget, gcTunePrevLim)
 		if budget > 0 {
 			debug.SetMemoryLimit(budget)
 		}
@@ -371,9 +389,17 @@ func freeOSMemoryAfterColdIndex(logger *zap.Logger) {
 		return
 	}
 	start := time.Now()
-	debug.FreeOSMemory()
-	if logger != nil {
-		logger.Debug("indexer: released heap to OS after cold index",
-			zap.Duration("elapsed", time.Since(start)))
+	ran, _ := runtimeactivity.RunIfQuiet(0, debug.FreeOSMemory)
+	if logger == nil {
+		return
 	}
+	if !ran {
+		snapshot := runtimeactivity.Current()
+		logger.Debug("indexer: deferred cold-index heap release until process idle",
+			zap.Int64("active_work", snapshot.Active),
+			zap.Any("active_by_kind", snapshot.ByKind))
+		return
+	}
+	logger.Debug("indexer: released heap to OS after cold index",
+		zap.Duration("elapsed", time.Since(start)))
 }

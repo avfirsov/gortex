@@ -23,13 +23,13 @@ func sectionHeader(lean bool) string {
 	if lean {
 		return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph queries over file reads — PreToolUse hooks deny §Read§ / §Grep§ / §Glob§ on indexed source, and the deny message names the right tool.
+A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
 
 `)
 	}
 	return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. PreToolUse hooks deny §Read§ / §Grep§ / §Glob§ against indexed source — the deny message names the right tool.
+A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
 
 `)
 }
@@ -39,13 +39,34 @@ A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenev
 // sectionExploreOpener positions the one-shot localization verb as
 // the opening move (standard rendering; the lean profile carries its
 // own condensed line).
-var sectionExploreOpener = bt(`**Start every task with §explore§.** Describe the request in plain words (paste the issue, name the area) and it returns the ranked localization neighborhood — the likely-involved symbols with their source, call paths, and the files to change — in ONE call. Answer or start editing from its output; the granular tools below are for following up on one specific symbol.
+var sectionExploreOpener = bt(`For files/symbols/evidence/"where" requests, call §explore(operation:"localize")§ and obey §completion.required_action§; make no further tool calls after §answer_ready§. For diagnosis or requested changes, call §explore(operation:"task")§, make at most one focused follow-up, then proceed to impact, edit, and test.
+
+`)
+
+// sectionCompactWorkflow is the ambient workflow for the default compact MCP
+// surface. It is deliberately directive and names only public tools an agent
+// can actually call; exact operation schemas remain on demand.
+var sectionCompactWorkflow = bt(`For every coding task:
+
+1. For files/symbols/evidence/"where", call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, respond without another tool call. For diagnosis or modification, call §explore(operation:"task")§.
+2. In a diagnosis/change flow, make at most one follow-up call on one unresolved symbol with §search§, §read§, §relations§, or §trace§, then continue to step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
+4. Call §capabilities§ only when you need the exact fields for an operation.
+
+Common calls: §search(operation:"symbols", query:"<name>")§ · §read(target:{symbol:"<id>"})§ · §relations(operation:"usages", target:{symbol:"<id>"})§.
+
+If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
+
+`)
+
+var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call §remember§ immediately for a durable decision, invariant, constraint, or gotcha.
 
 `)
 
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
-| Localizing a task / bug / "where is X" | §explore§ (one call: ranked neighborhood + source + call paths) |
+| Files / symbols / evidence / "where is X" | §explore(operation:"localize")§; obey §completion§ |
+| Diagnosing or changing code           | §explore(operation:"task")§, then impact/edit/test |
 | §Grep§ / §grep§ / §rg§ for a symbol | §search_symbols§ (BM25 + camelCase-aware) |
 | §Grep§ for references               | §find_usages§ (zero false positives)     |
 | Reading / grepping to find callers  | §get_callers§ / §get_call_chain§         |
@@ -59,9 +80,9 @@ var sectionFullRuleTable = bt(`| Instead of...                       | Use...   
 
 `)
 
-// sectionCLIFallback is the shell fallback line. Load-bearing for
-// harnesses that mount no MCP tools — present in every profile.
-var sectionCLIFallback = bt(`**CLI fallback (no MCP):** every tool above is reachable from a shell as §gortex call <tool> --arg k=v§ (e.g. §gortex call read_file --arg path=<file>§) — there is no bare §gortex <tool>§ verb.
+// sectionMCPRequired keeps the legacy/full MCP profile from silently changing
+// transports when a host bridge fails to expose a configured tool.
+var sectionMCPRequired = bt(`**Native MCP required:** if a configured Gortex tool is missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
 
 `)
 
@@ -85,12 +106,6 @@ The graph remembers code; these tools remember **why you made a call**. They are
 
 `)
 
-// sectionMemoryLean is the one-paragraph memory trio for the lean
-// profile — the triggers survive, the elaboration moves to the guide.
-var sectionMemoryLean = bt(`**Memory (mandatory):** §distill_session§ at session start; §surface_memories task:"<task>"§ right after §smart_context§; §save_note tags:"decision" body:"<what+why>"§ at every decision; §store_memory§ for durable invariants / gotchas the team should inherit; §query_notes§ / §query_memories§ before re-touching a symbol.
-
-`)
-
 // switchBullet renders the instruction-profile discovery line — the
 // line every profile carries so a switched-down machine can always
 // find its way back. The lean rendering keeps the verb and the
@@ -110,11 +125,11 @@ func sectionDiscovery(active, surfaceLine string) string {
 	return bt(`## Reference and discovery
 
 - **§gortex://guide§ resource** (or the §gortex guide [topic]§ CLI) is the full reference: LLM-provider matrix, capabilities catalog, analyze / search_ast catalogs, token-economy detail, MCP resources, session-start checklist. Read it on demand — it is not pre-paid here.
-- `) + surfaceLine + bt(`- The SessionStart hook injects daemon status. "daemon is not running" → run §gortex daemon start --detach§; "cwd is not covered by any tracked repo" → graph tools are unavailable there.
+- `) + surfaceLine + bt(`- MCP startup manages daemon availability. If the configured server or its tools are unavailable, report a Gortex MCP integration failure; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there.
 `) + switchBullet(active, false)
 }
 
-var coreSurfaceLine = bt(`**§tools_search§** — the server publishes a lean tool preset eagerly and defers the rest; call §tools_search§ to discover and load any tool by keyword (every tool stays callable by name).
+var compactSurfaceLine = bt(`**§capabilities§** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding requires no tool discovery or promotion.
 `)
 
 var fullSurfaceLine = bt(`**§tools_search§** — under this profile the server publishes the full documented dev-cycle preset (~34 workhorse tools) eagerly; the long tail still loads by keyword via §tools_search§ (every tool stays callable by name).
@@ -124,12 +139,9 @@ var fullSurfaceLine = bt(`**§tools_search§** — under this profile the server
 // profile-switch discovery line.
 func coreBody() string {
 	return sectionHeader(false) +
-		sectionExploreOpener +
-		sectionFullRuleTable +
-		sectionCLIFallback +
-		sectionReadDiscipline +
-		sectionMemoryFull +
-		sectionDiscovery("core", coreSurfaceLine)
+		sectionCompactWorkflow +
+		sectionCompactMemory +
+		sectionDiscovery("core", compactSurfaceLine)
 }
 
 // fullBody differs from core only in the eager-surface description —
@@ -139,7 +151,7 @@ func fullBody() string {
 	return sectionHeader(false) +
 		sectionExploreOpener +
 		sectionFullRuleTable +
-		sectionCLIFallback +
+		sectionMCPRequired +
 		sectionReadDiscipline +
 		sectionMemoryFull +
 		sectionDiscovery("full", fullSurfaceLine)
@@ -174,31 +186,14 @@ var localizationNonTableTools = map[string]bool{
 	"index_health":  true, // the liveness line in discovery
 }
 
-func localizationTable() string {
-	var sb strings.Builder
-	sb.WriteString("| Instead of...                  | Use...                          |\n")
-	sb.WriteString("|--------------------------------|---------------------------------|\n")
-	for _, r := range localizationRows {
-		fmt.Fprintf(&sb, "| %s | %s |\n", bt(r.instead), bt(r.use))
-	}
-	sb.WriteString("\n")
-	return sb.String()
-}
-
 // localizationBody is the lean profile: every positioning cue (MUST
 // rule, deny warning, one-shot opener, memory triggers, discovery /
 // switch-back path) survives; reference elaboration moves to
 // gortex://guide.
 func localizationBody() string {
 	return sectionHeader(true) +
-		bt(`**Open every localization task with §explore§** (paste the whole issue — distilled server-side): the ranked neighborhood in one call. Answer from its output; its source is in context — don't re-open those files with §Read§/§Glob§, read one with §get_symbol_source§/§batch_symbols§.
-
-`) +
-		localizationTable() +
-		bt(`Read the real body (§get_symbol_source§, without §compress_bodies§) before you change or depend on a symbol; §smart_context§ assembles the broader working set when explore's neighborhood is not enough. **No MCP mounted?** Any tool works from a shell: §gortex call <tool> --arg k=v§.
-
-`) +
-		sectionMemoryLean +
-		bt(`**Discovery:** lean §localization§ profile — the tools above plus §index_health§ (liveness) ship eagerly; anything else loads by name via §tools_search§. Full reference: §gortex://guide§.
+		sectionCompactWorkflow +
+		sectionCompactMemory +
+		bt(`**Reference:** call §capabilities§ for an exact operation schema; use §gortex://guide§ only for deeper background.
 `) + switchBullet("localization", true)
 }

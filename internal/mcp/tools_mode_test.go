@@ -6,6 +6,8 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 func TestPlanningMode_TogglesAndBlocksEdits(t *testing.T) {
@@ -69,4 +71,22 @@ func TestPlanningMode_RejectsUnknownMode(t *testing.T) {
 	res, err := srv.handleSetPlanningMode(context.Background(), req)
 	require.NoError(t, err)
 	require.True(t, res.IsError, "an unknown mode must be rejected")
+}
+
+func TestPlanningModeRefiltersToolsWidenedBySessionPreset(t *testing.T) {
+	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
+	ctx := WithSessionID(context.Background(), "planning_full_override")
+	srv.NoteSessionToolPolicy("planning_full_override", "full", "defer")
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"mode": "planning"}
+	result, err := srv.handleSetPlanningMode(ctx, req)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	filtered := srv.toolSurfaceFilter(ctx, []mcplib.Tool{{Name: "search_symbols"}})
+	require.Greater(t, len(filtered), 1, "full override should widen read tools from the deferred catalogue")
+	for _, tool := range filtered {
+		require.Falsef(t, daemon.IsMutating(tool.Name), "planning tools/list leaked widened mutation %q", tool.Name)
+	}
 }

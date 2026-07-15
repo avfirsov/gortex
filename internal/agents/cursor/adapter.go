@@ -118,27 +118,17 @@ func workflowRulePath(env agents.Env) string {
 // project-specific rules.
 const workflowRuleBody = `## Gortex in Cursor
 
-This repository wires the **gortex** MCP server via .cursor/mcp.json (merge-managed by Gortex).
+Use Gortex MCP tools for indexed code. This is mandatory.
 
-**MANDATORY: use graph tools, not blind file reads**
+1. Start every coding task with **explore** using ` + "`operation: \"task\"`" + ` and the user's task text.
+2. Use **search**, **read**, **relations**, and **trace** instead of text search or whole-file source reads.
+3. Before mutation, call **change** with ` + "`operation: \"impact\"`" + `; for a signature change, also call operation ` + "`verify`" + ` with the proposed signature.
+4. Mutate only with **edit** or **refactor**. After mutation, call **change** operations ` + "`detect`" + `, ` + "`tests`" + `, ` + "`guards`" + `, and ` + "`contract`" + `.
+5. Call **capabilities** with ` + "`domain`" + `, ` + "`operation`" + `, and ` + "`detail: \"schema\"`" + ` when exact arguments are not visible.
 
-You **MUST** prefer Gortex graph queries over text search and whole-file opens on every task. These are not suggestions.
+If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
 
-- **Start** a new chat with **index_health** to confirm the daemon/index (cheap); use **graph_stats** only when you need node/edge counts or multi-repo orientation.
-- **Use** **search_symbols**, **get_symbol_source**, **get_file_summary**, **get_call_chain**, **find_usages**, and **smart_context** instead of opening whole files or guessing with text search.
-- Before any signature or API change, **run** **verify_change**; for test selection **run** **get_test_targets**.
-
-**MANDATORY: session memory**
-
-- **At session start**, call **distill_session** to recover decisions, pinned notes, and recent excerpts saved in prior sessions in this workspace.
-- **At every decision point** (picking an approach, rejecting an alternative, spotting a non-obvious constraint), call **save_note** with ` + "`tags:\"decision\"`" + ` and mention affected symbol IDs in the body — they auto-link.
-- **Before editing a symbol you've touched before**, call **query_notes** with ` + "`symbol_id:\"<id>\"`" + ` to surface prior warnings and decisions.
-
-**MANDATORY: development memories (cross-session)**
-
-- **Immediately after smart_context** on every task, call **surface_memories** with ` + "`task:\"<task>\"`" + ` and ` + "`symbol_ids:\"<top hits>\"`" + ` — returns memories ranked by anchor overlap, importance, pinning, recency.
-- **When you find a durable invariant, gotcha, or decision worth teaching the team**, call **store_memory** with ` + "`kind:\"<invariant|gotcha|convention|decision>\"`" + `, ` + "`symbol_ids:\"<id>\"`" + `, ` + "`importance:5`" + `. Pin load-bearing memories. Use ` + "`supersedes:\"<old-id>\"`" + ` when newer knowledge replaces older.
-- Memories are workspace-wide and outlive sessions, agents, and teammates — every future agent inherits them.
+Use **recall** before editing known code and **remember** for durable decisions or invariants.
 `
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {

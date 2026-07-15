@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime/debug"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -30,6 +31,7 @@ import (
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -47,20 +49,57 @@ type SymbolModification struct {
 	SignatureChanged bool      `json:"signature_changed"`
 }
 
-// symbolHistory tracks symbol modifications during the current session.
+const (
+	maxSymbolHistorySymbols   = 256
+	maxSymbolHistoryPerSymbol = 32
+)
+
+// symbolHistory tracks a bounded, daemon-wide working set of recent symbol
+// modifications. A per-symbol cap prevents one hot file from growing forever;
+// the LRU symbol cap bounds the aggregate to 8,192 modification records.
 type symbolHistory struct {
 	mu      sync.Mutex
-	entries map[string][]SymbolModification // symbolID → modifications
+	entries map[string][]SymbolModification // symbolID → oldest-to-newest modifications
+	order   []string                        // least-to-most recently modified symbol IDs
 }
 
 // Record adds a modification entry for the given symbol.
 func (sh *symbolHistory) Record(symbolID string, signatureChanged bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	sh.entries[symbolID] = append(sh.entries[symbolID], SymbolModification{
+	if sh.entries == nil {
+		sh.entries = make(map[string][]SymbolModification)
+	}
+
+	mods := append(sh.entries[symbolID], SymbolModification{
 		Timestamp:        time.Now(),
 		SignatureChanged: signatureChanged,
 	})
+	if len(mods) > maxSymbolHistoryPerSymbol {
+		copy(mods, mods[len(mods)-maxSymbolHistoryPerSymbol:])
+		mods = mods[:maxSymbolHistoryPerSymbol]
+	}
+	sh.entries[symbolID] = mods
+	sh.touchSymbolLocked(symbolID)
+	for len(sh.entries) > maxSymbolHistorySymbols && len(sh.order) > 0 {
+		oldest := sh.order[0]
+		copy(sh.order, sh.order[1:])
+		sh.order[len(sh.order)-1] = ""
+		sh.order = sh.order[:len(sh.order)-1]
+		delete(sh.entries, oldest)
+	}
+}
+
+func (sh *symbolHistory) touchSymbolLocked(symbolID string) {
+	for i, id := range sh.order {
+		if id != symbolID {
+			continue
+		}
+		copy(sh.order[i:], sh.order[i+1:])
+		sh.order[len(sh.order)-1] = symbolID
+		return
+	}
+	sh.order = append(sh.order, symbolID)
 }
 
 // Get returns the modification history for a specific symbol.
@@ -92,6 +131,7 @@ type Server struct {
 	engine        *query.Engine
 	graph         graph.Store
 	indexer       *indexer.Indexer
+	watcherMu     sync.RWMutex
 	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -143,13 +183,20 @@ type Server struct {
 	// fingerprint packages. On a disk backend the fingerprint scan alone is
 	// ~140s; the cache check is three scalar reads.
 	communitiesToken communityCacheToken
-	// hotspots is the default-threshold (mean + 2*stddev) hotspot
-	// ranking. FindHotspots' inner ComputeBetweenness pass dominates
-	// the wall clock of get_repo_outline / get_architecture /
-	// gortex_wakeup / the analyze(hotspots) resource — caching it
-	// once per RunAnalysis turn turns repeat calls into a map lookup.
-	// Rebuilt each RunAnalysis pass; guarded by analysisMu.
-	hotspots []analysis.HotspotEntry
+	// hotspots is the lazily-built default-threshold (mean + 2*stddev)
+	// ranking. FindHotspots' inner ComputeBetweenness pass is too expensive
+	// to put on every daemon cold-start path; RunAnalysis invalidates this
+	// cache and the first hotspot-consuming request rebuilds it once for that
+	// analysis epoch. Reads/cache state are guarded by analysisMu; the separate
+	// build mutex coalesces concurrent first requests without blocking unrelated
+	// analysis snapshots while betweenness runs.
+	hotspots        []analysis.HotspotEntry
+	hotspotsReady   bool
+	hotspotsBuildMu sync.Mutex
+	analysisEpoch   uint64
+	// hotspotsFn is a test seam for deterministic concurrency/invalidation
+	// tests. Production leaves it nil and uses analysis.FindHotspots.
+	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
 	// adjacency is the compact CSR snapshot of the call / reference
 	// graph, built once per RunAnalysis pass so seeded random-walk
 	// queries (context_closure proximity ranking) never re-scan
@@ -162,7 +209,14 @@ type Server struct {
 	// consumer can tell whether the snapshot still matches the live
 	// graph before trusting it.
 	adjacencyToken communityCacheToken
-	analysisMu     sync.RWMutex
+	// analysisGeneration is the small active durable-generation manifest.
+	// Warm startup publishes only this header; normalized metrics and bounded
+	// memberships stay in SQLite until a request asks for them.
+	analysisGeneration      graph.AnalysisGenerationHeader
+	analysisGenerationReady bool
+	analysisPruneScheduled  atomic.Bool
+	analysisMaterializeMu   sync.Mutex
+	analysisMu              sync.RWMutex
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -208,9 +262,10 @@ type Server struct {
 	// state for the embedded stdio path (one implicit client per process).
 	// Tool handlers reach per-session activity via sessionFor(ctx); that
 	// helper returns this default when ctx carries no session ID.
-	session    *sessionState
-	symHistory *symbolHistory
-	tokenStats *tokenStats
+	session      *sessionState
+	symHistory   *symbolHistory
+	tokenStats   *tokenStats
+	localization *localizationTerminalState
 
 	// sessions multiplexes per-client sessionLocal for the daemon
 	// transport. When ctx carries a session ID (WithSessionID), handlers
@@ -267,6 +322,24 @@ type Server struct {
 	// positives by stable identity; the suppress_finding tool mutates it. Nil
 	// until InitSuppressions fires; the review flow tolerates a nil store.
 	suppressions *suppressionManager
+
+	// mutationReceipts tracks watcher tickets that outlive an edit response.
+	// Safety-critical graph consumers wait on these receipts before reading the
+	// graph, so a slow patch is explicit rather than a silent stale read. Test
+	// servers may shorten the two bounded waits; zero selects production
+	// defaults. sync.Map keeps directly-constructed servers usable.
+	mutationReceipts    sync.Map
+	mutationReindexWait time.Duration
+	mutationSafetyWait  time.Duration
+
+	// batchTransactions holds daemon-lifetime delivery receipts for atomic
+	// batch edits. sync.Map's zero value keeps directly-constructed test and
+	// embedded servers usable without constructor wiring. batchWriteOverride is
+	// a narrow target-write fault-injection seam; batchDurabilityOverride covers
+	// journal, fsync, rollback, and cleanup ordering. Production leaves both nil.
+	batchTransactions       sync.Map
+	batchWriteOverride      func(string, []byte, os.FileMode) error
+	batchDurabilityOverride *batchDurabilityOps
 
 	// packCache retains recent smart_context pack views keyed by pack
 	// root so a later call with delta_from=<root> returns only the
@@ -420,6 +493,12 @@ type Server struct {
 	// closure wired in attachLazyRegistry). Nil only when the registry
 	// is explicitly disabled — see lazyEnabledFromEnv.
 	lazy *lazyToolRegistry
+
+	// facades maps the stable facade-v1 operation surface to the existing
+	// handlers. It captures registrations before lazy routing, so a facade can
+	// invoke a cold legacy implementation without promoting or re-advertising
+	// that legacy tool.
+	facades *facadeRegistry
 
 	// toolPolicy restricts the published tool surface to a named preset
 	// / allow-deny set (see tool_presets.go). Resolved at construction
@@ -884,10 +963,8 @@ func (s *Server) NoteSessionToolPolicy(sessionID, spec, mode string) {
 // named MCP client is known to decode. Resolution order is gcx >
 // toon > json:
 //
-//   - GCX-capable: claude-code, cursor, vscode (via the @gortex/wire
-//     extension that ships with the IDE plugin), zed (gortex-zed
-//     plugin links gcx-go), aider, kilocode, opencode, openclaw,
-//     codex (Anthropic CLI bundles the gcx decoder).
+//   - GCX-capable: the canonical coding clients and product aliases in
+//     knownAgentClients / knownAgentHosts.
 //   - TOON-capable but no GCX: kept for forward compat; today there
 //     is no client we know to be in this bucket. Listed for the
 //     mapping shape and as a placeholder — clients can be promoted
@@ -903,11 +980,9 @@ func defaultFormatForClient(name string) string {
 	return ""
 }
 
-// knownAgentClients is the set of MCP clients recognised as coding agents:
-// they ship a GCX decoder (so they default to the gcx wire format) AND they
-// get the lean `agent` tool preset by default. One list drives both
-// defaults so the two stay in lock-step. Matched case-insensitively on the
-// exact clientInfo.name.
+// knownAgentClients is the set of canonical MCP client identifiers known to
+// ship a GCX decoder. It controls wire-format negotiation only; every non-empty
+// clientInfo.name receives the compact coding surface independently.
 var knownAgentClients = map[string]bool{
 	"claude-code":      true,
 	"cursor":           true,
@@ -921,10 +996,26 @@ var knownAgentClients = map[string]bool{
 	"omp-coding-agent": true,
 }
 
+// knownAgentHosts are host-context families whose aliases name the same
+// GCX-capable coding client (for example "Claude Code 1.4", "Visual Studio
+// Code", or "openai-codex"). Editor-only hosts without the decoder remain on
+// JSON, while still receiving the compact coding surface.
+var knownAgentHosts = map[string]bool{
+	"claude-code": true,
+	"cursor":      true,
+	"vscode":      true,
+	"zed":         true,
+	"codex":       true,
+}
+
 // isKnownAgentClient reports whether the named MCP client is a recognised
 // coding agent (see knownAgentClients).
 func isKnownAgentClient(name string) bool {
-	return knownAgentClients[strings.ToLower(strings.TrimSpace(name))]
+	name = strings.ToLower(strings.TrimSpace(name))
+	if knownAgentClients[name] {
+		return true
+	}
+	return knownAgentHosts[resolveHostContext(name).name]
 }
 
 // resolveSessionFormat returns the format the current session prefers
@@ -1118,13 +1209,18 @@ type MultiRepoOptions struct {
 // the graph tools over raw file reads, and where to start."
 const serverInstructions = `Gortex is a code-intelligence graph server — it indexes repositories into a queryable knowledge graph. Prefer its graph tools over raw file reads and text search:
 
-- START WITH explore FOR EVERY TASK-SHAPED REQUEST (a bug report, a feature, "where is / how does X work"): one call returns the ranked neighborhood — the likely symbols with their source, call paths, and the files to change. Answer or start editing directly from its output instead of chaining search/read/callers calls; its locations are graph-verified, so no re-checking with file reads is needed.
+- For a request whose deliverable is only files, symbols, evidence, or a location, call explore(operation:"localize"). Follow completion.required_action: answer immediately when state is answer_ready; when state is needs_exact_read, make only the named exact read. For diagnosis or modification, call explore(operation:"task") and continue from its evidence.
 - For one known symbol: search_symbols (BM25, camelCase-aware) to find it, get_symbol_source to read it, batch_symbols for several bodies in one call; find_usages / get_callers for references and callers.
 - Before editing, call get_editing_context on the file; for refactors use edit_symbol / rename_symbol / batch_edit.
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).
 
 ` + sharedParamLegend
+
+// codingAgentInstructions is intentionally terse because some MCP hosts repeat
+// initialize instructions beside every rendered tool. It describes what to do,
+// not how the server versions or implements its tool surface.
+const codingAgentInstructions = `MUST use Gortex MCP. For files/symbols/evidence/where, call explore(operation:"localize"); obey completion.required_action and make no calls after answer_ready. For diagnosis/change, call explore(operation:"task"), then at most one focused follow-up. Before edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only with edit or refactor. After: change(operation:"detect"), then tests/guards/contract with its IDs. Call capabilities only for unknown fields.`
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1155,16 +1251,23 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 	return msg
 }
 
-// afterInitializeInstructions is the server's OnAfterInitialize hook: it
-// rewrites the initialize result's Instructions to the variant that fits THIS
-// connection's cwd. Because it runs inside the handshake, every MCP client —
-// not just ones that execute a SessionStart hook — learns the live workspace
-// shape and warmup state directly from initialize. See stateAwareInstructions.
-func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
-	if s == nil || result == nil {
+// afterInitializeInstructions is the server's OnAfterInitialize hook. It
+// records clientInfo on THIS session before tools/list is served, then rewrites
+// the initialize result's Instructions to the cwd-aware variant. Recording the
+// client here keeps embedded/raw HandleMessage users on the same client-aware
+// tool policy as the daemon path, whose dispatcher also snoops initialize.
+func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, req *mcp.InitializeRequest, result *mcp.InitializeResult) {
+	if s == nil {
 		return
 	}
-	result.Instructions = s.stateAwareInstructions(SessionCWDFromContext(ctx))
+	if req != nil {
+		s.sessionFor(ctx).recordClientName(req.Params.ClientInfo.Name)
+	}
+	if result == nil {
+		return
+	}
+	result.Instructions = s.stateAwareInstructionsForPolicy(
+		SessionCWDFromContext(ctx), s.effectiveSessionPolicy(ctx))
 }
 
 // stateAwareInstructions chooses the initialize `instructions` text for a
@@ -1189,15 +1292,31 @@ func (s *Server) trackedRepoRoots() []string {
 }
 
 func (s *Server) stateAwareInstructions(cwd string) string {
+	return s.stateAwareInstructionsWithBase(cwd, serverInstructions)
+}
+
+func (s *Server) stateAwareInstructionsForClient(cwd, client string) string {
+	return s.stateAwareInstructionsForPolicy(cwd, s.clientDefaultPolicy(client))
+}
+
+func (s *Server) stateAwareInstructionsForPolicy(cwd string, policy *toolPolicy) string {
+	base := serverInstructions
+	if policy != nil && policy.preset == FacadeSurfaceVersion {
+		base = codingAgentInstructions
+	}
+	return s.stateAwareInstructionsWithBase(cwd, base)
+}
+
+func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 	if s.multiIndexer != nil && strings.TrimSpace(cwd) != "" {
 		if _, _, _, ok := s.multiIndexer.ScopeForCWD(cwd); !ok {
 			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
-		return serverInstructions + "\n\n" + facts
+		return base + "\n\n" + facts
 	}
-	return serverInstructions
+	return base
 }
 
 // liveInstructionFacts renders the per-connection state block appended to the
@@ -1289,6 +1408,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		indexer:             idx,
 		logger:              logger,
 		session:             newSessionState(),
+		localization:        newLocalizationTerminalState(),
 		scopeIntentDefaults: true,
 		tokenStats:          &tokenStats{},
 		symHistory: &symbolHistory{
@@ -1302,6 +1422,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		pprCache:   newPPRWalkCache(),
 		packCache:  newPackDeltaCache(),
 		prCache:    newPRCache(prCacheTTL),
+		facades:    newFacadeRegistry(),
 	}
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
@@ -1470,6 +1591,11 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// Always registered — they degrade cleanly in single-project mode
 	// to a one-member view.
 	s.registerWorkspaceTools()
+
+	// Register the stable facade surface only after the legacy sweep, so every
+	// operation has captured its existing implementation. Facade dispatchers
+	// are installed live and session-filtered; they never rely on promotion.
+	s.registerFacadeTools()
 
 	// LLM-backed tools (`ask`) are NOT registered here — they're
 	// gated on SetLLMService being called with an enabled service,
@@ -2165,21 +2291,27 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 
 // communityCacheToken is the per-graph identity tuple
 // handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on any structural mutation; NodeCount
-// and EdgeCount cover pure additions / removals that leave the
-// identity counter alone. A zero token is "never populated".
+// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
+// cover additions/removals. analysisRevision closes the remaining same-count
+// mutation gap on durable stores (for example a rebind or source-location
+// shift). A zero token is "never populated".
 type communityCacheToken struct {
-	edgeIdentity int
-	nodeCount    int
-	edgeCount    int
+	edgeIdentity     int
+	nodeCount        int
+	edgeCount        int
+	analysisRevision uint64
 }
 
 func (s *Server) currentCommunityToken() communityCacheToken {
-	return communityCacheToken{
+	token := communityCacheToken{
 		edgeIdentity: s.graph.EdgeIdentityRevisions(),
 		nodeCount:    s.graph.NodeCount(),
 		edgeCount:    s.graph.EdgeCount(),
 	}
+	if writer, _ := s.analysisGenerationBackends(); writer != nil {
+		token.analysisRevision = writer.AnalysisMutationRevision()
+	}
+	return token
 }
 
 // RunAnalysis performs community detection and process discovery on
@@ -2187,47 +2319,20 @@ func (s *Server) currentCommunityToken() communityCacheToken {
 // for every bootstrap resource so subscribed clients can refresh
 // without polling.
 func (s *Server) RunAnalysis() {
+	runtimeactivity.Begin("analysis")
+	analysisStarted := time.Now()
+	var memoryBefore runtime.MemStats
+	runtime.ReadMemStats(&memoryBefore)
+	defer func() {
+		runtimeactivity.End("analysis")
+		s.releaseTransientAnalysisIfIdle()
+		writer, _ := s.analysisGenerationBackends()
+		s.scheduleAnalysisGenerationPrune(writer)
+		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
+	}()
+
 	s.analysisMu.Lock()
-	// Detect communities through the incremental path, threading the
-	// partition cache. When a re-warm only touched a few packages
-	// this recomputes just those; the cache is also left warm so the
-	// next `analyze kind=clusters` call inherits it. The result is
-	// shape-identical to a full DetectCommunities run.
-	communities, cache, _ := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
-	s.communities = communities
-	s.leidenCache = cache
-	s.communitiesToken = s.currentCommunityToken()
-	// Feed the freshly computed per-package fingerprints to the
-	// backend's bundle cache so it retires bundles for packages whose
-	// content changed since the last pass and keeps the rest. The
-	// fingerprints are edge-aware (DetectCommunitiesLeidenIncremental
-	// folds each package's nodes and the edges touching them), so this
-	// is the correct staleness signal for cached node + in/out edges.
-	// A backend without a bundle cache simply doesn't satisfy the
-	// interface and this no-ops.
-	if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && cache != nil {
-		sink.SetBundleFingerprints(cache.PackageFingerprints())
-	}
-	s.processes = analysis.DiscoverProcesses(s.graph)
-	s.pageRank = analysis.ComputePageRank(s.graph)
-	// Compact CSR adjacency over the same call / reference edge set
-	// PageRank uses — the substrate for seeded random-walk proximity
-	// queries. Built once here so per-query walks never re-scan the
-	// graph; stamped with the current graph identity for the same
-	// invalidation discipline as the community cache.
-	s.adjacency = analysis.BuildAdjacencySnapshot(s.graph)
-	s.adjacencyToken = s.currentCommunityToken()
-	// Auto-concept vocabulary: mine domain phrases from symbol names
-	// so equivalence-class expansion can bridge repo-specific terms
-	// even with no LLM provider configured.
-	s.autoConcepts = search.BuildAutoConcepts(s.graph)
-	// HITS authority/hub scores -- fed into the search rerank as an
-	// authority signal that complements raw fan-in.
-	s.hits = analysis.ComputeHITS(s.graph)
-	// Default-threshold hotspot ranking — cached because FindHotspots
-	// triggers ComputeBetweenness which is the shared wall-clock
-	// floor for outline / architecture / wakeup / the resource view.
-	s.hotspots = analysis.FindHotspots(s.graph, communities, 0)
+	analysisMetrics := s.populateAnalysisLocked()
 	s.analysisMu.Unlock()
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
@@ -2251,29 +2356,58 @@ func (s *Server) RunAnalysis() {
 		s.graphInvalidatedBroadcaster.broadcast(s.graph.NodeCount(), s.graph.EdgeCount(), "reanalysis")
 	}
 
-	// A full analysis pass (PageRank / Leiden / HITS / hotspots over the
-	// whole graph) is one of the daemon's largest on-demand allocation
-	// bursts. Scavenge its high-water back to the OS so a client-triggered
-	// reanalysis doesn't ratchet the idle footprint up and leave it there.
-	freeOSMemoryAfterBurst(s.logger, "mcp_analysis")
+	var memoryAfter runtime.MemStats
+	runtime.ReadMemStats(&memoryAfter)
+	if s.logger != nil {
+		s.logger.Info("mcp: analysis pass complete",
+			zap.Bool("cache_hit", analysisMetrics.cacheHit),
+			zap.Duration("cache_load", analysisMetrics.cacheLoad),
+			zap.Duration("cache_save", analysisMetrics.cacheSave),
+			zap.Duration("snapshot", analysisMetrics.snapshot),
+			zap.Duration("leiden", analysisMetrics.leiden),
+			zap.Duration("processes", analysisMetrics.processes),
+			zap.Duration("pagerank", analysisMetrics.pageRank),
+			zap.Duration("adjacency", analysisMetrics.adjacency),
+			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
+			zap.Duration("hits", analysisMetrics.hits),
+			zap.Duration("total", time.Since(analysisStarted)),
+			zap.Uint64("heap_alloc_before_bytes", memoryBefore.HeapAlloc),
+			zap.Uint64("heap_alloc_after_bytes", memoryAfter.HeapAlloc),
+			zap.Uint64("heap_inuse_before_bytes", memoryBefore.HeapInuse),
+			zap.Uint64("heap_inuse_after_bytes", memoryAfter.HeapInuse),
+			zap.Uint64("heap_idle_before_bytes", memoryBefore.HeapIdle),
+			zap.Uint64("heap_idle_after_bytes", memoryAfter.HeapIdle),
+			zap.Uint64("heap_released_before_bytes", memoryBefore.HeapReleased),
+			zap.Uint64("heap_released_after_bytes", memoryAfter.HeapReleased),
+			zap.Uint64("heap_sys_before_bytes", memoryBefore.HeapSys),
+			zap.Uint64("heap_sys_after_bytes", memoryAfter.HeapSys),
+			zap.Uint64("stack_inuse_before_bytes", memoryBefore.StackInuse),
+			zap.Uint64("stack_inuse_after_bytes", memoryAfter.StackInuse))
+	}
 }
 
-// freeOSMemoryAfterBurst returns a completed whole-graph burst's heap
-// high-water to the OS. debug.FreeOSMemory forces a GC + scavenge;
-// GORTEX_DAEMON_MEMRELEASE=0 (or "false") disables it. The env check is
-// duplicated here (rather than shared) because the canonical release helper
-// lives in the cmd layer, which this package must not import.
-func freeOSMemoryAfterBurst(logger *zap.Logger, reason string) {
-	if v := os.Getenv("GORTEX_DAEMON_MEMRELEASE"); v == "0" || strings.EqualFold(v, "false") {
+var osMemoryReleaseScheduled atomic.Bool
+
+// scheduleOSMemoryReleaseAfterBurst coalesces full-graph query bursts and
+// releases their heap high-water after the response has had time to leave the
+// handler. The short delay keeps debug.FreeOSMemory's stop-the-world work out
+// of the user-visible tool latency while bounding idle RSS after analysis.
+func scheduleOSMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
+	ScheduleMemoryReleaseAfterBurst(logger, reason)
+}
+
+// ScheduleMemoryReleaseAfterBurst coalesces process-wide allocation bursts and
+// reclaims their idle heap only after all tracked foreground and background work
+// has remained quiet. It is exported for the daemon lifecycle, which shares the
+// same process and therefore must share the same gate and scheduler.
+func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
+	if !memoryReleaseEnabled() {
 		return
 	}
-	start := time.Now()
-	debug.FreeOSMemory()
-	if logger != nil {
-		logger.Debug("mcp: released heap to OS",
-			zap.String("reason", reason),
-			zap.Duration("elapsed", time.Since(start)))
+	if !osMemoryReleaseScheduled.CompareAndSwap(false, true) {
+		return
 	}
+	go runScheduledMCPMemoryRelease(logger, reason)
 }
 
 // resetConfirmedRefs clears the lazy-enrichment ledger (see the
@@ -2288,9 +2422,17 @@ func (s *Server) resetConfirmedRefs() {
 	})
 }
 
+func (s *Server) analysisSnapshotCurrentLocked() bool {
+	return s.analysisEpoch > 0 && s.communitiesToken == s.currentCommunityToken()
+}
+
 func (s *Server) getCommunities() *analysis.CommunityResult {
+	_ = s.ensureCommunitiesMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.communities
 }
 
@@ -2311,6 +2453,8 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 // incremental run (no changed packages, no repartitioned nodes) so
 // callers see the cache hit on the wire.
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
+	_ = s.ensureCommunitiesMaterialized()
+	_ = s.ensureLeidenMaterialized()
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
 	cur := s.currentCommunityToken()
@@ -2353,18 +2497,33 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 	// the state the result was actually computed against, and the next
 	// call's token comparison stays meaningful.
 	s.communitiesToken = s.currentCommunityToken()
+	// A cache miss ran a real community recompute. Invalidate the dependent
+	// hotspot ranking and advance its epoch while holding analysisMu: an
+	// in-flight getHotspots build that captured the old communities will see
+	// the epoch change, discard its result, and rebuild before publishing.
+	s.hotspots = nil
+	s.hotspotsReady = false
+	s.analysisEpoch++
 	return result, stats
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {
+	_ = s.ensureProcessesMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.processes
 }
 
 func (s *Server) getPageRank() *analysis.PageRankResult {
+	_ = s.ensureNodeMetricsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.pageRank
 }
 
@@ -2373,8 +2532,12 @@ func (s *Server) getPageRank() *analysis.PageRankResult {
 // immutable after construction, so the caller may run seeded walks over
 // it after releasing the read lock.
 func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
+	_ = s.ensureAdjacencyMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.adjacency
 }
 
@@ -2382,8 +2545,12 @@ func (s *Server) getAdjacency() *analysis.AdjacencySnapshot {
 // vocabulary. Nil until the first RunAnalysis pass; callers
 // nil-check (AutoConcepts.Expand is itself nil-safe).
 func (s *Server) getAutoConcepts() *search.AutoConcepts {
+	_ = s.ensureAutoConceptsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.autoConcepts
 }
 
@@ -2391,20 +2558,77 @@ func (s *Server) getAutoConcepts() *search.AutoConcepts {
 // first RunAnalysis pass; callers nil-check (HITSResult accessors
 // are themselves nil-safe).
 func (s *Server) getHITS() *analysis.HITSResult {
+	_ = s.ensureNodeMetricsMaterialized()
 	s.analysisMu.RLock()
 	defer s.analysisMu.RUnlock()
+	if !s.analysisSnapshotCurrentLocked() {
+		return nil
+	}
 	return s.hits
 }
 
-// getHotspots returns the default-threshold hotspot ranking computed
-// by the most recent RunAnalysis pass. Nil/empty until the first
-// pass; callers use the live FindHotspots(threshold) path when they
-// need a non-default threshold. Returned slice is shared and must
-// not be mutated by the caller.
+// getHotspots returns the default-threshold hotspot ranking for the current
+// analysis epoch, computing it on first demand. Concurrent first callers are
+// coalesced. If RunAnalysis invalidates the epoch while a build is in flight,
+// the stale result is discarded and rebuilt against the new communities.
+// The returned slice is shared and must not be mutated by the caller.
 func (s *Server) getHotspots() []analysis.HotspotEntry {
+	if !s.ensureCommunitiesMaterialized() && s.hotspotsFn == nil {
+		return nil
+	}
 	s.analysisMu.RLock()
-	defer s.analysisMu.RUnlock()
-	return s.hotspots
+	if !s.analysisSnapshotCurrentLocked() {
+		s.analysisMu.RUnlock()
+		return nil
+	}
+	if s.hotspotsReady {
+		hotspots := s.hotspots
+		s.analysisMu.RUnlock()
+		return hotspots
+	}
+	s.analysisMu.RUnlock()
+
+	s.hotspotsBuildMu.Lock()
+	defer s.hotspotsBuildMu.Unlock()
+	for {
+		s.analysisMu.RLock()
+		if !s.analysisSnapshotCurrentLocked() {
+			s.analysisMu.RUnlock()
+			return nil
+		}
+		if s.hotspotsReady {
+			hotspots := s.hotspots
+			s.analysisMu.RUnlock()
+			return hotspots
+		}
+		epoch := s.analysisEpoch
+		token := s.communitiesToken
+		communities := s.communities
+		s.analysisMu.RUnlock()
+
+		build := analysis.FindHotspots
+		if s.hotspotsFn != nil {
+			build = s.hotspotsFn
+		}
+		hotspots := build(s.graph, communities, 0)
+
+		s.analysisMu.Lock()
+		if s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
+			s.hotspots = hotspots
+			s.hotspotsReady = true
+			s.analysisMu.Unlock()
+			scheduleOSMemoryReleaseAfterBurst(s.logger, "lazy_hotspots")
+			return hotspots
+		}
+		epochChanged := s.analysisEpoch != epoch
+		s.analysisMu.Unlock()
+		if !epochChanged {
+			// The graph changed before a new analysis snapshot was published.
+			// Fail closed instead of spinning or serving hotspots built from the
+			// stale community assignment.
+			return nil
+		}
+	}
 }
 
 // SetArchitecture installs the declarative architecture-rules DSL so
@@ -2483,24 +2707,46 @@ func (s *Server) MCPServer() *server.MCPServer {
 // session context burn for token-economical clients while keeping
 // the full surface reachable through a one-call discovery hop.
 func (s *Server) addTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
-	// Scrub control characters / ANSI escapes out of the tool's text
-	// before it reaches any client's tools/list rendering. tool is a
-	// value copy, so this mutates only the registered instance.
-	scrubToolText(&tool)
-	// Embed a project-size-scaled exploration-call budget in navigation
-	// tools' descriptions so the model self-throttles. Runs before the
-	// deferred-vs-live split so a tool keeps the hint after promotion.
-	s.annotateToolBudget(&tool)
-	// Replace the recurring-parameter prose (format / max_bytes / cursor /
-	// fields / scope / repo / project / workspace / ref) with a terse gloss;
-	// the full semantics live once in the server instructions legend. Runs
-	// before the split so deferred tools carry the compact schema too.
-	compactSharedToolParams(&tool)
+	handler = s.prepareTool(&tool, handler)
 	if s.lazy != nil && s.lazy.IsDeferred(tool.Name) {
 		s.lazy.Register(tool, handler)
 		return
 	}
 	s.mcpServer.AddTool(tool, s.wrapToolHandler(handler))
+}
+
+// addControlTool registers a live tool that must manage overlay state/views
+// itself. Unlike a bare mcpServer.AddTool it still captures facade adapters and
+// applies gates, sanitization, telemetry, logging, panic recovery, and response
+// middleware. These tools stay live because they are session/control recovery
+// paths or optional subsystems registered after the initial lazy sweep.
+func (s *Server) addControlTool(tool mcp.Tool, handler server.ToolHandlerFunc) {
+	handler = s.prepareTool(&tool, handler)
+	s.mcpServer.AddTool(tool, s.wrapControlToolHandler(handler))
+}
+
+func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) server.ToolHandlerFunc {
+	// Scrub control characters / ANSI escapes out of the tool's text
+	// before it reaches any client's tools/list rendering. tool is a
+	// value copy, so this mutates only the registered instance.
+	scrubToolText(tool)
+	// Embed a project-size-scaled exploration-call budget in navigation
+	// tools' descriptions so the model self-throttles. Runs before the
+	// deferred-vs-live split so a tool keeps the hint after promotion.
+	s.annotateToolBudget(tool)
+	// Replace the recurring-parameter prose (format / max_bytes / cursor /
+	// fields / scope / repo / project / workspace / ref) with a terse gloss;
+	// the full semantics live once in the server instructions legend. Runs
+	// before the split so deferred tools carry the compact schema too.
+	compactSharedToolParams(tool)
+	// Capture the finished schema plus the unwrapped legacy implementation
+	// before lazy routing. Reused facade names receive a compatibility wrapper
+	// that keeps their old call shape outside facade-v1 sessions.
+	if s.facades != nil {
+		s.facades.capture(*tool, handler)
+		handler = s.wrapLegacyFacade(tool.Name, handler)
+	}
+	return handler
 }
 
 // attachLazyRegistry wires the deferred catalog to the live MCP
@@ -2537,6 +2783,21 @@ func (s *Server) EnsureToolPromoted(name string) bool {
 		return false
 	}
 	return len(s.lazy.Promote(name)) > 0
+}
+
+// EnsureToolPromotedForSession is the per-connection promote-on-demand entry
+// point used by the daemon dispatcher. Live/absent names take the cheap no-op
+// path; a genuinely deferred name is promoted only when ctx's effective
+// surface permits calling it. This prevents a hide-mode request from mutating
+// the shared lazy registry before the MCP call gate rejects the tool.
+func (s *Server) EnsureToolPromotedForSession(ctx context.Context, name string) bool {
+	if s == nil || s.lazy == nil || name == "" || !s.lazy.IsDeferred(name) {
+		return false
+	}
+	if !s.IsToolEnabledForSession(ctx, name) {
+		return false
+	}
+	return s.EnsureToolPromoted(name)
 }
 
 // SetContractRegistry sets an explicit contract registry override for the MCP
@@ -2604,8 +2865,16 @@ type watcherHistory interface {
 // a symbol change callback to record modifications in symbolHistory.
 // Accepts either a single-repo *indexer.Watcher or a multi-repo
 // *indexer.MultiWatcher — both satisfy watcherHistory.
+func (s *Server) currentWatcher() watcherHistory {
+	s.watcherMu.RLock()
+	defer s.watcherMu.RUnlock()
+	return s.watcher
+}
+
 func (s *Server) SetWatcher(w watcherHistory) {
+	s.watcherMu.Lock()
 	s.watcher = w
+	s.watcherMu.Unlock()
 
 	// Register callback to track symbol modifications for
 	// get_symbol_history AND fan stale_refs notifications to any

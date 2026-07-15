@@ -33,15 +33,21 @@ type HookInput struct {
 
 // HookOutput is the JSON structure the hook writes to stdout.
 type HookOutput struct {
+	Decision           string              `json:"decision,omitempty"`
+	Reason             string              `json:"reason,omitempty"`
+	Continue           *bool               `json:"continue,omitempty"`
+	StopReason         string              `json:"stopReason,omitempty"`
+	SystemMessage      string              `json:"systemMessage,omitempty"`
 	HookSpecificOutput *HookSpecificOutput `json:"hookSpecificOutput,omitempty"`
 }
 
 // HookSpecificOutput carries the permission decision and/or additional context.
 type HookSpecificOutput struct {
-	HookEventName            string `json:"hookEventName"`
-	AdditionalContext        string `json:"additionalContext,omitempty"`
-	PermissionDecision       string `json:"permissionDecision,omitempty"`
-	PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
+	HookEventName            string         `json:"hookEventName"`
+	AdditionalContext        string         `json:"additionalContext,omitempty"`
+	PermissionDecision       string         `json:"permissionDecision,omitempty"`
+	PermissionDecisionReason string         `json:"permissionDecisionReason,omitempty"`
+	UpdatedInput             map[string]any `json:"updatedInput,omitempty"`
 }
 
 // enrichResult carries both the context text and whether the call should be blocked.
@@ -76,6 +82,7 @@ const gortexMCPToolPrefix = "mcp__gortex__"
 // alternative but the original call still runs and PostToolUse can layer
 // graph context on the actual output.
 func runPreToolUse(data []byte, gortexPort int, mode Mode) {
+	started := time.Now()
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -84,6 +91,10 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	if input.HookEventName != "PreToolUse" {
 		return
 	}
+	emitted := false
+	defer func() {
+		logHookEffectiveness("PreToolUse", emitted, daemonReachableFn(), hookAlternationSegmentCount(input), time.Since(started))
+	}()
 
 	isGortexMCP := strings.HasPrefix(input.ToolName, gortexMCPToolPrefix)
 
@@ -106,6 +117,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
 			hso.AdditionalContext = adv
 		}
+		emitted = hso.AdditionalContext != "" || hso.PermissionDecisionReason != ""
 		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 		return
 	}
@@ -138,7 +150,26 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		output.HookSpecificOutput.AdditionalContext = result.context
 	}
 
+	emitted = true
 	emitPreToolUse(output)
+}
+
+func hookAlternationSegmentCount(input HookInput) int {
+	var pattern string
+	switch input.ToolName {
+	case "Grep":
+		pattern, _ = input.ToolInput["pattern"].(string)
+	case "Bash":
+		command, _ := input.ToolInput["command"].(string)
+		classification := classifyBashCommand(command)
+		if classification.Action == BashActionGrepLike || classification.Action == BashActionFindName {
+			pattern = classification.Pattern
+		}
+	}
+	if pattern == "" || !strings.Contains(pattern, "|") {
+		return 0
+	}
+	return len(splitAlternation(pattern))
 }
 
 // applyMode adjusts a raw enrich result according to the active posture.
@@ -287,8 +318,8 @@ func adaptiveNudge(input HookInput, isGortexMCP bool, result enrichResult) enric
 func nudgeReason(guidance string) string {
 	var b strings.Builder
 	b.WriteString("[Gortex] You've made several raw file-search calls in a row. ")
-	b.WriteString("Localizing a task? Call `explore` — one call returns the ranked neighborhood (likely symbols + source + call paths) and ends the search/read loop. Otherwise prefer `search_symbols`, `find_usages`, `get_callers`, `get_symbol_source` — all faster and far more precise than raw search.\n")
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString("Call `explore` for the task, then use `search`, `read`, or `relations`; do not continue the raw search/read loop.\n")
+	b.WriteString(toolref.MCPRequiredLine())
 	if guidance != "" {
 		b.WriteString(guidance)
 		if !strings.HasSuffix(guidance, "\n") {
@@ -304,9 +335,9 @@ func enrich(input HookInput, port int) enrichResult {
 	case "Read":
 		return enrichRead(input.ToolInput, input.CWD)
 	case "Grep":
-		return enrichGrep(input.ToolInput, port)
+		return enrichGrep(input.ToolInput, port, input.CWD)
 	case "Glob":
-		return enrichGlob(input.ToolInput)
+		return enrichGlob(input.ToolInput, input.CWD)
 	case "Task":
 		return enrichTask(input.ToolInput, port)
 	case "Bash":
@@ -315,15 +346,15 @@ func enrich(input HookInput, port int) enrichResult {
 		return enrichEdit(input.ToolInput, input.CWD)
 	case "Write":
 		return enrichWrite(input.ToolInput, input.CWD)
-	case gortexReadFileTool, gortexEditingContextTool:
+	case gortexReadFileTool, gortexEditingContextTool, gortexCompactReadTool:
 		return enrichGortexRead(input.ToolName, input.ToolInput)
 	default:
 		return enrichResult{}
 	}
 }
 
-// enrichRead blocks whole-file reads of indexed source files and suggests graph tools.
-// Narrow reads (with offset+limit for editing) are allowed through with advisory context.
+// enrichRead blocks reads of indexed source files and suggests graph tools.
+// Ranged reads are included: indexed source must stay on the graph-aware read path.
 func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	filePath, ok := toolInput["file_path"].(string)
 	if !ok || filePath == "" {
@@ -335,25 +366,17 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		return enrichResult{}
 	}
 
-	// Detect narrow reads (offset+limit for editing). These are legitimate
-	// and should pass through — the agent already knows what it needs.
-	if isNarrowRead(toolInput) {
-		return enrichResult{}
-	}
-
 	fileIndexed, symbolCount := queryFileIndexed(cwd, filePath)
 
 	// If the file is indexed, BLOCK the read and provide graph alternatives.
 	if fileIndexed {
 		var reason strings.Builder
-		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Read it through a graph tool instead:\n", filePath, symbolCount)
-		reason.WriteString("  - `get_symbol_source` — read one symbol (80% fewer tokens); if `explore` already returned this file, its source is in context — read a listed symbol by its `id:`\n")
-		reason.WriteString("  - `batch_symbols` — several symbols in one call\n")
-		reason.WriteString("  - `get_editing_context` — full file context before editing\n")
-		reason.WriteString("  - `get_file_summary` — all symbols and imports\n")
-		reason.WriteString("  - `explore` — if you have not localized yet: one call for the ranked symbols + source + call paths\n")
+		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, symbolCount)
+		reason.WriteString("  - `read(target:{symbol:\"<id>\"})` — one symbol\n")
+		reason.WriteString("  - `read(target:{symbols:[\"<id>\"]})` — several symbols\n")
+		reason.WriteString("  - `read(operation:\"editing_context\", target:{file:\"<path>\"})` — full editing context\n")
 		reason.WriteString(gcxTip)
-		reason.WriteString(toolref.FallbackLine("get_symbol_source"))
+		reason.WriteString(toolref.MCPRequiredLine())
 
 		return enrichResult{
 			deny:   true,
@@ -363,21 +386,20 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 
 	// File not indexed — allow with advisory.
 	var guidance strings.Builder
-	guidance.WriteString("[Gortex] PREFER graph tools over Read for source files:\n")
-	guidance.WriteString("  - Localizing a whole task (a bug / \"where is X\"): use `explore` (ranked neighborhood + source + call paths in one call)\n")
-	guidance.WriteString("  - To read one symbol: use `get_symbol_source` (80% fewer tokens)\n")
-	guidance.WriteString("  - To understand a file before editing: use `get_editing_context`\n")
-	guidance.WriteString("  - To get a file overview: use `get_file_summary`\n")
+	guidance.WriteString("[Gortex] Use `explore` first, then `read` for indexed source:\n")
+	guidance.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
+	guidance.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
+	guidance.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
 	guidance.WriteString(gcxTip)
-	guidance.WriteString(toolref.FallbackLine("get_symbol_source"))
+	guidance.WriteString(toolref.MCPRequiredLine())
 
 	return enrichResult{context: guidance.String()}
 }
 
 // gcxTip is appended to every Read/Grep/Glob redirect so agents see the
-// GCX1 wire-format opt-in at the exact moment they are picking a tool
-// call. Kept short — the messages are read under token pressure.
-const gcxTip = "  - Tip: pass format:\"gcx\" to any of these for round-trippable compact output (~27% fewer tokens, spec: docs/wire-format.md).\n"
+// compact-output option at the exact moment they are picking a tool call.
+// Public tools nest response shaping under output.
+const gcxTip = "  - For compact output, pass `output:{format:\"gcx\"}`.\n"
 
 // isNarrowRead returns true if the Read has offset+limit targeting a small range,
 // indicating the agent is reading a specific section for editing.
@@ -437,13 +459,61 @@ type grepProbeFn func(pattern string, timeout time.Duration) ([]grepSymbolHit, e
 // tests reassign this var via a t.Cleanup-restored helper.
 var grepProbe grepProbeFn = probeViaDaemon
 
-// enrichGrep classifies the Grep pattern and, for symbol-shaped patterns,
-// probes the local daemon's search_symbols endpoint. On ≥1 hit the call is
-// denied with top matches and a bypass hint; on miss/timeout/non-symbol the
-// existing soft guidance is returned so Grep proceeds.
-func enrichGrep(toolInput map[string]any, _ int) enrichResult {
+// enrichGrep denies searches within a proven tracked/indexed scope, regardless
+// of pattern shape. When scope ownership cannot be established, the existing
+// symbol probe and soft fallback preserve the historical posture.
+func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult {
+	cwd := ""
+	if len(cwdArg) > 0 {
+		cwd = cwdArg[0]
+	}
 	pattern, _ := toolInput["pattern"].(string)
+	if pattern == "" {
+		return enrichResult{}
+	}
+	if hookSearchScopeIndexed(cwd, toolInput) {
+		return enrichResult{
+			deny:   true,
+			reason: formatTrackedSearchDeny("Grep", pattern),
+		}
+	}
 	return probeSymbolPattern("Grep", pattern, defaultGrepGuidance())
+}
+
+func hookSearchScopeIndexed(cwd string, toolInput map[string]any) bool {
+	scope, _ := toolInput["path"].(string)
+	scope = strings.TrimSpace(scope)
+	if scope != "" {
+		abs := scope
+		if !filepath.IsAbs(abs) && cwd != "" {
+			abs = filepath.Join(cwd, abs)
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			if !looksLikeSourceFile(scope) {
+				return false
+			}
+			indexed, _ := queryFileIndexed(cwd, scope)
+			return indexed
+		}
+		if filepath.Ext(scope) != "" {
+			if !looksLikeSourceFile(scope) {
+				return false
+			}
+			indexed, _ := queryFileIndexed(cwd, scope)
+			return indexed
+		}
+	}
+	return scopeTrackedFn(cwd, scope)
+}
+
+func formatTrackedSearchDeny(tool, query string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Gortex] BLOCKED: %s `%s` targets indexed source. Use the indexed search surface instead:\n", tool, query)
+	b.WriteString("  - `search(operation:\"text\", query:\"<literal>\")` — literal or regex-related source lookup\n")
+	b.WriteString("  - `search(operation:\"symbols\", query:\"<name>\")` — symbol lookup\n")
+	b.WriteString(gcxTip)
+	b.WriteString(toolref.MCPRequiredLine())
+	return b.String()
 }
 
 // maxAlternationProbes caps how many identifier-shaped alternatives of a
@@ -618,24 +688,19 @@ func splitAlternation(pattern string) []string {
 
 func defaultGrepGuidance() string {
 	var b strings.Builder
-	b.WriteString("[Gortex] PREFER graph tools over Grep:\n")
-	b.WriteString("  - Localizing a task / bug (not a single symbol): use `explore` (ranked neighborhood + source + call paths in one call)\n")
-	b.WriteString("  - To find a symbol by name: use `search_symbols` (BM25 + camelCase-aware)\n")
-	b.WriteString("  - To find all references: use `find_usages` (zero false positives)\n")
-	b.WriteString("  - To find callers: use `get_callers`\n")
-	b.WriteString("  - To find implementations: use `find_implementations`\n")
-	b.WriteString("  - For literal / multi-keyword text (phrases, `foo|bar|baz`, hyphenated or other non-identifier strings): use `search_text` (trigram literal / regex search)\n")
-	b.WriteString("  - For TODO / FIXME / HACK / XXX / NOTE patterns: use `analyze kind=todos` (filter by tag/assignee/ticket)\n")
-	b.WriteString("  - For HTTP route / handler patterns (e.g. `app.get`, `func.*Handler`, `@RequestMapping`): use `contracts` (action=list to enumerate, action=check to match cross-repo)\n")
+	b.WriteString("[Gortex] Do not Grep indexed source. Call `explore` for a task, then use:\n")
+	b.WriteString("  - symbol name: `search(operation:\"symbols\", query:\"...\")`; literal text: use operation `text`\n")
+	b.WriteString("  - references: `relations(operation:\"usages\", target:{symbol:\"<id>\"})`; choose `callers` or `implementations` when that is the required relation\n")
+	b.WriteString("  - TODOs or contracts: `analyze(kind:\"todos\")` or `analyze(kind:\"contracts\")`\n")
 	b.WriteString(gcxTip)
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString(toolref.MCPRequiredLine())
 	return b.String()
 }
 
 func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
 	const maxShown = 5
 	var b strings.Builder
-	fmt.Fprintf(&b, "[Gortex] BLOCKED: \"%s\" matches %d symbol(s) in the knowledge graph. Use `search_symbols` or `find_usages` instead:\n\n", pattern, len(hits))
+	fmt.Fprintf(&b, "[Gortex] BLOCKED: \"%s\" matches %d indexed symbol(s). Use `search(operation:\"symbols\")` or `relations(operation:\"usages\")`:\n\n", pattern, len(hits))
 	shown := min(len(hits), maxShown)
 	for i := range shown {
 		h := hits[i]
@@ -651,7 +716,7 @@ func formatGrepDeny(pattern string, hits []grepSymbolHit) string {
 	b.WriteString("\n")
 	b.WriteString("Localizing a task rather than one symbol? `explore` returns the ranked neighborhood (symbols + source + call paths) in one call.\n")
 	b.WriteString(gcxTip)
-	b.WriteString(toolref.FallbackLine("search_symbols"))
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To force text search, add a regex metachar (e.g. \\b) or quote the pattern.")
 	return b.String()
 }
@@ -727,11 +792,7 @@ func daemonFileSummaryRaw(cwd, filePath string) ([]byte, bool) {
 		return nil, false
 	}
 
-	client, err := daemon.Dial(daemon.Handshake{
-		Mode:       daemon.ModeMCP,
-		ClientName: "gortex-hook",
-		CWD:        root,
-	})
+	client, err := daemon.Dial(hookMCPHandshake(root))
 	if err != nil {
 		return nil, false
 	}
@@ -884,21 +945,19 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 			fmt.Fprintf(&reason,
 				"[Gortex] BLOCKED: Bash `%s %s` reads indexed source (%d symbols). Use graph tools instead:\n",
 				c.Primary, c.Path, symbolCount)
-			reason.WriteString("  - `get_symbol_source` — one symbol (80% fewer tokens)\n")
-			reason.WriteString("  - `get_file_summary` — all symbols and imports\n")
-			reason.WriteString("  - `get_editing_context` — full file context before editing\n")
+			reason.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
+			reason.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
+			reason.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
 			reason.WriteString(gcxTip)
-			reason.WriteString(toolref.FallbackLine("get_symbol_source"))
+			reason.WriteString(toolref.MCPRequiredLine())
 			return enrichResult{deny: true, reason: reason.String()}
 		}
 		// Not indexed — soft guidance so Bash proceeds.
 		var g strings.Builder
-		g.WriteString("[Gortex] PREFER graph tools over Bash cat/head/tail for source files:\n")
-		g.WriteString("  - To read one symbol: use `get_symbol_source` (80% fewer tokens)\n")
-		g.WriteString("  - To get a file overview: use `get_file_summary`\n")
-		g.WriteString("  - To understand a file before editing: use `get_editing_context`\n")
+		g.WriteString("[Gortex] Use `read` instead of Bash cat/head/tail for indexed source:\n")
+		g.WriteString("  - `read(target:{symbol:\"<id>\"})` for one symbol; use operation `summary` for an overview or `editing_context` before editing\n")
 		g.WriteString(gcxTip)
-		g.WriteString(toolref.FallbackLine("get_symbol_source"))
+		g.WriteString(toolref.MCPRequiredLine())
 		return enrichResult{context: g.String()}
 	}
 
@@ -909,14 +968,100 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 // without a real socket. Production reads daemon.IsRunning.
 var daemonReachableFn = daemon.IsRunning
 
-// enrichGlob denies "list all source files of extension X" patterns
-// when the daemon is reachable — those are exactly the queries the
-// graph already answers (via `get_repo_outline` / `search_symbols`).
-// Name-based patterns (e.g. `**/handler*.go`, `*test*.ts`) get soft
-// guidance only because grep-style filename search has no clean
-// graph equivalent. When the daemon is unreachable, every shape
-// degrades to soft guidance — no daemon means no enforcement.
-func enrichGlob(toolInput map[string]any) enrichResult {
+// scopeTrackedFn proves that a Grep/Glob scope contains at least one indexed
+// source file. Tests replace it so fallback cases stay deterministic.
+var scopeTrackedFn = scopeTrackedViaDaemon
+
+func scopeTrackedViaDaemon(cwd, scope string) bool {
+	if !daemonReachableFn() {
+		return false
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = cwd
+	}
+	if scope == "" {
+		return false
+	}
+	if !filepath.IsAbs(scope) {
+		if cwd == "" {
+			return false
+		}
+		scope = filepath.Join(cwd, scope)
+	}
+	scope = filepath.Clean(scope)
+	info, err := os.Stat(scope)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	root := repoRootForFile(scope)
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, scope)
+	if err != nil {
+		return false
+	}
+
+	client, err := daemon.Dial(hookMCPHandshake(root))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	_ = client.Conn.SetDeadline(time.Now().Add(fileIndexedTimeout))
+
+	arguments := map[string]any{"glob": "**/*", "limit": 1, "format": "json"}
+	if rel != "." {
+		arguments["path"] = filepath.ToSlash(rel)
+	}
+	frame, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "find_files",
+			"arguments": arguments,
+		},
+	})
+	if err != nil || client.WriteMCPFrame(frame) != nil {
+		return false
+	}
+	resp, err := client.ReadMCPFrame()
+	return err == nil && parseFindFilesHasSource(resp)
+}
+
+func parseFindFilesHasSource(resp []byte) bool {
+	var rpc struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(resp, &rpc) != nil || rpc.Result.IsError || len(rpc.Result.Content) == 0 {
+		return false
+	}
+	var files struct {
+		Count int `json:"count"`
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if json.Unmarshal([]byte(rpc.Result.Content[0].Text), &files) != nil {
+		return false
+	}
+	return files.Count > 0 && len(files.Files) > 0
+}
+
+// enrichGlob denies source enumeration within a proven tracked/indexed scope.
+// Pattern shape no longer creates a bypass; unproven or unavailable scopes
+// retain soft guidance so the hook never blocks code it cannot identify.
+func enrichGlob(toolInput map[string]any, cwdArg ...string) enrichResult {
+	cwd := ""
+	if len(cwdArg) > 0 {
+		cwd = cwdArg[0]
+	}
 	pattern, ok := toolInput["pattern"].(string)
 	if !ok || pattern == "" {
 		return enrichResult{}
@@ -925,25 +1070,19 @@ func enrichGlob(toolInput map[string]any) enrichResult {
 		return enrichResult{}
 	}
 
-	guidance := defaultGlobGuidance()
-
-	// Greedy source-ext patterns (`**/*.go`, `*.ts`) are the
-	// "enumerate every source file" shape. Hard-deny only when the
-	// daemon is up — we can't redirect to graph tools that aren't
-	// answering.
-	if isGreedySourceGlob(pattern) && daemonReachableFn() {
+	if hookSearchScopeIndexed(cwd, toolInput) {
 		var b strings.Builder
-		fmt.Fprintf(&b, "[Gortex] BLOCKED: Glob `%s` enumerates source files. The graph already indexes them — use:\n", pattern)
-		b.WriteString("  - `get_repo_outline` — every file with symbol counts\n")
-		b.WriteString("  - `search_symbols` — name-based lookup that returns file paths\n")
-		b.WriteString("  - `get_file_summary` — when you have a specific file in mind\n")
+		fmt.Fprintf(&b, "[Gortex] BLOCKED: Glob `%s` targets indexed source. Use:\n", pattern)
+		b.WriteString("  - `explore(operation:\"outline\")` — repository/file outline\n")
+		b.WriteString("  - `search(operation:\"files\", query:\"<name>\")` — filename lookup\n")
+		b.WriteString("  - `search(operation:\"symbols\", query:\"<name>\")` — symbols with file paths\n")
+		b.WriteString("  - `read(operation:\"summary\", target:{file:\"<path>\"})` — a specific file overview\n")
 		b.WriteString(gcxTip)
-		b.WriteString(toolref.FallbackLine("get_repo_outline"))
-		b.WriteString("If you genuinely need a file-system listing, run `find` or `ls` via Bash with a specific filename component — Glob deny only triggers on bare extension wildcards.")
+		b.WriteString(toolref.MCPRequiredLine())
 		return enrichResult{deny: true, reason: b.String()}
 	}
 
-	return enrichResult{context: guidance}
+	return enrichResult{context: defaultGlobGuidance()}
 }
 
 // defaultGlobGuidance is the soft-guidance message returned when a
@@ -951,13 +1090,12 @@ func enrichGlob(toolInput map[string]any) enrichResult {
 // extension" pattern, or when the daemon is unreachable.
 func defaultGlobGuidance() string {
 	return "[Gortex] PREFER graph tools over Glob for source files:\n" +
-		"  - To find a symbol by name: use `search_symbols`\n" +
-		"  - To find files containing a symbol: use `search_symbols` (returns file paths)\n" +
-		"  - To understand file structure: use `get_file_summary`\n" +
-		"  - For task-level file discovery: use `smart_context`\n" +
+		"  - symbol/file lookup: `search(operation:\"symbols\")`\n" +
+		"  - file structure: `read(operation:\"summary\", target:{file:\"<path>\"})`\n" +
+		"  - task-level discovery: `explore`\n" +
 		"  - For migration / SQL globs (`db/migrations/*.sql`, `**/*.sql`): use `analyze kind=orphan_tables` and `kind=unreferenced_tables` to find queried-but-undeclared and provided-but-unused tables\n" +
 		gcxTip +
-		toolref.FallbackLine("search_symbols")
+		toolref.MCPRequiredLine()
 }
 
 // isGreedySourceGlob returns true when the pattern is a bare
@@ -1031,11 +1169,9 @@ func enrichEdit(toolInput map[string]any, cwd string) enrichResult {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Gortex] BLOCKED: Edit of %s (indexed source). Use Gortex MCP edit tools — they don't require a prior Read and update the graph atomically:\n", filePath)
-	b.WriteString("  - `edit_symbol` — change one symbol's body by ID (cleanest for one-function changes)\n")
-	b.WriteString("  - `edit_file` — whole-file replace, no Read precondition\n")
-	b.WriteString("  - `rename_symbol` — coordinated rename across all references\n")
-	b.WriteString("  - `batch_edit` — multi-file edits in dependency order\n\n")
-	b.WriteString(toolref.FallbackLine("edit_file"))
+	b.WriteString("  - choose `edit` operation `symbol`, `file`, or `batch`; for example `edit(operation:\"file\", target:{file:\"<path>\"})`\n")
+	b.WriteString("  - `refactor(operation:\"rename\")` for a coordinated rename\n\n")
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To bypass this redirect: unset GORTEX_HOOK_BLOCK_EDIT, or target a file outside the tracked repos.\n")
 	return enrichResult{deny: true, reason: b.String()}
 }
@@ -1061,9 +1197,9 @@ func enrichWrite(toolInput map[string]any, cwd string) enrichResult {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Gortex] BLOCKED: Write of %s (indexed source — would overwrite existing tracked file). Use:\n", filePath)
-	b.WriteString("  - `write_file` — whole-file write through Gortex (re-indexes after)\n")
-	b.WriteString("  - `edit_file` — when you want a delta-style replace\n\n")
-	b.WriteString(toolref.FallbackLine("edit_file"))
+	b.WriteString("  - `edit(operation:\"write\")` for a whole-file write\n")
+	b.WriteString("  - `edit(operation:\"file\")` for a guarded replacement\n\n")
+	b.WriteString(toolref.MCPRequiredLine())
 	b.WriteString("To bypass: unset GORTEX_HOOK_BLOCK_EDIT, or target a path outside tracked repos.\n")
 	return enrichResult{deny: true, reason: b.String()}
 }

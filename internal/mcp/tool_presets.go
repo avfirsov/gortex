@@ -18,10 +18,11 @@ import (
 // toolPolicy. Zero value (empty preset, no deltas) means "no
 // restriction" — the full surface.
 type ToolPolicyConfig struct {
-	Preset string
-	Mode   string // "hide" | "defer" — default hide
-	Allow  []string
-	Deny   []string
+	Preset         string
+	Mode           string // "hide" | "defer" — default hide
+	Allow          []string
+	Deny           []string
+	OperatorPinned bool // explicit config provenance, including core/defer
 }
 
 const (
@@ -82,13 +83,12 @@ var corePresetTools = []string{
 	"surface_memories", "save_note", "store_memory",
 }
 
-// agentFloorTools is the measured coding-agent working set — the tools a
-// headless coding agent actually reaches for across a navigate → read →
-// edit → verify cycle, from adoption probes and dogfooding. This is the
-// FLOOR: it never shrinks, and it is the default eager surface for known
-// coding-agent clients. Everything else defers behind tools_search (still
-// callable by name via promote-on-demand). tool_profile / tools_search are
-// always kept on top (isAlwaysKeptTool).
+// agentFloorTools is the measured working set retained by the legacy `agent`
+// compatibility preset. It covers a navigate → read → edit → verify
+// cycle; everything else defers behind tools_search. Named MCP clients now use
+// the compact surface unless a higher-precedence policy explicitly selects
+// this preset. tool_profile / tools_search are always kept on top
+// (isAlwaysKeptTool).
 var agentFloorTools = []string{
 	// orient — explore is the one-shot localization verb: the obvious
 	// opening move for any task-shaped request. It returns the ranked
@@ -123,6 +123,11 @@ var agentTailTools = []string{
 // the cold tools/list stays a few thousand tokens — see the byte-ceiling
 // regression test (TestAgentPresetByteCeiling).
 var agentPresetTools = append([]string{}, agentFloorTools...)
+
+// facadePresetTools is the complete, static facade-v1 surface. All names are
+// registered live and carry compact schemas; capabilities discovers operation
+// details without promoting more tools into tools/list.
+var facadePresetTools = facadeToolNames()
 
 // editPresetTools is the minimal headless code-editing surface: orient,
 // navigate, mutate, verify. Sized so an agent can edit code safely on a
@@ -174,6 +179,8 @@ func builtinToolPresetSet(name string) (set map[string]bool, denyMutating, known
 		return toToolSet(corePresetTools), false, true
 	case "agent", "coding-agent":
 		return toToolSet(agentPresetTools), false, true
+	case FacadeSurfaceVersion, "compact", "facade", "agent-v2":
+		return toToolSet(facadePresetTools), false, true
 	case "readonly", "read-only", "read_only":
 		return nil, true, true
 	case "edit", "editor", "edit-harness":
@@ -188,7 +195,7 @@ func builtinToolPresetSet(name string) (set map[string]bool, denyMutating, known
 }
 
 // builtinPresetNames lists the recognised preset names for diagnostics.
-var builtinPresetNames = []string{"agent", "core", "full", "readonly", "edit", "nav", "localization"}
+var builtinPresetNames = []string{"agent", FacadeSurfaceVersion, "core", "full", "readonly", "edit", "nav", "localization"}
 
 // toolPolicy is the resolved, in-memory restriction applied to the tool
 // surface by the lazy registry (defer mode) and toolSurfaceFilter /
@@ -260,6 +267,8 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 			label = "core"
 		case "coding-agent":
 			label = "agent"
+		case "compact", "facade", "agent-v2":
+			label = FacadeSurfaceVersion
 		case "locate", "find":
 			label = "localization"
 		}
@@ -273,6 +282,17 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 		}
 		label = "full"
 	}
+	if label == FacadeSurfaceVersion && (len(allow) > 0 || len(deny) > 0) {
+		// This is a closed protocol contract: tools/list and the hard call gate
+		// must always agree on the same 21 names. Use a legacy/custom preset when
+		// a per-tool surface is required.
+		if logger != nil {
+			logger.Warn("compact MCP surface ignores allow/deny deltas",
+				zap.Strings("allow", cfg.Allow), zap.Strings("deny", cfg.Deny))
+		}
+		allow = nil
+		deny = nil
+	}
 	active := explicit != nil || denyMutating || len(allow) > 0 || len(deny) > 0
 	return &toolPolicy{
 		preset:       label,
@@ -282,7 +302,7 @@ func newToolPolicy(cfg ToolPolicyConfig, logger *zap.Logger) *toolPolicy {
 		allow:        allow,
 		deny:         deny,
 		active:       active,
-		lean:         label == "agent" || label == "localization",
+		lean:         label == "agent" || label == "localization" || label == FacadeSurfaceVersion,
 	}
 }
 
@@ -304,6 +324,12 @@ func (p *toolPolicy) allows(name string) bool {
 		return false
 	}
 	if isAlwaysKeptTool(name) {
+		// capabilities replaces legacy discovery/introspection on the closed
+		// facade-v1 surface. Keeping these two names would make tools/list and
+		// the hard call gate disagree.
+		if p.preset == FacadeSurfaceVersion {
+			return false
+		}
 		return true
 	}
 	if p.allow[name] {
@@ -460,13 +486,12 @@ func (s *ToolSurface) Preset() string {
 	return s.p.preset
 }
 
-// effectiveSessionPolicy resolves the tool-surface policy in force for
-// the current request's session. Precedence: a client-forwarded preset /
-// spec (GORTEX_TOOLS / --tools of the `gortex mcp` proxy, relayed through
-// the daemon handshake) wins; else the client-aware preset default (a
-// known coding-agent client gets the lean `agent` surface); else the
-// server's global preset (the `core` default). The result is cached on the
-// session so it is derived once, not on every tools/list. Never nil.
+// effectiveSessionPolicy resolves the tool-surface policy in force for the
+// current request's session. A forwarded, operator-pinned, or active-profile
+// selection wins; otherwise every identified client gets the compact closed
+// surface and an unidentified/pre-initialize session keeps the server default.
+// The result is cached on the session so it is derived once, not on every
+// tools/list. Never nil.
 //
 // This is the single authoritative resolution point the diet relies on:
 // wherever tools/list is answered on the daemon, the surface for THIS
@@ -516,10 +541,21 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 		switch {
 		case strings.TrimSpace(mode) != "":
 			cfg.Mode = mode
+		case isFacadePreset(cfg.Preset):
+			// facade-v1 is a closed, versioned contract. A bare forwarded
+			// GORTEX_TOOLS=facade-v1 must not inherit the daemon's usual
+			// core/defer mode and silently weaken its direct-call gate.
+			cfg.Mode = toolPolicyModeHide
 		case s.toolPolicy != nil:
 			cfg.Mode = s.toolPolicy.mode
 		}
 		return newToolPolicy(cfg, s.logger)
+	}
+	// A deliberate server/operator policy outranks machine instruction
+	// profiles and client-aware defaults. Returning nil makes
+	// effectiveSessionPolicy fall back to the already-resolved global policy.
+	if s.toolPolicyOperatorPinned {
+		return nil
 	}
 	if p := s.instructionProfilePolicy(); p != nil {
 		return p
@@ -528,6 +564,15 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 		return p
 	}
 	return nil
+}
+
+func isFacadePreset(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case FacadeSurfaceVersion, "compact", "facade", "agent-v2":
+		return true
+	default:
+		return false
+	}
 }
 
 // activeInstructionPreset reads the machine's active instruction
@@ -566,6 +611,9 @@ func operatorPinnedToolPolicy(base ToolPolicyConfig) bool {
 	if _, envSet := toolPolicyConfigFromEnv(); envSet {
 		return true
 	}
+	if base.OperatorPinned {
+		return true
+	}
 	if len(base.Allow) > 0 || len(base.Deny) > 0 {
 		return true
 	}
@@ -578,22 +626,17 @@ func operatorPinnedToolPolicy(base ToolPolicyConfig) bool {
 	return true
 }
 
-// clientDefaultPolicy returns the preset a known client should get when it
-// forwarded no explicit tool spec, or nil to keep the server's global
-// default. The default surface is client-aware: a known coding-agent client
-// (the same set that defaults the wire format to GCX) gets the lean `agent`
-// working set without any configuration; editors and unknown clients keep
-// the server's global preset. GORTEX_TOOLS always overrides, because a
-// forwarded spec is resolved before this in resolveSessionPolicy.
+// clientDefaultPolicy returns the compact, closed coding surface for every
+// identified MCP client. Surface selection is intentionally independent of
+// wire-format decoding: an unknown editor can use the JSON-safe compact tools,
+// while only decoder-allowlisted clients default to GCX. Empty/pre-initialize
+// sessions retain the server default. Explicit forwarded, operator-pinned, and
+// instruction-profile policies are resolved before this fallback.
 func (s *Server) clientDefaultPolicy(client string) *toolPolicy {
-	if !isKnownAgentClient(client) {
+	if strings.TrimSpace(client) == "" {
 		return nil
 	}
-	mode := toolPolicyModeDefer
-	if s.toolPolicy != nil && s.toolPolicy.mode != "" {
-		mode = s.toolPolicy.mode
-	}
-	return newToolPolicy(ToolPolicyConfig{Preset: "agent", Mode: mode}, s.logger)
+	return newToolPolicy(ToolPolicyConfig{Preset: FacadeSurfaceVersion, Mode: toolPolicyModeHide}, s.logger)
 }
 
 // toolPolicyBaseFromOptions extracts the config-supplied tool policy

@@ -84,7 +84,7 @@ func TestHermesApplyWritesGlobalConfigAndSkill(t *testing.T) {
 		t.Fatalf("skill missing: %v", err)
 	}
 	for _, want := range []string{
-		"name: gortex", "metadata:", "hermes:", "set_active_project",
+		"name: gortex", "metadata:", "hermes:", "workspace_admin",
 		"platforms: [linux, macos, windows]", // standard Hermes frontmatter
 		"related_skills:",                    // links to the routing playbooks
 		"## Task playbooks",                  // slash-command discoverability
@@ -94,8 +94,37 @@ func TestHermesApplyWritesGlobalConfigAndSkill(t *testing.T) {
 			t.Errorf("skill missing %q", want)
 		}
 	}
+	for _, legacy := range []string{"smart_context", "search_symbols", "get_symbol_source", "find_usages", "get_callers", "verify_change", "read_file"} {
+		if strings.Contains(string(skill), legacy) {
+			t.Errorf("skill contains legacy MCP tool %q", legacy)
+		}
+	}
 
 	agentstest.AssertIdempotent(t, a, env)
+}
+
+func TestHermesMigratesLegacyOwnedSkill(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	seedHermesHome(t, env.Home)
+	path := skillPath(env.Home, SkillName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "---\nname: gortex\ndescription: old\n---\nCall smart_context and search_symbols.\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "smart_context") || !strings.Contains(string(got), "explore") {
+		t.Fatalf("legacy skill was not migrated:\n%s", got)
+	}
 }
 
 // TestHermesInstallsRoutingSkills covers the Claude Code parity skill
@@ -154,6 +183,14 @@ func TestHermesInstallsRoutingSkills(t *testing.T) {
 		}
 		if len(meta.Metadata.Hermes.Platforms) == 0 || len(meta.Metadata.Hermes.RelatedSkills) == 0 {
 			t.Errorf("%s: missing platforms/related_skills: %+v", name, meta.Metadata.Hermes)
+		}
+		for _, legacy := range []string{"smart_context", "search_symbols", "get_symbol_source", "get_editing_context", "find_usages", "get_callers", "verify_change", "detect_changes", "tools_search"} {
+			if strings.Contains(string(data), legacy) {
+				t.Errorf("%s: routing skill contains legacy MCP tool %q", name, legacy)
+			}
+		}
+		if strings.Contains(string(data), "facade-v1") {
+			t.Errorf("%s: routing skill exposes an implementation version", name)
 		}
 	}
 

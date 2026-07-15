@@ -93,6 +93,11 @@ const (
 	// tool in the current phase. The error data carries the current
 	// phase and the allowed-tool list.
 	ErrCodeToolOutOfPhase ErrorCode = "tool_out_of_phase"
+
+	// ErrCodeLocalizationComplete — an explicit localization-only request
+	// already produced its terminal evidence. The caller must respond, or make
+	// the one exact read named by data.completion when that state is returned.
+	ErrCodeLocalizationComplete ErrorCode = "localization_complete"
 )
 
 // StructuredError is the JSON shape encoded into the TextContent

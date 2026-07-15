@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/llm/conversationlog"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/tui"
@@ -438,6 +439,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		stateCapture := state
 		controllerCapture := controller
 		state.mcpServer.AttachHealthSnapshot(func() map[string]any {
+			runtimeactivity.Begin("health_snapshot")
+			defer runtimeactivity.End("health_snapshot")
+
 			out := map[string]any{
 				"uptime_seconds": int64(time.Since(daemonStart).Seconds()),
 				"ready":          controllerCapture.IsReady(),
@@ -450,12 +454,22 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				out["alloc_bytes"] = st.Runtime.Alloc
 				out["sys_bytes"] = st.Runtime.Sys
 				out["heap_inuse_bytes"] = st.Runtime.HeapInuse
+				out["heap_idle_bytes"] = st.Runtime.HeapIdle
+				out["heap_released_bytes"] = st.Runtime.HeapReleased
+				out["stack_inuse_bytes"] = st.Runtime.StackInuse
 				out["num_goroutine"] = st.Runtime.NumGoroutine
 				out["num_gc"] = st.Runtime.NumGC
 				if st.LSPRouter != nil {
 					out["lsp_alive"] = len(st.LSPRouter.ActiveProviders)
 					out["lsp_specs_registered"] = len(st.LSPRouter.EnabledSpecs)
 				}
+			}
+			activity := runtimeactivity.Current()
+			out["activity_active"] = activity.Active
+			out["activity_epoch"] = activity.Epoch
+			out["activity_quiet_ms"] = activity.QuietFor(time.Now()).Milliseconds()
+			if len(activity.ByKind) > 0 {
+				out["activity_by_kind"] = activity.ByKind
 			}
 			if sessions := srvCapture.Sessions(); sessions != nil {
 				out["sessions"] = sessions.Count()
@@ -543,6 +557,12 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// buildDaemonState — they just won't reflect files that changed
 	// since the snapshot was written until warmup gets to that repo.
 	go func() {
+		runtimeactivity.Begin("warmup")
+		defer func() {
+			runtimeactivity.End("warmup")
+			releaseMemoryToOS(logger, "warmup_complete")
+		}()
+
 		start := time.Now()
 		logger.Info("daemon: warmup starting")
 		// markReady fires once references are resolved and the graph is
@@ -563,21 +583,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
-		// Wire the daemon's MultiWatcher into the per-server history
-		// surface so `get_recent_changes` and `get_symbol_history` see
-		// real events under the daemon. Without this the tools always
-		// reported "watch mode is not active" even though MultiWatcher
-		// was actively re-indexing changed files.
-		if state.mcpServer != nil && mw != nil {
-			state.mcpServer.SetWatcher(mw)
-			// Push a one-time degraded notice on the readiness channel when a
-			// watcher exhausts inotify watches / file descriptors, so a
-			// subscribed agent learns the index may be frozen without polling.
-			srv := state.mcpServer
-			mw.OnDegraded(func(reason string) {
-				srv.PublishReadiness("degraded", true, map[string]any{"watch_degraded": reason})
-			})
-		}
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not
 		// the channel), so this can't starve any other reader. No-op when
@@ -592,7 +597,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// loaded graph instead of returning "run index_repository
 		// first" against a fully populated state.
 		if state.mcpServer != nil {
+			analysisStart := time.Now()
+			publishReadinessPhase(state, "analysis", true, nil)
 			state.mcpServer.RunAnalysis()
+			warmup.analysis = time.Since(analysisStart)
+			publishReadinessPhase(state, "analysis_done", true, map[string]any{
+				"elapsed_ms": warmup.analysis.Milliseconds(),
+			})
 			// Co-change pre-warm: fire the git-history mine in the
 			// background so the first user-visible
 			// find_co_changing_symbols / search-rerank call sees a
@@ -613,15 +624,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			"warmup_ms":      elapsed.Milliseconds(),
 		})
 		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
-		// Warmup is the daemon's single largest allocation burst (parse +
-		// resolve + the end_batch graph passes, then the whole-graph
-		// analysis above). This is the last point reached in every warmup
-		// shape — every early return inside warmupDaemonState still lands
-		// here — so return the burst's heap high-water to the OS now rather
-		// than letting the peak pin the idle footprint. RunAnalysis above
-		// may already have released, but the enrichment tail allocates
-		// further, so a final release at the true end still pays.
-		releaseMemoryToOS(logger, "warmup_complete")
 	}()
 
 	return srv.Serve()
@@ -676,27 +678,27 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 		for {
 			select {
 			case <-t.C:
-				gced := mi.GCVanishedWorktrees()
-				if len(gced) > 0 {
-					logger.Info("janitor: pruned vanished worktrees",
-						zap.Int("count", len(gced)))
-				}
-				results := mi.ReconcileAll()
-				// Return the tick's heap to the OS only when it actually did
-				// work — a repo reindexed stale/deleted files, or a worktree
-				// was pruned. ReconcileAll fills a result for every repo, so
-				// the honest "did work" signal is the per-repo stale/deleted
-				// counts, not the map size. A quiescent tick skips the
-				// release: FreeOSMemory is a full GC, and paying it hourly
-				// for a no-op sweep is the periodic cost the release policy
-				// exists to avoid.
-				reconciled := 0
-				for _, r := range results {
-					if r != nil {
-						reconciled += r.StaleFileCount + r.DeletedFileCount
+				gcedCount, reconciled := func() (int, int) {
+					runtimeactivity.Begin("reconcile")
+					defer runtimeactivity.End("reconcile")
+
+					gced := mi.GCVanishedWorktrees()
+					if len(gced) > 0 {
+						logger.Info("janitor: pruned vanished worktrees",
+							zap.Int("count", len(gced)))
 					}
-				}
-				if reconciled > 0 || len(gced) > 0 {
+					results := mi.ReconcileAll()
+					reconciled := 0
+					for _, r := range results {
+						if r != nil {
+							reconciled += r.StaleFileCount + r.DeletedFileCount
+						}
+					}
+					return len(gced), reconciled
+				}()
+				// Only a tick that changed the graph schedules reclamation. The
+				// process-wide quiet gate postpones it if another subsystem is busy.
+				if reconciled > 0 || gcedCount > 0 {
 					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
 			case <-stop:
@@ -724,7 +726,12 @@ func startPeriodicSnapshots(g *graph.Graph, mi *indexer.MultiIndexer, version st
 					logger.Debug("snapshot: skipped tick — daemon still warming up")
 					continue
 				}
-				saveSnapshot(g, collectSnapshotRepos(mi), collectSnapshotContracts(mi), collectSnapshotVector(mi), version, logger)
+				func() {
+					runtimeactivity.Begin("snapshot")
+					defer runtimeactivity.End("snapshot")
+					saveSnapshot(g, collectSnapshotRepos(mi), collectSnapshotContracts(mi), collectSnapshotVector(mi), version, logger)
+				}()
+				releaseMemoryToOS(logger, "periodic_snapshot")
 			case <-stop:
 				return
 			}

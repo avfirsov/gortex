@@ -287,21 +287,38 @@ func (s *Server) resolveRepoPrefix(pathOrPrefix string) string {
 		return ""
 	}
 
-	// Check if it's a known prefix directly.
+	// Check if it is a known prefix directly.
 	if meta := s.multiIndexer.GetMetadata(pathOrPrefix); meta != nil {
 		return pathOrPrefix
 	}
 
-	// Try to match as a path — check all tracked repos. Also try the
-	// absolute form since users may pass either.
-	absInput, _ := filepath.Abs(pathOrPrefix)
+	// Files and working directories inside a tracked repository are valid
+	// selectors too. Prefer the longest containing root so nested repositories
+	// resolve deterministically to their own graph instead of the parent repo.
+	absInput, err := filepath.Abs(pathOrPrefix)
+	if err != nil {
+		return ""
+	}
+	bestPrefix := ""
+	bestRootLen := -1
 	for prefix, meta := range s.multiIndexer.AllMetadata() {
-		if meta.RootPath == pathOrPrefix || (absInput != "" && meta.RootPath == absInput) {
-			return prefix
+		if meta == nil || meta.RootPath == "" {
+			continue
+		}
+		root, err := filepath.Abs(meta.RootPath)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(root, absInput)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		if len(root) > bestRootLen {
+			bestPrefix = prefix
+			bestRootLen = len(root)
 		}
 	}
-
-	return ""
+	return bestPrefix
 }
 
 // diffJoinPrefix resolves the graph repo prefix used to join repo-relative

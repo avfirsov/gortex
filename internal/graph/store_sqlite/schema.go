@@ -196,6 +196,160 @@ func ensureNodeGeneratedColumns(db *sql.DB) error {
 	return nil
 }
 
+// analysisGenerationSchemaSQL is the normalized, generation-addressed
+// whole-graph analysis cache. Node IDs are copied into generation-local rows:
+// they deliberately do not reference live nodes because incremental reindex
+// deletes and recreates live rows, which would either erase an immutable
+// snapshot or turn a tiny edit into a large FK cascade. Dense CSR and Leiden
+// state remain blobs; point-queryable results use typed rows and compact
+// surrogate node IDs.
+const analysisGenerationSchemaSQL = `
+CREATE TABLE IF NOT EXISTS analysis_generations (
+    generation_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    format_version              INTEGER NOT NULL,
+    build_revision              INTEGER NOT NULL,
+    created_at_unix             INTEGER NOT NULL,
+    state                       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
+    node_count                  INTEGER NOT NULL CHECK (node_count >= 0),
+    community_count             INTEGER NOT NULL CHECK (community_count >= 0),
+    process_count               INTEGER NOT NULL CHECK (process_count >= 0),
+    concept_count               INTEGER NOT NULL CHECK (concept_count >= 0),
+    pagerank_max                REAL NOT NULL DEFAULT 0,
+    authority_max               REAL NOT NULL DEFAULT 0,
+    hub_max                     REAL NOT NULL DEFAULT 0,
+    modularity                  REAL NOT NULL DEFAULT 0,
+    processes_truncated         INTEGER NOT NULL DEFAULT 0 CHECK (processes_truncated IN (0, 1)),
+    processes_truncation_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS analysis_generations_by_state
+    ON analysis_generations(state, generation_id DESC);
+
+CREATE TABLE IF NOT EXISTS analysis_active_generation (
+    slot          INTEGER PRIMARY KEY CHECK (slot = 1),
+    generation_id INTEGER NOT NULL UNIQUE
+        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS analysis_generation_components (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    component     TEXT NOT NULL,
+    row_count     INTEGER NOT NULL CHECK (row_count >= 0),
+    sealed_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, component)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_communities (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    community_id  TEXT NOT NULL,
+    label         TEXT NOT NULL DEFAULT '',
+    hub            TEXT NOT NULL DEFAULT '',
+    parent_id      TEXT NOT NULL DEFAULT '',
+    size           INTEGER NOT NULL CHECK (size >= 0),
+    cohesion       REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (generation_id, community_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_community_files (
+    generation_id INTEGER NOT NULL,
+    community_id  TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    file_path     TEXT NOT NULL,
+    PRIMARY KEY (generation_id, community_id, ordinal),
+    FOREIGN KEY (generation_id, community_id)
+        REFERENCES analysis_communities(generation_id, community_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_nodes (
+    id            INTEGER PRIMARY KEY,
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    node_id       TEXT NOT NULL,
+    community_id  TEXT,
+    pagerank      REAL NOT NULL DEFAULT 0,
+    authority     REAL NOT NULL DEFAULT 0,
+    hub           REAL NOT NULL DEFAULT 0,
+    UNIQUE (generation_id, node_id),
+    FOREIGN KEY (generation_id, community_id)
+        REFERENCES analysis_communities(generation_id, community_id)
+);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_pagerank
+    ON analysis_nodes(generation_id, pagerank DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_authority
+    ON analysis_nodes(generation_id, authority DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_hub
+    ON analysis_nodes(generation_id, hub DESC, id ASC);
+CREATE INDEX IF NOT EXISTS analysis_nodes_by_community
+    ON analysis_nodes(generation_id, community_id, node_id);
+
+CREATE TABLE IF NOT EXISTS analysis_processes (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    process_id     TEXT NOT NULL,
+    name           TEXT NOT NULL DEFAULT '',
+    entry_point    TEXT NOT NULL DEFAULT '',
+    step_count     INTEGER NOT NULL CHECK (step_count >= 0),
+    score          REAL NOT NULL DEFAULT 0,
+    truncated      INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+    PRIMARY KEY (generation_id, process_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_process_files (
+    generation_id INTEGER NOT NULL,
+    process_id    TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    file_path     TEXT NOT NULL,
+    PRIMARY KEY (generation_id, process_id, ordinal),
+    FOREIGN KEY (generation_id, process_id)
+        REFERENCES analysis_processes(generation_id, process_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_process_steps (
+    generation_id INTEGER NOT NULL,
+    process_id    TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
+    node_rowid    INTEGER NOT NULL
+        REFERENCES analysis_nodes(id),
+    depth         INTEGER NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (generation_id, process_id, ordinal),
+    FOREIGN KEY (generation_id, process_id)
+        REFERENCES analysis_processes(generation_id, process_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS analysis_process_steps_by_node
+    ON analysis_process_steps(generation_id, node_rowid, process_id);
+
+CREATE TABLE IF NOT EXISTS analysis_concepts (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    token         TEXT NOT NULL,
+    in_vocabulary INTEGER NOT NULL CHECK (in_vocabulary IN (0, 1)),
+    PRIMARY KEY (generation_id, token)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS analysis_concept_relations (
+    generation_id INTEGER NOT NULL,
+    token         TEXT NOT NULL,
+    related_token TEXT NOT NULL,
+    rank          INTEGER NOT NULL CHECK (rank >= 0),
+    PRIMARY KEY (generation_id, token, rank, related_token),
+    FOREIGN KEY (generation_id, token)
+        REFERENCES analysis_concepts(generation_id, token) ON DELETE CASCADE,
+    FOREIGN KEY (generation_id, related_token)
+        REFERENCES analysis_concepts(generation_id, token) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS analysis_concept_relations_by_related
+    ON analysis_concept_relations(generation_id, related_token, rank, token);
+
+CREATE TABLE IF NOT EXISTS analysis_blobs (
+    generation_id INTEGER NOT NULL
+        REFERENCES analysis_generations(generation_id) ON DELETE CASCADE,
+    component     TEXT NOT NULL,
+    payload       BLOB NOT NULL,
+    PRIMARY KEY (generation_id, component)
+) WITHOUT ROWID;
+`
+
 // schemaSQL is the canonical DDL applied on Open. Statements are
 // idempotent (IF NOT EXISTS) so they run cleanly against a fresh DB
 // and against an existing one.
@@ -515,4 +669,4 @@ CREATE TABLE IF NOT EXISTS symbol_fts_rowid (
 -- repo_prefix / file_path / ordinal ride UNINDEXED so the per-repo and
 -- per-file staleness wipes hit literal columns without a b-tree.
 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, file_path UNINDEXED, ordinal UNINDEXED, body);
-`
+` + analysisGenerationSchemaSQL

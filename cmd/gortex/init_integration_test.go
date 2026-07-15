@@ -9,7 +9,22 @@ import (
 	"testing"
 
 	toml "github.com/pelletier/go-toml/v2"
+
+	"github.com/zzet/gortex/internal/agents"
 )
+
+func TestInitSummaryDoesNotRequireManualMCPEnablement(t *testing.T) {
+	var out bytes.Buffer
+	emitHumanSummary(&out, nil, agents.ApplyOpts{})
+
+	got := out.String()
+	if !strings.Contains(got, "no separate MCP enablement is normally required") {
+		t.Fatalf("init summary must describe automatic MCP registration:\n%s", got)
+	}
+	if strings.Contains(got, "enable the gortex server") {
+		t.Fatalf("init summary still asks for manual MCP enablement:\n%s", got)
+	}
+}
 
 // TestInitDryRunJSONReportShape is the end-to-end contract test for
 // the non-interactive init flags. It runs runInit with --yes

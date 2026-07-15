@@ -10,14 +10,19 @@ import (
 // on this list, so a path, a symbol name, or any arbitrary string can never
 // become a metric. Adding a counter is a deliberate edit here and nowhere else.
 var allowedMetrics = map[string]bool{
-	"mcp_tool_call":  true, // an MCP tool was invoked; dim = tool name
-	"cli_command":    true, // a CLI subcommand ran; dim = command name
-	"index":          true, // an index pass completed; dim = file-count bucket
-	"index_lang":     true, // a language was present in an index pass; dim = language
-	"daemon_session": true, // a daemon session started; dim = backend kind
-	"install":        true, // an install applied; dim = agent target / scope
-	"uninstall":      true, // an uninstall applied; dim = agent target / scope
-	"client":         true, // an MCP client connected; dim = client app name
+	"mcp_tool_call":      true, // an MCP tool was invoked; dim = tool name
+	"mcp_facade_call":    true, // a facade-v1 attempt; dim = facade.operation
+	"mcp_facade_status":  true, // facade result class; dim = facade.operation.ok|error
+	"mcp_facade_outcome": true, // bounded facade outcome; dim = facade.operation.outcome
+	"mcp_facade_invalid": true, // validation failure; dim = facade.operation.error_code
+	"mcp_facade_latency": true, // end-to-end latency; dim = facade.operation.duration_bucket
+	"cli_command":        true, // a CLI subcommand ran; dim = command name
+	"index":              true, // an index pass completed; dim = file-count bucket
+	"index_lang":         true, // a language was present in an index pass; dim = language
+	"daemon_session":     true, // a daemon session started; dim = backend kind
+	"install":            true, // an install applied; dim = agent target / scope
+	"uninstall":          true, // an uninstall applied; dim = agent target / scope
+	"client":             true, // an MCP client connected; dim = client app name
 }
 
 // IsAllowedMetric reports whether key may be recorded.
@@ -55,16 +60,19 @@ func BucketFileCount(n int) string {
 
 // BucketDuration collapses an elapsed time into a coarse bucket.
 func BucketDuration(d time.Duration) string {
-	ms := d.Milliseconds()
 	switch {
-	case ms < 10_000:
-		return "<10s"
-	case ms < 60_000:
-		return "10-60s"
-	case ms < 300_000:
-		return "1-5m"
+	case d < time.Millisecond:
+		return "<1ms"
+	case d < 10*time.Millisecond:
+		return "1-10ms"
+	case d < 100*time.Millisecond:
+		return "10-100ms"
+	case d < time.Second:
+		return "100ms-1s"
+	case d < 10*time.Second:
+		return "1-10s"
 	default:
-		return "5m+"
+		return "10s+"
 	}
 }
 

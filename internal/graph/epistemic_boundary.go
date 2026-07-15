@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"sort"
 	"strings"
 )
@@ -127,16 +128,56 @@ func CalleeBoundaries(g Store, nodeIDs []string, limit int) []EpistemicBoundary 
 // callers not attributed to it directly. It names the interface so an agent
 // can run find_implementations / get_callers on it to widen the picture.
 func CallerBoundaries(g Store, nodeIDs []string, limit int) []EpistemicBoundary {
+	out, _ := CallerBoundariesContext(context.Background(), g, nodeIDs, limit)
+	return out
+}
+
+type callerBoundaryOutgoingContextStore interface {
+	GetOutEdgesByNodeIDsContext(context.Context, []string, int) (map[string][]*Edge, bool, error)
+}
+
+type callerBoundaryNodesContextStore interface {
+	GetNodesByIDsContext(context.Context, []string) (map[string]*Node, error)
+}
+
+// CallerBoundariesContext reports interface-dispatch boundaries without
+// allowing SQLite reads to outlive ctx. Stores may opt into cancellable batch
+// reads; the legacy path remains available for in-memory implementations.
+func CallerBoundariesContext(ctx context.Context, g Store, nodeIDs []string, limit int) ([]EpistemicBoundary, bool) {
 	if g == nil {
-		return nil
+		return nil, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if limit <= 0 {
 		limit = maxBoundaries
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, true
+	}
+
+	edgeLimit := limit + 1
+	if edgeLimit < maxBoundaries+1 {
+		edgeLimit = maxBoundaries + 1
+	}
+	edgesByID, truncated := callerBoundaryOutEdgesContext(ctx, g, nodeIDs, edgeLimit)
+	nodesByID, nodeErr := callerBoundaryNodesContext(ctx, g, nodeIDs)
+	if nodeErr != nil {
+		truncated = true
+	}
+
 	seen := map[string]bool{}
 	var out []EpistemicBoundary
 	for _, id := range nodeIDs {
-		for _, e := range g.GetOutEdges(id) {
+		if err := ctx.Err(); err != nil {
+			return sortBoundaries(out), true
+		}
+		seedName := boundaryTargetName(id)
+		if n := nodesByID[id]; n != nil && n.Name != "" {
+			seedName = n.Name
+		}
+		for _, e := range edgesByID[id] {
 			if e.Kind != EdgeImplements && e.Kind != EdgeOverrides {
 				continue
 			}
@@ -147,18 +188,50 @@ func CallerBoundaries(g Store, nodeIDs []string, limit int) []EpistemicBoundary 
 			seen[key] = true
 			out = append(out, EpistemicBoundary{
 				SeedID:    id,
-				SeedName:  nameForID(g, id),
+				SeedName:  seedName,
 				Target:    boundaryTargetName(e.To),
 				EdgeKind:  string(e.Kind),
 				Reason:    BoundaryInterfaceDispatch,
 				Direction: "callers",
 			})
 			if len(out) >= limit {
-				return sortBoundaries(out)
+				return sortBoundaries(out), truncated
 			}
 		}
 	}
-	return sortBoundaries(out)
+	return sortBoundaries(out), truncated
+}
+
+func callerBoundaryOutEdgesContext(ctx context.Context, g Store, nodeIDs []string, limit int) (map[string][]*Edge, bool) {
+	if reader, ok := g.(callerBoundaryOutgoingContextStore); ok {
+		out, truncated, err := reader.GetOutEdgesByNodeIDsContext(ctx, nodeIDs, limit)
+		return out, truncated || err != nil
+	}
+	out := make(map[string][]*Edge, len(nodeIDs))
+	total := 0
+	for _, id := range nodeIDs {
+		if err := ctx.Err(); err != nil {
+			return out, true
+		}
+		for _, e := range g.GetOutEdges(id) {
+			if total >= limit {
+				return out, true
+			}
+			out[id] = append(out[id], e)
+			total++
+		}
+	}
+	return out, false
+}
+
+func callerBoundaryNodesContext(ctx context.Context, g Store, nodeIDs []string) (map[string]*Node, error) {
+	if reader, ok := g.(callerBoundaryNodesContextStore); ok {
+		return reader.GetNodesByIDsContext(ctx, nodeIDs)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return g.GetNodesByIDs(nodeIDs), nil
 }
 
 // LowerBoundCaveat reports whether the boundary set makes the count a genuine

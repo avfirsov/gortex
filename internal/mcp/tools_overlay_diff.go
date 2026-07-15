@@ -19,7 +19,7 @@ import (
 // answers to "what would change if I committed this buffer?" without
 // touching the saved-view graph.
 func (s *Server) registerOverlayDiffTool() {
-	s.mcpServer.AddTool(
+	s.addControlTool(
 		mcp.NewTool("compare_with_overlay",
 			mcp.WithDescription("Run a graph query against both the base (saved-buffer) graph and the calling session's overlay (editor-buffer) view, then report the delta. The base side answers \"what's true now?\"; the overlay side answers \"what would be true if I committed this buffer?\". Useful for previewing the impact of an unsaved edit on callers, dependents, or call chains. Supported `kind` values: find_usages, get_callers, get_call_chain, get_dependencies, get_dependents."),
 			mcp.WithString("kind", mcp.Required(), mcp.Description("Query kind to run. One of: find_usages, get_callers, get_call_chain, get_dependencies, get_dependents.")),
@@ -70,13 +70,13 @@ func (s *Server) handleCompareWithOverlay(ctx context.Context, req mcp.CallToolR
 
 	added, removed, common := diffIDSets(baseIDs, overlayIDs)
 	result := map[string]any{
-		"kind":         kind,
-		"id":           id,
-		"depth":        depth,
-		"limit":        limit,
+		"kind":          kind,
+		"id":            id,
+		"depth":         depth,
+		"limit":         limit,
 		"overlay_paths": view.Layer().FilePaths(),
-		"base":         baseIDs,
-		"overlay":      overlayIDs,
+		"base":          baseIDs,
+		"overlay":       overlayIDs,
 		"delta": map[string]any{
 			"added":   added,
 			"removed": removed,

@@ -293,8 +293,8 @@ func (s *Server) handleResourceGuideSection(_ context.Context, req mcp.ReadResou
 }
 
 func (s *Server) handleResourceCommunities(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	comms := s.getCommunities()
-	if comms == nil || len(comms.Communities) == 0 {
+	rows, next, err := s.analysisCommunitySummaries(100, "")
+	if err != nil || len(rows) == 0 {
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
 				URI:      req.Params.URI,
@@ -311,18 +311,26 @@ func (s *Server) handleResourceCommunities(_ context.Context, req mcp.ReadResour
 		Files    []string `json:"files"`
 		Cohesion float64  `json:"cohesion"`
 	}
-	var summaries []summary
-	for _, c := range comms.Communities {
+	summaries := make([]summary, 0, len(rows))
+	for _, row := range rows {
 		summaries = append(summaries, summary{
-			ID: c.ID, Label: c.Label, Size: c.Size,
-			Files: c.Files, Cohesion: c.Cohesion,
+			ID: row.ID, Label: row.Label, Size: row.Size,
+			Files: row.Files, Cohesion: row.Cohesion,
 		})
 	}
-
+	total := len(summaries)
+	modularity := 0.0
+	if _, header, ok := s.activeAnalysisQuery(); ok {
+		total = header.CommunityCount
+		modularity = header.Modularity
+	}
 	data, err := json.Marshal(map[string]any{
 		"communities": summaries,
-		"total":       len(summaries),
-		"modularity":  comms.Modularity,
+		"returned":    len(summaries),
+		"total":       total,
+		"modularity":  modularity,
+		"truncated":   next != "",
+		"next_cursor": next,
 	})
 	if err != nil {
 		return nil, err
@@ -337,38 +345,62 @@ func (s *Server) handleResourceCommunities(_ context.Context, req mcp.ReadResour
 }
 
 func (s *Server) handleResourceCommunity(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	comms := s.getCommunities()
-	if comms == nil {
-		return nil, fmt.Errorf("no communities detected yet")
-	}
-
-	// Extract ID from URI: gortex://community/{id}
 	id := extractURIParam(req.Params.URI, "gortex://community/")
 	if id == "" {
 		return nil, fmt.Errorf("missing community id in URI")
 	}
-
-	for _, c := range comms.Communities {
-		if c.ID == id {
-			data, err := json.Marshal(c)
-			if err != nil {
-				return nil, err
-			}
-			return []mcp.ResourceContents{
-				mcp.TextResourceContents{
-					URI:      req.Params.URI,
-					MIMEType: "application/json",
-					Text:     string(data),
-				},
-			}, nil
+	var found bool
+	var label, hub, parentID string
+	var size int
+	var cohesion float64
+	var files []string
+	cursor := ""
+	for !found {
+		rows, next, err := s.analysisCommunitySummaries(analysisGenerationQueryPage, cursor)
+		if err != nil {
+			return nil, fmt.Errorf("no communities detected yet")
 		}
+		for _, row := range rows {
+			if row.ID == id {
+				found, label, hub, parentID = true, row.Label, row.Hub, row.ParentID
+				size, cohesion, files = row.Size, row.Cohesion, row.Files
+				break
+			}
+		}
+		if found || next == "" || next == cursor || len(rows) == 0 {
+			break
+		}
+		cursor = next
 	}
-	return nil, fmt.Errorf("community not found: %s", id)
+	if !found {
+		return nil, fmt.Errorf("community not found: %s", id)
+	}
+	members, next, err := s.analysisCommunityMembers(id, analysisGenerationQueryMax, "")
+	if err != nil {
+		return nil, err
+	}
+	memberIDs := make([]string, 0, len(members))
+	for _, member := range members {
+		memberIDs = append(memberIDs, member.NodeID)
+	}
+	data, err := json.Marshal(map[string]any{
+		"id": id, "label": label, "hub": hub, "parent_id": parentID,
+		"size": size, "cohesion": cohesion, "files": files, "members": memberIDs,
+		"members_truncated": next != "", "next_member_cursor": next,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []mcp.ResourceContents{
+		mcp.TextResourceContents{
+			URI: req.Params.URI, MIMEType: "application/json", Text: string(data),
+		},
+	}, nil
 }
 
 func (s *Server) handleResourceProcesses(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	procs := s.getProcesses()
-	if procs == nil || len(procs.Processes) == 0 {
+	rows, next, err := s.analysisProcessSummaries(100, "")
+	if err != nil || len(rows) == 0 {
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
 				URI:      req.Params.URI,
@@ -386,17 +418,23 @@ func (s *Server) handleResourceProcesses(_ context.Context, req mcp.ReadResource
 		FileCount  int     `json:"file_count"`
 		Score      float64 `json:"score"`
 	}
-	var summaries []summary
-	for _, p := range procs.Processes {
+	summaries := make([]summary, 0, len(rows))
+	for _, row := range rows {
 		summaries = append(summaries, summary{
-			ID: p.ID, Name: p.Name, EntryPoint: p.EntryPoint,
-			StepCount: p.StepCount, FileCount: len(p.Files), Score: p.Score,
+			ID: row.ID, Name: row.Name, EntryPoint: row.EntryPoint,
+			StepCount: row.StepCount, FileCount: len(row.Files), Score: row.Score,
 		})
 	}
-
+	total := len(summaries)
+	if _, header, ok := s.activeAnalysisQuery(); ok {
+		total = header.ProcessCount
+	}
 	data, err := json.Marshal(map[string]any{
-		"processes": summaries,
-		"total":     len(summaries),
+		"processes":   summaries,
+		"returned":    len(summaries),
+		"total":       total,
+		"truncated":   next != "",
+		"next_cursor": next,
 	})
 	if err != nil {
 		return nil, err
@@ -411,32 +449,63 @@ func (s *Server) handleResourceProcesses(_ context.Context, req mcp.ReadResource
 }
 
 func (s *Server) handleResourceProcess(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	procs := s.getProcesses()
-	if procs == nil {
-		return nil, fmt.Errorf("no processes discovered yet")
-	}
-
 	id := extractURIParam(req.Params.URI, "gortex://process/")
 	if id == "" {
 		return nil, fmt.Errorf("missing process id in URI")
 	}
-
-	for _, p := range procs.Processes {
-		if p.ID == id {
-			data, err := json.Marshal(p)
-			if err != nil {
-				return nil, err
-			}
-			return []mcp.ResourceContents{
-				mcp.TextResourceContents{
-					URI:      req.Params.URI,
-					MIMEType: "application/json",
-					Text:     string(data),
-				},
-			}, nil
+	var found bool
+	var name, entryPoint string
+	var stepCount int
+	var score float64
+	var truncated bool
+	var files []string
+	cursor := ""
+	for !found {
+		rows, next, err := s.analysisProcessSummaries(analysisGenerationQueryPage, cursor)
+		if err != nil {
+			return nil, fmt.Errorf("no processes discovered yet")
 		}
+		for _, row := range rows {
+			if row.ID == id {
+				found, name, entryPoint = true, row.Name, row.EntryPoint
+				stepCount, score, truncated, files = row.StepCount, row.Score, row.Truncated, row.Files
+				break
+			}
+		}
+		if found || next == "" || next == cursor || len(rows) == 0 {
+			break
+		}
+		cursor = next
 	}
-	return nil, fmt.Errorf("process not found: %s", id)
+	if !found {
+		return nil, fmt.Errorf("process not found: %s", id)
+	}
+	steps, next, err := s.analysisProcessSteps(id, analysisGenerationQueryMax, -1)
+	if err != nil {
+		return nil, err
+	}
+	type step struct {
+		ID    string `json:"id"`
+		Depth int    `json:"depth"`
+	}
+	outSteps := make([]step, 0, len(steps))
+	for _, row := range steps {
+		outSteps = append(outSteps, step{ID: row.NodeID, Depth: row.Depth})
+	}
+	data, err := json.Marshal(map[string]any{
+		"id": id, "name": name, "entry_point": entryPoint,
+		"steps": outSteps, "step_count": stepCount, "files": files,
+		"score": score, "truncated": truncated || next >= 0,
+		"next_step_cursor": next,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []mcp.ResourceContents{
+		mcp.TextResourceContents{
+			URI: req.Params.URI, MIMEType: "application/json", Text: string(data),
+		},
+	}, nil
 }
 
 // extractURIParam extracts the parameter value after a URI prefix.

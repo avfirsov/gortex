@@ -222,15 +222,18 @@ func synthesizeCapabilityEdges(g graph.Store) (readsEnv, execProc, fieldAccess i
 		}
 	}
 
+	nodes := make([]*graph.Node, 0, len(procNodes))
 	for _, n := range procNodes {
-		g.AddNode(n)
+		nodes = append(nodes, n)
 	}
+	edges := make([]*graph.Edge, 0, len(pending))
 	for _, s := range pending {
-		g.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
 			From: s.from, To: s.to, Kind: s.kind,
 			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
 		})
 	}
+	g.AddBatch(nodes, edges)
 	return readsEnv, execProc, fieldAccess
 }
 
@@ -367,14 +370,17 @@ func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]b
 		}
 	}
 
+	nodes := make([]*graph.Node, 0, len(procNodes))
 	for _, n := range procNodes {
-		g.AddNode(n)
+		nodes = append(nodes, n)
 	}
+	edges := make([]*graph.Edge, 0, len(pending))
 	for _, s := range pending {
-		g.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
 			From: s.from, To: s.to, Kind: s.kind,
 			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
 		})
 	}
+	g.AddBatch(nodes, edges)
 	return readsEnv, execProc, fieldAccess
 }

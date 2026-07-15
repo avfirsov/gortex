@@ -69,7 +69,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 	if g == nil {
 		return &HITSResult{Authorities: map[string]float64{}, Hubs: map[string]float64{}}
 	}
-	nodes := excludeProxyNodes(g.AllNodes())
+	nodes := excludeProxyNodes(graph.AllNodesLight(g))
 	n := len(nodes)
 	if n == 0 {
 		return &HITSResult{Authorities: map[string]float64{}, Hubs: map[string]float64{}}

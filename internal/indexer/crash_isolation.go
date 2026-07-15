@@ -247,6 +247,7 @@ func (idx *Indexer) extractFile(
 			return nil, false, eerr
 		}
 		stampParseErrors(r)
+		normalizeExtractionMetadata(r, src)
 		return r, false, nil
 	}
 
@@ -278,6 +279,7 @@ func (idx *Indexer) extractFile(
 	if res.HasParseErr {
 		stampParseErrorCount(result.Nodes, res.ParseErrors)
 	}
+	normalizeExtractionMetadata(result, src)
 	return result, false, nil
 }
 
