@@ -61,7 +61,7 @@ func newLocalizationRefinementCompletion() localizationCompletion {
 	return localizationCompletion{
 		State:            localizationStateNeedsRefinement,
 		Scope:            "localization",
-		RequiredAction:   "read_one_candidate",
+		RequiredAction:   localizationRefinementRequiredAction,
 		AllowedToolCalls: 1,
 	}
 }

@@ -241,7 +241,7 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
 	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
-	require.Equal(t, "read_one_candidate", envelope.Completion.RequiredAction)
+	require.Equal(t, localizationRefinementRequiredAction, envelope.Completion.RequiredAction)
 	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
 	require.NotEmpty(t, envelope.Evidence)
 	require.NotEmpty(t, envelope.Symbols)
