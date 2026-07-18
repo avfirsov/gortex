@@ -134,6 +134,14 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
+		// Durable revert stamp: the guard's verdicts are otherwise invisible
+		// after the provenance drop, which blocks any selective replay — a
+		// future pass cannot learn which speculative shapes never survive
+		// scrutiny. The stamp rides the reindex write it already pays for.
+		if j.edge.Meta == nil {
+			j.edge.Meta = map[string]any{}
+		}
+		j.edge.Meta["guard_reverted"] = true
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}
