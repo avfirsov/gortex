@@ -1153,3 +1153,66 @@ func run(x any) {
 	// and the type is resolved by bare name like every other type reference.
 	assert.Contains(t, targets, "unresolved::Fooer")
 }
+
+func TestGoExtractor_GenericReceiverMethod(t *testing.T) {
+	src := []byte(`package main
+
+type Indexed[K comparable, V any] struct{}
+
+func (c *Indexed[K, V]) Stop() {
+	done := true
+	_ = done
+}
+
+type Loader[T any] struct{}
+
+func (l *Loader[T]) Get() {}
+
+func (*Indexed[K, V]) Reset() {}
+`)
+	e := NewGoExtractor()
+	result, err := e.Extract("cache.go", src)
+	require.NoError(t, err)
+
+	methods := nodesOfKind(result.Nodes, graph.KindMethod)
+	require.Len(t, methods, 3)
+	byName := map[string]*graph.Node{}
+	for _, m := range methods {
+		byName[m.Name] = m
+	}
+
+	// The multi-parameter receiver must keep one whole identity — never a
+	// comma fragment like "V].Stop" — canonicalised without inner spaces.
+	stop := byName["Stop"]
+	require.NotNil(t, stop)
+	assert.Equal(t, "cache.go::Indexed[K,V].Stop", stop.ID)
+	assert.Equal(t, "Indexed", stop.Meta["receiver"])
+
+	// Single-parameter receivers keep the established ID convention.
+	get := byName["Get"]
+	require.NotNil(t, get)
+	assert.Equal(t, "cache.go::Loader[T].Get", get.ID)
+	assert.Equal(t, "Loader", get.Meta["receiver"])
+
+	// An unnamed generic receiver must not read a type fragment as the
+	// receiver name.
+	reset := byName["Reset"]
+	require.NotNil(t, reset)
+	assert.Equal(t, "cache.go::Indexed[K,V].Reset", reset.ID)
+	assert.NotContains(t, reset.Meta, "recv_name")
+
+	// member_of must target the bare type node the type declaration mints.
+	memberEdges := edgesOfKind(result.Edges, graph.EdgeMemberOf)
+	targets := map[string]string{}
+	for _, e := range memberEdges {
+		targets[e.From] = e.To
+	}
+	assert.Equal(t, "cache.go::Indexed", targets["cache.go::Indexed[K,V].Stop"])
+	assert.Equal(t, "cache.go::Loader", targets["cache.go::Loader[T].Get"])
+
+	typeNames := map[string]bool{}
+	for _, n := range nodesOfKind(result.Nodes, graph.KindType) {
+		typeNames[n.ID] = true
+	}
+	assert.True(t, typeNames["cache.go::Indexed"], "type node is minted bare")
+}

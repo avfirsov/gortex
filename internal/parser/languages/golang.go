@@ -1343,6 +1343,12 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	def := m.Captures["method.def"]
 	receiverText := m.Captures["method.receiver"].Text
 	receiverType := extractReceiverType(receiverText)
+	// The node ID keeps the receiver's type-argument list (`noopCache[T]`,
+	// the corpus-wide convention), but every semantic surface — the scope
+	// type env, Meta["receiver"], and the member_of target — uses the bare
+	// name: type nodes are minted bare, and receiver_type consumers match
+	// bare names.
+	bareReceiver := stripTypeArgs(receiverType)
 
 	id, idOK := disambiguateID(seenIDs, filePath+"::"+receiverType+"."+name, def.StartLine+1)
 	if !idOK {
@@ -1354,8 +1360,8 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		}
 	}
 	scope := typeEnv{}
-	if recvName := extractReceiverName(receiverText); recvName != "" && receiverType != "" {
-		scope[recvName] = receiverType
+	if recvName := extractReceiverName(receiverText); recvName != "" && bareReceiver != "" {
+		scope[recvName] = bareReceiver
 	}
 	if paramsCap, ok := m.Captures["method.params"]; ok && paramsCap != nil {
 		for k, v := range extractGoParamTypes(paramsCap.Node, src) {
@@ -1374,7 +1380,7 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		EndLine:   def.EndLine + 1,
 		Language:  "go",
 		Meta: map[string]any{
-			"receiver": receiverType,
+			"receiver": bareReceiver,
 		},
 	}
 	if recvName := extractReceiverName(receiverText); recvName != "" {
@@ -1409,7 +1415,7 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 
-	typeID := filePath + "::" + receiverType
+	typeID := filePath + "::" + bareReceiver
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
@@ -2487,18 +2493,67 @@ func findEnclosingFunc(ranges []funcRange, line int) string {
 	return ""
 }
 
+// splitReceiverFields splits a receiver's text on top-level whitespace
+// only — whitespace inside a type-argument list (`Indexed[K, V]`) is part
+// of the type, not a field separator. strings.Fields would split there
+// and hand back a `V]` fragment as the receiver type, minting a broken
+// identity for the method and every child symbol under it.
+func splitReceiverFields(receiver string) []string {
+	var fields []string
+	depth := 0
+	start := -1
+	for i, r := range receiver {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 && (r == ' ' || r == '\t' || r == '\n' || r == '\r') {
+			if start >= 0 {
+				fields = append(fields, receiver[start:i])
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		fields = append(fields, receiver[start:])
+	}
+	return fields
+}
+
+// stripTypeArgs cuts a receiver type's type-argument list:
+// "Indexed[K,V]" -> "Indexed". The bare name is what type nodes, the
+// receiver_type resolution hints, and the param-type env all use.
+func stripTypeArgs(t string) string {
+	if i := strings.Index(t, "["); i >= 0 {
+		return t[:i]
+	}
+	return t
+}
+
 // extractReceiverName extracts the receiver name from a Go receiver
 // parameter list. "(s *Server)" -> "s", "(Server)" -> "" (unnamed).
 // Used to seed paramsByFunc so calls like `s.foo()` inside the method
 // body resolve via the receiver's type.
 func extractReceiverName(receiver string) string {
 	receiver = strings.Trim(receiver, "()")
-	parts := strings.Fields(receiver)
+	parts := splitReceiverFields(receiver)
 	if len(parts) < 2 {
 		return ""
 	}
 	name := parts[0]
-	if name == "" || name == "_" {
+	// A first token that is (or starts) the type itself means the
+	// receiver is unnamed — `(*Indexed[K, V])` splits to one bracket-
+	// aware field, but defensive formatting like `(* Indexed[K, V])`
+	// still must not read `*` as a name.
+	if name == "" || name == "_" || strings.ContainsAny(name, "*[") {
 		return ""
 	}
 	return name
@@ -2587,12 +2642,17 @@ func extractGoParamTypes(paramList *sitter.Node, src []byte) typeEnv {
 // "(s *Server)" -> "Server", "(s Server)" -> "Server".
 func extractReceiverType(receiver string) string {
 	receiver = strings.Trim(receiver, "()")
-	parts := strings.Fields(receiver)
+	parts := splitReceiverFields(receiver)
 	if len(parts) == 0 {
 		return ""
 	}
 	typePart := parts[len(parts)-1]
 	typePart = strings.TrimPrefix(typePart, "*")
+	// Canonicalise formatting drift inside a type-argument list:
+	// `Indexed[K, V]` and `Indexed[K,V]` must mint the same identity.
+	if strings.ContainsRune(typePart, ' ') {
+		typePart = strings.ReplaceAll(typePart, " ", "")
+	}
 	return typePart
 }
 
