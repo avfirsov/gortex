@@ -331,6 +331,9 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 			panicOnFatal(err)
 			return out
 		}
+		if edge == nil {
+			continue
+		}
 		out = append(out, graph.RepoEdgeRow{RepoPrefix: repoPrefix, Edge: edge})
 	}
 	if err := rows.Err(); err != nil {

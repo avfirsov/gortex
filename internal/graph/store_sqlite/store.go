@@ -933,7 +933,36 @@ func scanEdge(scanner interface {
 	// rows written after the promotion; a NULL column (pre-promotion rows)
 	// is left alone so any blob-carried value survives.
 	restorePromotedEdgeMeta(&e, p)
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		noteStructuralReadDrop()
+		return nil, nil
+	}
 	return &e, nil
+}
+
+// structuralReadDrops counts structurally invalid rows healed on read from
+// stores written before the write-funnel backstop existed. Every read path
+// dropping such a row means the on-disk store carries pre-gate corruption:
+// the first occurrence logs an engineer-facing signal (the feedback loop for
+// "something impossible reached disk"), and the audit battery reads the
+// counter. New stores must never increment it — the write backstop drops the
+// shape before it lands.
+var (
+	structuralReadDrops     atomic.Int64
+	structuralReadDropsOnce sync.Once
+)
+
+func noteStructuralReadDrop() {
+	structuralReadDrops.Add(1)
+	structuralReadDropsOnce.Do(func() {
+		log.Printf("store_sqlite: store contains structurally invalid edges (pre-backstop corruption); healing on read — rebuild or audit the store (see store_audit.sql A1)")
+	})
+}
+
+// StructuralReadDrops reports how many structurally invalid edge rows read
+// paths have healed since process start.
+func StructuralReadDrops() int64 {
+	return structuralReadDrops.Load()
 }
 
 // scanEdgeLight scans an edge WITHOUT decoding its meta blob -- for hot
@@ -957,6 +986,10 @@ func scanEdgeLight(scanner interface {
 		return nil, err
 	}
 	e.CrossRepo = crossRepo != 0
+	if graph.StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		noteStructuralReadDrop()
+		return nil, nil
+	}
 	return &e, nil
 }
 
@@ -1767,6 +1800,9 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 			panicOnFatal(err)
 			return out
 		}
+		if e == nil {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
@@ -1788,6 +1824,9 @@ func (s *Store) queryEdgesLight(stmt *sql.Stmt, args ...any) []*graph.Edge {
 		if err != nil {
 			panicOnFatal(err)
 			return out
+		}
+		if e == nil {
+			continue
 		}
 		out = append(out, e)
 	}

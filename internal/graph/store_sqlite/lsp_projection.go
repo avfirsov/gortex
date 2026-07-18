@@ -148,6 +148,9 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJ
 			panicOnFatal(err)
 			return out
 		}
+		if edge == nil {
+			continue
+		}
 		out = append(out, edge)
 	}
 	if err := rows.Err(); err != nil {
@@ -203,6 +206,9 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJ
 		if err != nil {
 			panicOnFatal(err)
 			return out
+		}
+		if edge == nil {
+			continue
 		}
 		out = append(out, edge)
 	}
@@ -288,6 +294,9 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, idsJSON, kindsJSON)
 		if err != nil {
 			panicOnFatal(err)
 			return out
+		}
+		if edge == nil {
+			continue
 		}
 		out = append(out, edge)
 	}
