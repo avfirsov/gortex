@@ -29,6 +29,19 @@ type lspBudgetAnswer struct {
 	ok      bool
 }
 
+// laggingDeadlineContext models the observable window where a context's
+// absolute deadline has passed but its timer callback has not yet published
+// cancellation through Err. That window is rare but valid under scheduler
+// pressure, so strict pass budgets must check Deadline as well as Err.
+type laggingDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c laggingDeadlineContext) Deadline() (time.Time, bool) {
+	return c.deadline, true
+}
+
 func (h *slowLSPBudgetHelper) SupportsPath(path string) bool { return true }
 
 func (h *slowLSPBudgetHelper) Definition(_ string, _ int, name string) (string, int, bool) {
@@ -177,6 +190,50 @@ func TestResolveDeferredLSPChecksCancellationBeforeAttempt(t *testing.T) {
 	assert.Empty(t, helper.callNames())
 }
 
+func TestResolveDeferredLSPChecksDeadlineBeforeCancellationDelivery(t *testing.T) {
+	g, edges := lspBudgetGraph("Alpha", "Beta")
+	helper := &slowLSPBudgetHelper{ok: false}
+	r := New(g)
+	r.SetLSPHelper(helper)
+	deferred := make([]deferredLSPEdge, 0, len(edges))
+	for i, edge := range edges {
+		deferred = append(deferred, deferredLSPEdge{edge: edge, target: []string{"Alpha", "Beta"}[i]})
+	}
+	ctx := laggingDeadlineContext{
+		Context:  context.Background(),
+		deadline: time.Now().Add(-time.Millisecond),
+	}
+
+	result := r.resolveDeferredLSP(ctx, deferred)
+
+	assert.Zero(t, result.attempted)
+	assert.Equal(t, len(edges), result.skipped)
+	assert.True(t, result.budgetExhausted)
+	assert.Empty(t, helper.callNames())
+}
+
+func TestResolveDeferredLSPStopsAfterDeadlineBeforeCancellationDelivery(t *testing.T) {
+	g, edges := lspBudgetGraph("Alpha", "Beta")
+	helper := &slowLSPBudgetHelper{delay: 20 * time.Millisecond, ok: false}
+	r := New(g)
+	r.SetLSPHelper(helper)
+	deferred := make([]deferredLSPEdge, 0, len(edges))
+	for i, edge := range edges {
+		deferred = append(deferred, deferredLSPEdge{edge: edge, target: []string{"Alpha", "Beta"}[i]})
+	}
+	ctx := laggingDeadlineContext{
+		Context:  context.Background(),
+		deadline: time.Now().Add(5 * time.Millisecond),
+	}
+
+	result := r.resolveDeferredLSP(ctx, deferred)
+
+	assert.Equal(t, 1, result.attempted)
+	assert.Equal(t, 1, result.skipped)
+	assert.True(t, result.budgetExhausted)
+	assert.Equal(t, []string{"Alpha"}, helper.callNames())
+}
+
 func TestResolveAllBudgetSkippedLSPIsNotStampedTerminal(t *testing.T) {
 	g, edges := lspBudgetGraph("NoDefinitionA", "NoDefinitionB")
 	for _, edge := range edges {
@@ -215,7 +272,7 @@ func TestResolveAllDeferredLSPBudgetContinuesAfterSlowSortedHead(t *testing.T) {
 	require.Equal(t, 1, first.LSPAttempted)
 	require.Equal(t, []string{"Alpha"}, helper.callNames(),
 		"the deterministic source order starts at the sorted head")
-	assert.Empty(t, r.lspDeferredRetry,
+	assert.Zero(t, r.deferredLSPRetryCount(),
 		"unresolved work stays in the graph pending set instead of retaining edge payloads")
 
 	second := r.ResolveAll()
@@ -260,7 +317,7 @@ func TestResolveAllRetriesBudgetSkippedHeuristicCorrection(t *testing.T) {
 	require.Equal(t, []string{"Alpha"}, helper.callNames())
 	require.Equal(t, "src/caller.ts::WrongBeta", edges[1].To,
 		"the skipped edge should retain its best heuristic answer meanwhile")
-	require.NotEmpty(t, r.lspDeferredRetry,
+	require.Equal(t, 1, r.deferredLSPRetryCount(),
 		"a resolved edge cannot rely on the next unresolved-edge scan")
 
 	second := r.ResolveAll()
@@ -271,5 +328,5 @@ func TestResolveAllRetriesBudgetSkippedHeuristicCorrection(t *testing.T) {
 	assert.Equal(t, []string{"Alpha", "Beta"}, helper.callNames())
 	assert.Equal(t, "src/correct.ts::CorrectBeta", edges[1].To)
 	assert.Equal(t, graph.OriginLSPResolved, edges[1].Origin)
-	assert.Empty(t, r.lspDeferredRetry)
+	assert.Zero(t, r.deferredLSPRetryCount())
 }

@@ -2,6 +2,8 @@ package resolver
 
 import "github.com/zzet/gortex/internal/graph"
 
+const crossRepoAddBatchSize = 4096
+
 // DetectCrossRepoEdges is the graph-wide materialisation pass for the
 // cross-repo edge layer (M3). It walks every resolved calls / implements
 // / extends edge and, whenever the From node and the To node live in
@@ -29,8 +31,82 @@ func DetectCrossRepoEdges(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
-	emitted := 0
-	for _, row := range crossRepoCandidates(g) {
+	return materializeCrossRepoCandidates(g, crossRepoCandidates(g))
+}
+
+// DetectCrossRepoEdgesForRepos materializes only relationships incident to the
+// changed repository frontier. SQLite pushes the prefix predicate into one
+// endpoint join; the in-memory backend uses one batched endpoint projection.
+func DetectCrossRepoEdgesForRepos(g graph.Store, repoPrefixes []string) int {
+	if g == nil || len(repoPrefixes) == 0 {
+		return 0
+	}
+	return materializeCrossRepoCandidates(g, crossRepoCandidatesForRepos(g, repoPrefixes))
+}
+
+// DetectCrossRepoEdgesForReindexes materializes only base relationships that
+// changed in the current bounded resolver chunk. Endpoint ownership is fetched
+// once for the whole batch; no graph-wide candidate layer or endpoint N+1
+// crosses into memory. This is the ResolveAll settle path—global indexer
+// passes retain DetectCrossRepoEdges for newly inferred hierarchy edges.
+func DetectCrossRepoEdgesForReindexes(g graph.Store, batch []graph.EdgeReindex) int {
+	if g == nil || len(batch) == 0 {
+		return 0
+	}
+	ids := make([]string, 0, len(batch)*2)
+	seen := make(map[string]struct{}, len(batch)*2)
+	for _, reindex := range batch {
+		if reindex.Edge == nil {
+			continue
+		}
+		for _, id := range []string{reindex.Edge.From, reindex.Edge.To} {
+			if id == "" {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	nodes := g.GetNodesByIDs(ids)
+	rows := make([]graph.CrossRepoCandidateRow, 0, len(batch))
+	for _, reindex := range batch {
+		edge := reindex.Edge
+		if edge == nil {
+			continue
+		}
+		if _, ok := graph.CrossRepoKindFor(edge.Kind); !ok {
+			continue
+		}
+		from, to := nodes[edge.From], nodes[edge.To]
+		if from == nil || to == nil || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
+			continue
+		}
+		rows = append(rows, graph.CrossRepoCandidateRow{
+			Edge: edge, FromRepo: from.RepoPrefix, ToRepo: to.RepoPrefix,
+		})
+	}
+	return materializeCrossRepoCandidates(g, rows)
+}
+
+func materializeCrossRepoCandidates(g graph.Store, rows []graph.CrossRepoCandidateRow) int {
+	if len(rows) == 0 {
+		return 0
+	}
+
+	type pendingRelationship struct {
+		base     *graph.Edge
+		parallel graph.Edge
+		fromRepo string
+		toRepo   string
+	}
+	pending := make([]pendingRelationship, 0, len(rows))
+	sites := make([]graph.EdgeSite, 0, len(rows))
+	seenSites := make(map[graph.EdgeSite]struct{}, len(rows))
+	baseToMark := make([]*graph.Edge, 0, len(rows))
+	for _, row := range rows {
 		e := row.Edge
 		if e == nil {
 			continue
@@ -39,13 +115,11 @@ func DetectCrossRepoEdges(g graph.Store) int {
 		if !ok {
 			continue
 		}
-		// Keep the bool flag on the base edge consistent with the
-		// dedicated kind — existing consumers (smart_context's
-		// cross_repo_dependencies, the Cypher / GraphML exporters) read
-		// Edge.CrossRepo, and structurally-resolved cross-repo edges
-		// would otherwise carry the parallel kind without the flag.
+		if !e.CrossRepo {
+			baseToMark = append(baseToMark, e)
+		}
 		e.CrossRepo = true
-		g.AddEdge(&graph.Edge{
+		parallel := graph.Edge{
 			From:            e.From,
 			To:              e.To,
 			Kind:            crKind,
@@ -55,15 +129,56 @@ func DetectCrossRepoEdges(g graph.Store) int {
 			ConfidenceLabel: e.ConfidenceLabel,
 			Origin:          e.Origin,
 			CrossRepo:       true,
-			Meta: map[string]any{
-				"base_kind":   string(e.Kind),
-				"source_repo": row.FromRepo,
-				"target_repo": row.ToRepo,
-			},
-		})
-		emitted++
+		}
+		pending = append(pending, pendingRelationship{base: e, parallel: parallel, fromRepo: row.FromRepo, toRepo: row.ToRepo})
+		site := graph.EdgeSite{From: parallel.From, Line: parallel.Line, Kind: parallel.Kind}
+		if _, seen := seenSites[site]; !seen {
+			seenSites[site] = struct{}{}
+			sites = append(sites, site)
+		}
 	}
-	return emitted
+	if len(pending) == 0 {
+		return 0
+	}
+
+	// Keep the bool flag on the base edge consistent with the dedicated kind.
+	// SQLite candidate rows are compact projections rather than live pointers,
+	// so persist only this promoted column with a set-oriented marker.
+	if marker, ok := g.(graph.CrossRepoFlagMarker); ok && len(baseToMark) > 0 {
+		marker.MarkEdgesCrossRepo(baseToMark)
+	}
+
+	existing := g.GetEdgeCandidates(nil, sites)
+	additions := make([]*graph.Edge, 0, len(pending))
+	for i := range pending {
+		relationship := &pending[i]
+		parallel := &relationship.parallel
+		found := false
+		for _, candidate := range existing.Site(parallel.From, parallel.Line, parallel.Kind) {
+			if candidate != nil && candidate.To == parallel.To && candidate.FilePath == parallel.FilePath {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		parallel.Meta = map[string]any{
+			"base_kind":   string(relationship.base.Kind),
+			"source_repo": relationship.fromRepo,
+			"target_repo": relationship.toRepo,
+		}
+		additions = append(additions, parallel)
+		existing.Add(parallel)
+	}
+	for start := 0; start < len(additions); start += crossRepoAddBatchSize {
+		end := start + crossRepoAddBatchSize
+		if end > len(additions) {
+			end = len(additions)
+		}
+		g.AddBatch(nil, additions[start:end])
+	}
+	return len(pending)
 }
 
 // crossRepoCandidates returns every edge whose Kind has a parallel
@@ -82,41 +197,86 @@ func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
 	if cap, ok := g.(graph.CrossRepoCandidates); ok {
 		return cap.CrossRepoCandidates(baseKinds)
 	}
-	if len(baseKinds) == 0 {
+	return crossRepoCandidatesFallback(g, baseKinds, nil, nil)
+}
+
+func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.CrossRepoCandidateRow {
+	baseKinds := graph.BaseKindsForCrossRepo()
+	if cap, ok := g.(graph.ScopedCrossRepoCandidates); ok {
+		return cap.CrossRepoCandidatesForRepos(baseKinds, repoPrefixes)
+	}
+	return crossRepoCandidatesFallback(g, baseKinds, stringSet(repoPrefixes), nil)
+}
+
+func crossRepoCandidatesForFiles(g graph.Store, filePaths []string) []graph.CrossRepoCandidateRow {
+	baseKinds := graph.BaseKindsForCrossRepo()
+	if cap, ok := g.(graph.ScopedCrossRepoCandidates); ok {
+		return cap.CrossRepoCandidatesForFiles(baseKinds, filePaths)
+	}
+	return crossRepoCandidatesFallback(g, baseKinds, nil, stringSet(filePaths))
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "" {
+			out[value] = struct{}{}
+		}
+	}
+	return out
+}
+
+// crossRepoCandidatesFallback is used only by stores without the optional
+// predicate-shaped capability. It still avoids both graph-wide snapshot APIs
+// and endpoint N+1 reads: kinds are streamed and endpoint nodes are fetched in
+// one batch.
+func crossRepoCandidatesFallback(g graph.Store, baseKinds []graph.EdgeKind, repos, files map[string]struct{}) []graph.CrossRepoCandidateRow {
+	if len(baseKinds) == 0 || (repos != nil && len(repos) == 0) || (files != nil && len(files) == 0) {
 		return nil
 	}
-	kset := make(map[graph.EdgeKind]struct{}, len(baseKinds))
-	for _, k := range baseKinds {
-		kset[k] = struct{}{}
+	seenKinds := make(map[graph.EdgeKind]struct{}, len(baseKinds))
+	var edges []*graph.Edge
+	for _, kind := range baseKinds {
+		if kind == "" {
+			continue
+		}
+		if _, duplicate := seenKinds[kind]; duplicate {
+			continue
+		}
+		seenKinds[kind] = struct{}{}
+		for edge := range g.EdgesByKind(kind) {
+			if edge != nil {
+				edges = append(edges, edge)
+			}
+		}
 	}
-	var out []graph.CrossRepoCandidateRow
-	// Meta-less kind-scoped scan (see LightEdgeScanner): this fallback only runs
-	// for a store without the CrossRepoCandidates capability, and reads just
-	// e.Kind and endpoints — the emitted row propagates e but its consumer
-	// (DetectCrossRepoEdges) touches only promoted fields, never Meta.
-	for _, e := range graph.EdgesForKindsLight(g, baseKinds...) {
-		if e == nil {
+	endpointIDs := make([]string, 0, len(edges)*2)
+	for _, edge := range edges {
+		endpointIDs = append(endpointIDs, edge.From, edge.To)
+	}
+	nodes := g.GetNodesByIDs(endpointIDs)
+	out := make([]graph.CrossRepoCandidateRow, 0, len(edges))
+	for _, edge := range edges {
+		from, to := nodes[edge.From], nodes[edge.To]
+		if from == nil || to == nil || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
 			continue
 		}
-		if _, ok := kset[e.Kind]; !ok {
-			continue
+		if repos != nil {
+			_, fromScoped := repos[from.RepoPrefix]
+			_, toScoped := repos[to.RepoPrefix]
+			if !fromScoped && !toScoped {
+				continue
+			}
 		}
-		from := g.GetNode(e.From)
-		to := g.GetNode(e.To)
-		if from == nil || to == nil {
-			continue
+		if files != nil {
+			_, edgeScoped := files[edge.FilePath]
+			_, fromScoped := files[from.FilePath]
+			_, toScoped := files[to.FilePath]
+			if !edgeScoped && !fromScoped && !toScoped {
+				continue
+			}
 		}
-		if from.RepoPrefix == "" || to.RepoPrefix == "" {
-			continue
-		}
-		if from.RepoPrefix == to.RepoPrefix {
-			continue
-		}
-		out = append(out, graph.CrossRepoCandidateRow{
-			Edge:     e,
-			FromRepo: from.RepoPrefix,
-			ToRepo:   to.RepoPrefix,
-		})
+		out = append(out, graph.CrossRepoCandidateRow{Edge: edge, FromRepo: from.RepoPrefix, ToRepo: to.RepoPrefix})
 	}
 	return out
 }

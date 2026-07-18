@@ -44,6 +44,14 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	if len(jobs) == 0 {
 		return 0
 	}
+	var liveJobs resolveJobLiveness
+	if r.validateLiveness {
+		edges := make([]*graph.Edge, 0, len(jobs))
+		for i := range jobs {
+			edges = append(edges, jobs[i].edge)
+		}
+		liveJobs = loadEdgeLiveness(r.graph, edges)
+	}
 	// Collect both mutation lists across the whole pass and apply them
 	// via the batched Store methods at the end. Per-edge
 	// SetEdgeProvenance + ReindexEdge in the body would otherwise pay
@@ -56,7 +64,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// A concurrent edit during a chunked ResolveAll yield may have evicted
 		// this edge since it resolved; reverting + reindexing it would
 		// half-resurrect it. Skip — it is no longer in the graph.
-		if r.validateLiveness && !edgeStillLive(r.graph, j.edge) {
+		if r.validateLiveness && !liveJobs.containsEdge(j.edge) {
 			continue
 		}
 		// The deferred LSP batch may have re-bound (or confirmed) this edge

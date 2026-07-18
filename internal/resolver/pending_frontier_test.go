@@ -38,8 +38,14 @@ func TestBuildPassIndexesForPendingBoundsReachability(t *testing.T) {
 	if _, ok := r.reachableDirsByFile["other/other.go"]; ok {
 		t.Fatal("unrelated file leaked into frontier reachability")
 	}
-	if r.dirIndex != nil || r.depModuleIndex != nil || r.providesForIdx != nil {
-		t.Fatal("call-only frontier eagerly built a global resolver index")
+	// Directory lookup serves resolver shapes beyond dependency imports, so a
+	// call-only frontier must retain the exhaustive directory index. Dependency
+	// and framework-provides indexes remain shape-gated.
+	if r.dirIndex == nil {
+		t.Fatal("call-only frontier did not build the required directory index")
+	}
+	if r.depModuleIndex != nil || r.providesForIdx != nil {
+		t.Fatal("call-only frontier eagerly built dependency/provides indexes")
 	}
 }
 

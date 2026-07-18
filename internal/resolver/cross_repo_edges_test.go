@@ -7,6 +7,22 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+type crossRepoBatchSpy struct {
+	graph.Store
+	addEdgeCalls  int
+	addBatchCalls int
+}
+
+func (s *crossRepoBatchSpy) AddEdge(edge *graph.Edge) {
+	s.addEdgeCalls++
+	s.Store.AddEdge(edge)
+}
+
+func (s *crossRepoBatchSpy) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.addBatchCalls++
+	s.Store.AddBatch(nodes, edges)
+}
+
 // countOutEdgesByKind returns how many out-edges of the given kind the
 // node fromID has.
 func countOutEdgesByKind(g graph.Store, fromID string, kind graph.EdgeKind) int {
@@ -140,4 +156,33 @@ func TestDetectCrossRepoEdges_DoesNotRecurseOnOwnOutput(t *testing.T) {
 	// parallel of a cross_repo_calls edge.
 	assert.Equal(t, 1, countOutEdgesByKind(g, "repoA/a.go::Caller", graph.EdgeCalls))
 	assert.Equal(t, 1, countOutEdgesByKind(g, "repoA/a.go::Caller", graph.EdgeCrossRepoCalls))
+}
+
+func TestDetectCrossRepoEdgesForReposUsesIncidentScopeAndBatchWrite(t *testing.T) {
+	base := graph.New()
+	for _, node := range []*graph.Node{
+		{ID: "repoA/a.go::A", Kind: graph.KindFunction, FilePath: "repoA/a.go", RepoPrefix: "repoA"},
+		{ID: "repoB/b.go::B", Kind: graph.KindFunction, FilePath: "repoB/b.go", RepoPrefix: "repoB"},
+		{ID: "repoC/c.go::C", Kind: graph.KindFunction, FilePath: "repoC/c.go", RepoPrefix: "repoC"},
+		{ID: "repoD/d.go::D", Kind: graph.KindFunction, FilePath: "repoD/d.go", RepoPrefix: "repoD"},
+	} {
+		base.AddNode(node)
+	}
+	inbound := &graph.Edge{From: "repoA/a.go::A", To: "repoB/b.go::B", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 3}
+	outside := &graph.Edge{From: "repoC/c.go::C", To: "repoD/d.go::D", Kind: graph.EdgeCalls, FilePath: "repoC/c.go", Line: 4}
+	base.AddBatch(nil, []*graph.Edge{inbound, outside})
+	spy := &crossRepoBatchSpy{Store: base}
+
+	emitted := DetectCrossRepoEdgesForRepos(spy, []string{"repoB"})
+	assert.Equal(t, 1, emitted, "an inbound relationship must be included in the changed-target frontier")
+	assert.True(t, inbound.CrossRepo)
+	assert.False(t, outside.CrossRepo)
+	assert.Equal(t, 0, spy.addEdgeCalls)
+	assert.Equal(t, 1, spy.addBatchCalls)
+	assert.Equal(t, 1, countOutEdgesByKind(base, inbound.From, graph.EdgeCrossRepoCalls))
+	assert.Equal(t, 0, countOutEdgesByKind(base, outside.From, graph.EdgeCrossRepoCalls))
+
+	// The exact batched existence lookup makes a warm replay write-free.
+	DetectCrossRepoEdgesForRepos(spy, []string{"repoB"})
+	assert.Equal(t, 1, spy.addBatchCalls)
 }

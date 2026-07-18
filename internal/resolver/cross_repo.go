@@ -18,10 +18,12 @@ import (
 
 // CrossRepoStats holds counts from a cross-repo resolution pass.
 type CrossRepoStats struct {
-	Resolved       int            `json:"resolved"`
-	Unresolved     int            `json:"unresolved"`
-	CrossRepoEdges int            `json:"cross_repo_edges"`
-	ByRepo         map[string]int `json:"by_repo"`
+	Resolved        int            `json:"resolved"`
+	Unresolved      int            `json:"unresolved"`
+	CrossRepoEdges  int            `json:"cross_repo_edges"`
+	ByRepo          map[string]int `json:"by_repo"`
+	peakPendingPage int
+	peakLookupKeys  int
 }
 
 // CrossWorkspaceDepRule names one allowed dependency from a source
@@ -56,8 +58,8 @@ type CrossWorkspaceDepLookup func(sourceWorkspaceID string) []CrossWorkspaceDepR
 // from the same Graph. Private to CrossRepoResolver wasn't enough:
 // MultiWatcher.forwardEvents calls ResolveForRepo while the per-repo
 // Watcher's debounce timer concurrently calls Resolver.ResolveFile,
-// and both paths iterate graph.AllEdges() / AllNodes() and mutate
-// Edge.To in place. Sharing g.ResolveMutex() serialises both resolver
+// and both paths iterate shared predicate projections and mutate Edge.To in
+// place. Sharing g.ResolveMutex() serialises both resolver
 // types against the same graph.
 //
 // crossWorkspaceLookup is the workspace-boundary check. Empty (nil)
@@ -77,8 +79,14 @@ type CrossRepoResolver struct {
 	// them first. Without it the cross-repo pass fires one
 	// GetNode/FindNodesByName query per pending edge — across 200k+
 	// unresolved edges that is a warmup hang on disk backends.
-	logger          *zap.Logger
-	nodeByID        map[string]*graph.Node
+	logger   *zap.Logger
+	nodeByID map[string]*graph.Node
+	// hotCache retains node-by-ID and global name-bucket lookups across the
+	// pages of one cross-repo pass (see resolve_hot_cache.go). Nodes are not
+	// created during the pass (it only reindexes edges), so retention is
+	// sound; an interleaving writer is detected via the store mutation
+	// revision at the chunk yield and flushes it.
+	hotCache        *resolveHotCache
 	nodesByName     map[string][]*graph.Node
 	nodesByNameRepo map[string]map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
@@ -289,6 +297,28 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
+	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	// Share the master resolver's stable high-water/keyset stream. The cold
+	// residual can exceed 200k edges; retaining it plus the cross-repo name,
+	// raw-name, repo and qualified-name caches was the second whole-corpus heap
+	// spike after Resolver.ResolveAll itself.
+	pendingStream := newUnresolvedEdgeStream(cr.graph)
+	defer pendingStream.close()
+	pendingBefore := pendingStream.scan.PendingBefore
+	var pendingLoaded atomic.Int64
+	pending, streamDone, err := pendingStream.nextPage()
+	if err != nil {
+		cr.logger.Error("cross-repo resolve: unresolved edge stream", zap.Error(err))
+		return stats
+	}
+	if !pendingStream.countKnown {
+		pendingBefore = len(pending)
+	}
+	pendingLoaded.Store(int64(len(pending)))
+	if len(pending) == 0 && streamDone {
+		return stats
+	}
+
 	cr.buildDirIndexes()
 	defer cr.clearDirIndexes()
 	cr.buildDepModuleIndex()
@@ -296,23 +326,24 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 	cr.buildReachableReposIndex()
 	defer cr.clearReachableReposIndex()
 
-	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-
-	// Predicate-shaped read: disk backends only enumerate the
-	// "unresolved::*" slice (the only one this pass mutates). Batch
-	// mutations to commit in chunks at the end.
-	// Materialise the pending slice once so warmLookupCache can batch
-	// the per-edge GetNode / FindNodesByName the cascade would otherwise
-	// fire serially (the cross-repo warmup storm on disk backends).
-	var pending []*graph.Edge
-	for e := range cr.graph.EdgesWithUnresolvedTarget() {
-		pending = append(pending, e)
+	if resolveHotCacheEnabled() {
+		cr.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes())
+		defer func() {
+			if c := cr.hotCache; c != nil {
+				cr.logger.Info("cross-repo resolve: hot cache stats",
+					zap.Int64("node_hits", c.nodeHits),
+					zap.Int64("node_misses", c.nodeMisses),
+					zap.Int64("name_hits", c.nameHits),
+					zap.Int64("name_misses", c.nameMisses))
+			}
+			cr.hotCache = nil
+		}()
 	}
-	cr.warmLookupCache(pending)
-	defer cr.clearLookupCache()
 
 	passStart := time.Now()
-	cr.logger.Info("cross-repo resolve: pass start", zap.Int("pending", len(pending)))
+	cr.logger.Info("cross-repo resolve: pass start",
+		zap.Int("pending", pendingBefore),
+		zap.Int("first_page", len(pending)))
 	var processed atomic.Int64
 	progressDone := make(chan struct{})
 	go func() {
@@ -325,120 +356,133 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 			case <-t.C:
 				cr.logger.Info("cross-repo resolve: compute progress",
 					zap.Int64("processed", processed.Load()),
-					zap.Int("pending", len(pending)),
+					zap.Int64("pending_loaded", pendingLoaded.Load()),
+					zap.Int("pending_total", pendingBefore),
 					zap.Duration("elapsed", time.Since(passStart)))
 			}
 		}
 	}()
 
-	// Resolve concurrently across NumCPU workers, mirroring the master
-	// Resolver's pool. Each edge is touched by exactly one worker (disjoint
-	// chunks); the per-pass caches/indexes are read-only here; each worker
-	// accumulates into its OWN batch + stats — so no shared mutable state is
-	// written concurrently. Batches are concatenated and applied once after
-	// the barrier (cr never reindexes per-edge mid-loop, so unlike the
-	// master pool no edge clone is needed); stats are summed.
-	// Chunked resolve: process pending in super-chunks, releasing the resolve
-	// mutex between chunks so an interactive single-file edit can interleave
-	// instead of waiting out the whole pass. Each super-chunk's compute+apply
-	// runs entirely under the lock (atomic, fresh reads); only the inter-chunk
-	// gap is unlocked, where the pass holds no partial graph state. resolveEdge's
-	// liveness guards (cr.validateLiveness) skip any edge/candidate a yielded
-	// edit evicted. GORTEX_RESOLVE_CHUNK=0 restores one chunk == the prior
-	// whole-pass-locked behaviour.
+	// Resolve one bounded page at a time. Lookup maps are warmed and cleared per
+	// page, so raw/bare name negatives and repo buckets cannot accumulate with
+	// corpus size. Worker batches remain bounded by the smaller super-chunk.
 	cr.validateLiveness = resolveChunkEnabled()
-	superChunk := len(pending)
-	if cr.validateLiveness {
-		if sz := resolveChunkSize(); sz < superChunk {
-			superChunk = sz
-		}
+	superChunk := resolvePendingPageRows
+	if cr.validateLiveness && resolveChunkSize() < superChunk {
+		superChunk = resolveChunkSize()
 	}
 	if superChunk < 1 {
 		superChunk = 1
 	}
 	reindexTotal := 0
-	for base := 0; base < len(pending); base += superChunk {
-		hi := base + superChunk
-		if hi > len(pending) {
-			hi = len(pending)
+	for {
+		cr.warmLookupCache(pending)
+		if len(pending) > stats.peakPendingPage {
+			stats.peakPendingPage = len(pending)
 		}
-		sc := pending[base:hi]
+		lookupKeys := len(cr.nodeByID) + len(cr.nodesByName) + len(cr.nodesByNameRepo) + len(cr.nodesByQualName)
+		if lookupKeys > stats.peakLookupKeys {
+			stats.peakLookupKeys = lookupKeys
+		}
+		for base := 0; base < len(pending); base += superChunk {
+			hi := base + superChunk
+			if hi > len(pending) {
+				hi = len(pending)
+			}
+			sc := pending[base:hi]
 
-		workers := runtime.NumCPU()
-		if workers > len(sc) {
-			workers = len(sc)
-		}
-		if workers < 1 {
-			workers = 1
-		}
-		perWorkerBatch := make([][]graph.EdgeReindex, workers)
-		perWorkerStats := make([]*CrossRepoStats, workers)
-		var wg sync.WaitGroup
-		chunk := (len(sc) + workers - 1) / workers
-		for w := 0; w < workers; w++ {
-			start := w * chunk
-			end := start + chunk
-			if end > len(sc) {
-				end = len(sc)
+			workers := runtime.NumCPU()
+			if workers > len(sc) {
+				workers = len(sc)
 			}
-			if start >= end {
-				continue
+			if workers < 1 {
+				workers = 1
 			}
-			wg.Add(1)
-			go func(idx int, slice []*graph.Edge) {
-				defer wg.Done()
-				ws := &CrossRepoStats{ByRepo: make(map[string]int)}
-				var batch []graph.EdgeReindex
-				for _, e := range slice {
-					cr.resolveEdge(e, ws, &batch)
-					processed.Add(1)
+			perWorkerBatch := make([][]graph.EdgeReindex, workers)
+			perWorkerStats := make([]*CrossRepoStats, workers)
+			var wg sync.WaitGroup
+			chunk := (len(sc) + workers - 1) / workers
+			for w := 0; w < workers; w++ {
+				start := w * chunk
+				end := start + chunk
+				if end > len(sc) {
+					end = len(sc)
 				}
-				perWorkerStats[idx] = ws
-				perWorkerBatch[idx] = batch
-			}(w, sc[start:end])
-		}
-		wg.Wait()
+				if start >= end {
+					continue
+				}
+				wg.Add(1)
+				go func(idx int, slice []*graph.Edge) {
+					defer wg.Done()
+					ws := &CrossRepoStats{ByRepo: make(map[string]int)}
+					var batch []graph.EdgeReindex
+					for _, edge := range slice {
+						cr.resolveEdge(edge, ws, &batch)
+						processed.Add(1)
+					}
+					perWorkerStats[idx] = ws
+					perWorkerBatch[idx] = batch
+				}(w, sc[start:end])
+			}
+			wg.Wait()
 
-		var scBatch []graph.EdgeReindex
-		for i := range perWorkerBatch {
-			scBatch = append(scBatch, perWorkerBatch[i]...)
-		}
-		for _, ws := range perWorkerStats {
-			if ws == nil {
-				continue
+			var scBatch []graph.EdgeReindex
+			for i := range perWorkerBatch {
+				scBatch = append(scBatch, perWorkerBatch[i]...)
 			}
-			stats.Resolved += ws.Resolved
-			stats.Unresolved += ws.Unresolved
-			stats.CrossRepoEdges += ws.CrossRepoEdges
-			for repo, n := range ws.ByRepo {
-				stats.ByRepo[repo] += n
+			for _, ws := range perWorkerStats {
+				if ws == nil {
+					continue
+				}
+				stats.Resolved += ws.Resolved
+				stats.Unresolved += ws.Unresolved
+				stats.CrossRepoEdges += ws.CrossRepoEdges
+				for repo, n := range ws.ByRepo {
+					stats.ByRepo[repo] += n
+				}
+			}
+			if len(scBatch) > 0 {
+				if cr.validateLiveness {
+					scBatch = cr.filterLiveReindex(scBatch)
+				}
+				cr.graph.ReindexEdges(scBatch)
+				reindexTotal += len(scBatch)
+				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+			}
+			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
+				revBefore, revKnown := loadMutationRevision(cr.graph)
+				cr.mu.Unlock()
+				runtime.Gosched()
+				cr.mu.Lock()
+				if revKnown {
+					if revAfter, _ := loadMutationRevision(cr.graph); revAfter != revBefore {
+						// An interleaving writer may have created nodes or
+						// changed name buckets; drop cross-page retention.
+						cr.hotCache.flush()
+					}
+				}
 			}
 		}
-		if len(scBatch) > 0 {
-			if cr.validateLiveness {
-				scBatch = cr.filterLiveReindex(scBatch)
-			}
-			cr.graph.ReindexEdges(scBatch)
-			reindexTotal += len(scBatch)
+		cr.clearLookupCache()
+		if streamDone {
+			break
 		}
-		// Hand the resolve mutex to any waiting interactive edit before the
-		// next chunk. Held continuously within a chunk; released only here,
-		// where the pass holds no partial graph state.
-		if cr.validateLiveness && hi < len(pending) {
-			cr.mu.Unlock()
-			runtime.Gosched()
-			cr.mu.Lock()
+		pending, streamDone, err = pendingStream.nextPage()
+		if err != nil {
+			cr.logger.Error("cross-repo resolve: unresolved edge stream", zap.Error(err))
+			break
 		}
+		if !pendingStream.countKnown {
+			pendingBefore += len(pending)
+		}
+		pendingLoaded.Add(int64(len(pending)))
 	}
 	close(progressDone)
 	cr.logger.Info("cross-repo resolve: compute done",
-		zap.Int("pending", len(pending)),
+		zap.Int64("pending", pendingLoaded.Load()),
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
 		zap.Duration("elapsed", time.Since(passStart)))
-	// Materialise the cross_repo_* edge layer over the freshly lifted
-	// calls / implements / extends edges.
-	DetectCrossRepoEdges(cr.graph)
 	return stats
 }
 
@@ -453,7 +497,9 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 	// was O(repo_nodes) round-trips per pass — single-digit minutes
 	// of warmup on a multi-repo workspace where this method runs
 	// once per tracked repo.
-	return cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
+	stats := cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
+	DetectCrossRepoEdgesForRepos(cr.graph, []string{repoPrefix})
+	return stats
 }
 
 // ResolveForFile is the watcher fast path: it re-resolves only the
@@ -479,7 +525,11 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
-	nodes := cr.graph.GetFileNodes(relPath)
+	graphPath := relPath
+	if repoPrefix != "" && relPath != repoPrefix && !strings.HasPrefix(relPath, repoPrefix+"/") {
+		graphPath = repoPrefix + "/" + strings.TrimPrefix(relPath, "/")
+	}
+	nodes := cr.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
 		return &CrossRepoStats{ByRepo: make(map[string]int)}
 	}
@@ -493,7 +543,9 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 	for _, es := range cr.graph.GetOutEdgesByNodeIDs(ids) {
 		edges = append(edges, es...)
 	}
-	return cr.resolveScopedLocked(edges)
+	stats := cr.resolveScopedLocked(edges)
+	DetectCrossRepoEdgesForFiles(cr.graph, []string{graphPath})
+	return stats
 }
 
 // resolveScopedLocked lifts every unresolved target among edges to its
@@ -519,11 +571,6 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 	if len(reindexBatch) > 0 {
 		cr.graph.ReindexEdges(reindexBatch)
 	}
-	// Materialise the cross_repo_* edge layer. The pass is graph-wide
-	// (cheap relative to a resolve pass) so an edge into repoPrefix
-	// from another repo — lifted when that other repo was resolved —
-	// also picks up its parallel edge once repoPrefix's nodes exist.
-	DetectCrossRepoEdges(cr.graph)
 	return stats
 }
 
@@ -752,8 +799,8 @@ func (cr *CrossRepoResolver) warmLookupCache(pending []*graph.Edge) {
 	for n := range nameSet {
 		names = append(names, n)
 	}
-	cr.nodeByID = cr.graph.GetNodesByIDs(ids)
-	cr.nodesByName = cr.graph.FindNodesByNames(names)
+	cr.nodeByID = cr.hotCachedNodesByIDs(ids)
+	cr.nodesByName = cr.hotCachedNodesByNames(names)
 	// Authoritative negatives: record an empty result for every queried
 	// name that has no node, so the cached lookup returns empty instead
 	// of falling through to a per-edge FindNodesByName scan.
@@ -971,65 +1018,44 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 // target is gone. O(batch) — only the edges that actually resolved, NOT the
 // whole pending set (an O(pending*out-degree) per-edge check stalled the pass).
 func (cr *CrossRepoResolver) filterLiveReindex(batch []graph.EdgeReindex) []graph.EdgeReindex {
+	sites := make([]graph.EdgeSite, 0, len(batch))
+	targetIDs := make([]string, 0, len(batch))
+	for _, reindex := range batch {
+		if reindex.Edge == nil {
+			continue
+		}
+		sites = append(sites, graph.EdgeSite{
+			From: reindex.Edge.From, Line: reindex.Edge.Line, Kind: reindex.Edge.Kind,
+		})
+		if !isSyntheticResolveTarget(reindex.Edge.To) {
+			targetIDs = append(targetIDs, reindex.Edge.To)
+		}
+	}
+	liveCandidates := cr.graph.GetEdgeCandidates(nil, sites)
+	targets := cr.graph.GetNodesByIDs(targetIDs)
 	out := batch[:0]
-	for _, r := range batch {
-		e := r.Edge
-		if e == nil || !edgeStillLive(cr.graph, e) {
+	for _, reindex := range batch {
+		edge := reindex.Edge
+		if edge == nil {
 			continue
 		}
-		if !isSyntheticResolveTarget(e.To) && cr.graph.GetNode(e.To) == nil {
-			e.To = r.OldTo
+		live := false
+		for _, candidate := range liveCandidates.Site(edge.From, edge.Line, edge.Kind) {
+			if candidate == edge || (candidate != nil && candidate.To == reindex.OldTo && candidate.FilePath == edge.FilePath) {
+				live = true
+				break
+			}
+		}
+		if !live {
 			continue
 		}
-		out = append(out, r)
+		if !isSyntheticResolveTarget(edge.To) && targets[edge.To] == nil {
+			edge.To = reindex.OldTo
+			continue
+		}
+		out = append(out, reindex)
 	}
 	return out
-}
-
-// edgeStillLive reports whether e is currently present as an out-edge of its
-// source node — i.e. it was not evicted by a concurrent single-file edit
-// since the resolve pass snapshotted its pending set. The in-memory store
-// returns the live stored *Edge pointers, so identity comparison is exact
-// there; disk-backed stores materialise a fresh copy per read, so a value
-// identity on the fields that pin a unique edge row backs the pointer test
-// up. Without the value fallback, the chunked ResolveAll apply-loop dropped
-// EVERY computed resolution on a sqlite-backed daemon (`reindex_batch: 0` on
-// every pass) — the whole master resolve silently no-opped.
-func edgeStillLive(g graph.Store, e *graph.Edge) bool {
-	if e == nil {
-		return false
-	}
-	// Fast path: the value fallback below only ever compares the fields that
-	// pin a unique edge row (From/To/Kind/Line/FilePath) -- the pointer test
-	// never fires on a sqlite-backed daemon (GetOutEdges returns freshly
-	// decoded pointers). A backend that can answer edge existence as a single
-	// indexed point lookup (no row decode, no Meta gob, no per-edge slice
-	// allocation) does exactly that comparison far more cheaply. On the
-	// cold/full pass this guard runs once per applied edge -- hundreds of
-	// thousands of times -- so the scan-all-out-edges form is a dominant share
-	// of resolve cost and GC churn.
-	if ex, ok := g.(edgeExister); ok {
-		return ex.EdgeExists(e.From, e.To, e.Kind, e.FilePath, e.Line)
-	}
-	for _, oe := range g.GetOutEdges(e.From) {
-		if oe == e {
-			return true
-		}
-		if oe != nil && oe.Kind == e.Kind && oe.To == e.To &&
-			oe.Line == e.Line && oe.FilePath == e.FilePath {
-			return true
-		}
-	}
-	return false
-}
-
-// edgeExister is the optional fast path for edgeStillLive: a store backend that
-// can answer "does this exact edge row exist" as an indexed point lookup rather
-// than materialising all of From's out-edges. The sqlite store implements it;
-// the in-memory graph falls through to the GetOutEdges scan (already cheap, no
-// disk, no gob).
-type edgeExister interface {
-	EdgeExists(from, to string, kind graph.EdgeKind, filePath string, line int) bool
 }
 
 // isSyntheticResolveTarget reports whether a resolved target is an intentional
@@ -1404,4 +1430,68 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 	}
 
 	stats.Unresolved++
+}
+
+// hotCacheNameSpace keeps cross-repo global name buckets from colliding with
+// the master resolver's repository/language-scoped keys in a shared cache.
+const hotCacheNameSpace = "xrepo"
+
+// hotCachedNodesByIDs answers as many IDs as possible from the pass-scoped
+// hot cache and fetches only the misses. Result shape matches
+// graph.GetNodesByIDs: positives only.
+func (cr *CrossRepoResolver) hotCachedNodesByIDs(ids []string) map[string]*graph.Node {
+	if cr.hotCache == nil {
+		return cr.graph.GetNodesByIDs(ids)
+	}
+	out := make(map[string]*graph.Node, len(ids))
+	missing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if n, ok := cr.hotCache.getNode(id); ok {
+			out[id] = n
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		for id, n := range cr.graph.GetNodesByIDs(missing) {
+			if n == nil {
+				continue
+			}
+			out[id] = n
+			cr.hotCache.putNode(n)
+		}
+	}
+	return out
+}
+
+// hotCachedNodesByNames answers global name buckets from the pass-scoped hot
+// cache, including cached negatives — no nodes are created while the pass
+// holds its mutex, and an interleaving writer flushes the cache at the chunk
+// yield. Only cache misses reach the store.
+func (cr *CrossRepoResolver) hotCachedNodesByNames(names []string) map[string][]*graph.Node {
+	if cr.hotCache == nil {
+		return cr.graph.FindNodesByNames(names)
+	}
+	out := make(map[string][]*graph.Node, len(names))
+	missing := make([]string, 0, len(names))
+	for _, name := range names {
+		if hits, ok := cr.hotCache.getNames(hotNameKey("", hotCacheNameSpace, name)); ok {
+			if hits != nil {
+				out[name] = hits
+			}
+		} else {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		fetched := cr.graph.FindNodesByNames(missing)
+		for _, name := range missing {
+			hits := fetched[name]
+			if hits != nil {
+				out[name] = hits
+			}
+			cr.hotCache.putNames(hotNameKey("", hotCacheNameSpace, name), hits)
+		}
+	}
+	return out
 }

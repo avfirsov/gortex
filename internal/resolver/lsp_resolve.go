@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -188,6 +189,29 @@ type deferredLSPBatchResult struct {
 	retry               map[deferredLSPWorkKey]deferredLSPEdge
 }
 
+// deferredLSPPassBudget is shared across every disk page in one ResolveAll LSP
+// pass. Its clock starts at the first helper attempt, so spool reads and
+// set-oriented liveness validation do not consume a budget intended to bound
+// language-server work. The first call is therefore the sole in-flight call
+// allowed to outlive the budget; every later call checks the absolute deadline.
+type deferredLSPPassBudget struct {
+	duration time.Duration
+	deadline time.Time
+	started  bool
+}
+
+func (b *deferredLSPPassBudget) allowAttempt(now time.Time) bool {
+	if b == nil || b.duration <= 0 {
+		return true
+	}
+	if !b.started {
+		b.started = true
+		b.deadline = now.Add(b.duration)
+		return true
+	}
+	return now.Before(b.deadline)
+}
+
 // prepareDeferredLSPBatch merges newly collected work with budget-skipped
 // work from the prior pass, de-duplicates it by stable source identity, and
 // returns a deterministic order. Retry work outside an active scope remains
@@ -234,12 +258,23 @@ func (r *Resolver) hasDeferredLSPRetryForScope() bool {
 	if r.lspHelper == nil {
 		return false
 	}
+	if r.lspDeferredSpool != nil && r.lspDeferredSpool.hasForScope(r.scope) {
+		return true
+	}
 	for _, de := range r.lspDeferredRetry {
 		if de.edge != nil && (len(r.scope) == 0 || edgeInResolveScope(de.edge, r.scope)) {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *Resolver) deferredLSPRetryCount() int {
+	count := len(r.lspDeferredRetry)
+	if r.lspDeferredSpool != nil {
+		count += r.lspDeferredSpool.count()
+	}
+	return count
 }
 
 func (r *Resolver) replaceDeferredLSPRetries(
@@ -334,12 +369,43 @@ func (r *Resolver) lspDeferTarget(e *graph.Edge) (string, bool) {
 // those move the pass tally from Unresolved to Resolved. Overriding an
 // already-resolved heuristic bind changes the target but not the count.
 func (r *Resolver) resolveDeferredLSP(ctx context.Context, edges []deferredLSPEdge) deferredLSPBatchResult {
+	return r.resolveDeferredLSPWithPassBudget(ctx, edges, nil)
+}
+
+func (r *Resolver) resolveDeferredLSPWithPassBudget(
+	ctx context.Context,
+	edges []deferredLSPEdge,
+	passBudget *deferredLSPPassBudget,
+) deferredLSPBatchResult {
 	result := deferredLSPBatchResult{}
 	if len(edges) == 0 || r.lspHelper == nil {
 		return result
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	// Validate every carried/chunked edge through one set-oriented projection.
+	// The previous per-edge EdgeExists call was an N+1 SQL path in the cold
+	// resolver's deferred phase.
+	needsLiveness := r.validateLiveness
+	if !needsLiveness {
+		for i := range edges {
+			if edges[i].carried {
+				needsLiveness = true
+				break
+			}
+		}
+	}
+	var liveEdges resolveJobLiveness
+	if needsLiveness {
+		candidates := make([]*graph.Edge, 0, len(edges))
+		for i := range edges {
+			if r.validateLiveness || edges[i].carried {
+				candidates = append(candidates, edges[i].edge)
+			}
+		}
+		liveEdges = loadEdgeLiveness(r.graph, candidates)
 	}
 
 	// Start at the first key at-or-after the prior pass's first skipped item.
@@ -374,7 +440,7 @@ func (r *Resolver) resolveDeferredLSP(ctx context.Context, edges []deferredLSPEd
 		// A resolved-but-live edge is NOT skipped: the heuristic may have
 		// confidently bound it to the wrong node, and the LSP override
 		// below is exactly what corrects that.
-		if (de.carried || r.validateLiveness) && !edgeStillLive(r.graph, e) {
+		if (de.carried || r.validateLiveness) && !liveEdges.containsEdge(e) {
 			continue
 		}
 		// Cancellation/deadline is checked before accounting an attempt: a
@@ -383,9 +449,22 @@ func (r *Resolver) resolveDeferredLSP(ctx context.Context, edges []deferredLSPEd
 		// bounds the batch to the configured budget plus at most one helper's
 		// own per-call timeout.
 		if !stopped {
-			if err := ctx.Err(); err != nil {
+			now := time.Now()
+			err := ctx.Err()
+			if err == nil {
+				// Context cancellation is published by a timer callback. Under
+				// scheduler pressure that callback can lag the absolute deadline,
+				// so ctx.Err may briefly remain nil after the deadline has elapsed.
+				if deadline, ok := ctx.Deadline(); ok && !now.Before(deadline) {
+					err = context.DeadlineExceeded
+				}
+			}
+			if err != nil {
 				stopped = true
 				result.budgetExhausted = errors.Is(err, context.DeadlineExceeded)
+			} else if !passBudget.allowAttempt(now) {
+				stopped = true
+				result.budgetExhausted = true
 			}
 		}
 		if stopped {
@@ -410,11 +489,12 @@ func (r *Resolver) resolveDeferredLSP(ctx context.Context, edges []deferredLSPEd
 			continue
 		}
 		oldTo := e.To
+		oldKind := e.Kind
 		wasUnresolved := graph.IsUnresolvedTarget(oldTo)
 		result.attempted++
 		if r.tryResolveViaLSP(e, de.target, &stats) {
 			result.resolved++
-			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {
 				result.newlyResolved++
 			}

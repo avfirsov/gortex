@@ -21,6 +21,88 @@ import (
 
 const unresolvedPrefix = "unresolved::"
 
+const (
+	// resolvePendingScanPageRows amortises the fixed SQLite lookup-cache and
+	// worker-barrier cost across a larger keyset page. The independent byte cap
+	// remains the hard payload bound; compute, mutation, deferred-LSP, guard,
+	// and legacy-store chunks deliberately stay at resolvePendingPageRows.
+	resolvePendingScanPageRows = 16 * 1024
+	resolvePendingPageRows     = 2048
+	resolvePendingPageBytes    = 16 << 20
+)
+
+// unresolvedEdgeStream keeps ResolveAll's raw pending corpus outside Go's
+// retained heap. SQLite uses a stable rowid high-water/keyset scan; legacy
+// stores use the early-stoppable iterator and retain at most one bounded page.
+type unresolvedEdgeStream struct {
+	pager      graph.UnresolvedEdgePager
+	scan       graph.UnresolvedEdgeScan
+	legacy     *unresolvedLegacySpool
+	afterID    int64
+	initErr    error
+	countKnown bool
+	exhausted  bool
+}
+
+func newUnresolvedEdgeStream(store graph.Store) *unresolvedEdgeStream {
+	stream := &unresolvedEdgeStream{}
+	if pager, ok := store.(graph.UnresolvedEdgePager); ok {
+		if scan, err := pager.BeginUnresolvedEdgeScan(); err == nil {
+			stream.pager = pager
+			stream.scan = scan
+			stream.countKnown = true
+			stream.exhausted = scan.PendingBefore == 0
+			return stream
+		}
+	}
+	legacy, err := newUnresolvedLegacySpool(store)
+	if err != nil {
+		stream.initErr = err
+		return stream
+	}
+	stream.legacy = legacy
+	stream.scan.PendingBefore = legacy.count
+	stream.countKnown = true
+	stream.exhausted = legacy.count == 0
+	return stream
+}
+
+func (s *unresolvedEdgeStream) close() {
+	if s.legacy != nil {
+		s.legacy.close()
+	}
+}
+
+func (s *unresolvedEdgeStream) nextPage() ([]*graph.Edge, bool, error) {
+	if s.exhausted {
+		return nil, true, nil
+	}
+	if s.initErr != nil {
+		return nil, false, s.initErr
+	}
+	if s.pager != nil {
+		page, err := s.pager.ReadUnresolvedEdgePage(
+			s.scan, s.afterID, resolvePendingScanPageRows, resolvePendingPageBytes,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if page.NextID <= s.afterID && !page.Exhausted {
+			return nil, false, fmt.Errorf("unresolved edge pager did not advance after %d", s.afterID)
+		}
+		s.afterID = page.NextID
+		s.exhausted = page.Exhausted
+		return page.Edges, s.exhausted, nil
+	}
+
+	page, exhausted, err := s.legacy.nextPage(resolvePendingPageRows, resolvePendingPageBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	s.exhausted = exhausted
+	return page, exhausted, nil
+}
+
 // resolveProfileStarted guards the one-shot GORTEX_RESOLVE_CPUPROFILE capture
 // so only the first full resolve pass is profiled.
 var resolveProfileStarted atomic.Bool
@@ -66,6 +148,14 @@ type Resolver struct {
 	logger       *zap.Logger
 	dirIndex     map[string][]*graph.Node
 	lastDirIndex map[string][]*graph.Node
+	// OnComputeDone, when set, fires once per ResolveAll immediately after
+	// the parallel compute loop (and its deferred LSP batch) has committed —
+	// before the serial refinement tail (guard, attribution, dispatch
+	// reconcile, terminal stamping). At that point every same-repo reference
+	// the pass will resolve is already queryable; the tail only refines
+	// confidence and reverts unreachable weak matches. The daemon uses this
+	// to mark the graph queryable minutes before the tail completes.
+	OnComputeDone func()
 	// receiverTypeIdxByDir memoizes, per package directory, the Go type index
 	// the per-file method-receiver rebind builds. On a scoped tail that visits
 	// every file of a D-file package, building it once per package (O(D)) rather
@@ -126,9 +216,18 @@ type Resolver struct {
 	// locks the same mutex — necessary for MultiIndexer's per-repo
 	// goroutines, each of which spawns its own Resolver instance.
 	// Without the shared lock, concurrent ResolveAll passes race on
-	// edge mutations (resolveImport writes e.To while another
-	// goroutine iterates via graph.AllEdges()).
+	// edge mutations (resolveImport writes e.To while another goroutine
+	// iterates a shared edge projection).
 	mu *sync.Mutex
+	// scratchGeneration changes whenever a pass tears down shared Resolver
+	// scratch. ResolveAll snapshots it before releasing mu between chunks; a
+	// same-instance interactive resolve that interleaves and clears the caches
+	// forces the current page's indexes and lookup cache to be rebuilt after
+	// relock. Guarded by mu.
+	scratchGeneration uint64
+	// chunkYieldHook is a deterministic same-instance interleave seam used by
+	// resolver tests. Nil in production.
+	chunkYieldHook func()
 	// validateLiveness turns on the concurrent-edit guard on the chunked
 	// ResolveAll path: it releases mu between chunks so an interactive edit
 	// can interleave and evict an edge the pass already resolved. With it on,
@@ -162,9 +261,29 @@ type Resolver struct {
 	// queries, each one a round trip on disk backends (~ms each).
 	// With the cache the same information lands in two batched
 	// queries per pass.
-	nodeByID        map[string]*graph.Node
+	nodeByID map[string]*graph.Node
+	// missingNodeByID contains only IDs requested by the current page's
+	// completed source hydration that the backend omitted (or returned nil).
+	// It prevents dangling From IDs from falling into a point-query N+1 while
+	// remaining generation-local; clearLookupCache tears it down on every page
+	// and interleaving resolver mutation boundary.
+	missingNodeByID map[string]struct{}
+
 	nodesByName     map[string][]*graph.Node
 	nodesByQualName map[string]*graph.Node
+	// nodesByRepoLanguageName is the authoritative per-pending-page cache for
+	// normal resolution. It is keyed by exact repository plus compatible source
+	// language family, so a Go call never materialises or examines Python
+	// definitions merely because they share a name. nodesByRepoName is the
+	// repository-only compatibility cache for tail passes that lack an edge
+	// language; unlike the former nodesByName scan it never crosses repositories.
+	nodesByRepoLanguageName map[resolverNameLookupScope]map[string][]*graph.Node
+	nodesByRepoName         map[string]map[string][]*graph.Node
+	// nodesByExternLanguageName is the authoritative global candidate cache for
+	// explicit extern targets. Its language-family key prevents same-named Go,
+	// Python, and other definitions from leaking into one another while retaining
+	// language-neutral candidates.
+	nodesByExternLanguageName map[string]map[string][]*graph.Node
 
 	// importFilesByCaller memoises, per caller file, the set of file
 	// paths that file imports (direct EdgeImports targets plus files
@@ -182,6 +301,14 @@ type Resolver struct {
 	// single-file index path. nil on every batch/whole-graph pass.
 	incrementalSkip map[string]struct{}
 
+	// incrementalNodesByFile / incrementalOutByNode are the bounded file and
+	// adjacency frontier preloaded by ResolveFilesAndIncoming. The attribution
+	// tail reuses them across its six passes so a package-sized partial resolve
+	// never falls back to GetFileNodes/file adjacency once per pass per file.
+	incrementalNodesByFile        map[string][]*graph.Node
+	incrementalOutByNode          map[string][]*graph.Edge
+	incrementalAttributionReindex []graph.EdgeReindex
+
 	// lspHelper, when non-nil, is consulted before falling back to
 	// AST heuristics for cross-file dispatch in languages whose
 	// helper-reported extensions match (today: TS/JS/JSX/TSX via
@@ -193,6 +320,12 @@ type Resolver struct {
 	// compatibility. Individual helper calls retain their own timeout, so the
 	// wall bound can overrun by at most the one call already in flight.
 	lspResolvePassBudget time.Duration
+
+	// hotCache retains node-by-ID and repository-scoped name-group lookups
+	// across the pages of one resolver pass (see resolve_hot_cache.go). It is
+	// mutated only from the pass's serial phases — page prepare, lookup warm,
+	// and guard warm — never from parallel resolve workers.
+	hotCache *resolveHotCache
 	// lspDeferredRetry preserves only budget-skipped LSP work across
 	// ResolveAll calls. This is required for heuristic-resolved edges: after
 	// the heuristic rewrites To they no longer appear in
@@ -202,6 +335,7 @@ type Resolver struct {
 	// candidate set changes between calls. All three fields are protected by
 	// mu; retries run synchronously in the next compatible ResolveAll.
 	lspDeferredRetry     map[deferredLSPWorkKey]deferredLSPEdge
+	lspDeferredSpool     *deferredLSPSpool
 	lspDeferredCursor    deferredLSPWorkKey
 	lspDeferredCursorSet bool
 
@@ -333,6 +467,10 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	// Deferred entries hold edge pointers from the previous store. Carrying
 	// them across a graph swap could reindex an unrelated/stale row.
 	r.lspDeferredRetry = nil
+	if r.lspDeferredSpool != nil {
+		r.lspDeferredSpool.close()
+		r.lspDeferredSpool = nil
+	}
 	r.lspDeferredCursor = deferredLSPWorkKey{}
 	r.lspDeferredCursorSet = false
 	if oldMu != nil {
@@ -360,79 +498,104 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.buildDirIndexes()
-	defer r.clearDirIndexes()
-	r.buildDepModuleIndex()
-	defer r.clearDepModuleIndex()
-	r.buildProvidesForIndex()
-	defer r.clearProvidesForIndex()
-	r.buildReachabilityIndex()
-	defer r.clearReachabilityIndex()
-	defer r.clearLSPIndex()
+	r.logUnresolvedFrontier("start")
+	defer r.logUnresolvedFrontier("end")
 
-	// Backend-delegated resolution: when the store implements
-	// graph.BackendResolver, drain the bulk-tractable subset of the
-	// resolver's work via a sequence of queries that run
-	// inside the backend engine. ON BY DEFAULT — opt out with
-	// GORTEX_BACKEND_RESOLVER=0 (see backendResolverEnabled). ResolveAllBulk
-	// chains the per-rule methods (SameFile → SamePackage → ImportAware → …)
-	// in precision-descending order, so higher-precision rules bind first
-	// and unique-name fallback only resolves what nothing more specific
-	// covered.
-	//
-	// This is the disk-only / large-repo path: without it the Go worker
-	// pool's ~100k+ per-edge round trips dominate wall time. The bulk pass
-	// drains the name-equality-tractable edges in-engine before the Go pool
-	// runs on whatever's left. Errors are non-fatal — the Go resolver
-	// re-runs on the remainder.
-	if backendResolverEnabled() {
-		if br, ok := r.graph.(graph.BackendResolver); ok {
-			bulkStart := time.Now()
-			n, err := br.ResolveAllBulk()
-			r.logger.Info("resolver: backend bulk pass",
-				zap.Int("resolved", n),
-				zap.Duration("elapsed", time.Since(bulkStart)),
-				zap.Error(err))
+	// Keep the unresolved corpus disk-resident. SQLite captures a rowid
+	// high-water mark and keyset-pages beneath it; legacy stores are consumed
+	// through the early-stoppable iterator. Scope and terminal predicates are
+	// applied to each page before any lookup cache is built. The initial scan
+	// deliberately precedes every workspace index and backend bulk pass: a warm
+	// no-op pays one indexed pending query, not several whole-graph scans.
+	pendingStream := r.prepareResolveAllStream()
+	defer pendingStream.close()
+	// Push the scoped pass's row filters into the store: ScopeFilter drops
+	// rows edgeInResolveScope provably never reconsiders, and SkipTerminal
+	// additionally drops durably-stamped edges the pass would skip. Both are
+	// tested on the generated from_repo / to_repo_unresolved columns (SQL
+	// mirrors of the Go prefix helpers, parity-asserted), with NULL shapes
+	// failing open. The Go-side filters below still run and stay the
+	// semantic authority — they cover legacy pagers, the shapes only Go can
+	// parse, and stamps that only exist in memory.
+	if len(r.scope) > 0 {
+		for prefix := range r.scope {
+			pendingStream.scan.ScopeAnchors = append(pendingStream.scan.ScopeAnchors, prefix)
+		}
+		sort.Strings(pendingStream.scan.ScopeAnchors)
+		pendingStream.scan.ScopeFilter = true
+		pendingStream.scan.SkipTerminal = !warmupFullResolve()
+	}
+	pendingBefore := pendingStream.scan.PendingBefore
+	pendingAfter := 0
+	var pendingTotal atomic.Int64
+	var pendingLoaded atomic.Int64
+	pendingTotal.Store(int64(pendingBefore))
+	terminalSkipped := 0
+	streamDone := false
+	loadPendingPage := func() ([]*graph.Edge, error) {
+		for {
+			raw, done, err := pendingStream.nextPage()
+			if err != nil {
+				return nil, err
+			}
+			streamDone = done
+			if !pendingStream.countKnown {
+				pendingBefore += len(raw)
+				pendingTotal.Store(int64(pendingBefore))
+			}
+			pending := raw
+			if len(r.scope) > 0 {
+				pending = filterPendingByScope(pending, r.scope)
+			}
+			if len(r.scope) > 0 && !warmupFullResolve() {
+				var skipped int
+				pending, skipped = filterTerminalSkip(pending, r.scope)
+				terminalSkipped += skipped
+			}
+			pendingAfter += len(pending)
+			pendingLoaded.Store(int64(pendingAfter))
+			if len(pending) > 0 || done {
+				return pending, nil
+			}
 		}
 	}
+	pending, pendingErr := loadPendingPage()
+	if pendingErr != nil {
+		r.logger.Error("resolver: unresolved edge stream", zap.Error(pendingErr))
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+	}
+	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+	}
 
-	// Use the predicate-shaped Store method so disk backends scan
-	// only the contiguous "unresolved::*" slice instead of pulling
-	// the whole edges table back to the client and filtering in Go.
-	// In-memory keeps the same cost as the old AllEdges()+prefix-check
-	// loop.
-	var pending []*graph.Edge
-	for e := range r.graph.EdgesWithUnresolvedTarget() {
-		pending = append(pending, e)
-	}
-	pendingBefore := len(pending)
-	// Scoped warm-restart resolve: when a set of changed repos is armed via
-	// SetScope, drop the pending edges that provably can't newly resolve into
-	// any of them. See filterPendingByScope for the conservative superset
-	// rule. nil / empty scope leaves pending untouched — exactly the
-	// whole-graph behaviour.
-	if len(r.scope) > 0 {
-		pending = filterPendingByScope(pending, r.scope)
-	}
-	// Terminal-edge skip: on a scoped warm pass, drop the edges a prior FULL
-	// pass durably flagged as permanently external / stdlib / definition-less
-	// (see terminal.go), unless they are anchored to a changed repo. A full /
-	// unscoped pass (scope empty), and the GORTEX_WARMUP_FULL_RESOLVE override,
-	// ignore the flag and re-examine everything so a stamp self-heals.
-	terminalSkipped := 0
-	if len(r.scope) > 0 && !warmupFullResolve() {
-		pending, terminalSkipped = filterTerminalSkip(pending, r.scope)
-	}
-	if len(pending) == 0 && !r.hasDeferredLSPRetryForScope() {
-		return &ResolveStats{PendingBefore: pendingBefore}
+	passIndexes := newResolveAllPassIndexes(r)
+	defer passIndexes.close()
+
+	// Pass-scoped hot lookup cache: answers repeat node/name hydration across
+	// pages (and the guard's re-reads) without re-touching the store. Torn
+	// down with the pass; see resolve_hot_cache.go for the immutability and
+	// flush rules that make this safe.
+	if resolveHotCacheEnabled() {
+		r.hotCache = newResolveHotCache(resolveHotCacheBudgetBytes())
+		defer func() {
+			if c := r.hotCache; c != nil {
+				r.logger.Info("resolver: hot cache stats",
+					zap.Int64("node_hits", c.nodeHits),
+					zap.Int64("node_misses", c.nodeMisses),
+					zap.Int64("name_hits", c.nameHits),
+					zap.Int64("name_misses", c.nameMisses))
+			}
+			r.hotCache = nil
+		}()
 	}
 
 	passStart := time.Now()
 	r.logger.Info("resolver: pass start",
-		zap.Int("pending", len(pending)),
+		zap.Int("pending", pendingBefore),
+		zap.Int("first_page", len(pending)),
 		zap.Int("terminal_skipped", terminalSkipped),
 		zap.Bool("backend_bulk", backendResolverEnabled()),
-		zap.String("shapes", pendingShapeSummary(pending)))
+		zap.String("first_page_shapes", pendingShapeSummary(pending)))
 	// Diagnostic: capture a CPU profile of the first full (unscoped) resolve
 	// pass when GORTEX_RESOLVE_CPUPROFILE names a path. Env-gated and one-shot
 	// so it never touches steady-state resolution.
@@ -456,25 +619,12 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 			case <-t.C:
 				r.logger.Info("resolver: compute progress",
 					zap.Int64("processed", processed.Load()),
-					zap.Int("pending", len(pending)),
+					zap.Int64("pending_loaded", pendingLoaded.Load()),
+					zap.Int64("pending_total", pendingTotal.Load()),
 					zap.Duration("elapsed", time.Since(passStart)))
 			}
 		}
 	}()
-
-	// Pre-warm the per-pass lookup cache. The resolver workers below
-	// will call store.GetNode for endpoints and store.FindNodesByName
-	// for resolution candidates — across 10-30k pending edges that's
-	// 100k+ individual queries on a disk backend
-	// (hundreds of seconds wall time). Collecting the
-	// IDs / names upfront and batch-loading them collapses those
-	// queries to ~10 chunked SELECT IN statements. Cleared on return
-	// via defer so callers outside ResolveAll see the empty caches and
-	// fall through to the underlying store on every lookup.
-	warmStart := time.Now()
-	r.warmLookupCache(pending)
-	defer r.clearLookupCache()
-	warmElapsed := time.Since(warmStart)
 
 	// Chunked compute + apply: process pending in super-chunks and release the
 	// resolve mutex between chunks so an interactive single-file edit can
@@ -494,173 +644,398 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// can never disable inline LSP on a later single-file ResolveFile.
 	r.bulkMode = true
 	defer func() { r.bulkMode = false }()
-	var deferredLSP []deferredLSPEdge
-	superChunk := len(pending)
-	if r.validateLiveness {
-		if sz := resolveChunkSize(); sz < superChunk {
-			superChunk = sz
+	if r.lspHelper != nil && r.lspDeferredSpool == nil {
+		var err error
+		r.lspDeferredSpool, err = newDeferredLSPSpool()
+		if err != nil {
+			close(progressDone)
+			r.logger.Error("resolver: create deferred LSP spool", zap.Error(err))
+			return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
 		}
+		if len(r.lspDeferredRetry) > 0 {
+			carried := make([]deferredLSPEdge, 0, len(r.lspDeferredRetry))
+			for _, deferred := range r.lspDeferredRetry {
+				deferred.carried = true
+				carried = append(carried, deferred)
+			}
+			if err := r.lspDeferredSpool.append(carried); err != nil {
+				close(progressDone)
+				r.logger.Error("resolver: migrate deferred LSP retries", zap.Error(err))
+				return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+			}
+			r.lspDeferredRetry = nil
+		}
+	}
+	superChunk := resolvePendingPageRows
+	if r.validateLiveness && resolveChunkSize() < superChunk {
+		superChunk = resolveChunkSize()
 	}
 	if superChunk < 1 {
 		superChunk = 1
 	}
-	var allJobs [][]reindexJob
-	var allStats []ResolveStats
+	guardSpool, guardSpoolErr := newResolveGuardSpool()
+	if guardSpoolErr != nil {
+		r.logger.Error("resolver: create guard spool", zap.Error(guardSpoolErr))
+		close(progressDone)
+		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}
+	}
+	defer guardSpool.close()
+	guardRepos := make(map[string]struct{})
+	total := &ResolveStats{}
 	reindexTotal := 0
-	for base := 0; base < len(pending); base += superChunk {
-		hi := base + superChunk
-		if hi > len(pending) {
-			hi = len(pending)
+	warmElapsed := time.Duration(0)
+	for {
+		// The pending page is a stable edge snapshot taken while mu is held.
+		// Production stores expose a cheap edge mutation revision. As long as
+		// it stays unchanged across yields, no edge in this page can have been
+		// evicted or replaced and the expensive liveness query is unnecessary.
+		// Once an interleave mutates the store, retain exact validation for all
+		// remaining edges from this old page; only a freshly loaded page resets
+		// the fast path. Stores without the optional capability conservatively
+		// keep the former per-chunk validation.
+		pageRevision, pageRevisionKnown := loadEdgeMutationRevision(r.graph)
+		pageMutationRevision, pageMutationRevisionKnown := loadMutationRevision(r.graph)
+		pageLivenessRequired := false
+		var pageLiveness resolveJobLiveness
+		var pageDeferredLSP []deferredLSPEdge
+		if len(pending) > 0 {
+			sources := passIndexes.prepare(pending)
+			warmStart := time.Now()
+			r.warmLookupCacheWithSources(pending, sources)
+			warmElapsed += time.Since(warmStart)
 		}
-		scPending := pending[base:hi]
+		for base := 0; base < len(pending); base += superChunk {
+			hi := base + superChunk
+			if hi > len(pending) {
+				hi = len(pending)
+			}
+			scPending := pending[base:hi]
 
-		workers := runtime.NumCPU()
-		if workers < 1 {
-			workers = 1
-		}
-		if workers > len(scPending) {
-			workers = len(scPending)
-		}
-		perWorkerStats := make([]ResolveStats, workers)
-		perWorkerJobs := make([][]reindexJob, workers)
-		perWorkerDeferred := make([][]deferredLSPEdge, workers)
-		var wg sync.WaitGroup
-		chunk := (len(scPending) + workers - 1) / workers
-		for w := 0; w < workers; w++ {
-			start := w * chunk
-			end := start + chunk
-			if end > len(scPending) {
-				end = len(scPending)
-			}
-			if start >= end {
-				continue
-			}
-			wg.Add(1)
-			go func(idx int, slice []*graph.Edge) {
-				defer wg.Done()
-				ws := &perWorkerStats[idx]
-				jobs := make([]reindexJob, 0, len(slice))
-				var deferred []deferredLSPEdge
-				for _, e := range slice {
-					// Capture LSP eligibility + the pre-heuristic identifier
-					// BEFORE resolveEdge runs: e.To is still the `unresolved::`
-					// stub here (the real edge is rewritten only in the apply
-					// phase below), so this sees the pre-heuristic target even
-					// for an edge the heuristic then confidently (mis)binds.
-					// Collecting EVERY LSP-eligible edge — not only the ones the
-					// heuristic leaves unresolved — is what preserves the LSP-
-					// first override the inline path applies: the post-loop batch
-					// re-binds via the type-aware helper, correcting a confident-
-					// but-wrong heuristic bind (see resolveDeferredLSP).
-					lspTarget, lspElig := r.lspDeferTarget(e)
-					clone := cloneEdgeForResolve(e)
-					oldTo, changed := r.resolveEdge(clone, ws)
-					processed.Add(1)
-					if changed {
-						// A now-resolved edge sheds any durable terminal-skip
-						// flag it carried (full self-healing pass): it has left
-						// the pending set, so a later scoped pass must not treat
-						// the flag as live. The cleared Meta rides the reindex
-						// below (To changed => the row is rewritten).
-						if !graph.IsUnresolvedTarget(clone.To) {
-							clearEdgeTerminal(clone)
-						}
-						jobs = append(jobs, reindexJob{
-							edge:       e,
-							oldTo:      oldTo,
-							newTo:      clone.To,
-							kind:       clone.Kind,
-							crossRepo:  clone.CrossRepo,
-							confidence: clone.Confidence,
-							origin:     clone.Origin,
-							meta:       clone.Meta,
-						})
-					}
-					if lspElig {
-						// Bulk mode skipped the inline LSP round-trip; collect the
-						// edge for the post-loop deferred batch so the helper is
-						// consulted off the parallel worker barrier. Independent of
-						// `changed`: a heuristic-resolved edge is still deferred so
-						// LSP retains override authority.
-						deferred = append(deferred, deferredLSPEdge{edge: e, target: lspTarget})
-					}
-					releaseResolverClone(clone)
+			if r.validateLiveness && pageRevisionKnown {
+				currentRevision, _ := loadEdgeMutationRevision(r.graph)
+				if currentRevision != pageRevision {
+					// One set-oriented read covers every old-snapshot edge still
+					// present in this page. Reuse it across later chunks until a
+					// subsequent real interleave advances the revision again.
+					pageLiveness = loadEdgeLiveness(r.graph, pending[base:])
+					pageLivenessRequired = true
+					pageRevision = currentRevision
 				}
-				perWorkerJobs[idx] = jobs
-				perWorkerDeferred[idx] = deferred
-			}(w, scPending[start:end])
-		}
-		wg.Wait()
+			}
 
-		// Apply this chunk's mutations under the lock. An edit during a PRIOR
-		// inter-chunk yield may have evicted an edge this chunk resolved;
-		// reindexing it would half-resurrect it, so drop it (filter in place
-		// so allJobs carries only applied jobs for the post-passes).
-		reindexBatch := make([]graph.EdgeReindex, 0)
-		for i := range perWorkerJobs {
-			kept := perWorkerJobs[i][:0]
-			for _, j := range perWorkerJobs[i] {
-				if r.validateLiveness && !edgeStillLive(r.graph, j.edge) {
+			workers := runtime.NumCPU()
+			if workers < 1 {
+				workers = 1
+			}
+			if workers > len(scPending) {
+				workers = len(scPending)
+			}
+			perWorkerStats := make([]ResolveStats, workers)
+			perWorkerJobs := make([][]reindexJob, workers)
+			perWorkerDeferred := make([][]deferredLSPEdge, workers)
+			var wg sync.WaitGroup
+			chunk := (len(scPending) + workers - 1) / workers
+			for w := 0; w < workers; w++ {
+				start := w * chunk
+				end := start + chunk
+				if end > len(scPending) {
+					end = len(scPending)
+				}
+				if start >= end {
 					continue
 				}
-				j.edge.To = j.newTo
-				j.edge.Kind = j.kind
-				j.edge.CrossRepo = j.crossRepo
-				j.edge.Confidence = j.confidence
-				j.edge.Origin = j.origin
-				j.edge.Meta = j.meta
-				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo})
-				kept = append(kept, j)
+				wg.Add(1)
+				go func(idx int, slice []*graph.Edge) {
+					defer wg.Done()
+					ws := &perWorkerStats[idx]
+					jobs := make([]reindexJob, 0, len(slice))
+					var deferred []deferredLSPEdge
+					for _, e := range slice {
+						// Capture LSP eligibility + the pre-heuristic identifier
+						// BEFORE resolveEdge runs: e.To is still the `unresolved::`
+						// stub here (the real edge is rewritten only in the apply
+						// phase below), so this sees the pre-heuristic target even
+						// for an edge the heuristic then confidently (mis)binds.
+						// Collecting EVERY LSP-eligible edge — not only the ones the
+						// heuristic leaves unresolved — is what preserves the LSP-
+						// first override the inline path applies: the post-loop batch
+						// re-binds via the type-aware helper, correcting a confident-
+						// but-wrong heuristic bind (see resolveDeferredLSP).
+						lspTarget, lspElig := r.lspDeferTarget(e)
+						oldKind := e.Kind
+						clone := cloneEdgeForResolve(e)
+						oldTo, changed := r.resolveEdge(clone, ws)
+						processed.Add(1)
+						if changed {
+							// A now-resolved edge sheds any durable terminal-skip
+							// flag it carried (full self-healing pass): it has left
+							// the pending set, so a later scoped pass must not treat
+							// the flag as live. The cleared Meta rides the reindex
+							// below (To changed => the row is rewritten).
+							if !graph.IsUnresolvedTarget(clone.To) {
+								clearEdgeTerminal(clone)
+							}
+							job := reindexJob{
+								edge:       e,
+								oldTo:      oldTo,
+								oldKind:    oldKind,
+								newTo:      clone.To,
+								kind:       clone.Kind,
+								crossRepo:  clone.CrossRepo,
+								confidence: clone.Confidence,
+								origin:     clone.Origin,
+								meta:       clone.Meta,
+							}
+							if r.validateLiveness {
+								// resolveEdge mutates only clone, so e still holds the
+								// exact persisted payload observed before resolution.
+								job.preResolution = snapshotPersistedEdge(e)
+							}
+							jobs = append(jobs, job)
+						}
+						if lspElig {
+							// Bulk mode skipped the inline LSP round-trip; collect the
+							// edge for the post-loop deferred batch so the helper is
+							// consulted off the parallel worker barrier. Independent of
+							// `changed`: a heuristic-resolved edge is still deferred so
+							// LSP retains override authority.
+							deferred = append(deferred, deferredLSPEdge{edge: e, target: lspTarget})
+						}
+						releaseResolverClone(clone)
+					}
+					perWorkerJobs[idx] = jobs
+					perWorkerDeferred[idx] = deferred
+				}(w, scPending[start:end])
 			}
-			perWorkerJobs[i] = kept
-		}
-		if len(reindexBatch) > 0 {
-			r.graph.ReindexEdges(reindexBatch)
-			reindexTotal += len(reindexBatch)
-		}
-		allJobs = append(allJobs, perWorkerJobs...)
-		allStats = append(allStats, perWorkerStats...)
-		for i := range perWorkerDeferred {
-			deferredLSP = append(deferredLSP, perWorkerDeferred[i]...)
-		}
+			wg.Wait()
 
-		// Hand the resolve mutex to any waiting interactive edit before the
-		// next chunk. Drop bulk mode across the hand-off so an interleaving
-		// single-file ResolveFile on a shared instance resolves LSP-first.
-		if r.validateLiveness && hi < len(pending) {
-			r.bulkMode = false
-			r.mu.Unlock()
-			runtime.Gosched()
-			r.mu.Lock()
-			r.bulkMode = true
+			// Apply this chunk's mutations under the lock. An edit during a PRIOR
+			// inter-chunk yield may have evicted an edge this chunk resolved;
+			// reindexing it would half-resurrect it, so drop it (filter in place
+			// so the guard spool carries only applied jobs for the post-pass).
+			// Resolve liveness in one set-oriented store query for the chunk;
+			// SQLite must never pay one EdgeExists SELECT per successful edge.
+			var liveJobs resolveJobLiveness
+			validateLiveJobs := false
+			if r.validateLiveness {
+				switch {
+				case !pageRevisionKnown:
+					// Unknown stores cannot prove that the page stayed stable.
+					liveJobs = loadResolveJobLiveness(r.graph, perWorkerJobs)
+					validateLiveJobs = true
+				case pageLivenessRequired:
+					liveJobs = pageLiveness
+					validateLiveJobs = true
+				}
+			}
+			reindexBatch := make([]graph.EdgeReindex, 0, resolveJobCount(perWorkerJobs))
+			for i := range perWorkerJobs {
+				kept := perWorkerJobs[i][:0]
+				for _, j := range perWorkerJobs[i] {
+					if validateLiveJobs && !liveJobs.contains(j) {
+						continue
+					}
+					j.edge.To = j.newTo
+					j.edge.Kind = j.kind
+					j.edge.CrossRepo = j.crossRepo
+					j.edge.Confidence = j.confidence
+					j.edge.Origin = j.origin
+					j.edge.Meta = j.meta
+					reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo, OldKind: j.oldKind})
+					kept = append(kept, j)
+				}
+				perWorkerJobs[i] = kept
+			}
+			if len(reindexBatch) > 0 {
+				r.graph.ReindexEdges(reindexBatch)
+				reindexTotal += len(reindexBatch)
+				if pageRevisionKnown {
+					// Ignore this pass's own committed mutations. A later delta
+					// can then only come from work that ran while mu was yielded.
+					pageRevision, _ = loadEdgeMutationRevision(r.graph)
+				}
+				if pageMutationRevisionKnown {
+					pageMutationRevision, _ = loadMutationRevision(r.graph)
+				}
+			}
+			if guardSpoolErr == nil {
+				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
+				if guardSpoolErr != nil {
+					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
+				}
+			}
+			for i := range perWorkerJobs {
+				for j := range perWorkerJobs[i] {
+					if guardCandidateJob(&perWorkerJobs[i][j]) {
+						guardRepos[graph.RepoPrefixOfID(perWorkerJobs[i][j].edge.From)] = struct{}{}
+					}
+				}
+			}
+			for i := range perWorkerStats {
+				total.Resolved += perWorkerStats[i].Resolved
+				total.Unresolved += perWorkerStats[i].Unresolved
+				total.External += perWorkerStats[i].External
+			}
+			for i := range perWorkerDeferred {
+				pageDeferredLSP = append(pageDeferredLSP, perWorkerDeferred[i]...)
+			}
+
+			// Hand the resolve mutex to any waiting interactive edit before the
+			// next chunk. Drop bulk mode across the hand-off so an interleaving
+			// single-file ResolveFile on a shared instance resolves LSP-first.
+			if r.validateLiveness && (hi < len(pending) || !streamDone) {
+				r.bulkMode = false
+				yieldHook := r.chunkYieldHook
+				r.mu.Unlock()
+				if yieldHook != nil {
+					yieldHook()
+				}
+				runtime.Gosched()
+				r.mu.Lock()
+				forceRefresh := false
+				if pageMutationRevisionKnown {
+					currentRevision, _ := loadMutationRevision(r.graph)
+					forceRefresh = currentRevision != pageMutationRevision
+					if forceRefresh {
+						// The refreshed indexes/cache now represent this shared-store
+						// generation. Keep the edge-only baseline untouched so the
+						// next chunk still performs exact stale-job validation.
+						pageMutationRevision = currentRevision
+					}
+				}
+				passIndexes.refreshAfterInterleave(pending, forceRefresh)
+				r.bulkMode = true
+			}
+		}
+		if r.lspDeferredSpool != nil && len(pageDeferredLSP) > 0 {
+			if err := r.lspDeferredSpool.append(pageDeferredLSP); err != nil {
+				r.logger.Error("resolver: append deferred LSP spool", zap.Error(err))
+			}
+		}
+		r.clearLookupCache()
+		passIndexes.clearPage()
+		if streamDone {
+			break
+		}
+		var err error
+		pending, err = loadPendingPage()
+		if err != nil {
+			r.logger.Error("resolver: unresolved edge stream", zap.Error(err))
+			break
 		}
 	}
 	close(progressDone)
 	loopElapsed := time.Since(passStart) - warmElapsed
 
-	// Deferred LSP batch: bind the still-unresolved LSP-eligible edges the
-	// parallel workers collected, now that the compute barrier is behind us.
-	// Runs before the tail attribution passes so external-call
-	// materialisation sees the LSP-resolved targets, exactly as the inline
-	// (non-bulk) path would.
-	deferredLSP, retainedLSPRetries := r.prepareDeferredLSPBatch(deferredLSP)
-	lspDeferred := len(deferredLSP)
+	// Deferred LSP work is replayed in the same stable source-key order as the
+	// former whole-pass slice, but from a disk-backed dedup spool. Completed
+	// keys are deleted in batches; budget-skipped keys remain carried in the
+	// spool for the next compatible pass, so retry state never grows a Go map.
+	lspDeferred := 0
 	lspResult := deferredLSPBatchResult{}
 	lspStart := time.Now()
-	if lspDeferred > 0 {
-		lspCtx := context.Background()
-		cancel := func() {}
-		if r.lspResolvePassBudget > 0 {
-			lspCtx, cancel = context.WithTimeout(lspCtx, r.lspResolvePassBudget)
+	lspCtx := context.Background()
+	lspPassBudget := &deferredLSPPassBudget{duration: r.lspResolvePassBudget}
+	if r.lspDeferredSpool != nil {
+		var start *deferredLSPWorkKey
+		if r.lspDeferredCursorSet {
+			cursor := r.lspDeferredCursor
+			start = &cursor
 		}
-		lspResult = r.resolveDeferredLSP(lspCtx, deferredLSP)
-		cancel()
+		iterator := r.lspDeferredSpool.iterator(start)
+		var passRetryCursor deferredLSPWorkKey
+		passRetryCursorSet := false
+		for {
+			records, done, err := iterator.next(resolvePendingPageRows)
+			if err != nil {
+				r.logger.Error("resolver: read deferred LSP spool", zap.Error(err))
+				break
+			}
+			if len(records) == 0 && done {
+				break
+			}
+			edges, stale := lspEdgesFromRecords(r.graph, records, r.scope)
+			lspDeferred += len(edges)
+			alreadyExhausted := lspResult.budgetExhausted
+			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if pageResult.budgetExhausted {
+				if !alreadyExhausted {
+					passRetryCursor = r.lspDeferredCursor
+					passRetryCursorSet = r.lspDeferredCursorSet
+				} else if passRetryCursorSet {
+					// Later disk pages are all skipped under the same expired
+					// context. Keep the first skipped key from this pass, exactly
+					// as the former single whole-pass slice did.
+					r.lspDeferredCursor = passRetryCursor
+					r.lspDeferredCursorSet = true
+				}
+			}
+			lspResult.newlyResolved += pageResult.newlyResolved
+			lspResult.resolved += pageResult.resolved
+			lspResult.attempted += pageResult.attempted
+			lspResult.skipped += pageResult.skipped
+			lspResult.budgetExhausted = lspResult.budgetExhausted || pageResult.budgetExhausted
+			// Merge the skip exclusions: terminal stamping runs even on a
+			// budget-exhausted pass and must see every edge whose LSP verdict
+			// is still pending, across all spool pages.
+			if len(pageResult.terminalityExcluded) > 0 {
+				if lspResult.terminalityExcluded == nil {
+					lspResult.terminalityExcluded = make(map[deferredLSPEdgeKey]struct{}, len(pageResult.terminalityExcluded))
+				}
+				for key := range pageResult.terminalityExcluded {
+					lspResult.terminalityExcluded[key] = struct{}{}
+				}
+			}
+			// A skipped edge must not remain durably terminal: it still has
+			// higher-quality LSP work queued. Clear any prior full-pass stamp in
+			// one batch; successful heuristic resolutions already cleared it.
+			terminalClears := make([]graph.EdgeReindex, 0, len(pageResult.retry))
+			for _, edge := range edges {
+				key := deferredLSPWorkKeyFor(edge)
+				if _, retry := pageResult.retry[key]; !retry || edge.edge == nil || !edgeTerminalFlag(edge.edge) {
+					continue
+				}
+				oldTo := edge.edge.To
+				clearEdgeTerminal(edge.edge)
+				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: edge.edge, OldTo: oldTo})
+			}
+			if len(terminalClears) > 0 {
+				r.graph.ReindexEdges(terminalClears)
+			}
+
+			completed := append([]deferredLSPWorkKey(nil), stale...)
+			carried := make([]deferredLSPWorkKey, 0, len(pageResult.retry))
+			for _, edge := range edges {
+				key := deferredLSPWorkKeyFor(edge)
+				if _, retry := pageResult.retry[key]; retry {
+					if edge.edge != nil && graph.IsUnresolvedTarget(edge.edge.To) {
+						// The graph's normal pending set is already the durable
+						// retry queue for an unresolved edge.
+						completed = append(completed, key)
+					} else {
+						carried = append(carried, key)
+					}
+				} else {
+					completed = append(completed, key)
+				}
+			}
+			if err := r.lspDeferredSpool.markCarried(carried); err != nil {
+				r.logger.Error("resolver: mark deferred LSP retries", zap.Error(err))
+				break
+			}
+			if err := r.lspDeferredSpool.deleteKeys(completed); err != nil {
+				r.logger.Error("resolver: delete completed deferred LSP work", zap.Error(err))
+				break
+			}
+			if done {
+				break
+			}
+		}
+		if r.lspDeferredSpool.count() == 0 {
+			r.lspDeferredSpool.close()
+			r.lspDeferredSpool = nil
+		}
 	}
-	// Commit retry state as soon as the bounded batch completes. Later
-	// attribution passes may rewrite an entry's live edge, but the retry holds
-	// that same pointer and validates liveness on the next pass. Persisting here
-	// also keeps work retryable if an unrelated tail pass fails afterward.
-	r.replaceDeferredLSPRetries(retainedLSPRetries, lspResult.retry)
 	lspElapsed := time.Since(lspStart)
 	if lspResult.budgetExhausted {
 		r.logger.Warn("resolver: deferred LSP pass budget exhausted",
@@ -678,7 +1053,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 
 	computeElapsed := time.Since(passStart)
 	r.logger.Info("resolver: compute done",
-		zap.Int("pending", len(pending)),
+		zap.Int("pending", pendingAfter),
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
 		zap.Int("lsp_deferred", lspDeferred),
@@ -692,7 +1067,19 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		zap.Duration("deferred_lsp", lspElapsed),
 		zap.Duration("elapsed", computeElapsed))
 
+	if r.OnComputeDone != nil {
+		r.OnComputeDone()
+	}
+
 	tailStart := time.Now()
+
+	// The serial tail below (guard → attribution → lang dispatch → terminal
+	// stamping) historically ran for minutes between "compute done" and its
+	// retrospective breakdown lines — an unattributable silent span for
+	// anyone watching the log. Each phase now announces itself up front.
+	tailPhase := func(phase string) {
+		r.logger.Info("resolver: tail phase starting", zap.String("phase", phase))
+	}
 
 	// Cross-package name-match guard. The heuristic fallbacks above can
 	// resolve a call by name alone to a candidate in a package the
@@ -701,6 +1088,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// closure and revert the ones whose target is unreachable. The
 	// closure is built once and shared; each job still carries its
 	// pre-resolution target so a reverted edge is restored exactly.
+	tailPhase("cross_package_guard")
 	guarded := 0
 	// The guard consults the import-reachability closure only for the caller
 	// files of the jobs the compute loop resolved. On a scoped warm pass those
@@ -709,9 +1097,37 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// scanning every file + import edge in the workspace — the entries for the
 	// queried callers stay byte-identical, so the guard's verdicts are
 	// unchanged. An empty scope builds the whole-graph closure.
-	if closure := r.importClosureForJobs(allJobs); len(closure) > 0 {
-		for i := range allJobs {
-			guarded += r.guardCrossPackageCallEdges(allJobs[i], closure)
+	var guardClosure map[string]map[string]struct{}
+	if len(r.scope) == 0 {
+		guardClosure = r.buildImportClosure()
+	} else {
+		guardClosure = r.buildImportClosureFiltered(guardRepos)
+	}
+	if guardSpoolErr == nil && len(guardClosure) > 0 {
+		guardPages := 0
+		guardJobs := 0
+		lastGuardLog := time.Now()
+		for done := false; !done; {
+			records, exhausted, err := guardSpool.nextPage(resolvePendingPageRows)
+			if err != nil {
+				guardSpoolErr = err
+				r.logger.Error("resolver: read guard spool", zap.Error(err))
+				break
+			}
+			jobs := guardJobsFromRecords(r.graph, records)
+			r.warmGuardLookupCache(jobs)
+			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
+			r.clearLookupCache()
+			guardPages++
+			guardJobs += len(jobs)
+			if time.Since(lastGuardLog) > 10*time.Second {
+				lastGuardLog = time.Now()
+				r.logger.Info("resolver: guard progress",
+					zap.Int("pages", guardPages),
+					zap.Int("jobs_checked", guardJobs),
+					zap.Int("reverted", guarded))
+			}
+			done = exhausted
 		}
 	}
 	tAfterGuard := time.Now()
@@ -732,6 +1148,11 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// identical edge set — the attribution passes are idempotent and re-running
 	// them over an unchanged repo is a no-op — so a large changed repo is routed
 	// through the streaming path instead of the per-file storm.
+	// The attribution passes below materialise builtin/external nodes; the
+	// hot cache's immutability argument ends here.
+	r.hotCache.flush()
+	passIndexes.prepareTail()
+	tailPhase("go_attribution")
 	if len(r.scope) == 0 || r.scopedTailExceedsFileBudget() {
 		r.runFileAttributionPassesLocked()
 	} else {
@@ -744,6 +1165,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// Relative-import resolution for Python and Dart files. Runs
 	// before module attribution so internal-target stems never get
 	// mis-mapped to a phantom pypi/pub package.
+	tailPhase("lang_dispatch_reconcile")
 	ldStart := time.Now()
 	r.resolveRelativeImports()
 	ld1 := time.Now()
@@ -799,7 +1221,15 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	// stamps the newly-terminal edges and un-stamps any that regained a
 	// candidate. Gated to the master resolve via SetStampTerminal so a
 	// partially-indexed per-repo pass never stamps a false "no definition".
+	// An exhausted deferred-LSP budget does NOT disable stamping: the edges
+	// whose LSP verdict is still pending are excluded individually (the
+	// heuristic cascade DID run to completion for everything else), and on a
+	// cold start the LSP budget is always exhausted — a whole-pass abort here
+	// left the entire unresolved residual unstamped, so every subsequent
+	// full pass re-paged ~300k edges that the first pass had already proven
+	// unbindable.
 	if r.stampTerminal && len(r.scope) == 0 {
+		tailPhase("terminal_stamping")
 		stamped, unstamped := r.reconcileTerminalStampsExcluding(lspResult.terminalityExcluded)
 		if stamped > 0 || unstamped > 0 {
 			r.logger.Info("resolver: terminal stamps",
@@ -826,12 +1256,6 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 		zap.Duration("go_attribution", tAfterAttrib.Sub(tAfterGuard)),
 		zap.Duration("lang_dispatch_reconcile", time.Since(tAfterAttrib)))
 
-	total := &ResolveStats{}
-	for i := range allStats {
-		total.Resolved += allStats[i].Resolved
-		total.Unresolved += allStats[i].Unresolved
-		total.External += allStats[i].External
-	}
 	// A guarded edge was counted as resolved by the fallback that
 	// produced it; reverting it moves the tally back to unresolved.
 	if guarded > 0 {
@@ -860,7 +1284,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	total.LSPBudgetSkipped = lspResult.skipped
 	total.LSPBudgetExhausted = lspResult.budgetExhausted
 	total.PendingBefore = pendingBefore
-	total.PendingAfter = len(pending)
+	total.PendingAfter = pendingAfter
 	return total
 }
 
@@ -983,27 +1407,6 @@ func (r *Resolver) scopedFiles() []string {
 	return files
 }
 
-// importClosureForJobs builds the import-reachability closure the cross-package
-// guard consults. On an unscoped pass it is the whole-graph closure. On a
-// scoped pass it is restricted to the repos that own the resolved jobs' caller
-// nodes — the only files the guard ever queries — which keeps the closure
-// entries for those callers byte-identical to the whole-graph build while
-// skipping the unchanged workspace's file + import scan.
-func (r *Resolver) importClosureForJobs(allJobs [][]reindexJob) map[string]map[string]struct{} {
-	if len(r.scope) == 0 {
-		return r.buildImportClosure()
-	}
-	repos := make(map[string]struct{})
-	for i := range allJobs {
-		for j := range allJobs[i] {
-			if e := allJobs[i][j].edge; e != nil {
-				repos[graph.RepoPrefixOfID(e.From)] = struct{}{}
-			}
-		}
-	}
-	return r.buildImportClosureFiltered(repos)
-}
-
 // buildDirIndexes builds two lookup maps for resolveImport. Populated
 // once per ResolveAll / ResolveFile pass and torn down after.
 //
@@ -1040,12 +1443,20 @@ func (r *Resolver) clearDirIndexes() {
 // resulting maps via cachedGetNode / cachedFindNodesByName; misses
 // fall through to the underlying store.
 func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
+	r.warmLookupCacheWithSources(pending, nil)
+}
+
+// warmLookupCacheWithSources reuses source nodes already hydrated while
+// deriving a scoped page's repository prefixes. A non-nil map is a completed
+// hydration, even when empty; requested IDs absent from that result become
+// authoritative negatives only for the current page/generation, preventing a
+// dangling source from falling into a point-query N+1.
+func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map[string]*graph.Node) {
 	if len(pending) == 0 {
 		return
 	}
 	warmStart := time.Now()
-	idSet := make(map[string]struct{}, len(pending)*2)
-	nameSet := make(map[string]struct{}, len(pending))
+	idSet := make(map[string]struct{}, len(pending))
 	qualNameSet := make(map[string]struct{})
 	for _, e := range pending {
 		if e == nil {
@@ -1053,25 +1464,6 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 		}
 		if e.From != "" {
 			idSet[e.From] = struct{}{}
-		}
-		// e.To still carries the "unresolved::" (or multi-repo
-		// "<repoPrefix>::unresolved::") prefix. Strip it with
-		// UnresolvedName, then reduce to the bare identifier the cascade
-		// resolvers actually look up ("*.m" -> "m", "extern::p::S" ->
-		// "S"). Seeding the embedded identifier — NOT the raw stub id,
-		// which matches no node — is what lets the worker's
-		// cachedFindNodesByName(InRepo) HIT instead of firing one
-		// FindNodesByName(InRepo) query per edge (the warmup storm).
-		if name := identifierFromTarget(graph.UnresolvedName(e.To)); name != "" {
-			nameSet[name] = struct{}{}
-		}
-		// Receiver types drive the method/field disambiguation passes
-		// (receiverIsInterface, same-receiver field/method preference);
-		// seed them too so those lookups hit the cache (or its
-		// authoritative negative) instead of falling through to a
-		// per-edge FindNodesByName.
-		if rt := edgeReceiverType(e); rt != "" {
-			nameSet[rt] = struct{}{}
 		}
 		// Import targets resolve by qualified name: resolveImport's first
 		// lookup is GetNodeByQualName(importPath), an unindexed scan per
@@ -1087,54 +1479,75 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 	for id := range idSet {
 		ids = append(ids, id)
 	}
-	names := make([]string, 0, len(nameSet))
-	for n := range nameSet {
-		names = append(names, n)
+	// Load source nodes once, then query definitions by bounded
+	// repository+compatible-language groups. Both positive and negative group
+	// results are authoritative for the worker page.
+	sort.Strings(ids)
+	idStart := time.Now()
+	if sources != nil {
+		r.nodeByID = sources
+	} else {
+		r.nodeByID = r.cachedParallelGetNodesByIDs(ids)
 	}
-	// Both the id and name key sets run to ~0.5M keys on a cold warmup, and
-	// each backed store call was a single serial round trip before the first
-	// progress tick — the silent 3-6s start-up gap. Split each into per-CPU
-	// batches issued concurrently: both graph backends serve concurrent point
-	// reads safely (in-memory takes per-shard RLocks; sqlite pools NumCPU WAL
-	// reader connections), which is the same property the resolver's worker
-	// fan-out below already depends on.
-	r.nodeByID = r.parallelGetNodesByIDs(ids)
-	r.nodesByName = r.parallelFindNodesByNames(names)
-	// Authoritative negatives: a name we queried that has NO node in the
-	// graph (stdlib / external method calls — *.QueryRow, *.Errorf,
-	// *.Fatalf, *.StringVar, … — dominate the pending set) must be
-	// recorded as an empty result, not left absent. Absence means "not
-	// pre-warmed" so the cached lookup falls through to a per-edge
-	// FindNodesByName scan of the unindexed name column; across 200k+
-	// external-method stubs that fall-through IS the warmup hang.
-	// Backfilling the negative makes the pre-warmed name set
-	// authoritative — the lookup returns empty without touching the store.
-	if r.nodesByName == nil {
-		r.nodesByName = make(map[string][]*graph.Node, len(nameSet))
+	// A completed batch is authoritative for exactly this page's requested
+	// source IDs. Normalize nil/all-missing backends to a non-nil positive map
+	// and record misses separately so a dangling From cannot trigger one point
+	// query per edge. The negative set is cleared with the page/generation.
+	if r.nodeByID == nil {
+		r.nodeByID = make(map[string]*graph.Node)
 	}
-	for n := range nameSet {
-		if _, ok := r.nodesByName[n]; !ok {
-			r.nodesByName[n] = nil
+	r.missingNodeByID = make(map[string]struct{})
+	for _, id := range ids {
+		if node, ok := r.nodeByID[id]; !ok || node == nil {
+			r.missingNodeByID[id] = struct{}{}
 		}
 	}
+	if len(r.missingNodeByID) == 0 {
+		r.missingNodeByID = nil
+	}
+	idElapsed := time.Since(idStart)
+	nameStart := time.Now()
+	nameGroups, names, nameErr := r.warmRepoLanguageNameCache(pending)
+	nameElapsed := time.Since(nameStart)
+	foldStart := time.Now()
 	// Fold every candidate node returned by the name lookup into the
 	// id cache too: when a worker picks a candidate and the
 	// downstream guard (cross_pkg / cross_repo) calls GetNode on the
 	// chosen target, the cache should hit instead of falling through
 	// to a per-id store call.
-	if r.nodeByID == nil && len(r.nodesByName) > 0 {
-		r.nodeByID = make(map[string]*graph.Node, len(r.nodesByName))
+	if r.nodeByID == nil && (len(r.nodesByRepoLanguageName) > 0 || len(r.nodesByExternLanguageName) > 0 || len(r.nodesByName) > 0) {
+		r.nodeByID = make(map[string]*graph.Node)
 	}
-	for _, hits := range r.nodesByName {
-		for _, n := range hits {
-			if n == nil || n.ID == "" {
-				continue
-			}
-			if _, ok := r.nodeByID[n.ID]; !ok {
-				r.nodeByID[n.ID] = n
+	cacheCandidate := func(n *graph.Node) {
+		if n == nil || n.ID == "" {
+			return
+		}
+		if existing, ok := r.nodeByID[n.ID]; !ok || existing == nil {
+			r.nodeByID[n.ID] = n
+		}
+		delete(r.missingNodeByID, n.ID)
+	}
+	for _, byName := range r.nodesByRepoLanguageName {
+		for _, hits := range byName {
+			for _, n := range hits {
+				cacheCandidate(n)
 			}
 		}
 	}
+	for _, hits := range r.nodesByName {
+		for _, n := range hits {
+			cacheCandidate(n)
+		}
+	}
+	for _, byName := range r.nodesByExternLanguageName {
+		for _, hits := range byName {
+			for _, n := range hits {
+				cacheCandidate(n)
+			}
+		}
+	}
+	foldElapsed := time.Since(foldStart)
+	qualStart := time.Now()
 	// Pre-warm the import qual-name cache + record authoritative negatives,
 	// so resolveImport's GetNodeByQualName hits the cache instead of
 	// scanning the unindexed qual_name column once per import edge.
@@ -1153,12 +1566,21 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 			}
 		}
 	}
+	qualElapsed := time.Since(qualStart)
 	// Make the previously-silent warm phase observable — the batched store
 	// reads over ~0.5M keys land before the first compute progress tick.
 	r.logger.Info("resolver: warm lookup cache",
 		zap.Int("ids", len(ids)),
-		zap.Int("names", len(names)),
+		zap.Bool("ids_reused", sources != nil),
+		zap.Int("id_misses", len(r.missingNodeByID)),
+		zap.Int("name_groups", nameGroups),
+		zap.Int("names", names),
+		zap.Error(nameErr),
 		zap.Int("qual_names", len(qualNameSet)),
+		zap.Duration("id_lookup", idElapsed),
+		zap.Duration("name_lookup", nameElapsed),
+		zap.Duration("candidate_fold", foldElapsed),
+		zap.Duration("qual_lookup", qualElapsed),
 		zap.Duration("elapsed", time.Since(warmStart)))
 }
 
@@ -1257,9 +1679,14 @@ func lookupWarmBatches(n int) int {
 }
 
 func (r *Resolver) clearLookupCache() {
+	r.scratchGeneration++
 	r.nodeByID = nil
+	r.missingNodeByID = nil
 	r.nodesByName = nil
 	r.nodesByQualName = nil
+	r.nodesByRepoLanguageName = nil
+	r.nodesByRepoName = nil
+	r.nodesByExternLanguageName = nil
 	r.importFilesMu.Lock()
 	r.importFilesByCaller = nil
 	r.importFilesMu.Unlock()
@@ -1268,17 +1695,21 @@ func (r *Resolver) clearLookupCache() {
 // cachedGetNode returns the node for id, consulting the per-pass
 // lookup cache first and falling through to the underlying store on
 // miss. The cache is a positive-only fast path — absence means "not
-// pre-warmed", not "doesn't exist", so a miss still asks the store.
-// Outside a ResolveAll pass the cache is nil and every call goes
-// straight to the store.
+// pre-warmed" only when it was never requested by the completed page batch;
+// requested omissions are authoritative until the page/generation is cleared.
+// Outside a ResolveAll pass both caches are nil and every call goes straight to
+// the store.
 func (r *Resolver) cachedGetNode(id string) *graph.Node {
 	if id == "" {
 		return nil
 	}
 	if r.nodeByID != nil {
-		if n, ok := r.nodeByID[id]; ok {
+		if n, ok := r.nodeByID[id]; ok && n != nil {
 			return n
 		}
+	}
+	if _, missing := r.missingNodeByID[id]; missing {
+		return nil
 	}
 	return r.graph.GetNode(id)
 }
@@ -1330,34 +1761,14 @@ func (r *Resolver) cachedFindNodesByNameInRepo(name, repo string) []*graph.Node 
 	if name == "" {
 		return nil
 	}
-	if r.nodesByName != nil {
-		if hits, ok := r.nodesByName[name]; ok {
-			// Count repo matches before allocating. When every hit is in
-			// repo -- always so in single-repo mode, and common otherwise --
-			// hand back the cached slice (capped so a caller's append cannot
-			// scribble into the cache) instead of copying it. The per-call
-			// copy + growslice here was the largest allocation source during
-			// resolution on a large index; callers treat the result as
-			// read-only.
-			match := 0
-			for _, n := range hits {
-				if n != nil && n.RepoPrefix == repo {
-					match++
-				}
+	// Tail and guard callers that do not carry source-language context use the
+	// repository-only compatibility view. It is already repository-scoped and
+	// never rescans/filter-copies a global cross-language hit slice per edge.
+	if r.nodesByRepoName != nil {
+		if byName, warmed := r.nodesByRepoName[repo]; warmed {
+			if hits, queried := byName[name]; queried {
+				return hits
 			}
-			switch {
-			case match == 0:
-				return nil
-			case match == len(hits):
-				return hits[:len(hits):len(hits)]
-			}
-			out := make([]*graph.Node, 0, match)
-			for _, n := range hits {
-				if n != nil && n.RepoPrefix == repo {
-					out = append(out, n)
-				}
-			}
-			return out
 		}
 	}
 	return r.graph.FindNodesByNameInRepo(name, repo)
@@ -1430,6 +1841,7 @@ func (r *Resolver) buildPassIndexes() (clear func()) {
 }
 
 func (r *Resolver) clearPassIndexes() {
+	r.scratchGeneration++
 	r.clearDirIndexes()
 	r.clearDepModuleIndex()
 	r.clearProvidesForIndex()
@@ -1441,17 +1853,9 @@ func (r *Resolver) clearPassIndexes() {
 // represented by the pending frontier. Directory/dependency scans are paid only
 // when an unresolved import actually needs them; the DI provides index is lazy.
 func (r *Resolver) buildPassIndexesForPending(pending []*graph.Edge) (clear func()) {
-	for _, edge := range pending {
-		if edge != nil && edge.Kind == graph.EdgeImports && graph.IsUnresolvedTarget(edge.To) {
-			r.buildDirIndexes()
-			r.buildDepModuleIndex()
-			break
-		}
-	}
-	if !r.buildReachabilityIndexForPending(pending) {
-		r.buildReachabilityIndex()
-	}
-	return r.clearPassIndexes
+	indexes := newPendingFrontierPassIndexes(r)
+	indexes.prepare(pending)
+	return indexes.close
 }
 
 // ResolveFile resolves unresolved edges originating from a specific file.
@@ -1540,46 +1944,91 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 // referenceable symbols this file defines. It mirrors the edge walks
 // resolveFileEdgesLocked / resolveIncomingLocked perform, but only to seed
 // warmLookupCache; the result feeds caching, never resolution directly.
+type incrementalFileFrontier struct {
+	paths       []string
+	nodesByFile map[string][]*graph.Node
+	outByNode   map[string][]*graph.Edge
+	stubKeys    []string
+	pending     []*graph.Edge
+}
+
 func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge {
-	defNodes := r.graph.GetFileNodes(filePath)
-	var pending []*graph.Edge
-	seenNames := make(map[string]struct{}, len(defNodes))
-	defIDs := make([]string, 0, len(defNodes))
-	for _, n := range defNodes {
-		if n != nil {
-			defIDs = append(defIDs, n.ID)
-		}
-	}
-	outByNode := graph.OutEdgesForNodes(r.graph, defIDs)
-	for _, n := range defNodes {
-		if n == nil {
+	return r.collectIncrementalFileFrontier([]string{filePath}).pending
+}
+
+// collectIncrementalFileFrontier performs the complete read side of a
+// multi-file incremental resolve with a constant number of logical store
+// calls: one batched file-node read, one outgoing-adjacency read, and one
+// incoming-stub read. Backends may chunk each request at their bind limit.
+func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
+	var frontier incrementalFileFrontier
+	seenPaths := make(map[string]struct{}, len(filePaths))
+	for _, path := range filePaths {
+		if path == "" {
 			continue
 		}
-		for _, e := range outByNode[n.ID] {
-			if graph.IsUnresolvedTarget(e.To) && !r.incrementalSkipped(e) {
-				pending = append(pending, e)
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		frontier.paths = append(frontier.paths, path)
+	}
+	if len(frontier.paths) == 0 {
+		return frontier
+	}
+
+	frontier.nodesByFile = r.graph.GetFileNodesByPaths(frontier.paths)
+	var nodeIDs []string
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node != nil && node.ID != "" {
+				nodeIDs = append(nodeIDs, node.ID)
 			}
 		}
-		if n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
-			continue
+	}
+	frontier.outByNode = r.graph.GetOutEdgesByNodeIDs(nodeIDs)
+
+	seenStubKeys := make(map[string]struct{})
+	appendStubKey := func(key string) {
+		if key == "" {
+			return
 		}
-		if _, dup := seenNames[n.Name]; dup {
-			continue
+		if _, duplicate := seenStubKeys[key]; duplicate {
+			return
 		}
-		seenNames[n.Name] = struct{}{}
-		keys := []string{graph.UnresolvedMarker + n.Name}
-		if n.RepoPrefix != "" {
-			keys = append(keys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
-		}
-		for _, key := range keys {
-			for _, e := range r.graph.GetInEdges(key) {
-				if graph.IsUnresolvedTarget(e.To) {
-					pending = append(pending, e)
+		seenStubKeys[key] = struct{}{}
+		frontier.stubKeys = append(frontier.stubKeys, key)
+	}
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node == nil {
+				continue
+			}
+			for _, edge := range frontier.outByNode[node.ID] {
+				if graph.IsUnresolvedTarget(edge.To) && !r.incrementalSkipped(edge) {
+					frontier.pending = append(frontier.pending, edge)
 				}
 			}
+			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
+				continue
+			}
+			appendStubKey(graph.UnresolvedMarker + node.Name)
+			if node.RepoPrefix != "" {
+				appendStubKey(node.RepoPrefix + "::" + graph.UnresolvedMarker + node.Name)
+			}
 		}
 	}
-	return pending
+	// The unresolved target string is the incoming-edge bucket key even when
+	// no node with that ID exists.
+	inByStub := r.graph.GetInEdgesByNodeIDs(frontier.stubKeys)
+	for _, key := range frontier.stubKeys {
+		for _, edge := range inByStub[key] {
+			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+				frontier.pending = append(frontier.pending, edge)
+			}
+		}
+	}
+	return frontier
 }
 
 // ResolveFilesAndIncoming runs the forward and reverse passes for a
@@ -1598,43 +2047,37 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	defer r.mu.Unlock()
 
 	pendingStarted := time.Now()
-	var pending []*graph.Edge
-	seenPaths := make(map[string]struct{}, len(filePaths))
-	for _, p := range filePaths {
-		if _, duplicate := seenPaths[p]; duplicate {
-			continue
-		}
-		seenPaths[p] = struct{}{}
-		pending = append(pending, r.pendingEdgesForFileAndIncoming(p)...)
-	}
+	frontier := r.collectIncrementalFileFrontier(filePaths)
 	pendingDuration := time.Since(pendingStarted)
-	if len(pending) == 0 {
+	if len(frontier.pending) == 0 {
 		return stats
 	}
 	indexStarted := time.Now()
-	clear := r.buildPassIndexesForPending(pending)
+	clear := r.buildPassIndexesForPending(frontier.pending)
 	indexDuration := time.Since(indexStarted)
 	defer clear()
 	warmStarted := time.Now()
-	r.warmLookupCache(pending)
+	r.warmLookupCache(frontier.pending)
 	warmDuration := time.Since(warmStarted)
 	defer r.clearLookupCache()
 
 	resolveStarted := time.Now()
-	for p := range seenPaths {
-		r.resolveFileEdgesLocked(p, stats)
-		r.resolveIncomingLocked(p, stats)
-	}
+	// Resolve every changed file from the preloaded frontier, flush once, then
+	// read the incoming restub buckets afresh. The fresh read preserves the
+	// old forward-before-reverse semantics without one query/transaction per
+	// file.
+	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats)
+	r.resolveIncomingStubKeysLocked(frontier.stubKeys, stats)
 	resolveDuration := time.Since(resolveStarted)
 	attributionStarted := time.Now()
-	for p := range seenPaths {
-		r.runFileAttributionPassesForFileLocked(p)
-	}
+	r.prepareIncrementalAttributionCache(frontier)
+	r.runFileAttributionPassesForFilesLocked(frontier)
+	r.clearIncrementalAttributionCache()
 	attributionDuration := time.Since(attributionStarted)
 	if elapsed := time.Since(started); elapsed >= time.Second {
 		r.logger.Info("resolver: incremental files phases",
-			zap.Int("files", len(seenPaths)),
-			zap.Int("pending", len(pending)),
+			zap.Int("files", len(frontier.paths)),
+			zap.Int("pending", len(frontier.pending)),
 			zap.Duration("pending_collect", pendingDuration),
 			zap.Duration("build_indexes", indexDuration),
 			zap.Duration("warm_lookup", warmDuration),
@@ -1658,15 +2101,27 @@ func (r *Resolver) resolveFileLocked(filePath string, stats *ResolveStats) {
 // attributions all act on edges whose source is inside the edited file,
 // so this is the complete candidate set for those passes.
 func (r *Resolver) fileOutEdges(filePath string) []*graph.Edge {
-	nodes := r.graph.GetFileNodes(filePath)
+	nodes := r.incrementalFileNodes(filePath)
+	var out []*graph.Edge
+	if r.incrementalOutByNode != nil {
+		for _, node := range nodes {
+			if node != nil {
+				out = append(out, r.incrementalOutByNode[node.ID]...)
+			}
+		}
+		return out
+	}
 	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		ids = append(ids, n.ID)
+	for _, node := range nodes {
+		if node != nil {
+			ids = append(ids, node.ID)
+		}
 	}
 	byNode := graph.OutEdgesForNodes(r.graph, ids)
-	var out []*graph.Edge
-	for _, n := range nodes {
-		out = append(out, byNode[n.ID]...)
+	for _, node := range nodes {
+		if node != nil {
+			out = append(out, byNode[node.ID]...)
+		}
 	}
 	return out
 }
@@ -1676,66 +2131,80 @@ func (r *Resolver) fileOutEdges(filePath string) []*graph.Edge {
 // attribution passes once after the whole batch instead of once per
 // file. Caller holds r.mu and has built the per-pass indexes.
 func (r *Resolver) resolveFileEdgesLocked(filePath string, stats *ResolveStats) {
-	// Get all nodes in the file, then check their outgoing edges.
-	// Single-threaded path — collect mutations into a batch and flush
-	// in one ReindexEdges call after the file's edges are walked, so a
-	// per-file ResolveFile pass produces one Tx commit on disk
-	// backends instead of one per resolved edge. Resolved edges are
-	// also recorded as jobs so the cross-package guard can re-check
-	// (and, if needed, revert) the weak-tier ones.
+	nodesByFile := r.graph.GetFileNodesByPaths([]string{filePath})
+	ids := make([]string, 0, len(nodesByFile[filePath]))
+	for _, node := range nodesByFile[filePath] {
+		if node != nil && node.ID != "" {
+			ids = append(ids, node.ID)
+		}
+	}
+	byNode := r.graph.GetOutEdgesByNodeIDs(ids)
+	r.resolvePreparedFileEdgesLocked([]string{filePath}, nodesByFile, byNode, stats)
+}
+
+// resolvePreparedFileEdgesLocked resolves a preloaded multi-file frontier and
+// persists every changed edge in one batched mutation. Caller holds r.mu and
+// has built the per-pass indexes.
+func (r *Resolver) resolvePreparedFileEdgesLocked(
+	filePaths []string,
+	nodesByFile map[string][]*graph.Node,
+	outByNode map[string][]*graph.Edge,
+	stats *ResolveStats,
+) {
 	var jobs []reindexJob
 	var reindexBatch []graph.EdgeReindex
-	nodes := r.graph.GetFileNodes(filePath)
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		ids = append(ids, n.ID)
-	}
-	byNode := graph.OutEdgesForNodes(r.graph, ids)
-	for _, n := range nodes {
-		edges := byNode[n.ID]
-		for _, e := range edges {
-			if !graph.IsUnresolvedTarget(e.To) {
+	for _, filePath := range filePaths {
+		for _, node := range nodesByFile[filePath] {
+			if node == nil {
 				continue
 			}
-			// Carry-over reference unchanged since the last resolve and
-			// already unresolved then — leave it for the incoming pass
-			// instead of re-running the cascade (the bulk of edit latency
-			// on reference-heavy files).
-			if r.incrementalSkipped(e) {
-				continue
-			}
-			oldTo, changed := r.resolveEdge(e, stats)
-			if changed {
-				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+			for _, edge := range outByNode[node.ID] {
+				if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.incrementalSkipped(edge) {
+					continue
+				}
+				oldKind := edge.Kind
+				oldTo, changed := r.resolveEdge(edge, stats)
+				if !changed {
+					continue
+				}
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: oldTo, OldKind: oldKind})
 				jobs = append(jobs, reindexJob{
-					edge:       e,
+					edge:       edge,
 					oldTo:      oldTo,
-					newTo:      e.To,
-					kind:       e.Kind,
-					confidence: e.Confidence,
-					origin:     e.Origin,
+					oldKind:    oldKind,
+					newTo:      edge.To,
+					kind:       edge.Kind,
+					confidence: edge.Confidence,
+					origin:     edge.Origin,
 				})
 			}
 		}
 	}
+	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
+}
+
+func (r *Resolver) applyIncrementalReindexesLocked(
+	reindexBatch []graph.EdgeReindex,
+	jobs []reindexJob,
+	stats *ResolveStats,
+) {
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
 	}
-
 	// Cross-package name-match guard — same contract as in ResolveAll.
-	if len(jobs) > 0 {
-		if closure := r.buildImportClosure(); len(closure) > 0 {
-			if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
-				if stats.Resolved >= guarded {
-					stats.Resolved -= guarded
-				} else {
-					stats.Resolved = 0
-				}
-				stats.Unresolved += guarded
+	if len(jobs) == 0 {
+		return
+	}
+	if closure := r.buildImportClosure(); len(closure) > 0 {
+		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
+			if stats.Resolved >= guarded {
+				stats.Resolved -= guarded
+			} else {
+				stats.Resolved = 0
 			}
+			stats.Unresolved += guarded
 		}
 	}
-
 }
 
 // runFileAttributionPassesLocked re-runs the attribution passes that
@@ -1747,17 +2216,29 @@ func (r *Resolver) resolveFileEdgesLocked(filePath string, stats *ResolveStats) 
 // idempotent on already-rewritten edges (the `unresolved::` prefix
 // check makes a second sweep a no-op). Caller holds r.mu.
 func (r *Resolver) runFileAttributionPassesLocked() {
+	// Announce each sub-pass up front: several run 30-90s on a large cold
+	// graph, and the retrospective breakdown below only lands after ALL six —
+	// until then the log was silent for the whole sweep.
+	sub := func(pass string) {
+		r.logger.Info("resolver: attribution sub-pass starting", zap.String("pass", pass))
+	}
 	t0 := time.Now()
+	sub("rebind_go_method_receivers")
 	r.rebindGoMethodReceivers()
 	t1 := time.Now()
+	sub("bind_bare_name_scope_refs")
 	r.bindBareNameScopeRefs()
 	t2 := time.Now()
+	sub("bind_dataflow_callee_refs")
 	r.bindDataflowCalleeRefs()
 	t3 := time.Now()
+	sub("bind_generic_param_refs")
 	r.bindGenericParamRefs()
 	t4 := time.Now()
+	sub("attribute_go_builtins")
 	r.attributeGoBuiltins()
 	t5 := time.Now()
+	sub("attribute_go_external_calls")
 	r.attributeGoExternalCalls()
 	t6 := time.Now()
 	// Diagnostic sub-phase breakdown of the whole-graph attribution sweep,
@@ -1848,65 +2329,47 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 		return
 	}
 
+	r.resolveIncomingStubKeysLocked(stubKeys, stats)
+}
+
+// resolveIncomingStubKeysLocked binds a deduped unresolved-target frontier in
+// one incoming-edge read and one batched mutation. Caller holds r.mu.
+func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *ResolveStats) {
+	if len(stubKeys) == 0 {
+		return
+	}
 	var reindexBatch []graph.EdgeReindex
 	var jobs []reindexJob
+	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
 	for _, key := range stubKeys {
-		for _, e := range r.graph.GetInEdges(key) {
-			if e == nil || !graph.IsUnresolvedTarget(e.To) {
+		for _, edge := range inByStub[key] {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
 				continue
 			}
-			oldTo, changed := r.resolveEdge(e, stats)
+			oldKind := edge.Kind
+			oldTo, changed := r.resolveEdge(edge, stats)
 			// Restore the provenance the restub stashed when the stub rebound
-			// to the same target it had before the re-parse (unchanged binding
-			// keeps its verified tier); always drops the transient stash keys,
-			// so a rebind elsewhere / a still-unresolved stub carries only the
-			// honest tier the resolver just assigned. Runs before the job is
-			// captured so the cross-package guard below sees the real origin.
-			restored := graph.RestoreRestubProvenance(e)
+			// to the same target it had before the re-parse.
+			restored := graph.RestoreRestubProvenance(edge)
 			switch {
 			case changed:
-				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: oldTo, OldKind: oldKind})
 				jobs = append(jobs, reindexJob{
-					edge:       e,
+					edge:       edge,
 					oldTo:      oldTo,
-					newTo:      e.To,
-					kind:       e.Kind,
-					confidence: e.Confidence,
-					origin:     e.Origin,
+					oldKind:    oldKind,
+					newTo:      edge.To,
+					kind:       edge.Kind,
+					confidence: edge.Confidence,
+					origin:     edge.Origin,
 				})
 			case restored:
-				// The stub rebound to the SAME concrete target it already
-				// carried, so resolveEdge reported no To-change — but the
-				// restore mutated Origin/Tier/Confidence/Meta in place. A disk
-				// backend's GetInEdges handed us a freshly-decoded edge pointer,
-				// so that in-place mutation is lost unless it is written back.
-				// Re-index against the edge's own (unchanged) key to persist the
-				// restored provenance. Kept out of the cross-package guard's job
-				// list: its origin is the verified tier the restore re-applied,
-				// not a fresh name-only guess to second-guess.
-				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: e.To})
+				// Persist an in-place provenance restore even when To is unchanged.
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: edge.To})
 			}
 		}
 	}
-	if len(reindexBatch) > 0 {
-		r.graph.ReindexEdges(reindexBatch)
-	}
-
-	// Same cross-package name-match guard ResolveFile applies: revert a
-	// weak-tier call edge whose freshly-bound target lives in a package
-	// the caller never imports.
-	if len(jobs) > 0 {
-		if closure := r.buildImportClosure(); len(closure) > 0 {
-			if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
-				if stats.Resolved >= guarded {
-					stats.Resolved -= guarded
-				} else {
-					stats.Resolved = 0
-				}
-				stats.Unresolved += guarded
-			}
-		}
-	}
+	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
 // reindexJob captures the resolved state for an edge whose target
@@ -1926,14 +2389,16 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 // promoted to EdgeReferences so get_callers / find_usages surface the
 // method-value reference).
 type reindexJob struct {
-	edge       *graph.Edge
-	oldTo      string
-	newTo      string
-	kind       graph.EdgeKind
-	crossRepo  bool
-	confidence float64
-	origin     string
-	meta       map[string]any
+	edge          *graph.Edge
+	preResolution persistedEdgeSnapshot
+	oldTo         string
+	oldKind       graph.EdgeKind
+	newTo         string
+	kind          graph.EdgeKind
+	crossRepo     bool
+	confidence    float64
+	origin        string
+	meta          map[string]any
 }
 
 // resolverClonePool recycles the *graph.Edge shells handed out by
@@ -2183,7 +2648,14 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	// the common worker hot path; falls through to the store when
 	// called outside ResolveAll.
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByName(symbol)
+	candidates, lookupErr := r.cachedFindExternNodesByName(symbol, e)
+	if lookupErr != nil {
+		r.logger.Warn("resolver: extern candidate lookup failed",
+			zap.String("symbol", symbol),
+			zap.Error(lookupErr))
+		stats.Unresolved++
+		return
+	}
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
 			continue
@@ -2466,7 +2938,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 
 func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepo(funcName, callerRepo))
+	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
@@ -2701,7 +3173,7 @@ func pickTopLevelValueCallee(candidates []*graph.Node, funcName, callerDir strin
 // genuine cross-repo case with import-reachability evidence.
 func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepo(name, callerRepo)
+	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -2755,7 +3227,7 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 	// the `*.` and resolve on the bare type name.
 	name = strings.TrimPrefix(name, "*.")
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepo(name, callerRepo)
+	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -2784,7 +3256,7 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 // write but the runtime target is actually a method/property).
 func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *ResolveStats) bool {
 	receiverType := edgeReceiverType(e)
-	candidates := r.cachedFindNodesByNameInRepo(fieldName, r.callerRepoPrefix(e))
+	candidates := r.cachedFindNodesByNameInRepoForEdge(fieldName, r.callerRepoPrefix(e), e)
 	if len(candidates) == 0 {
 		return false
 	}
@@ -2846,7 +3318,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// method call across a repo boundary by name. A cross-repo method
 	// call is left unresolved for CrossRepoResolver, which carries the
 	// import-reachability + workspace-boundary evidence.
-	rawCandidates := r.cachedFindNodesByNameInRepo(methodName, r.callerRepoPrefix(e))
+	rawCandidates := r.cachedFindNodesByNameInRepoForEdge(methodName, r.callerRepoPrefix(e), e)
 	if len(rawCandidates) == 0 {
 		if r.applyBuiltinIfKnown(e, methodName, stats) {
 			return
@@ -3048,7 +3520,7 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// so downstream consumers don't treat the picked target as
 	// definitive. Done before the locality picks so it applies whether
 	// the chosen target lands in the same-dir or any-dir bucket.
-	if methodCount > 1 && r.receiverIsInterface(receiverType) {
+	if methodCount > 1 && r.receiverIsInterface(e, receiverType) {
 		if e.Meta == nil {
 			e.Meta = map[string]any{}
 		}
@@ -3132,11 +3604,11 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 // fallback to recognise interface-dispatch ambiguity rather than
 // treat it as a single-target resolution. Empty receiver type returns
 // false.
-func (r *Resolver) receiverIsInterface(receiverType string) bool {
+func (r *Resolver) receiverIsInterface(edge *graph.Edge, receiverType string) bool {
 	if receiverType == "" {
 		return false
 	}
-	for _, n := range r.cachedFindNodesByName(receiverType) {
+	for _, n := range r.cachedFindNodesByNameInRepoForEdge(receiverType, r.callerRepoPrefix(edge), edge) {
 		if n.Kind == graph.KindInterface {
 			return true
 		}
@@ -3174,7 +3646,7 @@ func (r *Resolver) resolveTokenRef(e *graph.Edge, name string, stats *ResolveSta
 	// repos ("TOKEN", "CONFIG", …); a cross-repo first-candidate pick
 	// is a name-only guess. CrossRepoResolver handles genuine cross-repo
 	// token references.
-	candidates := r.cachedFindNodesByNameInRepo(name, r.callerRepoPrefix(e))
+	candidates := r.cachedFindNodesByNameInRepoForEdge(name, r.callerRepoPrefix(e), e)
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -3347,15 +3819,49 @@ func (r *Resolver) buildReachabilityIndex() {
 // promote an interactive edit to a whole-graph scan: recover the path from the
 // concrete From node when possible, otherwise leave that edge unfiltered. The
 // reachability filter is explicitly fail-open for an unknown caller path.
-func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge) bool {
+func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge, sources map[string]*graph.Node) bool {
+	return r.buildReachabilityIndexForPendingCached(pending, sources, nil)
+}
+
+// buildReachabilityIndexForPendingCached materialises direct-import
+// reachability only for caller files in the current page. stableByFile is a
+// pass-local cache: entries containing only resolved/external imports can be
+// reused by overlapping pages, while unresolved imports are rebuilt because
+// resolving such an edge may change its target during the pass.
+
+// reachabilityStableFileCap bounds the pass-scoped stable-reachability cache.
+// Entries are one file path plus a handful of directory strings, so even a
+// workspace-wide cache is a few megabytes; the cap exists only to guard
+// pathological inputs.
+const reachabilityStableFileCap = 1 << 16
+
+func (r *Resolver) buildReachabilityIndexForPendingCached(
+	pending []*graph.Edge,
+	sources map[string]*graph.Node,
+	stableByFile map[string]map[string]struct{},
+) bool {
 	callerPaths := make(map[string]struct{})
+	missingCallerSet := make(map[string]struct{})
+	for _, edge := range pending {
+		if edge != nil && edge.FilePath == "" && edge.From != "" {
+			missingCallerSet[edge.From] = struct{}{}
+		}
+	}
+	missingCallerIDs := make([]string, 0, len(missingCallerSet))
+	for id := range missingCallerSet {
+		missingCallerIDs = append(missingCallerIDs, id)
+	}
+	missingCallers := sources
+	if missingCallers == nil && len(missingCallerIDs) > 0 {
+		missingCallers = r.graph.GetNodesByIDs(missingCallerIDs)
+	}
 	for _, edge := range pending {
 		if edge == nil {
 			continue
 		}
 		callerPath := edge.FilePath
 		if callerPath == "" {
-			if from := r.graph.GetNode(edge.From); from != nil {
+			if from := missingCallers[edge.From]; from != nil {
 				callerPath = from.FilePath
 			}
 		}
@@ -3364,50 +3870,77 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge) bool 
 		}
 	}
 
-	reachable := make(map[string]map[string]struct{}, len(callerPaths))
-	dirs := make(map[string]string, len(callerPaths))
+	filePaths := make([]string, 0, len(callerPaths))
 	for filePath := range callerPaths {
+		filePaths = append(filePaths, filePath)
+	}
+	sort.Strings(filePaths)
+	if stableByFile == nil {
+		stableByFile = make(map[string]map[string]struct{}, len(filePaths))
+	} else if len(stableByFile) > reachabilityStableFileCap {
+		// Entry-capped pass-scoped retention. A stable entry (only resolved /
+		// external imports) cannot change while the pass holds the resolve
+		// mutex, and caller files recur across pages — re-projecting one on
+		// every reappearance is a store read that decays badly once the store
+		// no longer fits the page cache. The cap only guards a pathological
+		// workspace with more caller files than any real one; overflow clears
+		// wholesale rather than evicting piecemeal, which would just recreate
+		// the per-page churn this retention exists to avoid.
+		clear(stableByFile)
+	}
+
+	reachable := make(map[string]map[string]struct{}, len(filePaths))
+	dirs := make(map[string]string, len(filePaths))
+	missingFiles := make([]string, 0, len(filePaths))
+	for _, filePath := range filePaths {
 		dir := filepath.Dir(filePath)
 		dirs[filePath] = dir
-		reachable[filePath] = map[string]struct{}{dir: {}}
-
-		nodes := r.graph.GetFileNodes(filePath)
-		if len(nodes) == 0 {
-			// Preserve the caller directory as the bounded evidence we do
-			// have. filterByReachability fails open if no candidate lands
-			// there, so an incomplete persisted file bucket cannot lose a
-			// resolution and does not justify a global index build.
+		if cached, ok := stableByFile[filePath]; ok {
+			reachable[filePath] = cached
 			continue
 		}
-		ids := make([]string, 0, len(nodes))
-		for _, node := range nodes {
-			if node != nil {
-				ids = append(ids, node.ID)
+		reachable[filePath] = map[string]struct{}{dir: {}}
+		missingFiles = append(missingFiles, filePath)
+	}
+
+	importsByFile := make(map[string][]string)
+	if len(missingFiles) > 0 {
+		if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
+			if projected, complete := projector.ProjectImportAdjacency(missingFiles); complete {
+				importsByFile = projected
+			} else {
+				importsByFile = r.legacyImportTargetsByFile(missingFiles)
+			}
+		} else {
+			importsByFile = r.legacyImportTargetsByFile(missingFiles)
+		}
+	}
+
+	targetSet := make(map[string]struct{})
+	for _, filePath := range missingFiles {
+		for _, targetID := range importsByFile[filePath] {
+			if !graph.IsUnresolvedTarget(targetID) && !strings.HasPrefix(targetID, "external::") {
+				targetSet[targetID] = struct{}{}
 			}
 		}
-		byNode := r.graph.GetOutEdgesByNodeIDs(ids)
-		var imports []*graph.Edge
-		var targetIDs []string
-		for _, id := range ids {
-			for _, edge := range byNode[id] {
-				if edge == nil || edge.Kind != graph.EdgeImports {
-					continue
-				}
-				imports = append(imports, edge)
-				if !graph.IsUnresolvedTarget(edge.To) && !strings.HasPrefix(edge.To, "external::") {
-					targetIDs = append(targetIDs, edge.To)
-				}
-			}
-		}
-		targets := r.graph.GetNodesByIDs(targetIDs)
-		for _, edge := range imports {
+	}
+	targetIDs := make([]string, 0, len(targetSet))
+	for id := range targetSet {
+		targetIDs = append(targetIDs, id)
+	}
+	targets := r.graph.GetNodesByIDs(targetIDs)
+
+	for _, filePath := range missingFiles {
+		stable := true
+		for _, targetID := range importsByFile[filePath] {
 			var importedDir string
 			switch {
-			case graph.IsUnresolvedTarget(edge.To) && strings.HasPrefix(graph.UnresolvedName(edge.To), "import::"):
+			case graph.IsUnresolvedTarget(targetID) && strings.HasPrefix(graph.UnresolvedName(targetID), "import::"):
+				stable = false
 				if r.dirIndex == nil {
 					r.buildDirIndexes()
 				}
-				path := strings.TrimPrefix(graph.UnresolvedName(edge.To), "import::")
+				path := strings.TrimPrefix(graph.UnresolvedName(targetID), "import::")
 				if files := r.dirIndex[path]; len(files) > 0 {
 					importedDir = filepath.Dir(files[0].FilePath)
 				} else if last := lastPathComponent(path); last != "" {
@@ -3415,9 +3948,11 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge) bool 
 						importedDir = filepath.Dir(files[0].FilePath)
 					}
 				}
-			case strings.HasPrefix(edge.To, "external::"):
+			case graph.IsUnresolvedTarget(targetID):
+				stable = false
+			case strings.HasPrefix(targetID, "external::"):
 			default:
-				if target := targets[edge.To]; target != nil && target.FilePath != "" {
+				if target := targets[targetID]; target != nil && target.FilePath != "" {
 					importedDir = filepath.Dir(target.FilePath)
 					dirs[target.FilePath] = importedDir
 				}
@@ -3426,10 +3961,44 @@ func (r *Resolver) buildReachabilityIndexForPending(pending []*graph.Edge) bool 
 				reachable[filePath][importedDir] = struct{}{}
 			}
 		}
+		if stable {
+			stableByFile[filePath] = reachable[filePath]
+		}
 	}
 	r.reachableDirsByFile = reachable
 	r.dirByFilePath = dirs
 	return true
+}
+
+// legacyImportTargetsByFile preserves the ordinary Store path for in-memory
+// stores and for SQLite projections that report malformed provenance. Reads
+// remain batched, but this intentionally retains the old materialisation cost
+// only on that compatibility path.
+func (r *Resolver) legacyImportTargetsByFile(filePaths []string) map[string][]string {
+	nodesByFile := r.graph.GetFileNodesByPaths(filePaths)
+	idsByFile := make(map[string][]string, len(filePaths))
+	var allNodeIDs []string
+	for _, filePath := range filePaths {
+		for _, node := range nodesByFile[filePath] {
+			if node == nil || node.ID == "" {
+				continue
+			}
+			idsByFile[filePath] = append(idsByFile[filePath], node.ID)
+			allNodeIDs = append(allNodeIDs, node.ID)
+		}
+	}
+	byNode := r.graph.GetOutEdgesByNodeIDs(allNodeIDs)
+	out := make(map[string][]string, len(filePaths))
+	for _, filePath := range filePaths {
+		for _, id := range idsByFile[filePath] {
+			for _, edge := range byNode[id] {
+				if edge != nil && edge.Kind == graph.EdgeImports {
+					out[filePath] = append(out[filePath], edge.To)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (r *Resolver) clearReachabilityIndex() {
@@ -3727,22 +4296,29 @@ func edgesByKinds(g graph.Store, kinds []graph.EdgeKind) iter.Seq[*graph.Edge] {
 
 // nodesByKindsOrAll returns every node whose Kind is in the given
 // set, using the NodesByKindsScanner capability when the backend
-// implements it (a single kind-IN scan) and falling back to
-// AllNodes + Go-side filter otherwise.
+// implements it (a single kind-IN scan). Adapter stores fall back to the
+// required predicate iterator once per requested kind; they never materialise
+// the graph-wide node corpus.
 func nodesByKindsOrAll(g graph.Store, kinds ...graph.NodeKind) []*graph.Node {
 	if scan, ok := g.(graph.NodesByKindsScanner); ok {
 		return scan.NodesByKinds(kinds)
 	}
-	set := make(map[graph.NodeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		set[k] = struct{}{}
-	}
+	seenKinds := make(map[graph.NodeKind]struct{}, len(kinds))
+	seenNodes := make(map[string]struct{})
 	var out []*graph.Node
-	for _, n := range g.AllNodes() {
-		if n == nil {
+	for _, k := range kinds {
+		if _, duplicate := seenKinds[k]; duplicate {
 			continue
 		}
-		if _, ok := set[n.Kind]; ok {
+		seenKinds[k] = struct{}{}
+		for n := range g.NodesByKind(k) {
+			if n == nil {
+				continue
+			}
+			if _, duplicate := seenNodes[n.ID]; duplicate {
+				continue
+			}
+			seenNodes[n.ID] = struct{}{}
 			out = append(out, n)
 		}
 	}
@@ -3755,7 +4331,8 @@ func nodesByKindsOrAll(g graph.Store, kinds ...graph.NodeKind) []*graph.Node {
 // implements it (one query — a join, server-side), falling back to the
 // EdgesByKind + per-edge GetNode loop the resolver used before the
 // capability landed. Used by InferImplements (and shaped to match its
-// existing map[string]map[string]bool API).
+// existing map[string]map[string]bool API). Adapter stores batch every method
+// endpoint into one GetNodesByIDs call.
 func memberMethodsByType(g graph.Store) map[string]map[string]bool {
 	if cap, ok := g.(graph.MemberMethodsByType); ok {
 		raw := cap.MemberMethodsByType()
@@ -3773,8 +4350,18 @@ func memberMethodsByType(g graph.Store) map[string]map[string]bool {
 		return out
 	}
 	out := map[string]map[string]bool{}
+	var edges []*graph.Edge
+	var methodIDs []string
 	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
-		methodNode := g.GetNode(e.From)
+		if e == nil {
+			continue
+		}
+		edges = append(edges, e)
+		methodIDs = append(methodIDs, e.From)
+	}
+	methods := g.GetNodesByIDs(methodIDs)
+	for _, e := range edges {
+		methodNode := methods[e.From]
 		if methodNode == nil || methodNode.Kind != graph.KindMethod {
 			continue
 		}
@@ -3794,7 +4381,8 @@ func memberMethodsByType(g graph.Store) map[string]map[string]bool {
 // a synthetic *Node that carries no Meta / QualName / Language); falls
 // back to the EdgesByKind + per-edge GetNode loop otherwise. Used by
 // InferOverrides which keys methods by name and reads ID/FilePath/
-// StartLine off the node when it emits an EdgeOverrides edge.
+// StartLine off the node when it emits an EdgeOverrides edge. Adapter stores
+// resolve all source methods with one batched endpoint lookup.
 func memberMethodNodesByType(g graph.Store) map[string]map[string]*graph.Node {
 	if cap, ok := g.(graph.MemberMethodsByType); ok {
 		raw := cap.MemberMethodsByType()
@@ -3819,8 +4407,18 @@ func memberMethodNodesByType(g graph.Store) map[string]map[string]*graph.Node {
 		return out
 	}
 	out := map[string]map[string]*graph.Node{}
+	var edges []*graph.Edge
+	var methodIDs []string
 	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
-		method := g.GetNode(e.From)
+		if e == nil {
+			continue
+		}
+		edges = append(edges, e)
+		methodIDs = append(methodIDs, e.From)
+	}
+	methods := g.GetNodesByIDs(methodIDs)
+	for _, e := range edges {
+		method := methods[e.From]
 		if method == nil || method.Kind != graph.KindMethod {
 			continue
 		}
@@ -3839,24 +4437,33 @@ func memberMethodNodesByType(g graph.Store) map[string]map[string]*graph.Node {
 // projected as the (FromID, ToID, Origin) tuples InferOverrides
 // consumes. Routed through the storage layer's StructuralParentEdges
 // capability when the backend implements it (one query — a join with
-// kind filters on both sides — no per-edge GetNode); falls back to
-// the AllEdges + per-edge GetNode walk otherwise.
+// kind filters on both sides — no per-edge GetNode). Adapter stores use
+// three predicate edge iterators followed by one batched endpoint lookup.
 func structuralParentEdges(g graph.Store) []graph.StructuralParentEdgeRow {
 	if cap, ok := g.(graph.StructuralParentEdges); ok {
 		return cap.StructuralParentEdges()
 	}
-	parentKinds := map[graph.EdgeKind]bool{
-		graph.EdgeExtends:    true,
-		graph.EdgeImplements: true,
-		graph.EdgeComposes:   true,
+	parentKinds := []graph.EdgeKind{
+		graph.EdgeExtends,
+		graph.EdgeImplements,
+		graph.EdgeComposes,
 	}
-	var out []graph.StructuralParentEdgeRow
-	for _, e := range g.AllEdges() {
-		if e == nil || !parentKinds[e.Kind] {
-			continue
+	var edges []*graph.Edge
+	var endpointIDs []string
+	for _, kind := range parentKinds {
+		for e := range g.EdgesByKind(kind) {
+			if e == nil {
+				continue
+			}
+			edges = append(edges, e)
+			endpointIDs = append(endpointIDs, e.From, e.To)
 		}
-		from := g.GetNode(e.From)
-		to := g.GetNode(e.To)
+	}
+	endpoints := g.GetNodesByIDs(endpointIDs)
+	var out []graph.StructuralParentEdgeRow
+	for _, e := range edges {
+		from := endpoints[e.From]
+		to := endpoints[e.To]
 		if from == nil || to == nil {
 			continue
 		}
@@ -3893,7 +4500,7 @@ func (r *Resolver) InferImplementsScoped(scopeTypes, scopeIfaces map[string]bool
 	return r.inferImplements(scopeTypes, scopeIfaces)
 }
 
-func (r *Resolver) inferImplements(scopeTypes, scopeIfaces map[string]bool) int {
+func (r *Resolver) inferImplementsLegacy(scopeTypes, scopeIfaces map[string]bool) int {
 	// Step 1: Collect all interfaces with their required method names.
 	type ifaceInfo struct {
 		id      string
@@ -4054,12 +4661,13 @@ func (r *Resolver) inferImplements(scopeTypes, scopeIfaces map[string]bool) int 
 	}
 
 	added := 0
+	var inferred []*graph.Edge
 	for _, chunkResults := range results {
 		for _, p := range chunkResults {
 			if declared[p.typeID+"\x00"+p.ifaceID] {
 				continue
 			}
-			r.graph.AddEdge(&graph.Edge{
+			inferred = append(inferred, &graph.Edge{
 				From:     p.typeID,
 				To:       p.ifaceID,
 				Kind:     graph.EdgeImplements,
@@ -4075,6 +4683,11 @@ func (r *Resolver) inferImplements(scopeTypes, scopeIfaces map[string]bool) int 
 			})
 			added++
 		}
+	}
+	if len(inferred) > 0 {
+		// Store.AddBatch owns the backend-sized chunking. Keeping the pass as
+		// one logical write avoids one SQLite transaction per inferred pair.
+		r.graph.AddBatch(nil, inferred)
 	}
 
 	return added
@@ -4102,7 +4715,7 @@ func (r *Resolver) InferOverrides() int { return r.inferOverrides(nil) }
 // same reasoning as InferImplementsScoped). Empty scope → zero work.
 func (r *Resolver) InferOverridesScoped(scope map[string]bool) int { return r.inferOverrides(scope) }
 
-func (r *Resolver) inferOverrides(scope map[string]bool) int {
+func (r *Resolver) inferOverridesLegacy(scope map[string]bool) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -4152,30 +4765,56 @@ func (r *Resolver) inferOverrides(scope map[string]bool) int {
 		}
 	}
 
-	added := 0
-	var provBatch []graph.EdgeProvenanceUpdate
+	// Fetch every candidate method's outgoing bucket once. The old loop did a
+	// store lookup per candidate pair, which becomes quadratic query traffic
+	// when one child/parent relationship contributes many methods.
+	fromSet := make(map[string]struct{}, len(pending))
 	for _, p := range pending {
-		// Skip when the edge already exists.
-		dup := false
-		for _, existing := range r.graph.GetOutEdges(p.from.ID) {
-			if existing.Kind == graph.EdgeOverrides && existing.To == p.to.ID {
-				dup = true
-				// Upgrade the provenance of the existing override edge
-				// through SetEdgeProvenanceBatch so the identity change
-				// is counted — a bare existing.Origin write would
-				// bypass the revision counter. Batched so a large
-				// hierarchy pass commits its provenance bumps in
-				// chunks on disk backends.
-				if graph.OriginRank(existing.Origin) < graph.OriginRank(p.origin) {
-					provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: existing, NewOrigin: p.origin})
-				}
-				break
+		fromSet[p.from.ID] = struct{}{}
+	}
+	fromIDs := make([]string, 0, len(fromSet))
+	for id := range fromSet {
+		fromIDs = append(fromIDs, id)
+	}
+	outByFrom := r.graph.GetOutEdgesByNodeIDs(fromIDs)
+	pairKey := func(from, to string) string { return from + "\x00" + to }
+	existingByPair := make(map[string]*graph.Edge, len(pending))
+	for _, id := range fromIDs {
+		for _, edge := range outByFrom[id] {
+			if edge == nil || edge.Kind != graph.EdgeOverrides {
+				continue
+			}
+			key := pairKey(edge.From, edge.To)
+			if _, seen := existingByPair[key]; !seen {
+				existingByPair[key] = edge
 			}
 		}
-		if dup {
+	}
+
+	added := 0
+	var edgeBatch []*graph.Edge
+	stagedByPair := make(map[string]*graph.Edge)
+	var provBatch []graph.EdgeProvenanceUpdate
+	for _, p := range pending {
+		key := pairKey(p.from.ID, p.to.ID)
+		if existing := existingByPair[key]; existing != nil {
+			// Upgrade the provenance of the existing override edge through
+			// SetEdgeProvenanceBatch so the identity change is counted.
+			if graph.OriginRank(existing.Origin) < graph.OriginRank(p.origin) {
+				provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: existing, NewOrigin: p.origin})
+			}
 			continue
 		}
-		r.graph.AddEdge(&graph.Edge{
+		if staged := stagedByPair[key]; staged != nil {
+			// Multiple structural parent edges can describe the same override.
+			// The former AddEdge/GetOutEdges loop kept one edge and promoted it
+			// to the strongest origin; do the same before the batch is written.
+			if graph.OriginRank(staged.Origin) < graph.OriginRank(p.origin) {
+				staged.Origin = p.origin
+			}
+			continue
+		}
+		edge := &graph.Edge{
 			From:            p.from.ID,
 			To:              p.to.ID,
 			Kind:            graph.EdgeOverrides,
@@ -4184,8 +4823,13 @@ func (r *Resolver) inferOverrides(scope map[string]bool) int {
 			Confidence:      1.0,
 			ConfidenceLabel: "EXTRACTED",
 			Origin:          p.origin,
-		})
+		}
+		stagedByPair[key] = edge
+		edgeBatch = append(edgeBatch, edge)
 		added++
+	}
+	if len(edgeBatch) > 0 {
+		r.graph.AddBatch(nil, edgeBatch)
 	}
 	if len(provBatch) > 0 {
 		r.graph.SetEdgeProvenanceBatch(provBatch)
