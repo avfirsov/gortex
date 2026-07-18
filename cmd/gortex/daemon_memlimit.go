@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/platform"
 )
@@ -220,6 +221,11 @@ func applyStandingMemoryLimit(logger *zap.Logger, cfgVal string) {
 		return
 	}
 	debug.SetMemoryLimit(d.limit)
+	// Only a DEFAULT-policy standing limit may be raised by the cold-index
+	// window toward its own host-derived budget (the raise documented in
+	// docs/multi-repo.md); an explicit operator limit (GOMEMLIMIT / env /
+	// config) is never exceeded.
+	indexer.SetColdIndexMemoryLimitRaise(d.source == "default")
 	if logger != nil {
 		logger.Info("daemon: standing memory limit applied",
 			zap.Int64("bytes", d.limit),
