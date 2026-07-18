@@ -445,10 +445,11 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	if err := semantic.ApplyGateWait(ctx); err != nil {
 		return nil, err
 	}
-	if parked := time.Since(applyGateStart); parked > 2*time.Second && p.logger != nil {
+	applyGateParked := time.Since(applyGateStart)
+	if applyGateParked > 2*time.Second && p.logger != nil {
 		p.logger.Info("go-types: apply gate opened after park",
 			zap.String("repo_prefix", repoPrefix),
-			zap.Duration("parked", parked))
+			zap.Duration("parked", applyGateParked))
 	}
 	_, persistentBindings := g.(graph.SemanticBindingTypeStore)
 	if writer, ok := g.(graph.SemanticBindingTypeWriter); ok {
@@ -480,20 +481,31 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return nil, err
 	}
 	defer rmu.Unlock()
-	if waited := time.Since(mutexWaitStart); waited > 5*time.Second && p.logger != nil {
+	mutexWaited := time.Since(mutexWaitStart)
+	if mutexWaited > 5*time.Second && p.logger != nil {
 		p.logger.Info("go-types: resolve mutex acquired after wait",
 			zap.String("repo_prefix", repoPrefix),
-			zap.Duration("waited", waited))
+			zap.Duration("waited", mutexWaited))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Apply-subphase instrumentation: one summary line per repo at apply
+	// completion splits the mutex-serialized section the drain-phase wall
+	// otherwise reports as a single number. refs_walk INCLUDES its inner
+	// write times (add_batch / reindex / confirm) — use-matching cost is
+	// refs_walk minus those three.
+	applyMutexHeld := time.Now()
+	var applyProjectionDur, applyDefsDur, applyRefsDur time.Duration
+	var applyAddBatchDur, applyReindexDur, applyConfirmDur time.Duration
+	var applyImplementsDur, applyStampsDur time.Duration
 
 	// Materialize this repository's Go nodes once and reuse them across every
 	// compiler definition/use. On SQLite, MatchNodeByFileLine and
 	// findContainingFunc otherwise issue one GetFileNodes query per go/types
 	// object, repeatedly decoding the same retrieval metadata hundreds of
 	// thousands of times on a large module.
+	projectionStart := time.Now()
 	repoNodes := repoGoNodes(g, repoPrefix)
 	nodesByFile := make(map[string][]*graph.Node)
 	nodesByID := make(map[string]*graph.Node, len(repoNodes))
@@ -511,11 +523,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// per-use linear scan over a file's node slice was a flat 28.8s per
 	// profiling window on a large module.
 	funcIndexByFile := buildFileFuncIndexes(nodesByFile)
+	applyProjectionDur = time.Since(projectionStart)
 
 	// Build the compiler-object → graph-node map used by later phases.
 	objToNode := make(map[types.Object]string)
 
 	// Phase 1: Map definitions.
+	defsStart := time.Now()
 	for _, pkg := range pkgs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -569,6 +583,8 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// (`stdlib::fmt::Println`, `dep::github.com/.../foo::Bar`) that no
 	// node holds; goanalysis upgrades them to real graph nodes with
 	// LSP-grade origin.
+	applyDefsDur = time.Since(defsStart)
+	refsStart := time.Now()
 	externals := newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
 	externals.prefetchExistingNodes(pkgs, objToNode)
 
@@ -690,13 +706,19 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		allNewEdges = append(allNewEdges, externalEdges...)
 		allNewEdges = append(allNewEdges, newEdges...)
 		if len(externalNodes) > 0 || len(allNewEdges) > 0 {
+			addBatchStart := time.Now()
 			g.AddBatch(externalNodes, allNewEdges)
+			applyAddBatchDur += time.Since(addBatchStart)
 		}
 		if reindexes := externals.drainPendingReindexes(); len(reindexes) > 0 {
+			reindexStart := time.Now()
 			g.ReindexEdges(reindexes)
+			applyReindexDur += time.Since(reindexStart)
 		}
 
+		confirmStart := time.Now()
 		persistConfirmedEdges(g, confirmedEdges)
+		applyConfirmDur += time.Since(confirmStart)
 		externals.edgeCandidates = nil
 	}
 
@@ -707,9 +729,14 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	result.EdgesAdded += externals.edgesAdded + externals.edgesUpgraded
 	result.NodesEnriched += externals.nodesAdded
 
+	applyRefsDur = time.Since(refsStart)
+
 	// Phase 3: Interface implementations via go/types.
+	implementsStart := time.Now()
 	result.EdgesConfirmed += p.enrichImplements(g, objToNode)
 	result.EdgesAdded += p.addMissingImplements(g, objToNode, nodesByID)
+	applyImplementsDur = time.Since(implementsStart)
+	stampsStart := time.Now()
 
 	// Phase 4: node-driven type stamping. go/types has a Def — hence an exact
 	// type — for every function, method, field, parameter and local variable.
@@ -809,6 +836,23 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return nil, err
 	}
 	result.NodesEnriched += persistedStamps
+	applyStampsDur = time.Since(stampsStart)
+
+	if p.logger != nil {
+		p.logger.Info("go-types: apply subphases",
+			zap.String("repo_prefix", repoPrefix),
+			zap.Duration("gate_parked", applyGateParked),
+			zap.Duration("mutex_waited", mutexWaited),
+			zap.Duration("mutex_held", time.Since(applyMutexHeld)),
+			zap.Duration("graph_projection", applyProjectionDur),
+			zap.Duration("defs_walk", applyDefsDur),
+			zap.Duration("refs_walk", applyRefsDur),
+			zap.Duration("add_batch", applyAddBatchDur),
+			zap.Duration("reindex", applyReindexDur),
+			zap.Duration("confirm_persist", applyConfirmDur),
+			zap.Duration("implements", applyImplementsDur),
+			zap.Duration("type_stamps", applyStampsDur))
+	}
 
 	result.DurationMs = time.Since(start).Milliseconds()
 	return result, nil

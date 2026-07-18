@@ -2868,6 +2868,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	var fileCount int64
 	var skippedByTimeout int64
 	var skippedByMinified int64
+	// Parse-subphase instrumentation. The per-stage numbers are SUMMED
+	// worker nanoseconds — read/extract/batch overlap across the pool, so
+	// their sum legitimately exceeds the critical-path wall emitted beside
+	// them; sem_wait is pure admission queuing. One log line per repo at
+	// parse completion, so a parse-phase regression is attributable to a
+	// stage instead of guessed at.
+	parseWallStart := time.Now()
+	var parseSemWaitNS, parseReadNS, parseExtractNS, parseBatchNS int64
 
 	// Bound peak parse memory: a weighted, bytes-in-flight semaphore
 	// admits each worker by its file size before it reads + extracts, so
@@ -2991,9 +2999,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					var weight int64
 					if parseSem != nil {
 						weight = clampParseWeight(wf.size, parseBudget)
+						semStart := time.Now()
 						if aerr := parseSem.Acquire(ctx, weight); aerr != nil {
 							return
 						}
+						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
 					relPath, _ := filepath.Rel(absRoot, path)
@@ -3047,7 +3057,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 						}
 					}
 
+					readStart := time.Now()
 					src, err := readFile(wf)
+					atomic.AddInt64(&parseReadNS, int64(time.Since(readStart)))
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
@@ -3088,7 +3100,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// PDF→markdown command, …).
 					src = idx.transforms.run(relPath, src)
 
+					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
 					if parseSem != nil {
 						parseSem.Release(weight)
 					}
@@ -3179,6 +3193,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// accumulator, amortising transaction/statement setup without
 					// retaining a repository-sized graph in Go memory.
 					if !contentHandled {
+						batchStart := time.Now()
 						durablePath, durableMtime := path, wf.mtimeNano
 						if !graphBatch.add(result.Nodes, result.Edges, func() {
 							recordStreamedMtime(durablePath, durableMtime)
@@ -3186,6 +3201,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 							idx.graph.AddBatch(result.Nodes, result.Edges)
 							recordStreamedMtime(durablePath, durableMtime)
 						}
+						atomic.AddInt64(&parseBatchNS, int64(time.Since(batchStart)))
 					}
 					sidecars.add(relPath, src, result)
 
@@ -3399,6 +3415,15 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// idx.graph back to diskTarget runs LATER, when IndexCtx returns,
 	// so we can't rely on it here. Falls through to idx.graph for the
 	// non-shadow path.
+	idx.logger.Info("indexer: parse subphases",
+		zap.String("repo", idx.repoPrefix),
+		zap.Duration("wall", time.Since(parseWallStart)),
+		zap.Duration("sem_wait_workers", time.Duration(atomic.LoadInt64(&parseSemWaitNS))),
+		zap.Duration("read_workers", time.Duration(atomic.LoadInt64(&parseReadNS))),
+		zap.Duration("extract_workers", time.Duration(atomic.LoadInt64(&parseExtractNS))),
+		zap.Duration("batch_workers", time.Duration(atomic.LoadInt64(&parseBatchNS))),
+		zap.Int("workers", workers),
+		zap.Int("files", totalFiles))
 	mtimeTarget := graph.Store(idx.graph)
 	if diskTarget != nil {
 		mtimeTarget = diskTarget
