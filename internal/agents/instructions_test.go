@@ -185,11 +185,12 @@ func TestBashInstructionsBodyUsesOnlyExplicitCLIMirror(t *testing.T) {
 func TestGlobalPointerBody_ShapeAndSentinel(t *testing.T) {
 	const dir = "/home/user/.gortex/instructions"
 	body := GlobalPointerBody(dir)
+	activePath := filepath.Join(dir, "active.md")
 
 	if !strings.Contains(body, InstructionsSentinel) {
 		t.Error("pointer block lost the idempotency sentinel heading")
 	}
-	if !strings.Contains(body, "@"+dir+"/active.md") {
+	if !strings.Contains(body, "@"+activePath) {
 		t.Errorf("pointer block does not @-include the active profile: %q", body)
 	}
 	if !strings.Contains(body, "gortex instructions switch") {
