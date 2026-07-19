@@ -15,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // defaultExtractorPluginTimeout bounds a plugin subprocess when the
@@ -126,6 +127,7 @@ func (e *SubprocessExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	// command/args are operator-declared config, not user-derived input.
 	cmd := exec.CommandContext(ctx, e.command, e.args...) //nolint:gosec
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Stdin = bytes.NewReader(src)
 	cmd.Env = append(os.Environ(), "GORTEX_FILE_PATH="+filePath)
 	var out, errBuf bytes.Buffer

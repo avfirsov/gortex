@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // Tuning defaults for a history scan.
@@ -94,6 +95,7 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 	// the file lists, grouped per commit by the NUL separator.
 	cmd := exec.CommandContext(ctx, "git", "-C", root, "log", "--no-merges", //nolint:gosec // root is daemon-internal
 		"-n", strconv.Itoa(opts.MaxCommits), "--name-only", "--format=%x00")
+	platform.ConfigureBackgroundCommand(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return empty

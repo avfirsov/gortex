@@ -14,6 +14,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // fixSubjectRe matches a commit subject that describes a bug fix:
@@ -39,6 +40,7 @@ func mineFixCommits(ctx context.Context, root string, maxScan int) []fixCommit {
 	// line; --name-only appends the changed files below it.
 	cmd := exec.CommandContext(ctx, "git", "-C", root, "log", "--no-merges", //nolint:gosec // root is daemon-internal
 		"-n", strconv.Itoa(maxScan), "--name-only", "--format=%x00%s")
+	platform.ConfigureBackgroundCommand(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil

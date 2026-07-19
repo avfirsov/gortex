@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/llm"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // defaultTimeout caps one Complete call when the user hasn't set
@@ -134,6 +135,7 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	}
 
 	cmd := exec.CommandContext(runCtx, p.binary, args...)
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // Severity is the normalized severity of a diagnostic across linters.
@@ -155,6 +157,7 @@ func runOne(ctx context.Context, l Linter, absPath string, timeout time.Duration
 		args[i] = strings.ReplaceAll(a, "{file}", absPath)
 	}
 	cmd := exec.CommandContext(cctx, l.Bin, args...)
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = filepath.Dir(absPath) // so per-project linter config is discovered
 
 	var stdout, stderr bytes.Buffer

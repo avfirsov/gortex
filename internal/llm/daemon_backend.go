@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // DaemonBackend speaks MCP over stdio to a long-running `gortex mcp`
@@ -41,6 +43,7 @@ func NewDaemonBackend(gortexBin string, extraEnv []string) (*DaemonBackend, erro
 		gortexBin = "gortex"
 	}
 	cmd := exec.Command(gortexBin, "mcp")
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Env = append(os.Environ(), extraEnv...)
 
 	stdin, err := cmd.StdinPipe()

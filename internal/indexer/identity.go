@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // RepoIdentity holds the canonical identity of a repository.
@@ -52,6 +53,7 @@ func DetectIdentity(repoPath string) (*RepoIdentity, error) {
 // gitRemoteOrigin runs `git -C <path> remote get-url origin` and returns the URL.
 func gitRemoteOrigin(repoPath string) (string, error) {
 	cmd := exec.Command("git", "-C", repoPath, "remote", "get-url", "origin")
+	platform.ConfigureBackgroundCommand(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

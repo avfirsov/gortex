@@ -20,6 +20,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/lspuri"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/semantic"
 )
 
@@ -2100,6 +2101,7 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 	ctx, cancel := context.WithTimeout(context.Background(), csharpRestoreTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "dotnet", "restore", "-p:NuGetAudit=false")
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = workspaceRoot
 	cmd.Env = append(os.Environ(), p.env...)
 	if out, err := cmd.CombinedOutput(); err != nil {

@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/semantic"
 )
 
@@ -138,6 +139,7 @@ func (p *Provider) runIndexerContext(ctx context.Context, repoRoot string) (stri
 	args = append(args, "--output", outputPath)
 
 	cmd := exec.CommandContext(ctx, p.command, args...)
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = repoRoot
 	cmd.Env = append(os.Environ(), "SCIP_OUTPUT="+outputPath)
 

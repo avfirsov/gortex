@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // defaultTransformTimeout bounds a transform subprocess when the rule
@@ -265,6 +266,7 @@ func (c *commandTransform) apply(_ string, src []byte) ([]byte, error) {
 	defer cancel()
 	// argv is operator-declared config, not user-derived input.
 	cmd := exec.CommandContext(ctx, c.argv[0], c.argv[1:]...) //nolint:gosec
+	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Stdin = bytes.NewReader(src)
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out

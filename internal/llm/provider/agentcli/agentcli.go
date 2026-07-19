@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/llm"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // DefaultTimeout caps one Complete call when the Spec leaves Timeout
@@ -152,6 +153,7 @@ func (p *Provider) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	}
 
 	cmd := exec.CommandContext(runCtx, p.spec.Binary, args...)
+	platform.ConfigureBackgroundCommand(cmd)
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
