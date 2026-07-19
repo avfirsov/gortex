@@ -10,8 +10,9 @@ import (
 // so the resolver can dereference a const-identifier dispatch name across
 // files without an unindexable per-node blob decode.
 var (
-	_ graph.ConstantValueWriter = (*Store)(nil)
-	_ graph.ConstantValueReader = (*Store)(nil)
+	_ graph.ConstantValueWriter       = (*Store)(nil)
+	_ graph.ConstantValueRepoReplacer = (*Store)(nil)
+	_ graph.ConstantValueReader       = (*Store)(nil)
 )
 
 // constValueChunk bounds rows per multi-row INSERT (4 params/row; 80 rows
@@ -28,7 +29,7 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -57,6 +58,44 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 	return tx.Commit()
 }
 
+// ReplaceConstantValues atomically replaces the authoritative repository
+// projection. The repo-wide delete is index-backed and the insert remains
+// bounded by constValueChunk; empty rows intentionally clear stale values.
+func (s *Store) ReplaceConstantValues(repoPrefix string, rows []graph.ConstantValueRow) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if _, err := tx.Exec(`DELETE FROM constant_values WHERE repo_prefix = ?`, repoPrefix); err != nil {
+		return err
+	}
+	for start := 0; start < len(rows); start += constValueChunk {
+		end := start + constValueChunk
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+		args := make([]any, 0, len(batch)*4)
+		stmt := make([]byte, 0, 96+len(batch)*16)
+		stmt = append(stmt, "INSERT INTO constant_values (node_id, repo_prefix, file_path, value) VALUES "...)
+		for i, row := range batch {
+			if i > 0 {
+				stmt = append(stmt, ',')
+			}
+			stmt = append(stmt, "(?, ?, ?, ?)"...)
+			args = append(args, row.NodeID, repoPrefix, row.FilePath, row.Value)
+		}
+		if _, err := tx.Exec(string(stmt), args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // DeleteConstantValuesByFiles drops all constant values sourced in the
 // supplied files for one repo prefix, chunked into `file_path IN (…)`
 // DELETEs. Empty input is a no-op.
@@ -67,7 +106,7 @@ func (s *Store) DeleteConstantValuesByFiles(repoPrefix string, files []string) e
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

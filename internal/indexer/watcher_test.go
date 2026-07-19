@@ -62,7 +62,14 @@ func waitForEvent(t *testing.T, w *Watcher, timeout time.Duration) GraphChangeEv
 	case ev := <-w.Events():
 		return ev
 	case <-time.After(timeout):
-		t.Fatal("timeout waiting for watcher event")
+		w.mu.Lock()
+		nextGeneration := w.nextGeneration
+		pending := len(w.pending)
+		pendingGenerations := len(w.pendingGeneration)
+		waiters := len(w.mutationWaiters)
+		w.mu.Unlock()
+		t.Fatalf("timeout waiting for watcher event: next_generation=%d pending=%d pending_generations=%d waiters=%d history=%d",
+			nextGeneration, pending, pendingGenerations, waiters, len(w.History()))
 		return GraphChangeEvent{}
 	}
 }
@@ -240,8 +247,8 @@ func Original() {}
 	w.runDirScan(map[string]struct{}{dir: {}}, nil)
 	require.NotEmpty(t, g.FindNodesByName("Original"))
 
-	w.patchGraph(path, ChangeDeleted)
-	w.patchGraph(path, ChangeDeleted) // redundant producer is suppressed
+	_ = w.patchGraph(path, ChangeDeleted)
+	_ = w.patchGraph(path, ChangeDeleted) // redundant producer is suppressed
 
 	require.Len(t, calls, 1)
 	require.NotEmpty(t, calls[0].oldSymbols)

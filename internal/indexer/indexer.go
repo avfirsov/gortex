@@ -144,6 +144,13 @@ type IndexError struct {
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
 	graph graph.Store
+
+	// shadowAdmission is shared by every Indexer in the process. Cold repos
+	// acquire a weighted lease before constructing an in-memory shadow; when the
+	// budget is busy or the repo is too large, SQLite receives the parse stream
+	// directly through the bounded graph accumulator.
+	shadowAdmission *shadowAdmissionBudget
+
 	// indexCount tracks how many IndexCtx calls this Indexer has
 	// completed. Gates the cold-start shadow-swap: each per-repo
 	// Indexer in MultiIndexer is fresh (indexCount==0), so all of
@@ -325,17 +332,39 @@ type Indexer struct {
 	// AllEdges().
 	deferResolve       bool
 	pendingContractReg *contracts.Registry
+	// deferredGoModDone makes go.mod contract materialisation idempotent for
+	// one pending contract generation. Coordinated multi-repo cold/warmup runs
+	// a pre-enrichment resolve and then the deferred enrichment/contract drain;
+	// both stages call runDeferredGoMod, but only the first may do the work.
+	deferredGoModDone bool
 
 	// pendingEnrich is raised by an index pass that did real work — IndexCtx
 	// that observed files (or a whole-repo re-track) and IncrementalReindex /
 	// IncrementalReindexPaths that re-indexed or evicted at least one file. It
-	// is cleared only after runDeferredEnrich completes a fully non-partial
-	// semantic enrichment for this repo. The daemon warmup enriches every
+	// is cleared only after runDeferredEnrich completes its queued file batch or
+	// repository pass without a partial result. The daemon warmup enriches every
 	// indexer it collected, so this gates the (multi-minute LSP hover) pass to
 	// repos that actually changed: an unchanged repo on a warm restart would
 	// otherwise re-confirm nothing for 10+ minutes. A partial / abandoned /
 	// failed enrich leaves it set so a later deferred pass retries.
 	pendingEnrich atomic.Bool
+
+	// deferredApplyGate, when non-nil, parks every enrichment provider's
+	// graph-apply phase until the channel closes. Set by BeginDeferredPasses
+	// before the pool launches (so the pool's compute may overlap the warmup
+	// resolve without its applies starving the resolver) and cleared by
+	// FinishTail.
+	deferredApplyGate <-chan struct{}
+
+	// deferredEnrichFiles holds a deduplicated, repo-scoped Go frontier for
+	// one deferred batch. Providers receive the whole set at once, so multiple
+	// edits become one compiler load rather than N loads or a ./... fallback.
+	// Deletions and unknown-language work promote the scope to full. Generation
+	// prevents a pass from clearing work queued concurrently while it ran.
+	deferredEnrichMu         sync.Mutex
+	deferredEnrichFiles      map[string]struct{}
+	deferredEnrichFull       bool
+	deferredEnrichGeneration uint64
 
 	// fullReindexed is raised by a whole-repo (re-)parse — IndexCtx, reached
 	// via a full re-track, a cold TrackRepo, or a snapshot-partial forced full
@@ -417,6 +446,15 @@ type Indexer struct {
 	affectedByPasses        atomic.Int64
 	affectedByFilesResolved atomic.Int64
 	affectedByDropped       atomic.Int64
+
+	// incrementalResolveFilesHook is a focused test seam for proving a
+	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
+	// production; the real path calls resolver.ResolveFilesAndIncoming.
+	incrementalResolveFilesHook func([]string)
+	// incrementalCatchupHook observes resolution-dependent incremental tails.
+	// It is nil in production and lets focused tests prove a watcher storm runs
+	// each tail once after the bounded mutation batch, never once per chunk.
+	incrementalCatchupHook func(kind string, files []string)
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
@@ -432,9 +470,10 @@ type contractCacheEntry struct {
 // callers.
 func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *zap.Logger) *Indexer {
 	idx := &Indexer{
-		graph:    g,
-		registry: reg,
-		resolver: resolver.New(g),
+		graph:           g,
+		shadowAdmission: processShadowAdmission,
+		registry:        reg,
+		resolver:        resolver.New(g),
 		// Wrap in Swappable so the auto-upgrade to Bleve at large
 		// corpus sizes can happen in a background goroutine without
 		// racing with concurrent searches. Subsequent reassignments to
@@ -607,27 +646,6 @@ func isSymbolSearcherBackend(b search.Backend) bool {
 	return ok
 }
 
-// lessEdgeKey orders edges by their logical key (from, to, kind,
-// file_path, line) — the same tuple the sqlite edges table's
-// UNIQUE(from_id, …) index is built on. Draining edges in this order on
-// the cold bulk load keeps that index's inserts local instead of random,
-// reducing B-tree page splits.
-func lessEdgeKey(a, b *graph.Edge) bool {
-	if a.From != b.From {
-		return a.From < b.From
-	}
-	if a.To != b.To {
-		return a.To < b.To
-	}
-	if a.Kind != b.Kind {
-		return a.Kind < b.Kind
-	}
-	if a.FilePath != b.FilePath {
-		return a.FilePath < b.FilePath
-	}
-	return a.Line < b.Line
-}
-
 // ftsTokensFor produces the pre-tokenised text the backend FTS path
 // indexes. Mirrors searchIndexFields' field selection but joins
 // every field through search.Tokenize (camelCase / snake_case /
@@ -729,7 +747,7 @@ type bleveUpgradeEntry struct {
 // from IndexCtx after every Node.Meta mutating pass has returned, so
 // the read of n.Meta happens with no concurrent writer.
 func (idx *Indexer) snapshotBleveEntries() []bleveUpgradeEntry {
-	nodes := idx.graph.AllNodes()
+	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 	out := make([]bleveUpgradeEntry, 0, len(nodes))
 	for _, n := range nodes {
 		if !idx.shouldIndexForSearch(n) {
@@ -1041,17 +1059,18 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 // stub. Split out of RunDeferredPasses so the batch driver can run it
 // serially across repos ahead of the parallel enrichment phase.
 func (idx *Indexer) runDeferredGoMod() {
-	if idx.pendingContractReg == nil {
+	if idx.pendingContractReg == nil || idx.deferredGoModDone {
 		return
 	}
 	idx.extractGoModContracts(idx.pendingContractReg)
+	idx.deferredGoModDone = true
 }
 
-// runDeferredEnrich runs semantic enrichment for this repo. Safe to run
-// concurrently across repos: the manager fetches a per-repo LSP provider
-// instance (keyed by the repo's workspace), the go-types stash is keyed by
-// repo root, tstypes is stateless, and every provider serialises its graph
-// mutations on the backend resolve mutex.
+// runDeferredEnrich runs semantic enrichment for this repo. The manager fetches
+// a per-repo LSP provider instance (keyed by the repo's workspace); go/types is
+// bounded by its cancellation-aware heavyweight gate and publishes only compact
+// repo-scoped binding strings; tstypes is stateless; and providers serialize
+// graph mutations on the backend resolve mutex.
 func (idx *Indexer) runDeferredEnrich() {
 	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
 		return
@@ -1072,6 +1091,11 @@ func (idx *Indexer) runDeferredEnrich() {
 		idx.logger.Info("deferred enrichment forced despite no pending changes",
 			zap.String("repo", idx.repoPrefix))
 	}
+	pendingFiles, fullScope, pendingGeneration := idx.deferredEnrichScope()
+	if forced {
+		pendingFiles = nil
+		fullScope = true
+	}
 	// Lease compiler-backed provider state before enrichment creates it. The
 	// matching release runs after this repo's contract pass, including failure
 	// unwinding, so a slow sibling in the batch cannot trigger TTL eviction.
@@ -1084,6 +1108,46 @@ func (idx *Indexer) runDeferredEnrich() {
 	// identical (sha, dirty): a provider whose persisted marker still matches
 	// HEAD on a clean tree is skipped instead of re-running its hover pass.
 	sha, dirty := repoHeadAndDirty(idx.rootPath)
+	if !fullScope && len(pendingFiles) > 0 {
+		byLanguage := idx.deferredEnrichFrontiers(pendingFiles)
+		languages := make([]string, 0, len(byLanguage))
+		for language := range byLanguage {
+			languages = append(languages, language)
+		}
+		sort.Strings(languages)
+		for _, language := range languages {
+			files := byLanguage[language]
+			result, err := idx.semanticMgr.EnrichFiles(
+				idx.graph, idx.repoPrefix, idx.rootPath, language, files,
+			)
+			if err != nil {
+				idx.logger.Warn("file-scoped deferred semantic enrichment failed",
+					zap.String("repo", idx.repoPrefix),
+					zap.String("language", language),
+					zap.Int("files", len(files)),
+					zap.Error(err))
+				return
+			}
+			if result != nil {
+				idx.logger.Info("semantic enrichment result",
+					zap.String("provider", result.Provider),
+					zap.String("language", result.Language),
+					zap.Int("confirmed", result.EdgesConfirmed),
+					zap.Int("added", result.EdgesAdded),
+					zap.Int("refuted", result.EdgesRefuted),
+					zap.Float64("coverage", result.CoveragePercent),
+				)
+				if result.Partial {
+					return
+				}
+			}
+		}
+		// A file frontier proves only that the affected language/file batches
+		// were refreshed. It must never publish the whole-repository completion
+		// marker: files and packages outside this exact frontier did not run.
+		idx.clearPendingEnrich(pendingGeneration)
+		return
+	}
 	// A re-parse this run evicted the persisted hover edges of the re-parsed
 	// files, so force the pass past the completion-marker gate — an unchanged
 	// clean HEAD would otherwise skip re-enrichment and leave those files' LSP
@@ -1095,6 +1159,8 @@ func (idx *Indexer) runDeferredEnrich() {
 		RepoState: map[string]semantic.RepoEnrichState{
 			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load()},
 		},
+		MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
+		ApplyGate:        idx.deferredApplyGate,
 	}
 	results, partialRepos, err := idx.semanticMgr.EnrichAll(idx.graph, roots, opts)
 	if err != nil {
@@ -1115,8 +1181,7 @@ func (idx *Indexer) runDeferredEnrich() {
 	// finished non-partial. A partial / abandoned / failed pass leaves it set
 	// so a later deferred pass (or the next restart, once the repo changes
 	// again) retries the enrichment rather than trusting an incomplete graph.
-	if !partialRepos[idx.repoPrefix] {
-		idx.pendingEnrich.Store(false)
+	if !partialRepos[idx.repoPrefix] && idx.clearPendingEnrich(pendingGeneration) {
 		// Persist a whole-repo completion marker at this HEAD so the next warm
 		// restart can tell, with one lookup, that this repo's enrichment finished
 		// and MaybeSeedPendingEnrich need not resume it. A partial / abandoned
@@ -1169,16 +1234,16 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 	idx.logger.Info("deferred enrichment re-armed: persisted enrichment incomplete",
 		zap.String("repo", idx.repoPrefix),
 		zap.String("sha", sha))
-	idx.pendingEnrich.Store(true)
+	idx.markPendingEnrichFull()
 	return true
 }
 
 // runDeferredContracts extracts and commits this repo's contract nodes and
 // clears the pending registration. extractGoModContracts already ran via
 // runDeferredGoMod. Mutates the shared graph and walks repo edges, so the
-// batch driver runs it serially after the parallel enrichment phase. The
-// go-types LookupTypeAtLine it relies on reads the per-repo stash, so it is
-// correct even though every repo's enrichment ran before any contracts.
+// batch driver runs it serially after the parallel enrichment phase. Compiler
+// binding types are resolved in one batch from SQLite, with the provider's
+// compact string index as the in-memory-store fallback.
 func (idx *Indexer) runDeferredContracts() {
 	if idx.pendingContractReg == nil {
 		return
@@ -1187,20 +1252,21 @@ func (idx *Indexer) runDeferredContracts() {
 	idx.extractDIContracts(idx.pendingContractReg)
 	idx.commitContracts(idx.pendingContractReg)
 	idx.pendingContractReg = nil
+	idx.deferredGoModDone = false
 }
 
-// runDeferredContractsAndReleaseSemanticState keeps the compiler program alive
-// through every contract consumer and releases it on every return path. The
-// defer also prevents a contract-extraction panic from stranding a multi-GB
-// stash while the panic unwinds.
+// runDeferredContractsAndReleaseSemanticState keeps the provider's compact
+// binding rows available through every contract consumer and releases them on
+// every return path. SQLite rows remain persistent for warm restarts; this
+// release only bounds the in-memory fallback.
 func (idx *Indexer) runDeferredContractsAndReleaseSemanticState() {
 	defer idx.releaseDeferredSemanticState()
 	idx.runDeferredContracts()
 }
 
-// repoSemanticStateRetainer leases repository-scoped compiler state across the
-// enrichment-to-contract batch barrier so TTL/LRU cleanup cannot evict it while
-// another repository in the same batch is still enriching.
+// repoSemanticStateRetainer leases repository-scoped compact binding rows
+// across the enrichment-to-contract batch barrier so the in-memory fallback is
+// released only after this repository's contract pass.
 type repoSemanticStateRetainer interface {
 	RetainRepoState(repoRoot string) bool
 }
@@ -2438,7 +2504,25 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	}
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
-	shadowTaken := blOK && firstIndex && belowShadowMax && belowShadowBytes
+	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
+	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
+	admission := idx.shadowAdmission
+	if admission == nil {
+		admission = processShadowAdmission
+	}
+	var shadowLease *shadowAdmissionLease
+	shadowBudgetGranted := false
+	if shadowLocallyEligible {
+		shadowLease, shadowBudgetGranted = admission.tryAcquire(shadowWeight)
+	}
+	shadowTaken := shadowLocallyEligible && shadowBudgetGranted
+	if shadowLease != nil {
+		// Registered before the shadow-drain defer below. Defers execute in
+		// reverse order, so the lease remains charged through every success,
+		// error, and cancellation drain/restore path and releases afterwards.
+		defer shadowLease.Release()
+	}
+	shadowBudgetCapacity, shadowBudgetUsed, shadowBudgetPeak := admission.snapshot()
 	preNodes := idx.graph.NodeCount()
 	preEdges := idx.graph.EdgeCount()
 	idx.logger.Info("indexer: shadow-swap decision",
@@ -2453,6 +2537,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		zap.Int64("total_file_bytes", totalFileBytes),
 		zap.Int64("shadow_max_bytes", maxShadowBytes),
 		zap.Bool("below_shadow_bytes", belowShadowBytes),
+		zap.Int64("shadow_weight_bytes", shadowWeight),
+		zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
+		zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
+		zap.Int64("shadow_process_peak_bytes", shadowBudgetPeak),
+		zap.Bool("shadow_budget_granted", shadowBudgetGranted),
 		zap.Bool("shadow_taken", shadowTaken),
 	)
 	if shadowTaken {
@@ -2521,81 +2610,89 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 				zap.Int("shadow_edges", shadowEdgeCount),
 			)
 			bl.BeginBulkLoad()
-			// Drain the shadow shard-by-shard so the indexer's hold on
-			// the 11-GB Linux-scale graph is released progressively
-			// instead of pinned until persist returns. The drain
-			// iterators free each shard's node/edge maps as they
-			// advance, so peak RAM during the persist window is
-			// roughly the chunk buffer + the backend's working set,
-			// not full shadow + the disk backend's bulk-COPY buffer.
-			//
-			// Collect (id, tokens) for every search-eligible node as
-			// the drain yields them — feeds the backend's native FTS
-			// at FlushBulk time when the store implements
-			// graph.SymbolSearcher. Nodes that fail
-			// shouldIndexForSearch (KindFile / KindImport /
-			// KindLocal / KindBuiltin / skip-search lang+kind pairs)
-			// are excluded so the FTS corpus matches the in-process
-			// BM25 corpus exactly.
+			// Transfer the shadow in explicit row/byte-capped batches. The
+			// process-wide shadow admission caps all live shadows at 1 GiB; these
+			// much smaller buffers prevent persistence from double-buffering an
+			// admitted repository while SQLite consumes it. Each destructive
+			// batch is locally key-ordered and released before the next batch.
+			const (
+				persistChunkRows     = 8192
+				persistChunkBytes    = 16 << 20
+				persistFTSChunkRows  = 2048
+				persistFTSChunkBytes = 4 << 20
+			)
 			searcher, hasFTS := diskTarget.(graph.SymbolSearcher)
-			var ftsItems []graph.SymbolFTSItem
+			ftsBatcher, hasFTSBatcher := diskTarget.(graph.SymbolFTSBatchUpserter)
+			ftsResetter, hasFTSResetter := diskTarget.(graph.SymbolFTSRepoResetter)
+			ftsReady := hasFTS && hasFTSBatcher && hasFTSResetter
+			ftsItemCount := 0
 			if hasFTS {
-				// Pre-size to the shadow's node count to avoid grow
-				// churn on a 600k-node Vscode-shape repo.
-				ftsItems = make([]graph.SymbolFTSItem, 0, inMemShadow.NodeCount())
-			}
-			// Key-ordered bulk drain. The nodes table is WITHOUT ROWID
-			// (its primary key IS the B-tree), so inserting in ascending
-			// id order makes each insert an append to the rightmost leaf
-			// instead of a random split mid-tree — far fewer page splits
-			// on the cold load. The edges table's UNIQUE(from_id, …) index
-			// benefits the same way from from-id-ordered inserts. So the
-			// whole drain is collected, sorted once, then chunk-written.
-			//
-			// This block only runs on the first/empty cold index (the
-			// shadow-swap branch above), and the shadow node/edge sets
-			// already fit in RAM (the branch is gated on the shadow byte /
-			// file budget). DrainNodes / DrainEdges free each shard as they
-			// yield, so holding the drained set in one slice to sort costs
-			// no more peak RAM than the shadow already did.
-			const persistChunk = 100000
-			allNodes := make([]*graph.Node, 0, shadowNodeCount)
-			for n := range inMemShadow.DrainNodes() {
-				if hasFTS && idx.shouldIndexForSearch(n) {
-					ftsItems = append(ftsItems, graph.SymbolFTSItem{
-						NodeID: n.ID,
-						Tokens: ftsTokensFor(n, idx.projectName),
-					})
+				reporter.Report("building symbol fts", 0, 0)
+				switch {
+				case !ftsReady:
+					retErr = fmt.Errorf("indexer: symbol FTS backend lacks bounded reset/upsert capabilities")
+				case retErr == nil:
+					if err := ftsResetter.ResetSymbolFTS(idx.RepoPrefix()); err != nil {
+						retErr = fmt.Errorf("indexer: reset symbol FTS: %w", err)
+						ftsReady = false
+					}
 				}
-				allNodes = append(allNodes, n)
 			}
-			sort.Slice(allNodes, func(i, j int) bool {
-				return allNodes[i].ID < allNodes[j].ID
-			})
-			for start := 0; start < len(allNodes); start += persistChunk {
-				end := min(start+persistChunk, len(allNodes))
-				diskTarget.AddBatch(allNodes[start:end], nil)
-			}
-			allNodes = nil
 
-			allEdges := make([]*graph.Edge, 0, shadowEdgeCount)
-			for e := range inMemShadow.DrainEdges() {
-				allEdges = append(allEdges, e)
+			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
+				diskTarget.AddBatch(nodes, nil)
+				if !ftsReady || retErr != nil {
+					continue
+				}
+				ftsItems := make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
+				var ftsBytes uint64
+				flushFTS := func() bool {
+					if len(ftsItems) == 0 {
+						return true
+					}
+					if err := ftsBatcher.BatchUpsertSymbolFTS(ftsItems); err != nil {
+						retErr = fmt.Errorf("indexer: append symbol FTS batch: %w", err)
+						ftsReady = false
+						return false
+					}
+					ftsItemCount += len(ftsItems)
+					ftsItems = make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
+					ftsBytes = 0
+					return true
+				}
+				for _, node := range nodes {
+					if !idx.shouldIndexForSearch(node) {
+						continue
+					}
+					tokens := ftsTokensFor(node, idx.projectName)
+					nextBytes := uint64(len(node.ID) + len(tokens) + 32)
+					if len(ftsItems) > 0 && (len(ftsItems) >= persistFTSChunkRows || ftsBytes+nextBytes > persistFTSChunkBytes) {
+						if !flushFTS() {
+							break
+						}
+					}
+					ftsItems = append(ftsItems, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
+					ftsBytes += nextBytes
+					if len(ftsItems) >= persistFTSChunkRows || ftsBytes >= persistFTSChunkBytes {
+						if !flushFTS() {
+							break
+						}
+					}
+				}
+				if ftsReady {
+					flushFTS()
+				}
 			}
-			sort.Slice(allEdges, func(i, j int) bool {
-				return lessEdgeKey(allEdges[i], allEdges[j])
-			})
-			for start := 0; start < len(allEdges); start += persistChunk {
-				end := min(start+persistChunk, len(allEdges))
-				diskTarget.AddBatch(nil, allEdges[start:end])
+			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
+				diskTarget.AddBatch(nil, edges)
 			}
-			allEdges = nil
+
 			flushStart := time.Now()
 			idx.logger.Info("indexer: FlushBulk start",
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Duration("drain_elapsed", flushStart.Sub(drainStart)),
 			)
-			if ferr := bl.FlushBulk(); ferr != nil {
+			if ferr := bl.FlushBulk(); ferr != nil && retErr == nil {
 				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
 			}
 			idx.logger.Info("indexer: FlushBulk complete",
@@ -2604,20 +2701,20 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 				zap.Duration("total_drain", time.Since(drainStart)),
 				zap.Int("nodes", shadowNodeCount),
 				zap.Int("edges", shadowEdgeCount),
+				zap.Int("fts_items", ftsItemCount),
 			)
-			// Build the backend FTS after the bulk load completes so
-			// CREATE_FTS_INDEX has the full corpus to scan in one
-			// pass. BulkUpsertSymbolFTS does its own
-			// extension-install dance, so this is the only place the
-			// indexer needs to know about SymbolSearcher.
-			if hasFTS && len(ftsItems) > 0 {
-				reporter.Report("building symbol fts", 0, 0)
-				if ferr := searcher.BulkUpsertSymbolFTS(idx.RepoPrefix(), ftsItems); ferr != nil {
-					idx.logger.Warn("indexer: bulk symbol FTS upsert failed",
-						zap.Error(ferr))
-				} else if ferr := searcher.BuildSymbolIndex(); ferr != nil {
-					idx.logger.Warn("indexer: backend FTS build failed",
-						zap.Error(ferr))
+			if retErr == nil {
+				if serr := persistShadowCompactSidecars(
+					inMemShadow, diskTarget, idx.RepoPrefix(),
+				); serr != nil {
+					retErr = fmt.Errorf("indexer: persist compact shadow sidecars: %w", serr)
+				}
+			}
+			if hasFTS {
+				if retErr == nil && ftsReady {
+					if ferr := searcher.BuildSymbolIndex(); ferr != nil {
+						retErr = fmt.Errorf("indexer: finalize backend FTS: %w", ferr)
+					}
 				}
 				reporter.Report("building symbol fts", 1, 1)
 			}
@@ -2635,14 +2732,18 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
-		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes) {
+		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowBudgetGranted) {
 			idx.logger.Info("indexer: skipping in-memory shadow; building against disk store (bounded RAM)",
 				zap.Int("files", len(files)),
 				zap.Int("file_threshold", shadowMaxFileCount()),
 				zap.Bool("over_file_count", !belowShadowMax),
 				zap.Int64("total_file_bytes", totalFileBytes),
 				zap.Int64("byte_threshold", maxShadowBytes),
-				zap.Bool("over_byte_budget", !belowShadowBytes))
+				zap.Bool("over_byte_budget", !belowShadowBytes),
+				zap.Int64("shadow_weight_bytes", shadowWeight),
+				zap.Int64("shadow_process_budget_bytes", shadowBudgetCapacity),
+				zap.Int64("shadow_process_used_bytes", shadowBudgetUsed),
+				zap.Bool("shadow_budget_unavailable", shadowLocallyEligible && !shadowBudgetGranted))
 		}
 	}
 
@@ -2662,27 +2763,33 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// cold-store no-op; a cheap per-repo DELETE on a warm one).
 	var (
 		contentWipeFile      func(filePath string)
+		contentRecordFile    func(filePath string)
 		contentStreamedMu    sync.Mutex
 		contentStreamedFiles map[string]struct{}
 	)
 	if cs := idx.contentSearcher(); cs != nil {
-		if w, ok := cs.(interface {
-			WipeContentFileInRepo(repoPrefix, filePath string) error
-		}); ok {
-			repoPrefix := idx.RepoPrefix()
-			contentStreamedFiles = make(map[string]struct{})
+		repoPrefix := idx.RepoPrefix()
+		contentStreamedFiles = make(map[string]struct{})
+		contentRecordFile = func(filePath string) {
+			if filePath == "" {
+				return
+			}
+			contentStreamedMu.Lock()
+			contentStreamedFiles[filePath] = struct{}{}
+			contentStreamedMu.Unlock()
+		}
+		wipeFile, projectionErr, perFile := prepareFullContentFileWiper(cs, repoPrefix, contentRecordFile)
+		if perFile {
+			if projectionErr != nil {
+				idx.logger.Warn("indexer: content repo presence projection failed; retaining per-file wipes",
+					zap.String("repo", repoPrefix), zap.Error(projectionErr))
+			}
 			contentWipeFile = func(filePath string) {
-				if filePath == "" {
-					return
-				}
-				contentStreamedMu.Lock()
-				contentStreamedFiles[filePath] = struct{}{}
-				contentStreamedMu.Unlock()
-				if err := w.WipeContentFileInRepo(repoPrefix, filePath); err != nil {
+				if err := wipeFile(filePath); err != nil {
 					idx.logger.Warn("indexer: per-file content wipe failed", zap.Error(err))
 				}
 			}
-		} else if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+		} else if err := cs.WipeContent(repoPrefix); err != nil {
 			idx.logger.Warn("indexer: content index wipe failed", zap.Error(err))
 		}
 	}
@@ -2740,6 +2847,14 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	var fileCount int64
 	var skippedByTimeout int64
 	var skippedByMinified int64
+	// Parse-subphase instrumentation. The per-stage numbers are SUMMED
+	// worker nanoseconds — read/extract/batch overlap across the pool, so
+	// their sum legitimately exceeds the critical-path wall emitted beside
+	// them; sem_wait is pure admission queuing. One log line per repo at
+	// parse completion, so a parse-phase regression is attributable to a
+	// stage instead of guessed at.
+	parseWallStart := time.Now()
+	var parseSemWaitNS, parseReadNS, parseExtractNS, parseBatchNS int64
 
 	// Bound peak parse memory: a weighted, bytes-in-flight semaphore
 	// admits each worker by its file size before it reads + extracts, so
@@ -2814,6 +2929,23 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}
 		}
 	}
+	flushStreamedMtimes := func() {
+		w, ok := idx.graph.(graph.FileMtimeWriter)
+		if !ok {
+			return
+		}
+		streamMtimeMu.Lock()
+		flush := streamMtimes
+		streamMtimes = make(map[string]int64, mtimeStreamPersistEvery)
+		streamMtimeMu.Unlock()
+		if len(flush) == 0 {
+			return
+		}
+		if err := w.BulkSetFileMtimes(idx.repoPrefix, flush); err != nil {
+			idx.logger.Warn("indexer: final incremental mtime batch persist failed",
+				zap.String("repo", idx.repoPrefix), zap.Error(err))
+		}
+	}
 
 	// parseChunk runs the per-file worker pool over the supplied
 	// slice. Closure over outer state (errors, counters, contract
@@ -2822,6 +2954,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// streaming-flush large-repo path where each call processes a
 	// bounded slice into a per-chunk in-memory shadow.
 	parseChunk := func(chunkFiles []walkedFile) {
+		sidecars := newParseSidecarBatch(idx)
+		contentBatch := newParseContentBatch(idx)
+		graphBatch := newParseGraphBatch(idx.graph)
 		fileCh := make(chan walkedFile, workers*4)
 		var wg sync.WaitGroup
 		for range workers {
@@ -2843,9 +2978,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					var weight int64
 					if parseSem != nil {
 						weight = clampParseWeight(wf.size, parseBudget)
+						semStart := time.Now()
 						if aerr := parseSem.Acquire(ctx, weight); aerr != nil {
 							return
 						}
+						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
 					relPath, _ := filepath.Rel(absRoot, path)
@@ -2871,18 +3008,37 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 								continue
 							}
 							idx.applyRepoPrefix(result.Nodes, result.Edges)
-							if contentWipeFile != nil {
-								contentWipeFile(firstContentFilePath(result.Nodes))
+							contentHandled := false
+							if contentBatch != nil {
+								durablePath, durableMtime := path, wf.mtimeNano
+								contentHandled = contentBatch.add(result.Nodes, result.Edges, func() {
+									recordStreamedMtime(durablePath, durableMtime)
+								})
+								if contentHandled && contentRecordFile != nil {
+									contentRecordFile(firstContentFilePath(result.Nodes))
+								}
 							}
-							idx.streamContentSections(result.Nodes)
-							idx.graph.AddBatch(result.Nodes, result.Edges)
-							idx.persistConstValues(result)
-							recordStreamedMtime(path, wf.mtimeNano)
+							if !contentHandled {
+								if contentWipeFile != nil {
+									contentWipeFile(firstContentFilePath(result.Nodes))
+								}
+								idx.streamContentSections(result.Nodes)
+								durablePath, durableMtime := path, wf.mtimeNano
+								if !graphBatch.add(result.Nodes, result.Edges, func() {
+									recordStreamedMtime(durablePath, durableMtime)
+								}) {
+									idx.graph.AddBatch(result.Nodes, result.Edges)
+									recordStreamedMtime(durablePath, durableMtime)
+								}
+							}
+							sidecars.addConstValues(result)
 							continue
 						}
 					}
 
+					readStart := time.Now()
 					src, err := readFile(wf)
+					atomic.AddInt64(&parseReadNS, int64(time.Since(readStart)))
 					if err != nil {
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
@@ -2923,7 +3079,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// PDF→markdown command, …).
 					src = idx.transforms.run(relPath, src)
 
+					extractStart := time.Now()
 					result, skipped, err := idx.extractFile(parsePool, quarantine, path, relPath, lang, ext, src)
+					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
 					if parseSem != nil {
 						parseSem.Release(weight)
 					}
@@ -2992,20 +3150,39 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 					// nodes to a snippet BEFORE AddBatch, so the bulk text
 					// never enters the graph, the symbol search, or the
 					// materialising code passes.
-					if contentWipeFile != nil {
-						contentWipeFile(firstContentFilePath(result.Nodes))
+					contentHandled := false
+					if contentBatch != nil {
+						durablePath, durableMtime := path, wf.mtimeNano
+						contentHandled = contentBatch.add(result.Nodes, result.Edges, func() {
+							recordStreamedMtime(durablePath, durableMtime)
+						})
+						if contentHandled && contentRecordFile != nil {
+							contentRecordFile(firstContentFilePath(result.Nodes))
+						}
 					}
-					idx.streamContentSections(result.Nodes)
+					if !contentHandled {
+						if contentWipeFile != nil {
+							contentWipeFile(firstContentFilePath(result.Nodes))
+						}
+						idx.streamContentSections(result.Nodes)
+					}
 
-					// Batch the per-file insert into one shard-grouped pass
-					// so each shard's lock is acquired at most once per
-					// file instead of N + 2·E times. Profiling showed 69
-					// of 102 workers blocked on lockTwoWrite under the
-					// per-edge path during cold-start warmup.
-					idx.graph.AddBatch(result.Nodes, result.Edges)
-					idx.persistConstValues(result)
-					idx.persistFileMeta(relPath, src, result)
-					recordStreamedMtime(path, wf.mtimeNano)
+					// In-memory shadows keep the existing per-file shard-grouped
+					// AddBatch. Direct SQLite writes enter a bounded cross-file
+					// accumulator, amortising transaction/statement setup without
+					// retaining a repository-sized graph in Go memory.
+					if !contentHandled {
+						batchStart := time.Now()
+						durablePath, durableMtime := path, wf.mtimeNano
+						if !graphBatch.add(result.Nodes, result.Edges, func() {
+							recordStreamedMtime(durablePath, durableMtime)
+						}) {
+							idx.graph.AddBatch(result.Nodes, result.Edges)
+							recordStreamedMtime(durablePath, durableMtime)
+						}
+						atomic.AddInt64(&parseBatchNS, int64(time.Since(batchStart)))
+					}
+					sidecars.add(relPath, src, result)
 
 					if !skipped && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
@@ -3045,11 +3222,23 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			}()
 		}
 
+	dispatch:
 		for _, f := range chunkFiles {
-			fileCh <- f
+			select {
+			case fileCh <- f:
+			case <-ctx.Done():
+				break dispatch
+			}
 		}
 		close(fileCh)
 		wg.Wait()
+		// Flush every successfully parsed file even when ctx was cancelled
+		// while another worker waited for admission. This preserves the old
+		// per-file durability boundary and makes the next cold attempt resume
+		// from the mtimes whose callbacks run after this commit.
+		graphBatch.flush()
+		contentBatch.flush()
+		sidecars.flush()
 	}
 
 	// Dispatch the largest files first. Both dispatch paths below
@@ -3085,11 +3274,34 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			chunkShadow := graph.New()
 			idx.graph = chunkShadow
 			parseChunk(files[chunkStart:chunkEnd])
-			// Flush chunk to disk.
+			if err := ctx.Err(); err != nil {
+				// This chunk has not crossed the durable boundary yet. Drop it
+				// and retain only prior fully-flushed chunks; never stamp mtimes
+				// for files the cancelled dispatch did not parse.
+				idx.graph = streamingDisk
+				return nil, err
+			}
+			// Flush the chunk to disk through the same explicit caps as the
+			// admitted whole-repository shadow. Node and edge buffers never
+			// overlap, and compact sidecars drain independently afterwards.
 			bl.BeginBulkLoad()
-			streamingDisk.AddBatch(chunkShadow.AllNodes(), chunkShadow.AllEdges())
+			const (
+				streamPersistRows  = 8192
+				streamPersistBytes = 16 << 20
+			)
+			for nodes := range chunkShadow.DrainNodeBatches(streamPersistRows, streamPersistBytes) {
+				streamingDisk.AddBatch(nodes, nil)
+			}
+			for edges := range chunkShadow.DrainEdgeBatches(streamPersistRows, streamPersistBytes) {
+				streamingDisk.AddBatch(nil, edges)
+			}
 			if err := bl.FlushBulk(); err != nil {
 				return nil, fmt.Errorf("indexer: streaming-flush chunk %d..%d: %w", chunkStart, chunkEnd, err)
+			}
+			if err := persistShadowCompactSidecarChunk(
+				chunkShadow, streamingDisk, idx.RepoPrefix(),
+			); err != nil {
+				return nil, fmt.Errorf("indexer: streaming-flush compact sidecars %d..%d: %w", chunkStart, chunkEnd, err)
 			}
 			// This chunk's nodes are durable on disk now, so persist its
 			// files' mtimes — a kill mid-track then resumes from this chunk
@@ -3118,6 +3330,15 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		idx.graph = streamingDisk
 	} else {
 		parseChunk(files)
+		if err := ctx.Err(); err != nil {
+			// Direct SQLite batches have committed all completed files at this
+			// point. Persist their under-threshold mtime tail before returning;
+			// the authoritative all-file replace below must not run on a
+			// cancelled walk. Shadow paths self-skip this writer capability and
+			// their deferred error restore discards the partial shadow.
+			flushStreamedMtimes()
+			return nil, err
+		}
 	}
 
 	// Finalise the content index after the per-file streaming appends so
@@ -3173,6 +3394,15 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// idx.graph back to diskTarget runs LATER, when IndexCtx returns,
 	// so we can't rely on it here. Falls through to idx.graph for the
 	// non-shadow path.
+	idx.logger.Info("indexer: parse subphases",
+		zap.String("repo", idx.repoPrefix),
+		zap.Duration("wall", time.Since(parseWallStart)),
+		zap.Duration("sem_wait_workers", time.Duration(atomic.LoadInt64(&parseSemWaitNS))),
+		zap.Duration("read_workers", time.Duration(atomic.LoadInt64(&parseReadNS))),
+		zap.Duration("extract_workers", time.Duration(atomic.LoadInt64(&parseExtractNS))),
+		zap.Duration("batch_workers", time.Duration(atomic.LoadInt64(&parseBatchNS))),
+		zap.Int("workers", workers),
+		zap.Int("files", totalFiles))
 	mtimeTarget := graph.Store(idx.graph)
 	if diskTarget != nil {
 		mtimeTarget = diskTarget
@@ -3248,6 +3478,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 		// ResolveAll mutation phase and a sibling goroutine's contract
 		// pass walking AllEdges. See SetDeferResolve.
 		idx.pendingContractReg = contractReg
+		idx.deferredGoModDone = false
 	} else {
 		// Materialise dep::<module> contract nodes from go.mod BEFORE
 		// ResolveAll so the resolver's import bridge can re-target Go
@@ -3278,9 +3509,13 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 			// file selection to this repo (empty in single-repo mode).
 			roots := map[string]string{idx.repoPrefix: absRoot}
 			// The inline full-index path does not gate or persist enrichment
-			// markers (a zero EnrichOptions): the deferred warmup path owns the
-			// skip-on-restart optimisation.
-			results, _, err := idx.semanticMgr.EnrichAll(idx.graph, roots, semantic.EnrichOptions{})
+			// markers (no RepoState): the deferred warmup path owns the
+			// skip-on-restart optimisation. The admission floor still applies —
+			// this is index-time enrichment of a whole repo, the exact workload
+			// the floor protects.
+			results, _, err := idx.semanticMgr.EnrichAll(idx.graph, roots, semantic.EnrichOptions{
+				MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
+			})
 			if err != nil {
 				idx.logger.Warn("semantic enrichment failed", zap.Error(err))
 			} else if len(results) > 0 {
@@ -3465,7 +3700,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 	// deferred semantic enrichment. FullRetrack is stamped by the multi-repo
 	// caller after this returns, so FileCount carries the signal here.
 	if result.FileCount > 0 || result.FullRetrack {
-		idx.pendingEnrich.Store(true)
+		idx.markPendingEnrichFull()
 		// IndexCtx re-parsed every file, dropping this repo's hover-enrichment
 		// edges — force the deferred pass past the completion-marker gate so
 		// they are restored even at an unchanged clean HEAD.
@@ -3506,7 +3741,7 @@ func (idx *Indexer) warnIfEdgeSanityViolated(r *IndexResult) {
 // add), including per-file resolver work for cross-file references.
 // Use in the single-event fsnotify path where each edit is isolated.
 func (idx *Indexer) IndexFile(filePath string) error {
-	return idx.indexFile(filePath, true)
+	return idx.indexFile(filePath, true, nil)
 }
 
 // IndexFileNoResolve is IndexFile minus the per-file resolver call.
@@ -3515,10 +3750,18 @@ func (idx *Indexer) IndexFile(filePath string) error {
 // once at the end of the batch; otherwise a 500-file checkout pays
 // the per-file resolver cost 500 times instead of once.
 func (idx *Indexer) IndexFileNoResolve(filePath string) error {
-	return idx.indexFile(filePath, false)
+	return idx.indexFile(filePath, false, nil)
 }
 
-func (idx *Indexer) indexFile(filePath string, resolve bool) error {
+func (idx *Indexer) indexFile(
+	filePath string,
+	resolve bool,
+	markerBatches ...*reparsePendingEnrichmentBatch,
+) error {
+	var markerBatch *reparsePendingEnrichmentBatch
+	if len(markerBatches) > 0 {
+		markerBatch = markerBatches[0]
+	}
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return err
@@ -3571,7 +3814,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		idx.graph.EvictFile(graphPath)
 	}
 
-	src, err := os.ReadFile(absPath)
+	src, readVersion, err := readFileWithVersion(absPath)
 	if err != nil {
 		return err
 	}
@@ -3596,6 +3839,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
 		evictExisting()
 		idx.graph.AddBatch([]*graph.Node{n}, nil)
+		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+			return errFileVersionChanged
+		}
 		return nil
 	}
 
@@ -3610,6 +3856,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		idx.applyRepoPrefix([]*graph.Node{n}, nil)
 		evictExisting()
 		idx.graph.AddBatch([]*graph.Node{n}, nil)
+		if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+			return errFileVersionChanged
+		}
 		return nil
 	}
 
@@ -3648,7 +3897,10 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 		// from perpetually seeing this one unparseable file as "the
 		// repo changed" and routing the whole repo through the
 		// expensive shadow re-track path on every restart.
-		idx.recordFileMtime(mtimeKey, absPath)
+		fresh := idx.recordFileReadVersion(mtimeKey, absPath, readVersion)
+		if err == nil && !fresh {
+			return errFileVersionChanged
+		}
 		return err
 	}
 
@@ -3656,9 +3908,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// sources the post-resolve signature-delta pass compares against,
 	// captured BEFORE eviction — EvictFile drops in-edges from
 	// unchanged files and replaces this file's nodes, so neither is
-	// recoverable afterwards. Skipped on the no-resolve and
-	// deferred-batch paths, whose callers run a full resolve (and
-	// persistAllRefFacts) once at the end of the batch.
+	// recoverable afterwards. A watcher-deferred batch captures the same compact
+	// snapshot and merges only its affected-file plan into the outer catch-up;
+	// it never retains this parse result across chunks.
 	//
 	// Also skipped for a quarantined / timed-out / minified-skipped file:
 	// its synthetic result carries zero symbols, so the delta would read
@@ -3668,7 +3920,8 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	var abSnap *affectedBySnapshot
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
-	if resolve && !idx.deferGlobalPasses && !skipped {
+	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
+	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses && !skipped {
 		snapshotStarted := time.Now()
 		abSnap = idx.snapshotAffectedBy(graphPath)
 		// Snapshot the file's outgoing edges before eviction: resolved ones so
@@ -3722,14 +3975,7 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// re-stream + lean — mirrors the full-index per-file path so an edited
 	// content file leaves no stale rows and doesn't revert to full text on
 	// the node.
-	if cs := idx.contentSearcher(); cs != nil {
-		if fp := firstContentFilePath(result.Nodes); fp != "" {
-			if err := cs.WipeContentFile(fp); err != nil {
-				idx.logger.Warn("indexer: content index file wipe failed", zap.Error(err))
-			}
-		}
-	}
-	idx.streamContentSections(result.Nodes)
+	idx.replaceContentSections(graphPath, result.Nodes, false)
 
 	idx.graph.AddBatch(result.Nodes, result.Edges)
 	idx.persistConstValues(result)
@@ -3741,18 +3987,28 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// also mirror each upsert into its native FTS, so an
 	// incremental reindex doesn't fall out of sync with the
 	// bulk-built corpus.
-	searcher, _ := idx.graph.(graph.SymbolSearcher)
+	batcher, _ := idx.graph.(graph.SymbolFTSBatchUpserter)
+	var ftsItems []graph.SymbolFTSItem
+	if batcher != nil {
+		ftsItems = make([]graph.SymbolFTSItem, 0, len(result.Nodes))
+	}
 	for _, n := range result.Nodes {
 		if !idx.shouldIndexForSearch(n) {
 			continue
 		}
 		idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
-		if searcher != nil {
-			if err := searcher.UpsertSymbolFTS(n.ID, ftsTokensFor(n, idx.projectName)); err != nil {
-				idx.logger.Debug("indexer: backend FTS upsert failed",
-					zap.String("id", n.ID),
-					zap.Error(err))
-			}
+		if batcher != nil {
+			ftsItems = append(ftsItems, graph.SymbolFTSItem{
+				NodeID: n.ID,
+				Tokens: ftsTokensFor(n, idx.projectName),
+			})
+		}
+	}
+	if len(ftsItems) > 0 {
+		if err := batcher.BatchUpsertSymbolFTS(ftsItems); err != nil {
+			idx.logger.Debug("indexer: backend FTS batch upsert failed",
+				zap.Int("symbols", len(ftsItems)),
+				zap.Error(err))
 		}
 	}
 	commitDuration = time.Since(commitStarted)
@@ -3834,18 +4090,19 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			// full-index EnrichAll call but scoped to the saved file, so a
 			// watcher save re-runs the type resolvers (and any watch-enabled
 			// LSP / compiler provider) instead of leaving the file's edges at
-			// their pre-enrichment tier until the next full reindex. Gated
-			// internally on Config.EnrichOnWatch; a no-op when disabled.
+			// their pre-enrichment tier until the next full reindex. This caller
+			// enforces Config.EnrichOnWatch; deferred batches use EnrichFiles.
 			providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+			watchEnrichment := providersPresent && !idx.deferGlobalPasses && idx.semanticMgr.EnrichesOnWatch()
 			reEnriched := false
-			if providersPresent {
+			if watchEnrichment {
 				enrichStarted := time.Now()
 				if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
 					idx.logger.Debug("indexer: incremental semantic enrichment failed",
 						zap.String("file", graphPath),
 						zap.Error(err))
 				} else {
-					reEnriched = idx.semanticMgr.EnrichesOnWatch()
+					reEnriched = true
 				}
 				enrichDuration = time.Since(enrichStarted)
 			}
@@ -3856,7 +4113,26 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 			// suppression as re-verification-pending so a hidden-but-real usage
 			// is diagnosable rather than silently dropped. Cleared when
 			// enrichment did re-run for the file.
-			idx.setReparsePendingEnrichment(graphPath, providersPresent && !reEnriched)
+			pendingReparseEnrichment := providersPresent && !reEnriched
+			if markerBatch == nil {
+				idx.setReparsePendingEnrichment(graphPath, pendingReparseEnrichment)
+			} else if markerBatch.add(graphPath, pendingReparseEnrichment) {
+				idx.flushReparsePendingEnrichment(markerBatch)
+			}
+		}
+	} else if deferredResolverCatchup && !skipped {
+		// Exceptional files that could not enter the prepared structural batch
+		// still defer every resolution-dependent tail to the watcher batch's one
+		// outer catch-up. Preserve the compact pre-evict affected-by frontier, but
+		// do not retain parse trees or run a per-file resolver/dataflow/fact pass.
+		markerBatch.mergeDeferredAffected(idx.planAffectedByStages([]*incrementalBatchStage{{
+			graphPath: graphPath,
+			result:    result,
+			abSnap:    abSnap,
+		}}))
+		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+		if markerBatch.add(graphPath, providersPresent) {
+			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 	}
 
@@ -3864,7 +4140,9 @@ func (idx *Indexer) indexFile(filePath string, resolve bool) error {
 	// form), NOT relPath — relPath is the OS-native graph key, whereas
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
-	idx.recordFileMtime(mtimeKey, absPath)
+	if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
+		return errFileVersionChanged
+	}
 	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
 		idx.logger.Warn("indexer: slow incremental stages",
 			zap.String("file", graphPath),
@@ -3893,7 +4171,25 @@ func (idx *Indexer) recordFileMtime(relPath, absPath string) {
 	if err != nil {
 		return
 	}
-	mtime := info.ModTime().UnixNano()
+	idx.recordFileMtimeValue(relPath, info.ModTime().UnixNano())
+}
+
+// recordFileReadVersion records only the version whose bytes were parsed. If
+// the file changed after the stable read, the prior receipt remains stale so a
+// queued event or the poller retries instead of treating newer bytes as done.
+func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileReadVersion) bool {
+	if !version.valid {
+		return false
+	}
+	current, err := os.Stat(absPath)
+	if err != nil || !sameFileVersion(version.info, current) {
+		return false
+	}
+	idx.recordFileMtimeValue(relPath, version.mtime)
+	return true
+}
+
+func (idx *Indexer) recordFileMtimeValue(relPath string, mtime int64) {
 	idx.mtimeMu.Lock()
 	idx.fileMtimes[relPath] = mtime
 	idx.mtimeMu.Unlock()
@@ -4077,13 +4373,14 @@ func (idx *Indexer) ReresolveFileScoped(filePath string) error {
 	}
 	idx.resolver.ResolveFileAndIncoming(graphPath)
 	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+	watchEnrichment := providersPresent && idx.semanticMgr.EnrichesOnWatch()
 	reEnriched := false
-	if providersPresent {
+	if watchEnrichment {
 		if _, err := idx.semanticMgr.EnrichFile(idx.graph, idx.rootPath, graphPath); err != nil {
 			idx.logger.Debug("indexer: forced scoped enrichment failed",
 				zap.String("file", graphPath), zap.Error(err))
 		} else {
-			reEnriched = idx.semanticMgr.EnrichesOnWatch()
+			reEnriched = true
 		}
 	}
 	// Keep the find_usages staleness marker consistent with the enrichment
@@ -4142,16 +4439,30 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) {
 		return
 	}
 	evicted := make(map[string]struct{}, len(nodes))
+	refIDs := make([]string, 0, len(nodes))
 	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
 		evicted[n.ID] = struct{}{}
+		if n.Name != "" && graph.IsReferenceableSymbol(n.Kind) {
+			refIDs = append(refIDs, n.ID)
+		}
 	}
+	if len(refIDs) == 0 {
+		return
+	}
+	// Fetch the whole changed file's incoming adjacency in one bounded store
+	// operation. On SQLite this is chunked under the parameter limit; more
+	// importantly, it avoids one transaction/query per definition in the file.
+	inEdges := idx.graph.GetInEdgesByNodeIDs(refIDs)
 	var batch []graph.EdgeReindex
 	for _, n := range nodes {
-		if n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
+		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
 			continue
 		}
 		stub := graph.UnresolvedMarker + n.Name
-		for _, e := range idx.graph.GetInEdges(n.ID) {
+		for _, e := range inEdges[n.ID] {
 			if e == nil || !graph.IsResolvableRefEdge(e.Kind) {
 				continue
 			}
@@ -4499,15 +4810,14 @@ func flattenEmbedResults(results [][][]float32) [][]float32 {
 //
 // In multi-repo mode the search backend is shared across every repo
 // (Indexer.search is wired to MultiIndexer.search at construction).
-// Walking g.AllNodes() and re-Add()ing every node would mean each
-// freshly-tracked repo pays an O(workspace) re-index pass over all
+// Re-reading every graph node would mean each freshly-tracked repo pays an
+// O(workspace) re-index pass over all
 // previously-tracked repos' nodes — quadratic in repo count and the
 // dominant cost of warming up a 260-repo workspace. So when this
 // indexer carries a non-empty repoPrefix we walk only that repo's
 // byRepo bucket; the other repos' entries are already in the shared
-// backend from when they were tracked. Single-repo mode keeps the
-// AllNodes() path because nodes there carry an empty RepoPrefix and
-// GetRepoNodes("") would miss them.
+// backend from when they were tracked. Single-repo mode uses the store's
+// non-content projection with an empty repo namespace.
 func (idx *Indexer) buildSearchIndex() {
 	// Start every build from a clean vector-build error: the degraded vector
 	// paths below set it, and a successful build (or a benign skip / no embedder)
@@ -5011,7 +5321,12 @@ func (idx *Indexer) incrementalDiscoverPaths(root string, paths []string) (*Inde
 	return idx.incrementalReindexPaths(root, paths, false)
 }
 
-func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectDeletions bool) (*IndexResult, error) {
+func (idx *Indexer) incrementalReindexPaths(
+	root string,
+	paths []string,
+	detectDeletions bool,
+	markerBatches ...*reparsePendingEnrichmentBatch,
+) (*IndexResult, error) {
 	if len(paths) == 0 {
 		// An empty scope means the repository root. detectDeletions decides
 		// whether absent persisted paths are evicted; keeping that choice here
@@ -5080,7 +5395,7 @@ func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectD
 					}
 					return nil
 				}
-				if _, ok := idx.effectiveLanguage(path, nil); !ok {
+				if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
 					return nil
 				}
 				if idx.shouldExclude(path, absRoot, false) {
@@ -5103,7 +5418,7 @@ func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectD
 
 		// Single file. Apply the same language / exclude gate so a
 		// caller can't force a non-source or excluded file in.
-		if _, ok := idx.effectiveLanguage(absPath, nil); !ok {
+		if _, ok := idx.effectiveLanguage(absPath, nil); !ok && !idx.isIncrementalContractManifest(absPath) {
 			continue
 		}
 		if idx.shouldExclude(absPath, absRoot, false) {
@@ -5166,97 +5481,25 @@ func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectD
 		}
 	}
 
-	var invalidation DerivedInvalidationPlan
-	for _, relPath := range deletedFiles {
-		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
-		// keys nodes under OS-native separators, so convert before the
-		// evict or a deleted file's nodes leak on Windows. FromSlash is
-		// a no-op on POSIX.
-		graphPath := idx.prefixPath(filepath.FromSlash(relPath))
-		priorNodes := idx.graph.GetFileNodes(graphPath)
-		for _, node := range priorNodes {
-			if node != nil && node.Kind != graph.KindFile && node.Kind != graph.KindImport {
-				idx.search.Remove(node.ID)
-			}
-		}
-		priorDerived := storedDerivedFingerprints(priorNodes)
-		deletedPlan := derivedPlanForDelta(
-			priorDerived, derivedFingerprints{}, true,
-			graphPath, priorNodes, nil,
-		)
-		// A known fingerprinted deletion is conservatively all-family but not
-		// a legacy uncertainty. Missing persisted fingerprints mean this is an
-		// upgraded database and must retain the wide safety fallback once.
-		deletedPlan.LegacyFallback = !priorDerived.complete()
-		invalidation.Merge(deletedPlan)
-		idx.restubIncomingRefs(graphPath)
-		idx.evictEnrichment(graphPath)
-		idx.graph.EvictFile(graphPath)
-		idx.mtimeMu.Lock()
-		delete(idx.fileMtimes, relPath)
-		idx.mtimeMu.Unlock()
+	// Capture surviving dependents before deletion evicts the target symbols and
+	// their incoming adjacency. The helper performs one batched node/edge
+	// frontier read for the whole deletion set.
+	deletedDependencyFiles := idx.semanticDependencyFrontierForDeletedFiles(deletedFiles)
+	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
+	markerBatch := &reparsePendingEnrichmentBatch{}
+	if len(markerBatches) > 0 && markerBatches[0] != nil {
+		markerBatch = markerBatches[0]
 	}
+	invalidation, reparsedFiles, failedFiles := idx.reindexIncrementalFilesBatched(
+		sourceStaleFiles, deletedFiles, markerBatch,
+	)
+	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
+	invalidation.Merge(manifestPlan)
+	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
 	idx.pruneDeletedFileMtimes(deletedFiles)
-
-	reindexOne := func(filePath string) error {
-		mtimeKey := idx.relKey(filePath)
-		graphPath := idx.prefixPath(idx.graphRelKey(filePath))
-		priorNodes := idx.graph.GetFileNodes(graphPath)
-		storedGraph := storedExtractionGraphFingerprints(priorNodes)
-		storedDerived := storedDerivedFingerprints(priorNodes)
-		probe, probeOK := idx.prepareFileDelta(filePath)
-
-		if probeOK && storedGraph.semantic != "" {
-			switch {
-			case probe.fingerprints.semantic == storedGraph.semantic && probe.fingerprints.metadata == storedGraph.metadata:
-				idx.discardPreparedExtraction(filePath)
-				idx.recordFileMtime(mtimeKey, filePath)
-				invalidation.InertFiles++
-				return nil
-			case probe.fingerprints.semantic == storedGraph.semantic:
-				if _, refreshed := idx.applyPreparedMetadataRefresh(filePath, priorNodes); refreshed {
-					invalidation.MetadataOnlyFiles++
-					invalidation.Files = appendUniqueSorted(invalidation.Files, graphPath)
-					return nil
-				}
-			}
-		}
-
-		if err := idx.IndexFile(filePath); err != nil {
-			idx.discardPreparedExtraction(filePath)
-			return err
-		}
-		freshNodes := idx.graph.GetFileNodes(graphPath)
-		freshDerived := storedDerivedFingerprints(freshNodes)
-		if probeOK && probe.derived.complete() {
-			freshDerived = probe.derived
-		}
-		semanticChanged := !probeOK || storedGraph.semantic == "" || probe.fingerprints.semantic != storedGraph.semantic
-		invalidation.Merge(derivedPlanForDelta(
-			storedDerived, freshDerived, semanticChanged, graphPath, priorNodes, freshNodes,
-		))
-		return nil
-	}
-
-	var failedFiles []string
-	for _, filePath := range staleFiles {
-		if err := reindexOne(filePath); err != nil {
-			idx.logger.Debug("incremental reindex: failed to index file",
-				zap.String("file", filePath), zap.Error(err))
-			failedFiles = append(failedFiles, filePath)
-		}
-	}
-	if len(failedFiles) > 0 {
-		retry := failedFiles
-		failedFiles = nil
-		for _, filePath := range retry {
-			if err := reindexOne(filePath); err != nil {
-				idx.logger.Warn("incremental reindex: file failed after retry",
-					zap.String("file", filePath), zap.Error(err))
-				failedFiles = append(failedFiles, filePath)
-			}
-		}
-	}
+	idx.flushReparsePendingEnrichment(markerBatch)
 
 	// Structural and metadata refreshes maintain both the in-memory search
 	// backend and persistent FTS one symbol at a time; deletions remove the
@@ -5273,11 +5516,17 @@ func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectD
 		// deltas: endpoint literals, response envelopes and source locations can
 		// change without changing declaration/call topology. Only an effective
 		// contract-set change requests the workspace reconciliation pass.
-		contractsChanged, contractFallback := idx.refreshContractsForFiles(invalidation.Files)
-		if contractsChanged {
+		contractRefresh := idx.refreshContractsForFiles(invalidation.Files)
+		if contractRefresh.Changed {
 			invalidation.Flags |= DerivedInvalidatesContracts
+			invalidation.ContractGroups = mergeContractGroups(
+				invalidation.ContractGroups, contractRefresh.Groups...,
+			)
+			invalidation.ContractSymbolIDs = appendUniqueSorted(
+				invalidation.ContractSymbolIDs, contractRefresh.SymbolIDs...,
+			)
 		}
-		if contractFallback {
+		if contractRefresh.LegacyFallback {
 			invalidation.LegacyFallback = true
 		}
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
@@ -5295,17 +5544,12 @@ func (idx *Indexer) incrementalReindexPaths(root string, paths []string, detectD
 		DerivedInvalidation: invalidation,
 	}
 	idx.warnIfEdgeSanityViolated(result)
-	// An incremental pass that re-indexed or evicted at least one file did
-	// work — mark the repo for deferred semantic enrichment. A zero-change
-	// reconcile leaves the marker untouched so an unchanged repo is skipped.
-	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
-		idx.pendingEnrich.Store(true)
-	}
-	// A re-parsed stale file's hover-enrichment edges were evicted with its old
-	// nodes, so force the deferred pass past the completion marker (a deletion
-	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
-	if result.StaleFileCount > 0 {
-		idx.reparsedThisRun.Store(true)
+	// Partial work always queues the exact changed/deleted/dependent graph-file
+	// frontier. runDeferredEnrich partitions surviving files by language in one
+	// read; deleted files need no provider call after their graph state is evicted.
+	// A partial pass never publishes or requires a whole-repository marker.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+		idx.markPendingEnrichFiles(invalidation.Files)
 	}
 	return result, nil
 }
@@ -5357,7 +5601,7 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {
@@ -5432,6 +5676,16 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 			zap.String("rel", relPath), zap.Error(err))
 	}
 
+	// Capture surviving dependents while the deleted symbols and their incoming
+	// adjacency are still present. Keep the exact deleted paths too so contract
+	// registries can remove their stale entries after graph eviction.
+	deletedDependencyFiles := idx.semanticDependencyFrontierForDeletedFiles(deletedFiles)
+	partialFrontier := appendUniqueSorted(nil, deletedDependencyFiles...)
+	for _, relPath := range deletedFiles {
+		partialFrontier = append(partialFrontier, idx.prefixPath(filepath.FromSlash(relPath)))
+	}
+	partialFrontier = appendUniqueSorted(nil, partialFrontier...)
+
 	// Evict only files that are truly absent from disk.
 	for _, relPath := range deletedFiles {
 		// relPath is a fileMtimes key (relKey: slash + NFC); the graph
@@ -5460,25 +5714,38 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 	// file that read but failed to parse gets its mtime recorded (see
 	// indexFile's result==nil branch), so it stops being retried until
 	// its content changes again — see IndexResult.FailedFiles.
+	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
+	markerBatch := &reparsePendingEnrichmentBatch{}
 	var failedFiles []string
-	for _, f := range staleFiles {
-		if err := idx.IndexFile(f); err != nil {
+	var reparsedFiles []string
+	for _, f := range sourceStaleFiles {
+		if err := idx.indexFile(f, true, markerBatch); err != nil {
 			idx.logger.Debug("incremental reindex: failed to index file",
 				zap.String("file", f), zap.Error(err))
 			failedFiles = append(failedFiles, f)
+		} else {
+			reparsedFiles = append(reparsedFiles, f)
 		}
 	}
 	if len(failedFiles) > 0 {
 		retry := failedFiles
 		failedFiles = nil
 		for _, f := range retry {
-			if err := idx.IndexFile(f); err != nil {
+			if err := idx.indexFile(f, true, markerBatch); err != nil {
 				idx.logger.Warn("incremental reindex: file failed after retry",
 					zap.String("file", f), zap.Error(err))
 				failedFiles = append(failedFiles, f)
+			} else {
+				reparsedFiles = append(reparsedFiles, f)
 			}
 		}
 	}
+
+	partialFrontier = appendUniqueSorted(partialFrontier, idx.graphFilePaths(reparsedFiles)...)
+	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
+	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
+	partialFrontier = appendUniqueSorted(partialFrontier, manifestPlan.Files...)
+	idx.flushReparsePendingEnrichment(markerBatch)
 
 	// Re-infer interface implementations (edges may have been lost
 	// during eviction). Skipped under deferGlobalPasses so a batch
@@ -5532,9 +5799,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		idx.totalDetected = len(diskFiles)
 	}
 
-	// Re-extract contracts only if stale files were re-indexed.
+	// Refresh contracts only for the changed/deleted/dependent frontier. The
+	// registry bootstrap and cross-file expansion remain contract-scoped; this
+	// path never scans the repository merely because one file changed.
 	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
-		idx.extractContracts()
+		idx.refreshContractsForFiles(partialFrontier)
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 
@@ -5549,17 +5818,11 @@ func (idx *Indexer) IncrementalReindex(root string) (*IndexResult, error) {
 		DurationMs:       time.Since(start).Milliseconds(),
 	}
 	idx.warnIfEdgeSanityViolated(result)
-	// An incremental pass that re-indexed or evicted at least one file did
-	// work — mark the repo for deferred semantic enrichment. A zero-change
-	// reconcile leaves the marker untouched so an unchanged repo is skipped.
-	if result.StaleFileCount > 0 || result.DeletedFileCount > 0 {
-		idx.pendingEnrich.Store(true)
-	}
-	// A re-parsed stale file's hover-enrichment edges were evicted with its old
-	// nodes, so force the deferred pass past the completion marker (a deletion
-	// evicts nodes but creates no fresh unstamped ones, so it alone does not).
-	if result.StaleFileCount > 0 {
-		idx.reparsedThisRun.Store(true)
+	// Queue only the exact changed/deleted/dependent file frontier. The deferred
+	// runner handles all surviving languages in batches and clears this generation
+	// only after every selected provider succeeds.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+		idx.markPendingEnrichFiles(partialFrontier)
 	}
 	return result, nil
 }
@@ -5674,6 +5937,47 @@ func (idx *Indexer) runContractExtractorsForFile(
 	return out
 }
 
+func (idx *Indexer) upgradeContractBareTypeRefs(reg *contracts.Registry) {
+	if reg == nil {
+		return
+	}
+	bareTypeSet := make(map[string]struct{})
+	for _, contract := range reg.All() {
+		for _, key := range []string{"request_type", "response_type"} {
+			name, _ := contract.Meta[key].(string)
+			if name != "" && !strings.Contains(name, "::") {
+				bareTypeSet[name] = struct{}{}
+			}
+		}
+	}
+	bareTypeNames := make([]string, 0, len(bareTypeSet))
+	for name := range bareTypeSet {
+		bareTypeNames = append(bareTypeNames, name)
+	}
+	sort.Strings(bareTypeNames)
+	typeNodesByName := make(map[string][]*graph.Node)
+	if len(bareTypeNames) > 0 {
+		typeNodesByName = idx.graph.FindNodesByNames(bareTypeNames)
+	}
+	reg.UpgradeBareTypeRefs(func(name, repoHint string) []string {
+		var same, others []string
+		for _, node := range typeNodesByName[name] {
+			if node.Kind != graph.KindType {
+				continue
+			}
+			if repoHint != "" && strings.HasPrefix(node.ID, repoHint+"/") {
+				same = append(same, node.ID)
+				continue
+			}
+			others = append(others, node.ID)
+		}
+		if len(same) > 0 {
+			return same
+		}
+		return others
+	})
+}
+
 // commitContracts writes contract nodes + provides/consumes edges for
 // every contract in reg, and sets idx.contractRegistry to reg. Called
 // once per index pass after all per-file contracts have been collected
@@ -5684,24 +5988,7 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	// graph is complete. During extraction the enricher only saw
 	// the handler's file-scoped node list, so types declared in a
 	// sibling file stayed as bare names.
-	reg.UpgradeBareTypeRefs(func(name, repoHint string) []string {
-		matches := idx.graph.FindNodesByName(name)
-		var same, others []string
-		for _, n := range matches {
-			if n.Kind != graph.KindType {
-				continue
-			}
-			if repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/") {
-				same = append(same, n.ID)
-				continue
-			}
-			others = append(others, n.ID)
-		}
-		if len(same) > 0 {
-			return same
-		}
-		return others
-	})
+	idx.upgradeContractBareTypeRefs(reg)
 
 	// Cross-file handler resolution. When a route is registered with
 	// a handler identifier that the file-scoped extractor couldn't
@@ -5745,7 +6032,11 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	// value-redacted config-key nodes and reads_config edges from the @Value /
 	// @ConfigurationProperties beans the Java extractor stamped. Cheap to skip
 	// on non-Spring repos (no config files + no stamped beans = no work).
-	contracts.BindSpringConfig(idx.graph, idx.contractFileSrc)
+	contracts.BindSpringConfig(idx.graph, contracts.SpringConfigScope{
+		RepoPrefix:  idx.repoPrefix,
+		RepoRoot:    idx.rootPath,
+		WorkspaceID: idx.workspaceID,
+	})
 
 	// Trace response variables back to their call-site return types.
 	// Handles `source, err := h.svc.Get(...)` → response_type is
@@ -5814,6 +6105,7 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 			Kind:     edgeKind,
 			FilePath: c.FilePath,
 			Line:     c.Line,
+			Meta:     contractOwnerEdgeMeta(c),
 		})
 		// Framework-layer EdgeHandlesRoute. Emitted alongside
 		// EdgeProvides for HTTP / gRPC / WS / GraphQL / topic
@@ -5824,15 +6116,15 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 		// OpenAPI specs, DI tokens) intentionally skip this
 		// edge — they aren't route handlers.
 		if c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
+			routeMeta := contractOwnerEdgeMeta(c)
+			routeMeta["contract_type"] = string(c.Type)
 			edges = append(edges, &graph.Edge{
 				From:     c.SymbolID,
 				To:       c.ID,
 				Kind:     graph.EdgeHandlesRoute,
 				FilePath: c.FilePath,
 				Line:     c.Line,
-				Meta: map[string]any{
-					"contract_type": string(c.Type),
-				},
+				Meta:     routeMeta,
 			})
 		}
 	}
@@ -5894,25 +6186,13 @@ func (idx *Indexer) routerPrefixScanFiles(reg *contracts.Registry) []string {
 		return nil
 	}
 
-	var out []string
-	for _, n := range idx.graph.AllNodes() {
-		if n.Kind != graph.KindFile {
-			continue
-		}
-		path := n.FilePath
-		if path == "" {
-			path = n.ID
-		}
-		switch {
-		case strings.HasSuffix(path, ".py"),
-			strings.HasSuffix(path, ".ts"),
-			strings.HasSuffix(path, ".tsx"),
-			strings.HasSuffix(path, ".js"),
-			strings.HasSuffix(path, ".jsx"):
-			out = append(out, path)
-		}
-	}
-	return out
+	return graph.ReadRepoFilePaths(
+		idx.graph,
+		idx.repoPrefix,
+		idx.workspaceID,
+		[]string{"python", "typescript", "javascript"},
+		[]string{".py", ".ts", ".tsx", ".js", ".jsx"},
+	)
 }
 
 // contractFileSrc reads the on-disk source for a contract FilePath
@@ -6042,10 +6322,61 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		return
 	}
 
-	// Cache file source + node list per file path — a single router
-	// often refers to dozens of handlers in the same sibling file.
+	// Resolve every distinct handler name in one store call. A router can
+	// contain hundreds of endpoints that repeat the same handful of handlers;
+	// issuing FindNodesByName for every trail segment turns SQLite into an N+1
+	// loop even though the candidate set is identical.
+	var handlerNames []string
+	seenHandlerNames := make(map[string]struct{})
+	for _, p := range todo {
+		candidates := contracts.HandlerCandidatesInTrail(p.trail)
+		if len(candidates) == 0 && p.fallback != "" {
+			candidates = []string{p.fallback}
+		}
+		for _, ident := range candidates {
+			name := handlerLookupName(ident)
+			if name == "" {
+				continue
+			}
+			if _, seen := seenHandlerNames[name]; seen {
+				continue
+			}
+			seenHandlerNames[name] = struct{}{}
+			handlerNames = append(handlerNames, name)
+		}
+	}
+	handlerCandidates := idx.graph.FindNodesByNames(handlerNames)
+
+	type resolvedPending struct {
+		pending pending
+		handler *graph.Node
+	}
+	resolvedTodo := make([]resolvedPending, 0, len(todo))
+	var handlerPaths []string
+	seenHandlerPaths := make(map[string]struct{})
+	for _, p := range todo {
+		handler := idx.resolveInnermostHandlerFromCandidates(
+			p.trail, p.fallback, p.repoHint, p.srcDir, handlerCandidates,
+		)
+		if handler == nil {
+			continue
+		}
+		resolvedTodo = append(resolvedTodo, resolvedPending{pending: p, handler: handler})
+		if handler.FilePath == "" {
+			continue
+		}
+		if _, seen := seenHandlerPaths[handler.FilePath]; seen {
+			continue
+		}
+		seenHandlerPaths[handler.FilePath] = struct{}{}
+		handlerPaths = append(handlerPaths, handler.FilePath)
+	}
+	handlerFileNodes := idx.graph.GetFileNodesByPaths(handlerPaths)
+
+	// Cache file source per file path — a single router often refers to
+	// dozens of handlers in the same sibling file. Handler nodes themselves
+	// were fetched above in one store batch.
 	fileSrc := make(map[string][]byte)
-	fileNodes := make(map[string][]*graph.Node)
 
 	// fileTrees caches per-file ParseTree handles parsed lazily below
 	// so a router referencing many handlers in the same sibling file
@@ -6057,11 +6388,9 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		}
 	}()
 	resolved := 0
-	for _, p := range todo {
-		handlerNode := idx.resolveInnermostHandler(p.trail, p.fallback, p.repoHint, p.srcDir)
-		if handlerNode == nil {
-			continue
-		}
+	for _, item := range resolvedTodo {
+		p := item.pending
+		handlerNode := item.handler
 		src, ok := fileSrc[handlerNode.FilePath]
 		if !ok {
 			diskPath := handlerNode.FilePath
@@ -6080,11 +6409,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		if src == nil {
 			continue
 		}
-		nodes, ok := fileNodes[handlerNode.FilePath]
-		if !ok {
-			nodes = idx.graph.GetFileNodes(handlerNode.FilePath)
-			fileNodes[handlerNode.FilePath] = nodes
-		}
+		nodes := handlerFileNodes[handlerNode.FilePath]
 
 		lang := detectLangFromPath(handlerNode.FilePath)
 		tree, treeReady := fileTrees[handlerNode.FilePath]
@@ -6135,21 +6460,23 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 	}
 }
 
-// resolveInnermostHandler picks the innermost handler candidate from
-// the call trail that resolves to a real function or method in the
-// graph. Walks candidates in source order and keeps the LAST
-// successful lookup — for `WithAuth(h.ServeArchive)` that's
-// `h.ServeArchive`, not the `WithAuth` wrapper. Falls back to the
-// single identifier when no trail is available (e.g. simple bare
-// `r.GET("/x", listUsers)` patterns).
-func (idx *Indexer) resolveInnermostHandler(trail, fallback, repoHint, srcDir string) *graph.Node {
+func (idx *Indexer) resolveInnermostHandlerFromCandidates(
+	trail, fallback, repoHint, srcDir string,
+	byName map[string][]*graph.Node,
+) *graph.Node {
 	candidates := contracts.HandlerCandidatesInTrail(trail)
 	if len(candidates) == 0 && fallback != "" {
 		candidates = []string{fallback}
 	}
 	var best *graph.Node
-	for _, c := range candidates {
-		if n := idx.lookupHandler(c, repoHint, srcDir); n != nil {
+	for _, ident := range candidates {
+		var n *graph.Node
+		if byName == nil {
+			n = idx.lookupHandler(ident, repoHint, srcDir)
+		} else {
+			n = lookupHandlerFromCandidates(ident, repoHint, srcDir, byName)
+		}
+		if n != nil {
 			best = n
 		}
 	}
@@ -6165,22 +6492,40 @@ func (idx *Indexer) resolveInnermostHandler(trail, fallback, repoHint, srcDir st
 //
 // Returns nil when no candidate resolves unambiguously.
 func (idx *Indexer) lookupHandler(ident, repoHint, srcDir string) *graph.Node {
-	// Strip a leading receiver / package qualifier — "h.ServeArchive"
-	// → "ServeArchive".
-	name := ident
-	if i := strings.LastIndex(name, "."); i >= 0 {
-		name = name[i+1:]
-	}
+	name := handlerLookupName(ident)
 	if name == "" {
 		return nil
 	}
-	candidates := idx.graph.FindNodesByName(name)
+	return pickHandlerCandidate(idx.graph.FindNodesByName(name), repoHint, srcDir)
+}
+
+func handlerLookupName(ident string) string {
+	// Strip a leading receiver / package qualifier — "h.ServeArchive"
+	// → "ServeArchive".
+	if i := strings.LastIndex(ident, "."); i >= 0 {
+		ident = ident[i+1:]
+	}
+	return ident
+}
+
+func lookupHandlerFromCandidates(
+	ident, repoHint, srcDir string,
+	byName map[string][]*graph.Node,
+) *graph.Node {
+	name := handlerLookupName(ident)
+	if name == "" {
+		return nil
+	}
+	return pickHandlerCandidate(byName[name], repoHint, srcDir)
+}
+
+func pickHandlerCandidate(candidates []*graph.Node, repoHint, srcDir string) *graph.Node {
 	if len(candidates) == 0 {
 		return nil
 	}
 	var sameRepo, other []*graph.Node
 	for _, n := range candidates {
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+		if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
 			continue
 		}
 		if repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/") {
@@ -6328,14 +6673,12 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 	resolved := 0
 	bfCache := newBodyFactsCache(idx)
 	defer bfCache.Close()
+	resolution := idx.prepareContractTypeResolution(reg, bfCache)
 
 	for _, c := range reg.All() {
 		if c.Role != contracts.RoleProvider || c.Type != contracts.ContractHTTP {
 			continue
 		}
-
-		handler := idx.graph.GetNode(c.SymbolID)
-		bf := bfCache.For(handler)
 
 		// Path 1: bare-variable response (`return WriteJSON(w, code, resp)`).
 		// Trace the variable to its binding call's return type — and,
@@ -6349,20 +6692,9 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 		//     extraction output, kept compatible by extracting the
 		//     third arg via responseHelperCallRe.
 		if rt, _ := c.Meta["response_type"].(string); rt == "" {
-			respExpr, _ := c.Meta["response_expr"].(string)
-			varName := ""
-			switch {
-			case respExpr == "":
-				// nothing to work with
-			case isLikelyIdentifier(respExpr):
-				varName = respExpr
-			default:
-				if m := responseHelperCallRe.FindStringSubmatch(respExpr); len(m) >= 2 {
-					varName = m[1]
-				}
-			}
+			varName := contractResponseVarName(c)
 			if varName != "" {
-				typeID, repeated := idx.lookupVarTypeForContract(c, bf, varName)
+				typeID, repeated := idx.lookupVarTypeForContract(c, varName, resolution)
 				if typeID != "" {
 					items := reg.ByID(c.ID)
 					changed := false
@@ -6418,7 +6750,7 @@ func (idx *Indexer) resolveCallReturnTypes(reg *contracts.Registry) {
 			if !isLikelyIdentifier(ident) {
 				continue
 			}
-			typeID, repeated := idx.lookupVarTypeForContract(c, bf, ident)
+			typeID, repeated := idx.lookupVarTypeForContract(c, ident, resolution)
 			if typeID != "" {
 				envRaw[ri]["type"] = typeID
 				if repeated {
@@ -6481,39 +6813,6 @@ func envelopeFullyTyped(env []map[string]any) bool {
 	return true
 }
 
-// upgradeBareTypeName looks up `name` in the graph and returns the
-// matching type node's ID, preferring same-repo matches. Falls back
-// to the input string when no graph type is found, so callers can
-// still surface primitives ("string", "int", "bool") and external
-// types ("map[string]int") that have no graph node. The shape-
-// inlining pass will leave those as-is since lookupShape requires a
-// `::` separator.
-func (idx *Indexer) upgradeBareTypeName(name, repoHint string) string {
-	if name == "" {
-		return name
-	}
-	if strings.Contains(name, "::") {
-		return name // already a graph ID
-	}
-	candidates := idx.graph.FindNodesByName(name)
-	var fallback *graph.Node
-	for _, n := range candidates {
-		if n.Kind != graph.KindType {
-			continue
-		}
-		if repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/") {
-			return n.ID
-		}
-		if fallback == nil {
-			fallback = n
-		}
-	}
-	if fallback != nil {
-		return fallback.ID
-	}
-	return name
-}
-
 // isLikelyIdentifier accepts the bare-identifier and dotted-path
 // forms that traceVarTypeFromBody can match against a binding line.
 // Compound expressions ("len(repos)", "&Foo{}") are out of scope —
@@ -6537,6 +6836,466 @@ func isLikelyIdentifier(s string) bool {
 	return true
 }
 
+type contractBindingKey struct {
+	repoPrefix string
+	filePath   string
+	symbolID   string
+	name       string
+}
+
+type contractCallKey struct {
+	callExpr   string
+	repoPrefix string
+}
+
+type contractTypeNameKey struct {
+	typeName   string
+	repoPrefix string
+}
+
+type rawContractCallType struct {
+	typeName string
+	repeated bool
+	pointer  bool
+}
+
+type resolvedContractCallType struct {
+	typeID   string
+	repeated bool
+	pointer  bool
+}
+
+type contractTypeResolution struct {
+	bindings      map[contractBindingKey]contracts.Binding
+	semanticTypes map[graph.SemanticBindingSite]string
+	upgradedTypes map[contractTypeNameKey]string
+	callTypes     map[contractCallKey]resolvedContractCallType
+}
+
+func contractBindingKeyFor(c contracts.Contract, name string) contractBindingKey {
+	return contractBindingKey{
+		repoPrefix: c.RepoPrefix,
+		filePath:   c.FilePath,
+		symbolID:   c.SymbolID,
+		name:       name,
+	}
+}
+
+func contractResponseVarName(c contracts.Contract) string {
+	respExpr, _ := c.Meta["response_expr"].(string)
+	switch {
+	case respExpr == "":
+		return ""
+	case isLikelyIdentifier(respExpr):
+		return respExpr
+	default:
+		if m := responseHelperCallRe.FindStringSubmatch(respExpr); len(m) >= 2 {
+			return m[1]
+		}
+		return ""
+	}
+}
+
+func unresolvedContractBindingNames(c contracts.Contract) []string {
+	seen := make(map[string]struct{})
+	add := func(name string) {
+		if name != "" {
+			seen[name] = struct{}{}
+		}
+	}
+
+	if rt, _ := c.Meta["response_type"].(string); rt == "" {
+		add(contractResponseVarName(c))
+	}
+	if env, ok := c.Meta["response_envelope"].([]map[string]any); ok {
+		for _, row := range env {
+			if typeName, _ := row["type"].(string); typeName != "" {
+				continue
+			}
+			expr, _ := row["expr"].(string)
+			ident := strings.TrimLeft(expr, "&*")
+			if isLikelyIdentifier(ident) {
+				add(ident)
+			}
+		}
+	}
+
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func semanticTypeForBinding(
+	key contractBindingKey,
+	binding contracts.Binding,
+	types map[graph.SemanticBindingSite]string,
+) string {
+	if binding.Line <= 0 {
+		return ""
+	}
+	site := graph.SemanticBindingSite{
+		RepoPrefix: key.repoPrefix,
+		FilePath:   key.filePath,
+		Line:       binding.Line,
+		Name:       key.name,
+	}
+	if typeName := types[site]; typeName != "" {
+		return typeName
+	}
+	site.Name = ""
+	return types[site]
+}
+
+func (idx *Indexer) prepareContractTypeResolution(
+	reg *contracts.Registry,
+	bfCache *bodyFactsCache,
+) *contractTypeResolution {
+	resolution := &contractTypeResolution{
+		bindings:      make(map[contractBindingKey]contracts.Binding),
+		semanticTypes: make(map[graph.SemanticBindingSite]string),
+		upgradedTypes: make(map[contractTypeNameKey]string),
+		callTypes:     make(map[contractCallKey]resolvedContractCallType),
+	}
+	if reg == nil {
+		return resolution
+	}
+
+	allContracts := reg.All()
+	handlerSet := make(map[string]struct{})
+	for _, c := range allContracts {
+		if c.Role != contracts.RoleProvider || c.Type != contracts.ContractHTTP || len(unresolvedContractBindingNames(c)) == 0 {
+			continue
+		}
+		if c.SymbolID != "" {
+			handlerSet[c.SymbolID] = struct{}{}
+		}
+	}
+	handlerIDs := make([]string, 0, len(handlerSet))
+	for id := range handlerSet {
+		handlerIDs = append(handlerIDs, id)
+	}
+	sort.Strings(handlerIDs)
+	handlers := make(map[string]*graph.Node)
+	if len(handlerIDs) > 0 {
+		handlers = idx.graph.GetNodesByIDs(handlerIDs)
+	}
+
+	siteSet := make(map[graph.SemanticBindingSite]struct{})
+	for _, c := range allContracts {
+		if c.Role != contracts.RoleProvider || c.Type != contracts.ContractHTTP {
+			continue
+		}
+		names := unresolvedContractBindingNames(c)
+		if len(names) == 0 {
+			continue
+		}
+		bf := bfCache.For(handlers[c.SymbolID])
+		for _, name := range names {
+			key := contractBindingKeyFor(c, name)
+			if _, exists := resolution.bindings[key]; exists {
+				continue
+			}
+			binding := bf.VarBinding(name)
+			resolution.bindings[key] = binding
+			if binding.Line <= 0 {
+				continue
+			}
+			site := graph.SemanticBindingSite{
+				RepoPrefix: c.RepoPrefix,
+				FilePath:   c.FilePath,
+				Line:       binding.Line,
+				Name:       name,
+			}
+			siteSet[site] = struct{}{}
+			site.Name = ""
+			siteSet[site] = struct{}{}
+		}
+	}
+
+	sites := make([]graph.SemanticBindingSite, 0, len(siteSet))
+	for site := range siteSet {
+		sites = append(sites, site)
+	}
+	sort.Slice(sites, func(i, j int) bool {
+		a, b := sites[i], sites[j]
+		if a.RepoPrefix != b.RepoPrefix {
+			return a.RepoPrefix < b.RepoPrefix
+		}
+		if a.FilePath != b.FilePath {
+			return a.FilePath < b.FilePath
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.Name < b.Name
+	})
+	resolution.semanticTypes = idx.readSemanticBindingTypes(sites)
+
+	callSet := make(map[contractCallKey]struct{})
+	typeNameSet := make(map[contractTypeNameKey]struct{})
+	for key, binding := range resolution.bindings {
+		if typeName := semanticTypeForBinding(key, binding, resolution.semanticTypes); typeName != "" {
+			typeNameSet[contractTypeNameKey{typeName: typeName, repoPrefix: key.repoPrefix}] = struct{}{}
+			continue
+		}
+		switch binding.Kind {
+		case contracts.BindingMethodCall, contracts.BindingFuncCall:
+			if binding.CallExpr != "" {
+				callSet[contractCallKey{callExpr: binding.CallExpr, repoPrefix: key.repoPrefix}] = struct{}{}
+			}
+		default:
+			if binding.TypeID != "" {
+				typeNameSet[contractTypeNameKey{typeName: binding.TypeID, repoPrefix: key.repoPrefix}] = struct{}{}
+			}
+		}
+	}
+
+	callKeys := make([]contractCallKey, 0, len(callSet))
+	for key := range callSet {
+		callKeys = append(callKeys, key)
+	}
+	sort.Slice(callKeys, func(i, j int) bool {
+		if callKeys[i].repoPrefix != callKeys[j].repoPrefix {
+			return callKeys[i].repoPrefix < callKeys[j].repoPrefix
+		}
+		return callKeys[i].callExpr < callKeys[j].callExpr
+	})
+	rawCalls := idx.resolveCallExprTypeNames(callKeys)
+	for key, raw := range rawCalls {
+		typeNameSet[contractTypeNameKey{typeName: raw.typeName, repoPrefix: key.repoPrefix}] = struct{}{}
+	}
+
+	typeNameKeys := make([]contractTypeNameKey, 0, len(typeNameSet))
+	for key := range typeNameSet {
+		typeNameKeys = append(typeNameKeys, key)
+	}
+	resolution.upgradedTypes = idx.upgradeBareTypeNames(typeNameKeys)
+	for key, raw := range rawCalls {
+		typeID := resolution.upgradedTypes[contractTypeNameKey{typeName: raw.typeName, repoPrefix: key.repoPrefix}]
+		if typeID == "" {
+			typeID = raw.typeName
+		}
+		resolution.callTypes[key] = resolvedContractCallType{
+			typeID:   typeID,
+			repeated: raw.repeated,
+			pointer:  raw.pointer,
+		}
+	}
+	return resolution
+}
+
+func (idx *Indexer) readSemanticBindingTypes(sites []graph.SemanticBindingSite) map[graph.SemanticBindingSite]string {
+	resolved := make(map[graph.SemanticBindingSite]string, len(sites))
+	if len(sites) == 0 {
+		return resolved
+	}
+
+	seen := make(map[graph.SemanticBindingSite]struct{}, len(sites))
+	missing := make([]graph.SemanticBindingSite, 0, len(sites))
+	for _, site := range sites {
+		if _, exists := seen[site]; exists {
+			continue
+		}
+		seen[site] = struct{}{}
+		missing = append(missing, site)
+	}
+	sort.Slice(missing, func(i, j int) bool {
+		a, b := missing[i], missing[j]
+		if a.RepoPrefix != b.RepoPrefix {
+			return a.RepoPrefix < b.RepoPrefix
+		}
+		if a.FilePath != b.FilePath {
+			return a.FilePath < b.FilePath
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.Name < b.Name
+	})
+
+	readers := make([]graph.SemanticBindingTypeReader, 0, 2)
+	if reader, ok := idx.graph.(graph.SemanticBindingTypeReader); ok {
+		readers = append(readers, reader)
+	}
+	if bindingResolver := contracts.CurrentBindingResolver(); bindingResolver != nil {
+		if reader, ok := bindingResolver.(graph.SemanticBindingTypeReader); ok {
+			readers = append(readers, reader)
+		}
+	}
+
+	for readerIndex, reader := range readers {
+		if len(missing) == 0 {
+			break
+		}
+		found, err := reader.SemanticBindingTypes(missing)
+		if err != nil && idx.logger != nil {
+			idx.logger.Debug("semantic binding batch lookup failed",
+				zap.Int("reader_index", readerIndex),
+				zap.Int("site_count", len(missing)),
+				zap.Error(err))
+		}
+		nextMissing := missing[:0]
+		for _, site := range missing {
+			if typeName := found[site]; typeName != "" {
+				resolved[site] = typeName
+				continue
+			}
+			nextMissing = append(nextMissing, site)
+		}
+		missing = nextMissing
+	}
+	return resolved
+}
+
+func (idx *Indexer) upgradeBareTypeNames(keys []contractTypeNameKey) map[contractTypeNameKey]string {
+	resolved := make(map[contractTypeNameKey]string, len(keys))
+	unique := make(map[contractTypeNameKey]struct{}, len(keys))
+	nameSet := make(map[string]struct{})
+	for _, key := range keys {
+		if key.typeName == "" {
+			continue
+		}
+		unique[key] = struct{}{}
+		if !strings.Contains(key.typeName, "::") {
+			nameSet[key.typeName] = struct{}{}
+		}
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	candidatesByName := make(map[string][]*graph.Node)
+	if len(names) > 0 {
+		candidatesByName = idx.graph.FindNodesByNames(names)
+	}
+
+	for key := range unique {
+		if strings.Contains(key.typeName, "::") {
+			resolved[key] = key.typeName
+			continue
+		}
+		var fallback *graph.Node
+		for _, node := range candidatesByName[key.typeName] {
+			if node.Kind != graph.KindType {
+				continue
+			}
+			if key.repoPrefix != "" && strings.HasPrefix(node.ID, key.repoPrefix+"/") {
+				fallback = node
+				break
+			}
+			if fallback == nil {
+				fallback = node
+			}
+		}
+		if fallback != nil {
+			resolved[key] = fallback.ID
+		} else {
+			resolved[key] = key.typeName
+		}
+	}
+	return resolved
+}
+
+func (idx *Indexer) resolveCallExprTypeNames(keys []contractCallKey) map[contractCallKey]rawContractCallType {
+	resolved := make(map[contractCallKey]rawContractCallType, len(keys))
+	type callInfo struct {
+		methodName   string
+		receiverHint string
+	}
+	infos := make(map[contractCallKey]callInfo, len(keys))
+	methodSet := make(map[string]struct{})
+	for _, key := range keys {
+		if key.callExpr == "" {
+			continue
+		}
+		parts := strings.Split(key.callExpr, ".")
+		methodName := parts[len(parts)-1]
+		if methodName == "" {
+			continue
+		}
+		info := callInfo{methodName: methodName}
+		if len(parts) >= 2 {
+			info.receiverHint = parts[len(parts)-2]
+		}
+		infos[key] = info
+		methodSet[methodName] = struct{}{}
+	}
+
+	methodNames := make([]string, 0, len(methodSet))
+	for name := range methodSet {
+		methodNames = append(methodNames, name)
+	}
+	sort.Strings(methodNames)
+	candidatesByName := make(map[string][]*graph.Node)
+	if len(methodNames) > 0 {
+		candidatesByName = idx.graph.FindNodesByNames(methodNames)
+	}
+
+	for key, info := range infos {
+		var matches []*graph.Node
+		for _, node := range candidatesByName[info.methodName] {
+			if node.Kind != graph.KindMethod && node.Kind != graph.KindFunction {
+				continue
+			}
+			if key.repoPrefix != "" && !strings.HasPrefix(node.ID, key.repoPrefix+"/") {
+				continue
+			}
+			if info.receiverHint != "" && !receiverMatchesHint(node, info.receiverHint) {
+				continue
+			}
+			matches = append(matches, node)
+		}
+		if len(matches) == 0 {
+			continue
+		}
+
+		var returnType string
+		ambiguous := false
+		for _, match := range matches {
+			if match.Meta == nil {
+				continue
+			}
+			signature, _ := match.Meta["signature"].(string)
+			typeName := parseFirstNonErrorReturnType(signature)
+			if typeName == "" {
+				continue
+			}
+			if returnType == "" {
+				returnType = typeName
+				continue
+			}
+			if typeName != returnType {
+				ambiguous = true
+				break
+			}
+		}
+		if ambiguous || returnType == "" {
+			continue
+		}
+
+		repeated := strings.HasPrefix(returnType, "[]")
+		pointer := strings.HasPrefix(returnType, "*") ||
+			(repeated && strings.HasPrefix(returnType[2:], "*"))
+		returnType = strings.TrimLeft(returnType, "*[]")
+		if dot := strings.LastIndex(returnType, "."); dot >= 0 {
+			returnType = returnType[dot+1:]
+		}
+		if returnType != "" {
+			resolved[key] = rawContractCallType{
+				typeName: returnType,
+				repeated: repeated,
+				pointer:  pointer,
+			}
+		}
+	}
+	return resolved
+}
+
 // lookupVarTypeForContract resolves a variable to its return type
 // using BodyFacts (AST-driven, structurally correct). Returns
 // (typeID, repeated) or ("", false) when the binding can't be
@@ -6550,152 +7309,47 @@ func isLikelyIdentifier(s string) bool {
 // detectors — only the post-pass cross-handler trace is AST-only.
 func (idx *Indexer) lookupVarTypeForContract(
 	c contracts.Contract,
-	bf contracts.BodyFacts,
 	varName string,
+	resolution *contractTypeResolution,
 ) (string, bool) {
-	if bf == nil {
+	if resolution == nil {
 		return "", false
 	}
-	b := bf.VarBinding(varName)
-	// Highest tier: BindingResolver (go/types via goanalysis.Provider)
-	// returns compiler-resolved types. When --semantic is enabled and
-	// the provider has run, this is authoritative for any binding
-	// whose source line we tracked.
-	if br := contracts.CurrentBindingResolver(); br != nil && b.Line > 0 {
-		if typeName, ok := br.LookupTypeAtLine(c.FilePath, b.Line); ok && typeName != "" {
-			return idx.upgradeBareTypeName(typeName, c.RepoPrefix), b.Repeated
-		}
+	key := contractBindingKeyFor(c, varName)
+	b, ok := resolution.bindings[key]
+	if !ok {
+		return "", false
 	}
+
+	// Highest tier: one compiler-resolved batch loaded before this pass. The
+	// SQLite reader serves warm restarts; the compact Go provider serves stores
+	// without persistent binding rows. Named rows disambiguate same-line
+	// declarations, while the blank-name row preserves legacy line parity.
+	if typeName := semanticTypeForBinding(key, b, resolution.semanticTypes); typeName != "" {
+		resolvedType := resolution.upgradedTypes[contractTypeNameKey{typeName: typeName, repoPrefix: c.RepoPrefix}]
+		if resolvedType == "" {
+			resolvedType = typeName
+		}
+		return resolvedType, b.Repeated
+	}
+
 	switch b.Kind {
 	case contracts.BindingMethodCall, contracts.BindingFuncCall:
-		if b.CallExpr != "" {
-			if typeID, repeated, _ := idx.resolveCallExprToType(b.CallExpr, c.RepoPrefix); typeID != "" {
-				return typeID, repeated
-			}
+		if resolved, ok := resolution.callTypes[contractCallKey{callExpr: b.CallExpr, repoPrefix: c.RepoPrefix}]; ok && resolved.typeID != "" {
+			return resolved.typeID, resolved.repeated
 		}
 	default:
 		// Composite / slice / map / literal / path-value /
 		// header-value / form-value / query-get — already typed.
 		if b.TypeID != "" {
-			return idx.upgradeBareTypeName(b.TypeID, c.RepoPrefix), b.Repeated
+			resolvedType := resolution.upgradedTypes[contractTypeNameKey{typeName: b.TypeID, repoPrefix: c.RepoPrefix}]
+			if resolvedType == "" {
+				resolvedType = b.TypeID
+			}
+			return resolvedType, b.Repeated
 		}
 	}
 	return "", false
-}
-
-// resolveCallExprToType walks the graph from a call expression like
-// `h.svc.GetRepos` to the called method/function's first non-error
-// return type, returning (typeID, repeated, pointer). Empty string
-// when the call is ambiguous (multiple candidates with disagreeing
-// signatures) or the receiver doesn't match any graph node.
-//
-// Extracted from traceVarTypeFromBodyWithShape so BodyFacts-driven
-// callers can reuse the graph walk without going through the regex
-// path. The regex-driven traceVarTypeFromBodyWithShape is the
-// fallback for non-Go languages until they ship a BodyFacts
-// implementation.
-func (idx *Indexer) resolveCallExprToType(callExpr, repoHint string) (string, bool, bool) {
-	if callExpr == "" {
-		return "", false, false
-	}
-	// Split the call path. `h.tucks.Update` → ["h", "tucks", "Update"].
-	// The last segment is the method name; the penultimate is the
-	// receiver field / package, which we use to disambiguate when
-	// multiple methods share the name.
-	parts := strings.Split(callExpr, ".")
-	methodName := parts[len(parts)-1]
-	if methodName == "" {
-		return "", false, false
-	}
-	var receiverHint string
-	if len(parts) >= 2 {
-		receiverHint = parts[len(parts)-2]
-	}
-
-	candidates := idx.graph.FindNodesByName(methodName)
-	var matches []*graph.Node
-	for _, n := range candidates {
-		if n.Kind != graph.KindMethod && n.Kind != graph.KindFunction {
-			continue
-		}
-		if repoHint != "" && !strings.HasPrefix(n.ID, repoHint+"/") {
-			continue
-		}
-		if receiverHint != "" && !receiverMatchesHint(n, receiverHint) {
-			continue
-		}
-		matches = append(matches, n)
-	}
-	if len(matches) == 0 {
-		return "", false, false
-	}
-
-	// Interface + implementation stacks often produce multiple
-	// receivers that share the same method signature — a production
-	// postgres store and a mock test store both implement
-	// `emailSources.Update(...) (*EmailSource, error)`. Parse every
-	// candidate's signature; if they all agree on the first
-	// non-error return type, use that. Otherwise bail so we don't
-	// attribute a wrong type silently.
-	var retType string
-	for _, m := range matches {
-		if m.Meta == nil {
-			continue
-		}
-		sig, _ := m.Meta["signature"].(string)
-		t := parseFirstNonErrorReturnType(sig)
-		if t == "" {
-			continue
-		}
-		// De-prioritise mock receivers: if a non-mock candidate
-		// later disagrees we want that to be the authoritative one.
-		if retType == "" {
-			retType = t
-			continue
-		}
-		if t != retType {
-			// Candidates disagree — can't tell which wins. The
-			// caller sees the raw expression and can drill in.
-			return "", false, false
-		}
-	}
-	if retType == "" {
-		return "", false, false
-	}
-	// Capture slice/pointer flags before stripping so the caller can
-	// render `[Foo]` / `*Foo` correctly. Order matters: a return type
-	// like `[]*Foo` is reported as repeated AND pointer.
-	repeated := strings.HasPrefix(retType, "[]")
-	pointer := strings.HasPrefix(retType, "*") ||
-		(repeated && strings.HasPrefix(retType[2:], "*"))
-	// Strip `*` / `[]` / package qualifier so resolveTypeByName can
-	// match the plain type-node name.
-	retType = strings.TrimLeft(retType, "*[]")
-	if dot := strings.LastIndex(retType, "."); dot >= 0 {
-		retType = retType[dot+1:]
-	}
-	// Look up the type node, preferring same-repo matches.
-	typeCandidates := idx.graph.FindNodesByName(retType)
-	var bestType *graph.Node
-	for _, n := range typeCandidates {
-		if n.Kind != graph.KindType {
-			continue
-		}
-		if repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/") {
-			bestType = n
-			break
-		}
-		if bestType == nil {
-			bestType = n
-		}
-	}
-	if bestType != nil {
-		return bestType.ID, repeated, pointer
-	}
-	// Bare name — downstream UpgradeBareTypeRefs can still upgrade
-	// it later, but we return it as-is so the consumer sees something
-	// real.
-	return retType, repeated, pointer
 }
 
 func parseFirstNonErrorReturnType(sig string) string {
@@ -6861,10 +7515,17 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 	if len(symbols) == 0 {
 		return
 	}
+	symbolIDs := make([]string, 0, len(symbols))
+	for id := range symbols {
+		symbolIDs = append(symbolIDs, id)
+	}
+	sort.Strings(symbolIDs)
+	typeNodes := idx.graph.GetNodesByIDs(symbolIDs)
 	srcCache := make(map[string][]byte)
 	attached := 0
-	for id := range symbols {
-		node := idx.graph.GetNode(id)
+	var updatedNodes []*graph.Node
+	for _, id := range symbolIDs {
+		node := typeNodes[id]
 		if node == nil {
 			continue
 		}
@@ -6907,9 +7568,14 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 			node.Meta = map[string]any{}
 		}
 		node.Meta["shape"] = shape
+		updatedNodes = append(updatedNodes, node)
 		attached++
 	}
 	if attached > 0 {
+		// GetNodesByIDs returns detached values on SQLite. Persist the compact
+		// shape updates in one batch so the following hydration pass observes
+		// identical data on both backends and warm restarts can reuse it.
+		idx.graph.AddBatch(updatedNodes, nil)
 		idx.logger.Info("contract shapes snapshotted",
 			zap.Int("types", attached),
 			zap.Int("examined", len(symbols)))
@@ -6937,8 +7603,48 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 // Meta["request_shape"] so plain-typed responses (no map envelope)
 // also expose their JSON object shape on the dashboard.
 func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
+	contractsAll := reg.All()
+	typeIDs := make(map[string]struct{})
+	collectTypeID := func(raw any) {
+		id, _ := raw.(string)
+		if id != "" && strings.Contains(id, "::") {
+			typeIDs[id] = struct{}{}
+		}
+	}
+	for _, c := range contractsAll {
+		if c.Meta == nil {
+			continue
+		}
+		collectTypeID(c.Meta["response_type"])
+		collectTypeID(c.Meta["request_type"])
+		if env, ok := c.Meta["response_envelope"].([]map[string]any); ok {
+			for _, row := range env {
+				collectTypeID(row["type"])
+			}
+		}
+	}
+	ids := make([]string, 0, len(typeIDs))
+	for id := range typeIDs {
+		ids = append(ids, id)
+	}
+	typeNodes := idx.graph.GetNodesByIDs(ids)
+	lookupShape := func(raw any) any {
+		id, ok := raw.(string)
+		if !ok || id == "" || !strings.Contains(id, "::") {
+			return nil
+		}
+		node := typeNodes[id]
+		if node == nil || node.Meta == nil {
+			return nil
+		}
+		shape, ok := node.Meta["shape"]
+		if !ok || shape == nil {
+			return nil
+		}
+		return shape
+	}
 	inlined := 0
-	for _, c := range reg.All() {
+	for _, c := range contractsAll {
 		changed := false
 
 		// Envelope rows.
@@ -6947,7 +7653,7 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 				if _, has := row["shape"]; has {
 					continue
 				}
-				if shape := idx.lookupShape(row["type"]); shape != nil {
+				if shape := lookupShape(row["type"]); shape != nil {
 					env[ri]["shape"] = shape
 					changed = true
 				}
@@ -6978,7 +7684,7 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 			if _, has := c.Meta[shapeKey]; has {
 				continue
 			}
-			if shape := idx.lookupShape(c.Meta[metaKey]); shape != nil {
+			if shape := lookupShape(c.Meta[metaKey]); shape != nil {
 				items := reg.ByID(c.ID)
 				for i := range items {
 					if items[i].Role != contracts.RoleProvider || items[i].SymbolID != c.SymbolID {
@@ -7002,26 +7708,6 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 		idx.logger.Info("response envelopes hydrated with shapes",
 			zap.Int("contracts", inlined))
 	}
-}
-
-// lookupShape resolves a Meta type reference to the snapshotted shape
-// stored on its graph node. Accepts string IDs (the only form used in
-// today's pipeline); other shapes pass through as nil so callers can
-// chain without type-asserting upstream.
-func (idx *Indexer) lookupShape(raw any) any {
-	id, ok := raw.(string)
-	if !ok || id == "" || !strings.Contains(id, "::") {
-		return nil
-	}
-	node := idx.graph.GetNode(id)
-	if node == nil || node.Meta == nil {
-		return nil
-	}
-	shape, ok := node.Meta["shape"]
-	if !ok || shape == nil {
-		return nil
-	}
-	return shape
 }
 
 // extractExternalModules parses the repo's go.mod once and writes
@@ -7117,11 +7803,21 @@ func (idx *Indexer) extractOneModuleManifest(relPath string, parse func([]byte) 
 	if err != nil {
 		return
 	}
+	idx.extractOneModuleManifestSource(relPath, src, parse, ownPathFromSrc)
+}
+
+// extractOneModuleManifestSource materialises a manifest from caller-owned
+// bytes. Incremental refresh uses this form so the graph mutation and the
+// post-commit mtime receipt refer to the exact same file version; the cold path
+// above retains its single os.ReadFile with no extra stat/hash overhead.
+func (idx *Indexer) extractOneModuleManifestSource(
+	relPath string,
+	src []byte,
+	parse func([]byte) []modules.Spec,
+	ownPathFromSrc func([]byte) string,
+) {
 	specs := parse(src)
 	nodes, edges := modules.BuildGraphArtifacts(relPath, specs)
-	if len(nodes) == 0 && len(edges) == 0 {
-		return
-	}
 	// Synthetic file node for the manifest — it isn't represented
 	// through the language-extractor pipeline (no extractor is
 	// registered for the .mod extension; package.json may have one
@@ -7150,14 +7846,17 @@ func (idx *Indexer) extractOneModuleManifest(relPath string, parse func([]byte) 
 		ownModulePath = ownPathFromSrc(src)
 	}
 	// Scope the walk to this repo's own import nodes. The unscoped
-	// LinkImports walks g.AllNodes(); under a warmup loop across
-	// hundreds of repos that's O(R · N). The per-repo byRepo bucket
+	// An unscoped import walk is O(R · N) under a warmup loop across
+	// hundreds of repos. The per-repo byRepo bucket
 	// keeps this O(repo size).
-	repoNodes := idx.graph.GetRepoNodes(idx.repoPrefix)
-	importNodes := make([]*graph.Node, 0, len(repoNodes))
-	for _, n := range repoNodes {
-		if n.Kind == graph.KindImport {
-			importNodes = append(importNodes, n)
+	importIDs := graph.ReadRepoNodeIDsByKinds(
+		idx.graph, []string{idx.repoPrefix}, []graph.NodeKind{graph.KindImport},
+	)
+	importsByID := idx.graph.GetNodesByIDs(importIDs)
+	importNodes := make([]*graph.Node, 0, len(importIDs))
+	for _, id := range importIDs {
+		if node := importsByID[id]; node != nil {
+			importNodes = append(importNodes, node)
 		}
 	}
 	modules.LinkImportsIn(idx.graph, importNodes, specs, ownModulePath)
@@ -7296,13 +7995,21 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	found := goModExtractor.Extract(goModFilePath, goModSrc, nil, nil)
 	reg.AddAllScoped(found, idx.repoPrefix, idx.workspaceID, idx.projectID)
 
+	dependencyIDs := make([]string, 0, len(found))
+	for i := range found {
+		if found[i].Type == contracts.ContractDependency {
+			dependencyIDs = append(dependencyIDs, found[i].ID)
+		}
+	}
+	existing := idx.graph.GetNodesByIDs(dependencyIDs)
+
 	var nodes []*graph.Node
 	for i := range found {
 		c := found[i]
 		if c.Type != contracts.ContractDependency {
 			continue
 		}
-		if idx.graph.GetNode(c.ID) != nil {
+		if existing[c.ID] != nil {
 			continue
 		}
 		nodes = append(nodes, &graph.Node{
@@ -7339,12 +8046,7 @@ func (idx *Indexer) extractContracts() {
 	// Multi-repo mode: walk only this repo's nodes. The previous
 	// AllNodes()-then-filter pass paid an O(global) walk per repo,
 	// which compounded with hundreds of tracked siblings.
-	var nodes []*graph.Node
-	if idx.repoPrefix != "" {
-		nodes = idx.graph.GetRepoNodes(idx.repoPrefix)
-	} else {
-		nodes = idx.graph.AllNodes()
-	}
+	nodes := graph.RepoCodeNodes(idx.graph, idx.repoPrefix)
 
 	// Pre-bucket the already-fetched node slice by FilePath so the
 	// per-file body can look up its co-located nodes in O(1) instead
@@ -7371,6 +8073,14 @@ func (idx *Indexer) extractContracts() {
 			}
 			edgesByFrom[e.From] = append(edgesByFrom[e.From], e)
 		}
+	} else {
+		nodeIDs := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n != nil {
+				nodeIDs = append(nodeIDs, n.ID)
+			}
+		}
+		edgesByFrom = idx.graph.GetOutEdgesByNodeIDs(nodeIDs)
 	}
 
 	for _, fileNode := range nodes {
@@ -7416,15 +8126,8 @@ func (idx *Indexer) extractContracts() {
 			continue
 		}
 
-		var fileNodes []*graph.Node
-		var fileEdges []*graph.Edge
-		if idx.repoPrefix != "" {
-			fileNodes = nodesByFile[fileNode.FilePath]
-			fileEdges = edgesByFrom[fileNode.ID]
-		} else {
-			fileNodes = idx.graph.GetFileNodes(fileNode.FilePath)
-			fileEdges = idx.graph.GetOutEdges(fileNode.ID)
-		}
+		fileNodes := nodesByFile[fileNode.FilePath]
+		fileEdges := edgesByFrom[fileNode.ID]
 
 		// Language-filtered dispatch: skip extractors that don't list
 		// this file's language in SupportedLanguages(). On big repos

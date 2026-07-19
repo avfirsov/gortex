@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -37,6 +38,24 @@ var goBuiltinConsts = map[string]struct{}{
 	"true": {}, "false": {}, "iota": {}, "nil": {},
 }
 
+// goBuiltinUnresolvedTargets is the finite target set this pass can ever
+// rewrite. Keeping it sorted makes resolution and tests deterministic while
+// allowing disk stores to answer the whole pass through one indexed IN query.
+var goBuiltinUnresolvedTargets = func() []string {
+	targets := make([]string, 0, len(goBuiltinFuncs)+len(goBuiltinTypes)+len(goBuiltinConsts))
+	for name := range goBuiltinFuncs {
+		targets = append(targets, "unresolved::"+name)
+	}
+	for name := range goBuiltinTypes {
+		targets = append(targets, "unresolved::"+name)
+	}
+	for name := range goBuiltinConsts {
+		targets = append(targets, "unresolved::"+name)
+	}
+	sort.Strings(targets)
+	return targets
+}()
+
 // attributeGoBuiltins rewrites `unresolved::<name>` edges whose name
 // is a Go language intrinsic onto the canonical `builtin::go::*` ID,
 // and materialises a single KindBuiltin node per unique builtin so
@@ -63,33 +82,16 @@ func (r *Resolver) attributeGoBuiltins() {
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	materialised := map[string]struct{}{}
-	var batch []graph.EdgeReindex
+	var candidates []*graph.Edge
 
-	// tryAttributeGoBuiltin only ever acts on an edge whose To has the bare
-	// `unresolved::` prefix — every other edge is a guaranteed no-op. This
-	// used to scan every edge of each of the 11 candidate kinds below
-	// (resolved and unresolved alike) via 11 separate EdgesByKind calls;
-	// EdgesWithUnresolvedTarget's is_unresolved index (see isUnresolvedColumnDDL)
-	// already collects the exact superset in one indexed scan, so filtering
-	// to these kinds in Go is equivalent but skips every resolved edge and
-	// every kind this pass never inspects. IsUnresolvedTarget covers both
-	// the bare and repo-qualified forms; tryAttributeGoBuiltin's own prefix
-	// check still rejects the repo-qualified ones exactly as it always did.
-	for e := range r.graph.EdgesWithUnresolvedTarget() {
-		if e == nil {
-			continue
-		}
-		if _, ok := attributeGoBuiltinCandidateKinds[e.Kind]; !ok {
-			continue
-		}
-		if old := r.tryAttributeGoBuiltin(e, materialised); old != "" {
-			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
-		}
+	// The pass can only act on the finite bare builtin target set. Batch those
+	// exact target IDs through the store's to_id index instead of decoding the
+	// graph's entire unresolved slice and discarding nearly every row.
+	byTarget := r.graph.GetInEdgesByNodeIDs(goBuiltinUnresolvedTargets)
+	for _, target := range goBuiltinUnresolvedTargets {
+		candidates = append(candidates, byTarget[target]...)
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.attributeGoBuiltinCandidates(candidates)
 }
 
 // attributeGoBuiltinCandidateKinds is every edge kind a builtin can be the
@@ -118,12 +120,49 @@ func (r *Resolver) attributeGoBuiltinsForFile(filePath string) {
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	materialised := map[string]struct{}{}
-	var batch []graph.EdgeReindex
-	for _, e := range r.fileOutEdges(filePath) {
-		if old := r.tryAttributeGoBuiltin(e, materialised); old != "" {
+	r.attributeGoBuiltinCandidates(r.fileOutEdges(filePath))
+}
+
+// attributeGoBuiltinCandidates resolves a set of possible builtin edges with
+// one batched source-node read, one batched node write, and one batched edge
+// rewrite. The source batch includes enclosing owners for IDs whose path does
+// not directly reveal the language, avoiding a node lookup per edge when the
+// resolver cache has not been warmed on cold or partial paths.
+func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
+	if len(candidates) == 0 {
+		return
+	}
+	ids := make(map[string]struct{}, len(candidates)*2)
+	for _, e := range candidates {
+		if e == nil {
+			continue
+		}
+		if e.From != "" {
+			ids[e.From] = struct{}{}
+		}
+		if owner := enclosingFunctionForBinding(e.From); owner != "" {
+			ids[owner] = struct{}{}
+		}
+	}
+	idList := make([]string, 0, len(ids))
+	for id := range ids {
+		idList = append(idList, id)
+	}
+	sourceNodes := r.graph.GetNodesByIDs(idList)
+
+	materialised := make(map[string]*graph.Node)
+	batch := make([]graph.EdgeReindex, 0, len(candidates))
+	for _, e := range candidates {
+		if old := tryAttributeGoBuiltin(e, sourceNodes, materialised); old != "" {
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
 		}
+	}
+	if len(materialised) > 0 {
+		nodes := make([]*graph.Node, 0, len(materialised))
+		for _, n := range materialised {
+			nodes = append(nodes, n)
+		}
+		r.graph.AddBatch(nodes, nil)
 	}
 	if len(batch) > 0 {
 		r.graph.ReindexEdges(batch)
@@ -136,8 +175,11 @@ func (r *Resolver) attributeGoBuiltinsForFile(filePath string) {
 // the target node (once per unique ID), rewrites e.To, and returns
 // the old To value for the batched reindex. Returns "" when the edge
 // is left alone.
-func (r *Resolver) tryAttributeGoBuiltin(e *graph.Edge, materialised map[string]struct{}) string {
+func tryAttributeGoBuiltin(e *graph.Edge, sourceNodes map[string]*graph.Node, materialised map[string]*graph.Node) string {
 	if e == nil || !strings.HasPrefix(e.To, "unresolved::") {
+		return ""
+	}
+	if _, ok := attributeGoBuiltinCandidateKinds[e.Kind]; !ok {
 		return ""
 	}
 	name := strings.TrimPrefix(e.To, "unresolved::")
@@ -165,27 +207,31 @@ func (r *Resolver) tryAttributeGoBuiltin(e *graph.Edge, materialised map[string]
 	// fromIsGo's fallback path can hit a node lookup, so try FilePath
 	// first — De Morgan's / && being commutative means this is the exact
 	// same condition, just evaluated in the cheaper order.
-	if !strings.HasSuffix(e.FilePath, ".go") && !r.fromIsGo(e.From) {
+	if !strings.HasSuffix(e.FilePath, ".go") && !sourceIsGo(e.From, sourceNodes) {
 		return ""
 	}
-	newID, kind, builtinKind := goBuiltinTarget(r.callerRepoPrefix(e), name)
+	repoPrefix := ""
+	if fromNode := sourceNodes[e.From]; fromNode != nil {
+		repoPrefix = fromNode.RepoPrefix
+	} else if owner := sourceNodes[enclosingFunctionForBinding(e.From)]; owner != nil {
+		repoPrefix = owner.RepoPrefix
+	}
+	newID, kind, builtinKind := goBuiltinTarget(repoPrefix, name)
 	if newID == "" {
 		return ""
 	}
 	if _, ok := materialised[newID]; !ok {
-		// AddNode is idempotent on ID, so even a second
-		// concurrent pass would not duplicate the row.
-		r.graph.AddNode(&graph.Node{
-			ID:       newID,
-			Kind:     kind,
-			Name:     name,
-			Language: "go",
+		materialised[newID] = &graph.Node{
+			ID:         newID,
+			Kind:       kind,
+			Name:       name,
+			Language:   "go",
+			RepoPrefix: repoPrefix,
 			Meta: map[string]any{
 				"builtin":      true,
 				"builtin_kind": builtinKind,
 			},
-		})
-		materialised[newID] = struct{}{}
+		}
 	}
 	oldTo := e.To
 	e.To = newID
@@ -239,7 +285,7 @@ func goBuiltinTarget(repoPrefix, name string) (id string, kind graph.NodeKind, b
 // suffix-stripping helper bare-name binding uses) — Go is the only
 // language whose IDs follow the `file.go::Func` convention with a
 // `.go` extension, so a path-based check is both cheap and reliable.
-func (r *Resolver) fromIsGo(fromID string) bool {
+func sourceIsGo(fromID string, sourceNodes map[string]*graph.Node) bool {
 	owner := enclosingFunctionForBinding(fromID)
 	if owner == "" {
 		return false
@@ -254,7 +300,7 @@ func (r *Resolver) fromIsGo(fromID string) bool {
 	// Fall back to looking up the owner node and checking its
 	// Language. More expensive but covers edge cases where the ID
 	// doesn't follow the `.go::Func` pattern.
-	if n := r.cachedGetNode(owner); n != nil && n.Language == "go" {
+	if n := sourceNodes[owner]; n != nil && n.Language == "go" {
 		return true
 	}
 	return false

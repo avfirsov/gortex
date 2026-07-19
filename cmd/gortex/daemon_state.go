@@ -429,6 +429,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// whole-workspace clone pass runs, degrading toward correctness.
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
+	coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
+	coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
+	defer func() {
+		if coordinatedBulkActive {
+			if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+			}
+		}
+	}()
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -575,6 +584,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 	close(jobs)
 	wg.Wait()
+	if coordinatedBulkActive {
+		flushStart := time.Now()
+		if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+			logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(err))
+		} else {
+			logger.Info("daemon: coordinated cold bulk-load complete",
+				zap.Duration("elapsed", time.Since(flushStart)))
+		}
+		coordinatedBulkActive = false
+	}
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
@@ -625,6 +644,43 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	resolveScope := warmupResolveScope(changed, len(repos), anyChanged,
 		scopeUnknown.Load(), state.snapshotPartial, storeNeedsRebuild(state.graph))
 
+	// Resume enrichment for any repo a prior process left partial / abandoned.
+	// Seeded BEFORE the resolve phase so the overlapped enrichment pool below
+	// covers those repos too. Cheap for a fully-enriched workspace: each
+	// already-complete repo pays only a git rev-parse plus one marker lookup.
+	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
+	if enrichPending > 0 && !anyChanged {
+		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
+			zap.Int("repos_pending_enrich", enrichPending))
+	}
+
+	// Overlap the enrichment pool with the resolve phase: the pool's COMPUTE
+	// (go/packages loads, tree-sitter parses) reads no graph state, so it
+	// runs on the cores the resolver leaves idle; every provider's graph
+	// APPLY parks on the apply gate until the resolve phase completes, so no
+	// giant apply can starve the resolver on the shared ResolveMutex
+	// (measured: an ungated overlap stretched the resolve compute loop 289s →
+	// 2,193s). GORTEX_ENRICH_OVERLAP=0 restores strictly-sequential ordering.
+	var deferredRun *indexer.DeferredPassesRun
+	openApplyGate := func() {}
+	if (anyChanged || enrichPending > 0) && os.Getenv("GORTEX_ENRICH_OVERLAP") != "0" {
+		applyGate := make(chan struct{})
+		openApplyGate = sync.OnceFunc(func() {
+			// Re-base the deferred window's unresolved-write counter before
+			// any parked apply can run: the resolve phase's own in-window
+			// writes (guard reverts, cross-repo binds) are its own to handle
+			// and must not force the post-enrichment fallback resolve.
+			deferredRun.SnapshotUnresolvedBase()
+			logger.Info("daemon: enrichment apply gate opened")
+			close(applyGate)
+		})
+		// FinishTail joins pool lanes that may be parked on the gate: the
+		// gate MUST open on every path that reaches it, including panics.
+		defer openApplyGate()
+		deferredRun = state.multiIndexer.BeginDeferredPasses(ctx, applyGate)
+		logger.Info("daemon: deferred enrichment pool started ahead of resolve")
+	}
+
 	// Resolve references ahead of the slow enrichment pass so find_usages /
 	// get_callers return complete results as soon as the daemon reports ready
 	// — independent of semantic enrichment. RunPreEnrichResolve materialises
@@ -635,7 +691,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if anyChanged {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "resolve", false, nil)
-		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope)
+		// markReady fires at the master resolver's compute-done point — the
+		// earliest moment same-repo references are queryable — instead of
+		// after the refinement tail + cross-repo pass (minutes on a large
+		// workspace; they only refine confidence and bind cross-repo edges,
+		// and keep running here after ready). The apply gate stays closed
+		// for the whole phase: an apply holds the ResolveMutex in
+		// multi-minute stretches, and admitting applies between the master
+		// and cross-repo passes starved cross-repo to a standstill
+		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
+		// gate opens right after this call returns.
+		state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
 		timings.resolve = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "resolve"),
@@ -645,6 +711,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		})
 	}
 
+	// The resolve phase is over: parked enrichment applies may now take the
+	// ResolveMutex without contending the warmup resolver.
+	openApplyGate()
+
 	// References are resolved (or unchanged and already resolved on the warm
 	// path): the graph is queryable. Flip ready before the multi-minute
 	// enrichment so clients can start issuing queries immediately. Everything
@@ -653,30 +723,20 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		markReady()
 	}
 
-	// Resume enrichment for any repo a prior process left partial / abandoned.
-	// pendingEnrich reflects only this run's re-indexing work, so an unchanged
-	// repo whose completion marker is absent (a cut-short pass writes none)
-	// would never re-run its semantic pass. Seeding re-arms the gate from the
-	// persisted marker so the deferred pass below resumes it — and runs that
-	// block even on a warm restart that changed nothing on disk (anyChanged is
-	// false). Cheap for a fully-enriched workspace: each already-complete repo
-	// pays only a git rev-parse plus one marker lookup.
-	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
-	if enrichPending > 0 && !anyChanged {
-		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
-			zap.Int("repos_pending_enrich", enrichPending))
-	}
-
 	// Drain deferred per-repo passes (semantic enrich / contract
-	// extract+commit) serially across the indexers the parallel loop
-	// populated. These run after ready: enrichment is a precision upgrade on
-	// top of the already-queryable reference graph. RunDeferredPassesAll
-	// re-runs the master resolver at its tail to lift placeholder edges the
-	// enrichment + contract passes add.
+	// extract+commit). These finish after ready: enrichment is a precision
+	// upgrade on top of the already-queryable reference graph. The tail
+	// re-runs the master resolver to lift placeholder edges the enrichment +
+	// contract passes add. When the pool was started ahead of resolve, this
+	// block only joins the surviving lanes and runs the tail.
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
-		timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+		if deferredRun != nil {
+			timings.enrichScheduled = deferredRun.FinishTail()
+		} else {
+			timings.enrichScheduled = state.multiIndexer.RunDeferredPassesAll(ctx)
+		}
 		timings.enrich = time.Since(phaseStart)
 		logger.Info("daemon: warmup phase done",
 			zap.String("phase", "deferred_passes_all"),
@@ -786,6 +846,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// disabled or the set is empty (run every repo, the prior behaviour).
 	if anyChanged && !scopeUnknown.Load() {
 		state.multiIndexer.ArmBatchScope(changed)
+		// Full-coverage attestation: every tracked repository re-indexed in
+		// this warmup (a cold index, or a warm restart that reconciled the
+		// whole workspace). The framework-synthesis admission census may
+		// then read the raw store even though the batch scope is non-nil —
+		// without this, the cold path's all-repos scope silently bypassed
+		// every census gate. Computed here, against the daemon's own repo
+		// registry, never inferred downstream from scope size.
+		if len(changed) == len(repos) {
+			state.multiIndexer.ArmBatchCensusEligible()
+		}
 	}
 
 	phaseStart = time.Now()

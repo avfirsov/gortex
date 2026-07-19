@@ -40,25 +40,91 @@ func (DjangoDescriptorResolver) Claims(e *graph.Edge) bool {
 // class's `__iter__` method — the class named by the QuerySet's
 // django_iterable_class hint, else Django's default ModelIterable.
 func (DjangoDescriptorResolver) Resolve(g graph.Store, e *graph.Edge) bool {
-	if g == nil || e == nil || djangoRefName(e.To) != "_iterable_class" {
-		return false
+	return DjangoDescriptorResolver{}.ResolveBatch(g, []*graph.Edge{e})[e]
+}
+
+// ResolveBatch resolves every claimed descriptor edge from one compact source
+// read and one name-index query, then persists all target rewrites together.
+// It preserves Resolve's first-match semantics for receiver classes and
+// __iter__ methods while avoiding three point/name queries per edge.
+func (DjangoDescriptorResolver) ResolveBatch(g graph.Store, edges []*graph.Edge) map[*graph.Edge]bool {
+	resolved := make(map[*graph.Edge]bool)
+	if g == nil || len(edges) == 0 {
+		return resolved
 	}
-	iterableClass := djangoIterableClassFor(g, e.From)
-	if iterableClass == "" {
-		iterableClass = djangoDefaultIterableClass
+	claimed := make([]*graph.Edge, 0, len(edges))
+	sourceIDs := make([]string, 0, len(edges))
+	for _, edge := range edges {
+		if edge == nil || djangoRefName(edge.To) != "_iterable_class" {
+			continue
+		}
+		claimed = append(claimed, edge)
+		sourceIDs = append(sourceIDs, edge.From)
 	}
-	target := djangoFindIterMethod(g, iterableClass)
-	if target == nil {
-		return false
+	if len(claimed) == 0 {
+		return resolved
 	}
-	oldTo := e.To
-	e.To = target.ID
-	e.Origin = graph.OriginASTInferred
-	e.Confidence = 0.7
-	e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, 0.7)
-	StampSynthesized(e, SynthDjangoDescriptor)
-	g.ReindexEdges([]graph.EdgeReindex{{Edge: e, OldTo: oldTo}})
-	return true
+	sources := g.GetNodesByIDs(sourceIDs)
+	names := []string{"__iter__"}
+	seenNames := map[string]bool{"__iter__": true}
+	for _, edge := range claimed {
+		source := sources[edge.From]
+		if source == nil || source.Meta == nil {
+			continue
+		}
+		receiver, _ := source.Meta["receiver"].(string)
+		if receiver != "" && !seenNames[receiver] {
+			seenNames[receiver] = true
+			names = append(names, receiver)
+		}
+	}
+	byName := g.FindNodesByNames(names)
+	iterMethods := make(map[string]*graph.Node)
+	for _, node := range byName["__iter__"] {
+		if node == nil || node.Kind != graph.KindMethod || node.Meta == nil {
+			continue
+		}
+		receiver, _ := node.Meta["receiver"].(string)
+		if receiver != "" && iterMethods[receiver] == nil {
+			iterMethods[receiver] = node
+		}
+	}
+
+	reindex := make([]graph.EdgeReindex, 0, len(claimed))
+	for _, edge := range claimed {
+		iterableClass := ""
+		if source := sources[edge.From]; source != nil && source.Meta != nil {
+			receiver, _ := source.Meta["receiver"].(string)
+			for _, class := range byName[receiver] {
+				if class == nil || class.Kind != graph.KindType || class.Meta == nil {
+					continue
+				}
+				if hint, _ := class.Meta["django_iterable_class"].(string); hint != "" {
+					iterableClass = hint
+					break
+				}
+			}
+		}
+		if iterableClass == "" {
+			iterableClass = djangoDefaultIterableClass
+		}
+		target := iterMethods[iterableClass]
+		if target == nil {
+			continue
+		}
+		oldTo := edge.To
+		edge.To = target.ID
+		edge.Origin = graph.OriginASTInferred
+		edge.Confidence = 0.7
+		edge.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeCalls, 0.7)
+		StampSynthesized(edge, SynthDjangoDescriptor)
+		reindex = append(reindex, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+		resolved[edge] = true
+	}
+	if len(reindex) > 0 {
+		g.ReindexEdges(reindex)
+	}
+	return resolved
 }
 
 // djangoRefName extracts the bare attribute name from an unresolved target
@@ -68,39 +134,4 @@ func djangoRefName(to string) string {
 		return ""
 	}
 	return strings.TrimPrefix(graph.UnresolvedName(to), "*.")
-}
-
-// djangoIterableClassFor returns the iterable-class name hinted on the class
-// enclosing the reference's source method, or "".
-func djangoIterableClassFor(g graph.Store, fromID string) string {
-	n := g.GetNode(fromID)
-	if n == nil || n.Meta == nil {
-		return ""
-	}
-	recv, _ := n.Meta["receiver"].(string)
-	if recv == "" {
-		return ""
-	}
-	for _, c := range g.FindNodesByName(recv) {
-		if c == nil || c.Kind != graph.KindType || c.Meta == nil {
-			continue
-		}
-		if ic, _ := c.Meta["django_iterable_class"].(string); ic != "" {
-			return ic
-		}
-	}
-	return ""
-}
-
-// djangoFindIterMethod returns the `__iter__` method of the named class.
-func djangoFindIterMethod(g graph.Store, className string) *graph.Node {
-	for _, n := range g.FindNodesByName("__iter__") {
-		if n == nil || n.Kind != graph.KindMethod || n.Meta == nil {
-			continue
-		}
-		if recv, _ := n.Meta["receiver"].(string); recv == className {
-			return n
-		}
-	}
-	return nil
 }

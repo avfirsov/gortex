@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -44,6 +46,14 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	if len(jobs) == 0 {
 		return 0
 	}
+	var liveJobs resolveJobLiveness
+	if r.validateLiveness {
+		edges := make([]*graph.Edge, 0, len(jobs))
+		for i := range jobs {
+			edges = append(edges, jobs[i].edge)
+		}
+		liveJobs = loadEdgeLiveness(r.graph, edges)
+	}
 	// Collect both mutation lists across the whole pass and apply them
 	// via the batched Store methods at the end. Per-edge
 	// SetEdgeProvenance + ReindexEdge in the body would otherwise pay
@@ -51,12 +61,13 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	// catastrophic on a 30k-job pass.
 	var provBatch []graph.EdgeProvenanceUpdate
 	var reindexBatch []graph.EdgeReindex
+	var spoolReverts []lspSpoolRevert
 	for i := range jobs {
 		j := &jobs[i]
 		// A concurrent edit during a chunked ResolveAll yield may have evicted
 		// this edge since it resolved; reverting + reindexing it would
 		// half-resurrect it. Skip — it is no longer in the graph.
-		if r.validateLiveness && !edgeStillLive(r.graph, j.edge) {
+		if r.validateLiveness && !liveJobs.containsEdge(j.edge) {
 			continue
 		}
 		// The deferred LSP batch may have re-bound (or confirmed) this edge
@@ -123,13 +134,32 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
 		j.edge.Confidence = 0
+		// Durable revert stamp: the guard's verdicts are otherwise invisible
+		// after the provenance drop, which blocks any selective replay — a
+		// future pass cannot learn which speculative shapes never survive
+		// scrutiny. The stamp rides the reindex write it already pays for.
+		if j.edge.Meta == nil {
+			j.edge.Meta = map[string]any{}
+		}
+		j.edge.Meta["guard_reverted"] = true
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
+		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}
 	if len(provBatch) > 0 {
 		r.graph.SetEdgeProvenanceBatch(provBatch)
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
+	}
+	// A reverted edge may still hold a deferred LSP verify-record spooled
+	// while it was heuristically bound. Re-snapshot those records to the
+	// post-revert edge state (after both batches, so the struct fields are
+	// authoritative on either backend) — otherwise the next pass's exact
+	// liveness matching declares them stale and deletes the queued retry.
+	if len(spoolReverts) > 0 && r.lspDeferredSpool != nil {
+		if err := r.lspDeferredSpool.refreshRevertedEdges(spoolReverts); err != nil {
+			r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+		}
 	}
 	return len(reindexBatch)
 }

@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -35,12 +37,20 @@ import (
 // Scope: Go only — other languages (Java / TS / Python) group methods
 // inside the class body in the same file, so the cross-file pattern
 // doesn't arise. The method node's Language gates the rebind.
-// pkgKey identifies a Go type by its package directory and name — the
+// pkgKey identifies a Go type by repository, package directory, and name — the
 // key the receiver-rebind type index is built on. Package-level so the
 // whole-graph and per-file builders share it.
-type pkgKey struct{ pkg, name string }
+type pkgKey struct{ repo, pkg, name string }
 
 func (r *Resolver) rebindGoMethodReceivers() {
+	if rebinder, ok := r.graph.(graph.GoMethodReceiverRebinder); ok {
+		if _, err := rebinder.RebindGoMethodReceivers(""); err == nil {
+			return
+		} else {
+			r.logger.Warn("resolver: backend Go receiver rebind failed; using graph fallback", zap.Error(err))
+		}
+	}
+
 	typesIdx := make(map[pkgKey]string)
 	for _, kind := range []graph.NodeKind{graph.KindType, graph.KindInterface} {
 		// Server-side language scope: only Go type/interface nodes cross
@@ -72,34 +82,78 @@ func (r *Resolver) rebindGoMethodReceivers() {
 // dominant per-edit cost on a large graph). dirIndex (built by
 // buildPassIndexes before this runs) supplies the package's files.
 func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
+	if rebinder, ok := r.graph.(graph.GoMethodReceiverRebinder); ok {
+		if _, err := rebinder.RebindGoMethodReceivers(filePath); err == nil {
+			return
+		} else {
+			r.logger.Warn("resolver: backend scoped Go receiver rebind failed; using graph fallback",
+				zap.String("file", filePath), zap.Error(err))
+		}
+	}
+
 	// The package's type index is a pure function of the directory's files and
 	// never mutated by the tail passes, so memoize it: a scoped tail visiting
 	// every file of a D-file package builds it once (O(D)) instead of per file
 	// (O(D^2)). The empty result is cached too so a package with no Go types
 	// isn't re-scanned per file.
+	fileNodes := r.incrementalFileNodes(filePath)
+	repoPrefix := ""
+	for _, n := range fileNodes {
+		if n != nil && n.RepoPrefix != "" {
+			repoPrefix = n.RepoPrefix
+			break
+		}
+	}
 	dir := filepath.Dir(filePath)
-	typesIdx, ok := r.receiverTypeIdxByDir[dir]
+	cacheKey := repoPrefix + "\x00" + dir
+	typesIdx, ok := r.receiverTypeIdxByDir[cacheKey]
 	if !ok {
 		typesIdx = make(map[pkgKey]string)
-		for _, fn := range r.dirIndex[dir] {
-			for _, n := range r.graph.GetFileNodes(fn.FilePath) {
-				if n != nil && n.Language == "go" &&
-					(n.Kind == graph.KindType || n.Kind == graph.KindInterface) {
+		// The normal SQLite path never reaches this fallback. For in-memory and
+		// failed-capability recovery, fetch the package's files through one
+		// set-oriented compound query instead of rescanning every Go type once
+		// per package or issuing one file query per package member.
+		var packageFiles []string
+		for _, fileNode := range r.dirIndex[dir] {
+			if fileNode != nil && fileNode.RepoPrefix == repoPrefix && fileNode.FilePath != "" {
+				packageFiles = append(packageFiles, fileNode.FilePath)
+			}
+		}
+		if finder, supported := r.graph.(graph.NodesInFilesByKindFinder); supported && len(packageFiles) > 0 {
+			for _, n := range finder.NodesInFilesByKind(packageFiles, []graph.NodeKind{graph.KindType, graph.KindInterface}) {
+				if n != nil && n.Language == "go" && n.RepoPrefix == repoPrefix {
 					addGoTypeToIndex(typesIdx, n)
+				}
+			}
+		} else {
+			// Third-party stores without the compound capability retain a bounded
+			// two-pass fallback; there is still no per-file query loop.
+			for _, kind := range []graph.NodeKind{graph.KindType, graph.KindInterface} {
+				for n := range r.nodesByKindLang(kind, "go") {
+					if n != nil && n.RepoPrefix == repoPrefix && filepath.Dir(n.FilePath) == dir {
+						addGoTypeToIndex(typesIdx, n)
+					}
 				}
 			}
 		}
 		if r.receiverTypeIdxByDir == nil {
 			r.receiverTypeIdxByDir = make(map[string]map[pkgKey]string)
 		}
-		r.receiverTypeIdxByDir[dir] = typesIdx
+		r.receiverTypeIdxByDir[cacheKey] = typesIdx
 	}
 	if len(typesIdx) == 0 {
 		return
 	}
+	ids := make([]string, 0, len(fileNodes))
+	for _, n := range fileNodes {
+		if n != nil {
+			ids = append(ids, n.ID)
+		}
+	}
+	out := r.graph.GetOutEdgesByNodeIDs(ids)
 	var memberOf []*graph.Edge
-	for _, n := range r.graph.GetFileNodes(filePath) {
-		for _, e := range r.graph.GetOutEdges(n.ID) {
+	for _, id := range ids {
+		for _, e := range out[id] {
 			if e.Kind == graph.EdgeMemberOf {
 				memberOf = append(memberOf, e)
 			}
@@ -117,7 +171,7 @@ func addGoTypeToIndex(idx map[pkgKey]string, n *graph.Node) {
 	if n == nil || n.Name == "" || n.FilePath == "" {
 		return
 	}
-	k := pkgKey{filepath.Dir(n.FilePath), n.Name}
+	k := pkgKey{n.RepoPrefix, filepath.Dir(n.FilePath), n.Name}
 	if existing, ok := idx[k]; ok && existing != n.ID {
 		idx[k] = ""
 		return
@@ -171,7 +225,7 @@ func (r *Resolver) rebindMemberOf(typesIdx map[pkgKey]string, memberOf []*graph.
 		if file == "" || typeName == "" {
 			continue
 		}
-		canonicalID, ok := typesIdx[pkgKey{filepath.Dir(file), typeName}]
+		canonicalID, ok := typesIdx[pkgKey{method.RepoPrefix, filepath.Dir(file), typeName}]
 		if !ok || canonicalID == "" || canonicalID == e.To {
 			continue
 		}
@@ -179,7 +233,5 @@ func (r *Resolver) rebindMemberOf(typesIdx map[pkgKey]string, memberOf []*graph.
 		e.To = canonicalID
 		batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.persistAttributionReindexes(batch)
 }

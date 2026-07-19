@@ -318,13 +318,15 @@ func nodeRelPath(n *graph.Node) string {
 // Unresolved call stubs are indexed by their target string, so this is a
 // single reverse-edge lookup, not a scan.
 func enrichNodeHasUnresolvedDemand(g graph.Store, n *graph.Node) bool {
-	if n == nil || n.Name == "" {
+	if n == nil || n.Name == "" || (n.Kind != graph.KindMethod && n.Kind != graph.KindFunction) {
 		return false
 	}
-	if n.Kind != graph.KindMethod && n.Kind != graph.KindFunction {
-		return false
-	}
-	return len(g.GetInEdges(graph.UnresolvedMarker+"*."+n.Name)) > 0
+	id := graph.UnresolvedMarker + "*." + n.Name
+	return len(g.GetInEdgesByNodeIDs([]string{id})[id]) > 0
+}
+
+func enrichNodeHasUnresolvedDemandFromView(view *lspGraphView, n *graph.Node) bool {
+	return view.hasUnresolvedDemand(n)
 }
 
 // enrichNodeIsDispatchRelevant reports whether a declaration's super/subtype
@@ -357,40 +359,27 @@ func enrichCallableIsDispatchRelevant(g graph.Store, n *graph.Node) bool {
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
 		return false
 	}
-	if isAbstractMarked(n) {
-		return true
-	}
+	view := newLSPGraphView([]*graph.Node{n}, nil)
+	out := g.GetOutEdgesByNodeIDs([]string{n.ID})
+	in := g.GetInEdgesByNodeIDs([]string{n.ID})
+	view.addEdges(out[n.ID])
+	view.addEdges(in[n.ID])
 	var parentType string
-	for _, e := range g.GetOutEdges(n.ID) {
-		switch e.Kind {
-		case graph.EdgeOverrides:
-			return true
-		case graph.EdgeMemberOf:
-			parentType = e.To
+	for _, edge := range out[n.ID] {
+		if edge.Kind == graph.EdgeMemberOf {
+			parentType = edge.To
+			break
 		}
 	}
-	for _, e := range g.GetInEdges(n.ID) {
-		if e.Kind == graph.EdgeOverrides {
-			return true
-		}
+	if parentType != "" {
+		view.addEdges(g.GetOutEdgesByNodeIDs([]string{parentType})[parentType])
+		view.addEdges(g.GetInEdgesByNodeIDs([]string{parentType})[parentType])
 	}
-	if parentType == "" {
-		return false
-	}
-	// The declaring type implementing / extending another type makes its
-	// methods dispatch targets: a call through the interface or base type
-	// binds elsewhere, so this method's callers surface only via incoming.
-	for _, e := range g.GetOutEdges(parentType) {
-		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
-			return true
-		}
-	}
-	for _, e := range g.GetInEdges(parentType) {
-		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
-			return true
-		}
-	}
-	return false
+	return view.callableIsDispatchRelevant(n)
+}
+
+func enrichCallableIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node) bool {
+	return view.callableIsDispatchRelevant(n)
 }
 
 // nodeHasSemanticType reports whether a node already carries a non-empty
@@ -466,13 +455,8 @@ func rebindTargetAcceptable(k graph.NodeKind) bool {
 // edgeExistsAt reports whether an edge (from, to, kind) already exists
 // at the given site line — used to avoid minting a duplicate when a
 // rebind would land exactly on an edge another pass already recorded.
-func edgeExistsAt(g graph.Store, from, to string, kind graph.EdgeKind, line int) bool {
-	for _, e := range g.GetOutEdges(from) {
-		if e.To == to && e.Kind == kind && e.Line == line {
-			return true
-		}
-	}
-	return false
+func edgeExistsAt(view *lspGraphView, from, to string, kind graph.EdgeKind, line int) bool {
+	return view.edgeExistsAt(from, to, kind, line)
 }
 
 // definitionNodeAtSite asks the language server which declaration the
@@ -493,7 +477,7 @@ func edgeExistsAt(g graph.Store, from, to string, kind graph.EdgeKind, line int)
 // from disk by the caller (via the shared document session). A nil content
 // yields a no-verdict, matching the pre-session behaviour when the site
 // file could not be opened.
-func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
+func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
@@ -517,7 +501,7 @@ func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, site
 		cache[key] = nil
 		return nil, true
 	}
-	node := findDeclarationNode(g, scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
+	node := findDeclarationNode(view, scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
 	cache[key] = node
 	return node, true
 }
@@ -527,23 +511,8 @@ func (p *Provider) definitionNodeAtSite(g graph.Store, repoPrefix, absRoot, site
 // slack covers servers that anchor the definition on the identifier
 // line of a multi-line declaration header. The name must match — that
 // is the identity check this lookup exists for.
-func findDeclarationNode(g graph.Store, filePath string, oneBasedLine int, name string) *graph.Node {
-	var near *graph.Node
-	for _, n := range g.GetFileNodes(filePath) {
-		if n == nil || n.Name != name {
-			continue
-		}
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport || n.Kind == graph.KindParam {
-			continue
-		}
-		if n.StartLine == oneBasedLine {
-			return n
-		}
-		if near == nil && n.StartLine >= oneBasedLine-1 && n.StartLine <= oneBasedLine+1 {
-			near = n
-		}
-	}
-	return near
+func findDeclarationNode(view *lspGraphView, filePath string, oneBasedLine int, name string) *graph.Node {
+	return view.findDeclarationNode(filePath, oneBasedLine, name)
 }
 
 // Enrich runs the full LSP enrichment pass for a single-repo (un-
@@ -623,72 +592,101 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// AddBatch once hovered (see flushFile), so on a light scan a candidate
 	// is never added there directly — its ID is queued and the FULL node
 	// (with any non-promoted meta intact) is re-fetched afterward.
-	repoNodes, lightScan := p.repoScopedNodesLight(g, repoPrefix)
-	langAllByID := make(map[string]*graph.Node, len(repoNodes))
-	langNodes := make([]*graph.Node, 0, len(repoNodes))
-	var candidateIDs []string
-	// Count symbol nodes a prior pass already stamped with a semantic type.
-	// Stamps persist in node Meta across restarts, so on a warm restart of an
-	// unchanged repo — or a changed repo where only a few files moved — most
-	// nodes are already covered and re-hovering them is redundant LSP work.
-	skippedAlreadyStamped := 0
-	for _, n := range repoNodes {
-		if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
-			continue
+	var (
+		repoNodes             []*graph.Node
+		langNodes             []*graph.Node
+		repoEdges             []*graph.Edge
+		targets               []enrichTarget
+		skippedAlreadyStamped int
+		lightScan             bool
+	)
+	projectedRepo, hasProjectedRepo := p.readLSPRepoProjection(g, repoPrefix)
+	if hasProjectedRepo {
+		repoNodes = projectedRepo.repoNodes
+		langNodes = projectedRepo.langNodes
+		repoEdges = projectedRepo.repoEdges
+		targets = projectedRepo.targets
+		skippedAlreadyStamped = projectedRepo.skippedAlreadyStamped
+		if p.logger != nil {
+			p.logger.Debug("LSP enrich: SQLite projection ready",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Int("frontier_pages", projectedRepo.frontierPages),
+				zap.Int("frontier_peak_files", projectedRepo.frontierPeakFiles),
+				zap.Int("frontier_peak_nodes", projectedRepo.frontierPeakNodes),
+				zap.Int("frontier_peak_edges", projectedRepo.frontierPeakEdges),
+				zap.Int("retained_location_nodes", projectedRepo.retainedLocationNodes),
+				zap.Int("retained_lsp_edges", projectedRepo.retainedConfirmableEdges),
+			)
 		}
-		// Skip machine-generated / vendored files (e.g. tree-sitter's generated
-		// parser.c) so the language server never opens or indexes them — that
-		// indexing is by far the slowest part of a fresh index for zero value.
-		if semantic.IsLowValueForEnrichment(n.FilePath, p.excludeGlobs) {
-			continue
+	} else {
+		repoNodes, lightScan = p.repoScopedNodesLight(g, repoPrefix)
+		langAllByID := make(map[string]*graph.Node, len(repoNodes))
+		langNodes = make([]*graph.Node, 0, len(repoNodes))
+		var candidateIDs []string
+		// Count symbol nodes a prior pass already stamped with a semantic type.
+		// Stamps persist in node Meta across restarts, so on a warm restart of an
+		// unchanged repo — or a changed repo where only a few files moved — most
+		// nodes are already covered and re-hovering them is redundant LSP work.
+		skippedAlreadyStamped = 0
+		for _, n := range repoNodes {
+			if n.RepoPrefix != repoPrefix || !p.languageMatches(n.Language) {
+				continue
+			}
+			// Skip machine-generated / vendored files (e.g. tree-sitter's generated
+			// parser.c) so the language server never opens or indexes them — that
+			// indexing is by far the slowest part of a fresh index for zero value.
+			if semantic.IsLowValueForEnrichment(n.FilePath, p.excludeGlobs) {
+				continue
+			}
+			langAllByID[n.ID] = n
+			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+				continue
+			}
+			// Skip symbols a prior enrichment pass already stamped — hover would
+			// only re-derive the same type. An edited file re-parses into fresh
+			// nodes with no Meta, so its symbols lose the stamp and re-enter here.
+			if nodeAlreadyStamped(n) {
+				skippedAlreadyStamped++
+				continue
+			}
+			if lightScan {
+				candidateIDs = append(candidateIDs, n.ID)
+				continue
+			}
+			langNodes = append(langNodes, n)
 		}
-		langAllByID[n.ID] = n
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		// Skip symbols a prior enrichment pass already stamped — hover would
-		// only re-derive the same type. An edited file re-parses into fresh
-		// nodes with no Meta, so its symbols lose the stamp and re-enter here.
-		if nodeAlreadyStamped(n) {
-			skippedAlreadyStamped++
-			continue
-		}
-		if lightScan {
-			candidateIDs = append(candidateIDs, n.ID)
-			continue
-		}
-		langNodes = append(langNodes, n)
-	}
-	if len(candidateIDs) > 0 {
-		full := g.GetNodesByIDs(candidateIDs)
-		for _, id := range candidateIDs {
-			if n := full[id]; n != nil {
-				langNodes = append(langNodes, n)
+		if len(candidateIDs) > 0 {
+			full := g.GetNodesByIDs(candidateIDs)
+			for _, id := range candidateIDs {
+				if n := full[id]; n != nil {
+					langNodes = append(langNodes, n)
+				}
 			}
 		}
-	}
 
-	// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
-	// repo's language nodes — the references pass below confirms / refutes
-	// them. The indexed GetRepoEdges scan + the id-set replaces the AllEdges
-	// walk with a per-edge GetNode. (enrichTarget is package-scoped so the
-	// confirm-pass grouping / matching helpers can take it.)
-	var targets []enrichTarget
-	for _, e := range p.repoScopedEdges(g, repoPrefix) {
-		if e.Confidence >= 1.0 {
-			continue
-		}
-		// Skip structural-containment edges (member_of, defines, contains,
-		// param_of, imports, captures): they anchor no use site a reference
-		// lookup can adjudicate, so confirming them wastes a round-trip and can
-		// feed a correct edge into the definition-rebind fallback and mutate its
-		// target. Use-site, type-position and dataflow edges stay confirmable.
-		// See confirmableEdgeKind.
-		if !confirmableEdgeKind(e.Kind) {
-			continue
-		}
-		if from, ok := langAllByID[e.From]; ok {
-			targets = append(targets, enrichTarget{node: from, edge: e})
+		// Collect AMBIGUOUS edges (confidence < 1.0) whose source is one of this
+		// repo's language nodes — the references pass below confirms / refutes
+		// them. The indexed GetRepoEdges scan + the id-set replaces the AllEdges
+		// walk with a per-edge GetNode. (enrichTarget is package-scoped so the
+		// confirm-pass grouping / matching helpers can take it.)
+		repoEdges = p.repoScopedEdges(g, repoPrefix)
+		for _, e := range repoEdges {
+			if e.Confidence >= 1.0 {
+				continue
+			}
+			// Skip structural-containment edges (member_of, defines, contains,
+			// param_of, imports, captures): they anchor no use site a reference
+			// lookup can adjudicate, so confirming them wastes a round-trip and can
+			// feed a correct edge into the definition-rebind fallback and mutate its
+			// target. Use-site, type-position and dataflow edges stay confirmable.
+			// See confirmableEdgeKind.
+			if !confirmableEdgeKind(e.Kind) {
+				continue
+			}
+			if from, ok := langAllByID[e.From]; ok {
+				targets = append(targets, enrichTarget{node: from, edge: e})
+			}
 		}
 	}
 
@@ -784,6 +782,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// since their semantic type is already in the graph.
 	result.HoverCandidates = len(langNodes)
 	result.SymbolsTotal = len(langNodes) + skippedAlreadyStamped
+	if hasProjectedRepo {
+		result.SymbolsTotal = projectedRepo.symbolsTotal
+	}
 	result.SymbolsCovered = skippedAlreadyStamped
 
 	// Lazy per-repo deadline: now that candidate selection is done, size the
@@ -801,12 +802,119 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 
+	// Productivity checkpoint: the candidate-scaled budget above assumes the
+	// server yields. A server that ANSWERS but resolves nothing for this
+	// workspace (observed: a 10-minute typescript pass, thousands of answered
+	// requests, zero confirmations and zero type stamps) would otherwise
+	// consume its whole budget producing nothing. Once real request volume
+	// has flowed with zero useful yield, cut the pass through the ordinary
+	// deadline path — completed work is already flushed, and zero yield
+	// means nothing is lost. A warming server (jdtls indexing, blocked
+	// requests) never reaches the volume gate, and any repo that yields even
+	// one confirmation, added edge, or type stamp is exempt for the pass.
+	var usefulYield atomic.Int64
+	passReqBase := p.reqStats.total()
+	checkpointCtx, cancelCheckpoint := context.WithCancel(ctx)
+	defer cancelCheckpoint()
+	ctx = checkpointCtx
+	if window := lspProductivityWindow(); window > 0 {
+		go func() {
+			t := time.NewTicker(window)
+			defer t.Stop()
+			tick := int64(0)
+			for {
+				select {
+				case <-checkpointCtx.Done():
+					return
+				case <-t.C:
+					tick++
+					if p.reqStats.total()-passReqBase < lspProductivityMinRequests {
+						// Requests are not flowing (server still warming /
+						// indexing); volume, not time, gates the verdict.
+						continue
+					}
+					// Sustained-rate verdict, not a one-shot zero check: the
+					// observed pathology dribbles one type stamp per ~30s of
+					// full-timeout requests — enough to defeat a zero-yield
+					// test while still wasting the whole budget. Require the
+					// cumulative yield to keep pace with a modest floor per
+					// elapsed window; any genuinely productive pass clears it
+					// by orders of magnitude, and short passes finish before
+					// the first tick.
+					if usefulYield.Load() >= tick*lspProductivityMinYieldPerWindow {
+						continue
+					}
+					p.logger.Warn("LSP enrich: pass cut by productivity checkpoint — request volume flowed with near-zero useful yield",
+						zap.String("provider", p.Name()),
+						zap.String("repo_prefix", repoPrefix),
+						zap.Duration("window", window),
+						zap.Int64("windows_elapsed", tick),
+						zap.Int64("useful_yield", usefulYield.Load()),
+						zap.Int64("requests", p.reqStats.total()-passReqBase))
+					cancelCheckpoint()
+					return
+				}
+			}
+		}()
+	}
+
 	// The graph-mutation blocks in this pass serialise on the backend
 	// resolve mutex (the same lock every other edge-mutating pass holds)
 	// so this pass can run concurrently with other repos' enrichment.
 	// Only the in-memory mutations are locked — the LSP I/O stays outside
 	// the lock so concurrent language servers still overlap.
 	rmu := g.ResolveMutex()
+
+	// Reuse the repo-scoped node/edge projections for every LSP result. The
+	// extra inbound read is one bounded batch for cross-repo dispatch edges;
+	// target endpoints absent from this repo projection are fetched together.
+	view := newLSPGraphView(repoNodes, repoEdges)
+	view.addNodes(langNodes)
+	if hasProjectedRepo {
+		view.setFanInCounts(projectedRepo.fanInByID)
+		view.addEdges(projectedRepo.inboundDispatchEdges)
+	} else {
+		inboundIDSet := make(map[string]struct{}, len(langNodes))
+		for _, n := range langNodes {
+			inboundIDSet[n.ID] = struct{}{}
+			for _, edge := range view.outByID[n.ID] {
+				if edge.Kind == graph.EdgeMemberOf {
+					inboundIDSet[edge.To] = struct{}{}
+				}
+			}
+		}
+		inboundIDs := make([]string, 0, len(inboundIDSet))
+		for id := range inboundIDSet {
+			inboundIDs = append(inboundIDs, id)
+		}
+		sort.Strings(inboundIDs)
+		if len(inboundIDs) > 0 {
+			for _, edges := range g.GetInEdgesByNodeIDs(inboundIDs) {
+				view.addEdges(edges)
+			}
+		}
+	}
+	missingTargetIDs := make([]string, 0)
+	seenMissingTarget := make(map[string]struct{})
+	for _, target := range targets {
+		id := target.edge.To
+		if view.nodesByID[id] != nil {
+			continue
+		}
+		if _, seen := seenMissingTarget[id]; seen {
+			continue
+		}
+		seenMissingTarget[id] = struct{}{}
+		missingTargetIDs = append(missingTargetIDs, id)
+	}
+	if len(missingTargetIDs) > 0 {
+		fetched := g.GetNodesByIDs(missingTargetIDs)
+		for _, id := range missingTargetIDs {
+			if n := fetched[id]; n != nil {
+				view.addNodes([]*graph.Node{n})
+			}
+		}
+	}
 
 	// Targeted edge work runs FIRST — before the whole-repo per-file
 	// sweep — because confirmed / added edges (implements, calls) decide
@@ -833,9 +941,19 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 	}
 
+	// Failure-streak breakers (see yield_breaker.go): a server that answers
+	// nothing for this workspace must not grind through the whole target and
+	// hover corpus at one timeout per request. Any successful answer disarms
+	// the phase's breaker permanently.
+	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
+	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
+
 	// Query implementations for interface nodes. A degraded pass skips this:
 	// the query opens each interface's file, and a database-less clangd cannot
-	// resolve implementations across translation units regardless.
+	// resolve implementations across translation units regardless. Graph
+	// matches are served from the repo projection and all writes land together.
+	interfaceMutations := newLSPMutationBatch()
+	interfacePromotions := make(map[*graph.Edge]struct{})
 	for _, n := range langNodes {
 		if degraded {
 			break
@@ -855,9 +973,6 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		// Open this interface's file through the shared session: the query
-		// runs while it is pinned, and release leaves it warm in the LRU so
-		// the confirm pass and sweep reuse it instead of reopening.
 		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
 		if err != nil {
 			continue
@@ -865,34 +980,47 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		col := identifierColumn(content, n.StartLine, n.Name)
 		impls, err := p.findImplementations(absRoot, rel, line, col)
 		release()
+		targetedBreaker.observe(err == nil)
+		if targetedBreaker.isTripped() {
+			break
+		}
 		if err != nil || len(impls) == 0 {
 			continue
 		}
 
-		rmu.Lock()
 		for _, loc := range impls {
 			implPath := uriToPath(loc.URI, absRoot)
 			if implPath == "" {
 				continue
 			}
-			implNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
+			implNode := view.matchNodeByFileLine(scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
 			if implNode == nil {
 				continue
 			}
 
-			existing := semantic.FindMatchingEdge(g, implNode.ID, n.ID, graph.EdgeImplements)
+			existing := view.findMatchingEdge(implNode.ID, n.ID, graph.EdgeImplements)
 			if existing != nil {
 				if existing.Confidence < 1.0 {
-					semantic.ConfirmEdge(existing, p.Name())
-					semantic.PersistEdge(g, existing)
-					result.EdgesConfirmed++
+					interfacePromotions[existing] = struct{}{}
 				}
-			} else {
-				semantic.AddSemanticEdge(g, implNode.ID, n.ID, graph.EdgeImplements,
-					implNode.FilePath, implNode.StartLine, p.Name())
+				continue
+			}
+			edge := newLSPResolvedEdge(implNode.ID, n.ID, graph.EdgeImplements,
+				implNode.FilePath, implNode.StartLine, p.Name(), graph.OriginLSPDispatch)
+			if interfaceMutations.stageAdd(view, edge) {
+				usefulYield.Add(1)
 				result.EdgesAdded++
 			}
 		}
+	}
+	if len(interfacePromotions) > 0 || len(interfaceMutations.adds) > 0 {
+		rmu.Lock()
+		for existing := range interfacePromotions {
+			semantic.ConfirmEdge(existing, p.Name())
+			interfaceMutations.stagePersist(existing)
+			result.EdgesConfirmed++
+		}
+		interfaceMutations.apply(g, nil)
 		rmu.Unlock()
 	}
 
@@ -914,14 +1042,15 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// fallback opens arbitrary call-site files, so it runs serially afterward
 	// over the targets the sweep left unconfirmed, keeping document open/close
 	// from overlapping across goroutines.
-	confirmGroups := p.groupConfirmTargets(g, targets, degradedSkipFile)
+	confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
 	var confirmMu sync.Mutex
+	confirmPromotions := make(map[*graph.Edge]struct{})
 	var fallback []enrichTarget
 	{
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for _, grp := range confirmGroups {
-			if targetedCtx.Err() != nil {
+			if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 				break
 			}
 			wg.Add(1)
@@ -931,7 +1060,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					<-sem
 					wg.Done()
 				}()
-				if targetedCtx.Err() != nil {
+				if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 					return
 				}
 				absPath := filepath.Join(absRoot, grp.rel)
@@ -961,10 +1090,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				}
 				refsByTarget := make(map[string]cachedRefs, len(grp.targets))
 				for _, t := range grp.targets {
-					if targetedCtx.Err() != nil {
+					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 						return
 					}
-					toNode := g.GetNode(t.edge.To)
+					toNode := view.nodesByID[t.edge.To]
 					if toNode == nil {
 						continue
 					}
@@ -976,6 +1105,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					if !seen {
 						col := identifierColumn(content, toNode.StartLine, toNode.Name)
 						refs, err := p.findReferences(absRoot, grp.rel, line, col)
+						targetedBreaker.observe(err == nil)
 						cr = cachedRefs{refs: refs, ok: err == nil}
 						refsByTarget[t.edge.To] = cr
 					}
@@ -983,12 +1113,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						continue
 					}
 					if p.confirmRefMatchesSite(cr.refs, absRoot, repoPrefix, t) {
-						rmu.Lock()
-						semantic.ConfirmEdge(t.edge, p.Name())
-						semantic.PersistEdge(g, t.edge)
-						rmu.Unlock()
+						usefulYield.Add(1)
 						confirmMu.Lock()
-						result.EdgesConfirmed++
+						confirmPromotions[t.edge] = struct{}{}
 						confirmMu.Unlock()
 						continue
 					}
@@ -1003,6 +1130,17 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}(grp)
 		}
 		wg.Wait()
+	}
+	if len(confirmPromotions) > 0 {
+		mutations := newLSPMutationBatch()
+		rmu.Lock()
+		for edge := range confirmPromotions {
+			semantic.ConfirmEdge(edge, p.Name())
+			mutations.stagePersist(edge)
+			result.EdgesConfirmed++
+		}
+		mutations.apply(g, nil)
+		rmu.Unlock()
 	}
 
 	// Serial definition-rebind fallback: for a site the reference sweep did
@@ -1036,11 +1174,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		curContent = nil
 	}
+	fallbackMutations := newLSPMutationBatch()
 	for _, t := range fallback {
-		if targetedCtx.Err() != nil {
+		if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 			break
 		}
-		toNode := g.GetNode(t.edge.To)
+		toNode := view.nodesByID[t.edge.To]
 		if toNode == nil {
 			continue
 		}
@@ -1068,7 +1207,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 		}
 		siteLine := t.edge.Line
-		cand, ok := p.definitionNodeAtSite(g, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
+		cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
 		switch {
 		case !ok || cand == nil:
 			// No verdict — leave the edge at its heuristic tier so
@@ -1076,25 +1215,28 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		case cand.ID == toNode.ID:
 			rmu.Lock()
 			semantic.ConfirmEdge(t.edge, p.Name())
-			semantic.PersistEdge(g, t.edge)
+			fallbackMutations.stagePersist(t.edge)
 			rmu.Unlock()
 			result.EdgesConfirmed++
-		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(g, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
+		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
 			rmu.Lock()
-			// Mutate the full edge state BEFORE ReindexEdge: disk
-			// backends persist the post-mutation struct verbatim
-			// (delete old key + insert current state), so anything
-			// stamped afterwards would be dropped.
+			// Mutate the full edge state before staging the set-oriented
+			// reindex so the backend persists the complete confirmed payload.
 			oldTo := t.edge.To
 			t.edge.To = cand.ID
 			semantic.ConfirmEdge(t.edge, p.Name())
 			t.edge.Meta["rebound_from"] = oldTo
-			g.ReindexEdge(t.edge, oldTo)
+			fallbackMutations.stageReindex(view, t.edge, oldTo)
 			rmu.Unlock()
 			result.EdgesConfirmed++
 		}
 	}
 	releaseSite()
+	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 {
+		rmu.Lock()
+		fallbackMutations.apply(g, nil)
+		rmu.Unlock()
+	}
 
 	// Degraded finalisation: the interface pass, the references-add pass, and
 	// the per-file hover / hierarchy sweep are all skipped when a needed
@@ -1135,7 +1277,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// call edges. Runs under the targeted budget (before the hover sweep) so
 	// a deadline cut sheds hover work, not the recall-bearing add.
 	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
-		p.referencesAddPass(targetedCtx, g, repoPrefix, absRoot, langNodes, rmu, session, result)
+		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
 
 	// Per-file document lifecycle + bounded concurrency. The original
@@ -1227,6 +1369,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return newC, nil
 	}
 
+	// Demand/dispatch decisions are immutable during the concurrent sweep.
+	// Compute them once from the repo adjacency projection before any file
+	// goroutine starts staging new hierarchy edges into that projection.
+	nodeDemand := make(map[string]bool, len(langNodes))
+	nodeDispatch := make(map[string]bool, len(langNodes))
+	for _, n := range langNodes {
+		nodeDemand[n.ID] = enrichNodeHasUnresolvedDemandFromView(view, n)
+		nodeDispatch[n.ID] = enrichCallableIsDispatchRelevantFromView(view, n)
+	}
+
 	// Group enrichment targets by file so each file's open/close lifecycle
 	// spans all of its symbols. Files keep encounter order; symbols keep
 	// their order within a file.
@@ -1250,7 +1402,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			fileList = append(fileList, ft)
 		}
 		ft.nodes = append(ft.nodes, n)
-		if enrichNodeHasUnresolvedDemand(g, n) {
+		if nodeDemand[n.ID] {
 			ft.demand++
 		}
 		if enrichNodeIsDispatchRelevant(n) {
@@ -1323,15 +1475,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		rmu.Lock()
 		defer rmu.Unlock()
-		if len(stamped) > 0 {
-			g.AddBatch(stamped, nil)
-		}
+		mutations := newLSPMutationBatch()
 		for _, h := range cHops {
-			p.recordHierarchyCall(g, repoPrefix, absRoot, h.n, h.other, h.asOutgoing, h.fromRanges, result)
+			p.recordHierarchyCall(view, mutations, repoPrefix, absRoot, h.n, h.other, h.asOutgoing, h.fromRanges, result)
 		}
 		for _, h := range tHops {
-			p.linkTypeHierarchy(g, repoPrefix, absRoot, h.n, h.other, h.asSupertype, result)
+			p.linkTypeHierarchy(view, mutations, repoPrefix, absRoot, h.n, h.other, h.asSupertype, result)
 		}
+		mutations.apply(g, stamped)
 	}
 
 	// fileSem bounds the number of simultaneously-open documents; hoverSem
@@ -1426,8 +1577,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// sweeps the demand-bearing callers before any deadline
 						// cut, so a skipped incoming costs no reachable edge.
 						wantIncoming := sweepMode == sweepModeFull ||
-							enrichCallableIsDispatchRelevant(g, n) ||
-							enrichNodeHasUnresolvedDemand(g, n)
+							nodeDispatch[n.ID] || nodeDemand[n.ID]
 						for _, item := range items {
 							if outs, oerr := p.outgoingCalls(item); oerr == nil {
 								for _, oc := range outs {
@@ -1498,7 +1648,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						<-hoverSem
 						nodeWg.Done()
 					}()
-					if aborted.Load() || ctx.Err() != nil {
+					if aborted.Load() || ctx.Err() != nil || hoverBreaker.isTripped() {
 						return
 					}
 
@@ -1539,6 +1689,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						hoverResult, err = p.hoverWith(c, absRoot, nodeRelPath(n), line, col)
 					}
 					if err != nil {
+						hoverBreaker.observe(false)
 						diagHoverErr.Add(1)
 						mu.Lock()
 						if diagFirstHoverError == "" {
@@ -1550,9 +1701,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						return
 					}
 					if hoverResult == nil {
+						hoverBreaker.observe(true)
 						diagHoverNil.Add(1)
 						return
 					}
+					hoverBreaker.observe(true)
 					diagHoverOK.Add(1)
 
 					typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
@@ -1570,6 +1723,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					}
 
 					semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
+					usefulYield.Add(1)
 					diagEnriched.Add(1)
 					mu.Lock()
 					fileStamped = append(fileStamped, n)
@@ -1622,7 +1776,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.String("first_hover_error", diagFirstHoverError),
 		zap.String("first_node_name", diagFirstNodeName),
 		zap.String("first_node_file", diagFirstNodeFile),
+		zap.Bool("targeted_breaker_tripped", targetedBreaker.isTripped()),
+		zap.Bool("hover_breaker_tripped", hoverBreaker.isTripped()),
 	)
+
+	if targetedBreaker.isTripped() && hoverBreaker.isTripped() &&
+		result.EdgesConfirmed == 0 && result.EdgesAdded == 0 && result.NodesEnriched == 0 {
+		result.DegradedReason = "language server answered no request for this workspace; pass abandoned by zero-yield breaker"
+	}
 
 	if result.SymbolsTotal > 0 {
 		result.CoveragePercent = float64(result.SymbolsCovered) / float64(result.SymbolsTotal) * 100
@@ -2631,7 +2792,6 @@ func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.No
 	if err != nil {
 		return 0, err
 	}
-	// LSP round-trips first, unlocked.
 	type hop struct {
 		other  CallHierarchyItem
 		ranges []Range
@@ -2649,13 +2809,58 @@ func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.No
 	if len(hops) == 0 {
 		return 0, nil
 	}
-	// Graph mutations under the resolve lock, batched.
+
+	// Fetch every referenced file and every caller adjacency in two bounded
+	// store calls. The per-hop loop below is then pure map work plus one batch
+	// mutation, even when a hot symbol has thousands of incoming calls.
+	paths := make([]string, 0, len(hops))
+	seenPath := make(map[string]struct{}, len(hops))
+	for _, h := range hops {
+		otherPath := uriToPath(h.other.URI, absRoot)
+		if otherPath == "" {
+			continue
+		}
+		path := scopedPath(n.RepoPrefix, otherPath)
+		if _, seen := seenPath[path]; seen {
+			continue
+		}
+		seenPath[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return 0, nil
+	}
+	nodesByFile := g.GetFileNodesByPaths(paths)
+	view := newLSPGraphView([]*graph.Node{n}, nil)
+	for _, path := range paths {
+		view.addNodes(nodesByFile[path])
+	}
+	callerIDs := make([]string, 0, len(hops))
+	seenCaller := make(map[string]struct{}, len(hops))
+	for _, h := range hops {
+		otherPath := uriToPath(h.other.URI, absRoot)
+		otherNode := view.matchCallableByFileLine(scopedPath(n.RepoPrefix, otherPath), h.other.SelectionRange.Start.Line+1)
+		if otherNode == nil {
+			continue
+		}
+		if _, seen := seenCaller[otherNode.ID]; seen {
+			continue
+		}
+		seenCaller[otherNode.ID] = struct{}{}
+		callerIDs = append(callerIDs, otherNode.ID)
+	}
+	for _, edges := range g.GetOutEdgesByNodeIDs(callerIDs) {
+		view.addEdges(edges)
+	}
+
 	result := &semantic.EnrichResult{Provider: p.Name()}
+	mutations := newLSPMutationBatch()
 	rmu := g.ResolveMutex()
 	rmu.Lock()
 	for _, h := range hops {
-		p.recordHierarchyCall(g, n.RepoPrefix, absRoot, n, h.other, false, h.ranges, result)
+		p.recordHierarchyCall(view, mutations, n.RepoPrefix, absRoot, n, h.other, false, h.ranges, result)
 	}
+	mutations.apply(g, nil)
 	rmu.Unlock()
 	return result.EdgesConfirmed + result.EdgesAdded, nil
 }
@@ -3042,17 +3247,12 @@ func (p *Provider) Source(repoRoot, relPath string) []byte {
 // at the calling function's declaration line. When the server
 // returned no ranges, the caller's declaration line remains the
 // fallback anchor.
-func (p *Provider) recordHierarchyCall(g graph.Store, repoPrefix, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, fromRanges []Range, result *semantic.EnrichResult) {
+func (p *Provider) recordHierarchyCall(view *lspGraphView, mutations *lspMutationBatch, repoPrefix, absRoot string, n *graph.Node, other CallHierarchyItem, asOutgoing bool, fromRanges []Range, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
 	}
-	// A hierarchy item names a function or method — match callable
-	// kinds only. The generic innermost-node matcher used to land on
-	// a KindParam node here (params share the declaration line with
-	// a zero-height span, so they always won the innermost tie),
-	// wiring call edges to `<fn>#param:<name>` endpoints.
-	otherNode := semantic.MatchCallableByFileLine(g, scopedPath(repoPrefix, otherPath),
+	otherNode := view.matchCallableByFileLine(scopedPath(repoPrefix, otherPath),
 		other.SelectionRange.Start.Line+1)
 	if otherNode == nil {
 		return
@@ -3065,13 +3265,10 @@ func (p *Provider) recordHierarchyCall(g graph.Store, repoPrefix, absRoot string
 		return
 	}
 
-	// One pass over the caller's out-edges: bucket every existing
-	// (from, to, calls) edge by line so per-line dedup and per-site
-	// promotion share a single fetch.
 	var existing *graph.Edge
 	pairEdges := 0
 	byLine := map[int][]*graph.Edge{}
-	for _, e := range g.GetOutEdges(from.ID) {
+	for _, e := range view.outByID[from.ID] {
 		if e.Kind != graph.EdgeCalls || e.To != to.ID {
 			continue
 		}
@@ -3085,36 +3282,26 @@ func (p *Provider) recordHierarchyCall(g graph.Store, repoPrefix, absRoot string
 		if graph.OriginRank(e.Origin) < graph.OriginRank(graph.OriginLSPResolved) {
 			semantic.ConfirmEdge(e, p.Name())
 			e.Origin = graph.OriginLSPResolved
-			semantic.PersistEdge(g, e)
+			mutations.stagePersist(e)
 			result.EdgesConfirmed++
 		}
 	}
 
 	lines := callSiteLines(fromRanges)
 	if len(lines) == 0 {
-		// No precise ranges from the server. The (from → to) pair is
-		// still server-verified, but WHICH line each edge sits on is
-		// not: promote only when the pair has exactly one candidate
-		// edge. With several candidate lines and no ranges, promoting
-		// the first was an arbitrary pick that could stamp the lsp
-		// tier onto a heuristically-misbound site — those stay at
-		// their heuristic tier instead.
 		if existing != nil {
 			if pairEdges == 1 {
 				promote(existing)
 			}
 			return
 		}
-		semantic.AddSemanticEdge(g, from.ID, to.ID, graph.EdgeCalls,
-			from.FilePath, from.StartLine, p.Name())
-		result.EdgesAdded++
+		edge := newLSPResolvedEdge(from.ID, to.ID, graph.EdgeCalls,
+			from.FilePath, from.StartLine, p.Name(), graph.OriginLSPResolved)
+		if mutations.stageAdd(view, edge) {
+			result.EdgesAdded++
+		}
 		return
 	}
-	// Server-verified call sites: promote EVERY existing pair edge at a
-	// verified line, mint the rest. Promoting only the first edge left a
-	// caller's second call site as text_matched — which the read-path
-	// precision filter then suppressed, silently costing recall on
-	// repeated calls within one function.
 	for _, line := range lines {
 		if es, ok := byLine[line]; ok {
 			for _, e := range es {
@@ -3122,9 +3309,11 @@ func (p *Provider) recordHierarchyCall(g graph.Store, repoPrefix, absRoot string
 			}
 			continue
 		}
-		semantic.AddSemanticEdge(g, from.ID, to.ID, graph.EdgeCalls,
-			from.FilePath, line, p.Name())
-		result.EdgesAdded++
+		edge := newLSPResolvedEdge(from.ID, to.ID, graph.EdgeCalls,
+			from.FilePath, line, p.Name(), graph.OriginLSPResolved)
+		if mutations.stageAdd(view, edge) {
+			result.EdgesAdded++
+		}
 	}
 }
 
@@ -3158,12 +3347,12 @@ func callSiteLines(ranges []Range) []int {
 // whose name matches a method on the parent — closing the
 // method-level half of the type hierarchy (Joern calls these
 // CONTAINS + OVERRIDES).
-func (p *Provider) linkTypeHierarchy(g graph.Store, repoPrefix, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
+func (p *Provider) linkTypeHierarchy(view *lspGraphView, mutations *lspMutationBatch, repoPrefix, absRoot string, cur *graph.Node, other TypeHierarchyItem, asSupertype bool, result *semantic.EnrichResult) {
 	otherPath := uriToPath(other.URI, absRoot)
 	if otherPath == "" {
 		return
 	}
-	otherNode := semantic.MatchNodeByFileLine(g, scopedPath(repoPrefix, otherPath), other.SelectionRange.Start.Line+1)
+	otherNode := view.matchNodeByFileLine(scopedPath(repoPrefix, otherPath), other.SelectionRange.Start.Line+1)
 	if otherNode == nil {
 		return
 	}
@@ -3172,28 +3361,30 @@ func (p *Provider) linkTypeHierarchy(g graph.Store, repoPrefix, absRoot string, 
 		from, to = otherNode, cur
 	}
 	kind := graph.EdgeExtends
+	origin := graph.OriginLSPResolved
 	if to.Kind == graph.KindInterface {
 		kind = graph.EdgeImplements
+		origin = graph.OriginLSPDispatch
 	}
 	if from.ID == to.ID {
 		return
 	}
-	existing := semantic.FindMatchingEdge(g, from.ID, to.ID, kind)
+	existing := view.findMatchingEdge(from.ID, to.ID, kind)
 	if existing != nil {
 		if graph.OriginRank(existing.Origin) < graph.OriginRank(graph.OriginLSPResolved) {
 			semantic.ConfirmEdge(existing, p.Name())
 			existing.Origin = graph.OriginLSPResolved
-			semantic.PersistEdge(g, existing)
+			mutations.stagePersist(existing)
 			result.EdgesConfirmed++
 		}
 	} else {
-		semantic.AddSemanticEdge(g, from.ID, to.ID, kind, from.FilePath, from.StartLine, p.Name())
-		result.EdgesAdded++
+		edge := newLSPResolvedEdge(from.ID, to.ID, kind, from.FilePath, from.StartLine, p.Name(), origin)
+		if mutations.stageAdd(view, edge) {
+			result.EdgesAdded++
+		}
 	}
 
-	// Method-level override edges: child methods that share a name
-	// with parent methods.
-	addOverrideEdges(g, from, to, p.Name(), graph.OriginLSPDispatch, result)
+	addOverrideEdgesBatch(view, mutations, from, to, p.Name(), graph.OriginLSPDispatch, result)
 }
 
 // addOverrideEdges emits EdgeOverrides from each method of child to
@@ -3209,12 +3400,51 @@ func addOverrideEdges(g graph.Store, child, parent *graph.Node, provider, origin
 	if child == nil || parent == nil || child.ID == parent.ID {
 		return
 	}
+	ownerIDs := []string{child.ID, parent.ID}
+	inByID := g.GetInEdgesByNodeIDs(ownerIDs)
+	methodSet := make(map[string]struct{})
+	edges := make([]*graph.Edge, 0)
+	for _, id := range ownerIDs {
+		for _, edge := range inByID[id] {
+			edges = append(edges, edge)
+			if edge.Kind == graph.EdgeMemberOf {
+				methodSet[edge.From] = struct{}{}
+			}
+		}
+	}
+	methodIDs := make([]string, 0, len(methodSet))
+	for id := range methodSet {
+		methodIDs = append(methodIDs, id)
+	}
+	methodNodes := g.GetNodesByIDs(methodIDs)
+	nodes := []*graph.Node{child, parent}
+	for _, id := range methodIDs {
+		if n := methodNodes[id]; n != nil {
+			nodes = append(nodes, n)
+		}
+	}
+	for _, out := range g.GetOutEdgesByNodeIDs(methodIDs) {
+		edges = append(edges, out...)
+	}
+	view := newLSPGraphView(nodes, edges)
+	mutations := newLSPMutationBatch()
+	rmu := g.ResolveMutex()
+	rmu.Lock()
+	addOverrideEdgesBatch(view, mutations, child, parent, provider, origin, result)
+	mutations.apply(g, nil)
+	rmu.Unlock()
+}
+
+func addOverrideEdgesBatch(view *lspGraphView, mutations *lspMutationBatch, child, parent *graph.Node, provider, origin string, result *semantic.EnrichResult) {
+	if child == nil || parent == nil || child.ID == parent.ID {
+		return
+	}
 	parentMethods := map[string]*graph.Node{}
-	for _, e := range g.GetInEdges(parent.ID) {
+	for _, e := range view.inByID[parent.ID] {
 		if e.Kind != graph.EdgeMemberOf {
 			continue
 		}
-		m := g.GetNode(e.From)
+		m := view.nodesByID[e.From]
 		if m == nil || m.Kind != graph.KindMethod {
 			continue
 		}
@@ -3223,11 +3453,11 @@ func addOverrideEdges(g graph.Store, child, parent *graph.Node, provider, origin
 	if len(parentMethods) == 0 {
 		return
 	}
-	for _, e := range g.GetInEdges(child.ID) {
+	for _, e := range view.inByID[child.ID] {
 		if e.Kind != graph.EdgeMemberOf {
 			continue
 		}
-		m := g.GetNode(e.From)
+		m := view.nodesByID[e.From]
 		if m == nil || m.Kind != graph.KindMethod {
 			continue
 		}
@@ -3235,24 +3465,20 @@ func addOverrideEdges(g graph.Store, child, parent *graph.Node, provider, origin
 		if !ok || pm.ID == m.ID {
 			continue
 		}
-		existing := semantic.FindMatchingEdge(g, m.ID, pm.ID, graph.EdgeOverrides)
+		existing := view.findMatchingEdge(m.ID, pm.ID, graph.EdgeOverrides)
 		if existing != nil {
 			if graph.OriginRank(existing.Origin) < graph.OriginRank(origin) {
 				semantic.ConfirmEdge(existing, provider)
 				existing.Origin = origin
-				semantic.PersistEdge(g, existing)
+				mutations.stagePersist(existing)
 				if result != nil {
 					result.EdgesConfirmed++
 				}
 			}
 			continue
 		}
-		ed := semantic.AddSemanticEdge(g, m.ID, pm.ID, graph.EdgeOverrides, m.FilePath, m.StartLine, provider)
-		if ed != nil && ed.Origin != origin {
-			ed.Origin = origin
-			semantic.PersistEdge(g, ed)
-		}
-		if result != nil {
+		edge := newLSPResolvedEdge(m.ID, pm.ID, graph.EdgeOverrides, m.FilePath, m.StartLine, provider, origin)
+		if mutations.stageAdd(view, edge) && result != nil {
 			result.EdgesAdded++
 		}
 	}
@@ -3293,17 +3519,11 @@ func (p *Provider) servesFile(relPath string) bool {
 	return false
 }
 
-// repoScopedNodes returns the repo's nodes via the indexed GetRepoNodes scan
-// rather than a whole-graph AllNodes walk — the latter is O(graph) per
-// provider per repo on a disk backend. For the embedded single-repo path
-// (repoPrefix == "") where GetRepoNodes can return empty on some backends,
-// it falls back to AllNodes so the standalone server still enriches.
+// repoScopedNodes returns the exact repo projection. Empty prefix denotes the
+// embedded single-repository namespace; Store implementations handle it as an
+// exact predicate, never as a request for a graph-wide snapshot.
 func (p *Provider) repoScopedNodes(g graph.Store, repoPrefix string) []*graph.Node {
-	nodes := g.GetRepoNodes(repoPrefix)
-	if len(nodes) == 0 && repoPrefix == "" {
-		return g.AllNodes()
-	}
-	return nodes
+	return g.GetRepoNodes(repoPrefix)
 }
 
 // repoScopedNodesLight fetches this repo's nodes via the store's optional
@@ -3320,14 +3540,25 @@ func (p *Provider) repoScopedNodesLight(g graph.Store, repoPrefix string) ([]*gr
 	return p.repoScopedNodes(g, repoPrefix), false
 }
 
-// repoScopedEdges returns the edges whose source node belongs to
-// repoPrefix via the indexed GetRepoEdges scan, falling back to AllEdges
-// only for the embedded single-repo ("") path where GetRepoEdges returns
-// nothing by contract.
+// repoScopedEdges returns the edges whose source belongs to repoPrefix. The
+// multi-repo path uses the compound store query. GetRepoEdges intentionally
+// treats an empty prefix as no scope, so the embedded path resolves its exact
+// empty-prefix nodes once and performs one batched adjacency lookup.
 func (p *Provider) repoScopedEdges(g graph.Store, repoPrefix string) []*graph.Edge {
-	edges := g.GetRepoEdges(repoPrefix)
-	if len(edges) == 0 && repoPrefix == "" {
-		return g.AllEdges()
+	if repoPrefix != "" {
+		return g.GetRepoEdges(repoPrefix)
+	}
+	nodes := g.GetRepoNodes("")
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node != nil {
+			ids = append(ids, node.ID)
+		}
+	}
+	bySource := g.GetOutEdgesByNodeIDs(ids)
+	var edges []*graph.Edge
+	for _, id := range ids {
+		edges = append(edges, bySource[id]...)
 	}
 	return edges
 }

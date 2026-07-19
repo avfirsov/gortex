@@ -56,7 +56,7 @@ func TestWatcher_DeletePatchPrunesPersistedMtime(t *testing.T) {
 
 	gonePath := filepath.Join(dir, "gone.go")
 	require.NoError(t, os.Remove(gonePath))
-	w.patchGraph(gonePath, ChangeDeleted)
+	_ = w.patchGraph(gonePath, ChangeDeleted)
 
 	after := s.LoadFileMtimes("")
 	assert.NotContains(t, after, "gone.go",
@@ -107,7 +107,7 @@ func TestWatcher_ModifyPatchPersistsMtimeToStore(t *testing.T) {
 	future := time.Now().Add(2 * time.Second)
 	writeTestFile(t, path, "package main\n\nfunc First() {}\n\nfunc Second() {}\n")
 	require.NoError(t, os.Chtimes(path, future, future))
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	info, statErr := os.Stat(path)
 	require.NoError(t, statErr)
@@ -130,7 +130,7 @@ func TestWatcher_DeleteEventForPresentFileKeepsMtime(t *testing.T) {
 	path := filepath.Join(dir, "revert.go")
 	require.Contains(t, s.LoadFileMtimes(""), "revert.go")
 
-	w.patchGraph(path, ChangeDeleted)
+	_ = w.patchGraph(path, ChangeDeleted)
 
 	assert.Contains(t, s.LoadFileMtimes(""), "revert.go",
 		"a delete event for a still-present file (a revert) must not prune its mtime")
@@ -150,7 +150,7 @@ func TestWatcher_DeletePatchInMemoryBackendSkipsStore(t *testing.T) {
 	require.Contains(t, idx.FileMtimes(), "solo.go")
 
 	require.NoError(t, os.Remove(path))
-	w.patchGraph(path, ChangeDeleted)
+	_ = w.patchGraph(path, ChangeDeleted)
 
 	assert.NotContains(t, idx.FileMtimes(), "solo.go",
 		"the in-memory mtime entry must be pruned even without a store deleter")

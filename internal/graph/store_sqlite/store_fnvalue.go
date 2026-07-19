@@ -24,8 +24,7 @@ var _ graph.FnValuePlaceholderScanner = (*Store)(nil)
 // straight off the index instead.
 func (s *Store) FnValuePlaceholderEdges() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`
-SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason
+		out := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
 FROM edges
 WHERE (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
    OR (is_unresolved = 1 AND to_id LIKE '%::unresolved::fnvalue::%')`)

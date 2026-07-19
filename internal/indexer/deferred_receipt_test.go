@@ -23,7 +23,7 @@ func TestResolveDeferredMutationsSkipsCompleteEmptyReceiptWithoutScanning(t *tes
 	store, edge := deferredReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: true}, true, nil)
+	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: true}, true, nil, false)
 	if mode != deferredResolveSkipped {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveSkipped)
 	}
@@ -46,7 +46,7 @@ func TestResolveDeferredMutationsUsesExactDefinitionFrontier(t *testing.T) {
 		TargetIDs:          []string{"b.go::Target"},
 	}
 
-	mode := mi.resolveDeferredMutations(receipt, true, nil)
+	mode := mi.resolveDeferredMutations(receipt, true, nil, false)
 	if mode != deferredResolveExact {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
 	}
@@ -68,7 +68,7 @@ func TestResolveDeferredMutationsUsesExactChangedFileFrontier(t *testing.T) {
 		TargetNames:        []string{"Target"},
 	}
 
-	mode := mi.resolveDeferredMutations(receipt, false, nil)
+	mode := mi.resolveDeferredMutations(receipt, false, nil, false)
 	if mode != deferredResolveExact {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveExact)
 	}
@@ -84,7 +84,7 @@ func TestResolveDeferredMutationsIncompleteReceiptFallsBackToFullScan(t *testing
 	store, edge := deferredReceiptFixture()
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 
-	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, map[string]struct{}{"repo": {}})
+	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, map[string]struct{}{"repo": {}}, false)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
 	}
@@ -101,7 +101,7 @@ func TestResolveDeferredMutationsMissingExactPathFailsClosed(t *testing.T) {
 	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
 	receipt := &graph.MutationReceipt{Complete: true, ResolutionRelevant: true, TargetNames: []string{"Target"}}
 
-	mode := mi.resolveDeferredMutations(receipt, false, nil)
+	mode := mi.resolveDeferredMutations(receipt, false, nil, false)
 	if mode != deferredResolveFallback {
 		t.Fatalf("mode = %q, want %q", mode, deferredResolveFallback)
 	}
@@ -120,4 +120,24 @@ func deferredReceiptFixture() (*deferredScanCountingStore, *graph.Edge) {
 		{ID: "b.go::Target", Kind: graph.KindFunction, Name: "Target", FilePath: "b.go", Language: "go"},
 	}, []*graph.Edge{edge})
 	return &deferredScanCountingStore{Graph: g}, edge
+}
+
+// An incomplete (overlap-voided) receipt normally forces the whole-graph
+// fallback resolve — but when the store's unresolved-insertion counter is
+// unchanged across the deferred window, the fallback provably has nothing to
+// resolve and must be skipped without touching the resolver.
+func TestResolveDeferredMutationsIncompleteReceiptSkipsWhenNoUnresolvedWrites(t *testing.T) {
+	store, edge := deferredReceiptFixture()
+	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
+
+	mode := mi.resolveDeferredMutations(&graph.MutationReceipt{Complete: false}, false, nil, true)
+	if mode != deferredResolveSkipped {
+		t.Fatalf("mode = %q, want %q", mode, deferredResolveSkipped)
+	}
+	if got := store.unresolvedScans.Load(); got != 0 {
+		t.Fatalf("skip path ran %d unresolved scans, want 0", got)
+	}
+	if edge.To == "b.go::Target" {
+		t.Fatal("skip path must not resolve edges")
+	}
 }

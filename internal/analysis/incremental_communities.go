@@ -78,16 +78,26 @@ type leidenGraph struct {
 // the resulting weighted graph. Returns nil when the graph has no
 // clustering-relevant edges — the caller then yields an empty
 // partition.
-func buildLeidenGraph(g graph.Store) *leidenGraph {
-	nodes := graph.AllNodesLight(g)
-	// Meta-less scan (see LightEdgeScanner): the Leiden weighting keys only off
-	// e.Kind (via edgeWeight) and endpoints. No kind argument — edgeWeight scores
-	// ~14 kinds, so the kind set is pushed down here rather than duplicated at the
-	// call, and a meta-less all-kinds scan still drops the per-edge blob decode.
-	edges := graph.EdgesForKindsLight(g)
+var leidenEdgeKinds = []graph.EdgeKind{
+	graph.EdgeCalls,
+	graph.EdgeSpawns,
+	graph.EdgeMemberOf,
+	graph.EdgeParamOf,
+	graph.EdgeReferences,
+	graph.EdgeReturns,
+	graph.EdgeTypedAs,
+	graph.EdgeImplements,
+	graph.EdgeExtends,
+	graph.EdgeAliases,
+	graph.EdgeComposes,
+	graph.EdgeImports,
+	graph.EdgeDependsOnModule,
+	graph.EdgeInstantiates,
+}
 
-	symbolNodes := make(map[string]bool, len(nodes))
-	for _, n := range nodes {
+func buildLeidenGraph(g graph.Store) *leidenGraph {
+	symbolNodes := make(map[string]bool, g.NodeCount())
+	for n := range graph.NodesLightSeq(g) {
 		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
 			symbolNodes[n.ID] = true
 		}
@@ -95,7 +105,9 @@ func buildLeidenGraph(g graph.Store) *leidenGraph {
 
 	type edgeKey struct{ a, b string }
 	weights := make(map[edgeKey]float64)
-	for _, e := range edges {
+	// The fixed kind projection mirrors edgeWeight exactly. SQLite can serve it
+	// from edges_by_kind and never transfers unrelated domain edges or Meta.
+	for e := range graph.EdgesLightSeq(g, leidenEdgeKinds...) {
 		if !symbolNodes[e.From] || !symbolNodes[e.To] {
 			continue
 		}
@@ -234,15 +246,12 @@ func packageKey(filePath string) string {
 // fingerprint of every package it touches and leaves all others
 // bit-identical.
 func fingerprintPackages(g graph.Store) map[string]uint64 {
-	nodes := graph.AllNodesLight(g)
-	edges := graph.EdgesForKindsLight(g)
-
 	// Symbol-node filter + each node's package, mirroring
 	// buildLeidenGraph so the fingerprint and the partition agree on
 	// what counts.
-	pkgOf := make(map[string]string, len(nodes))
+	pkgOf := make(map[string]string, g.NodeCount())
 	fp := make(map[string]uint64)
-	for _, n := range nodes {
+	for n := range graph.NodesLightSeq(g) {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
@@ -257,7 +266,7 @@ func fingerprintPackages(g graph.Store) map[string]uint64 {
 		fp[pk] ^= h.Sum64()
 	}
 
-	for _, e := range edges {
+	for e := range graph.EdgesLightSeq(g, leidenEdgeKinds...) {
 		fromPkg, fromOK := pkgOf[e.From]
 		toPkg, toOK := pkgOf[e.To]
 		if !fromOK || !toOK {
@@ -425,7 +434,7 @@ func incrementalLeiden(
 ) (*CommunityResult, incrementalResult) {
 	// Package of every current symbol node.
 	pkgOf := make(map[string]string, len(lg.symbolNodes))
-	for _, n := range graph.AllNodesLight(g) {
+	for n := range graph.NodesLightSeq(g) {
 		if lg.symbolNodes[n.ID] {
 			pkgOf[n.ID] = packageKey(n.FilePath)
 		}

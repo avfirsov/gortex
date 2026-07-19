@@ -1,0 +1,214 @@
+package tstypes
+
+import (
+	"context"
+	"runtime"
+	"sync"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/semantic"
+)
+
+// stageRepoFacts is the only SQLite writer. Parser workers never transact;
+// their results are encoded and committed in bounded file/byte batches by the
+// receiver goroutine, then released before the next batch grows.
+func (p *Provider) stageRepoFacts(ctx context.Context, files []fileRef, spool *factSpool) error {
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers > len(files) {
+		workers = len(files)
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan fileRef)
+	factsCh := make(chan *fileFacts, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case ref, ok := <-jobs:
+					if !ok {
+						return
+					}
+					facts, err := analyzeFile(p.spec, ref)
+					if err != nil {
+						if workCtx.Err() != nil {
+							return
+						}
+						p.logger.Debug("tstypes: file analysis failed",
+							zap.String("provider", p.Name()),
+							zap.String("file", ref.node.FilePath),
+							zap.Error(err))
+						continue
+					}
+					if facts != nil {
+						select {
+						case factsCh <- facts:
+						case <-workCtx.Done():
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, ref := range files {
+			select {
+			case jobs <- ref:
+			case <-workCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(factsCh)
+	}()
+
+	batch := make([]stagedFileFacts, 0, tstypesFactPageFiles)
+	batchBytes := 0
+	var stageErr error
+	flush := func() {
+		if stageErr != nil || len(batch) == 0 {
+			return
+		}
+		if err := spool.appendFiles(batch); err != nil {
+			stageErr = err
+			cancel()
+		}
+		for i := range batch {
+			batch[i] = stagedFileFacts{}
+		}
+		batch = batch[:0]
+		batchBytes = 0
+	}
+	for facts := range factsCh {
+		if stageErr != nil || workCtx.Err() != nil {
+			continue
+		}
+		record, err := stageFileFacts(facts)
+		if err != nil {
+			stageErr = err
+			cancel()
+			continue
+		}
+		if len(batch) > 0 && (len(batch) >= tstypesFactPageFiles ||
+			batchBytes+len(record.payload) > tstypesFactPageBytes) {
+			flush()
+		}
+		if stageErr == nil {
+			batch = append(batch, record)
+			batchBytes += len(record.payload)
+		}
+	}
+	if stageErr == nil && ctx.Err() == nil {
+		flush()
+	}
+	if stageErr != nil {
+		return stageErr
+	}
+	return ctx.Err()
+}
+
+type stagedFactPhase int
+
+const (
+	stagedSupers stagedFactPhase = iota
+	stagedMetas
+	stagedAliases
+	stagedCalls
+)
+
+func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult) error {
+	if counter, ok := g.(graph.RepoLanguageSymbolCounter); ok {
+		res.SymbolsTotal = counter.CountRepoLanguageSymbols(repoPrefix, p.spec.Languages)
+	} else {
+		// Compatibility-only stores may lack the count projection. Production
+		// Graph and SQLite stores implement it without row materialization.
+		langs := make(map[string]bool, len(p.spec.Languages))
+		for _, language := range p.spec.Languages {
+			langs[language] = true
+		}
+		for _, node := range g.GetRepoNodes(repoPrefix) {
+			if node != nil && langs[node.Language] && node.Kind != graph.KindFile && node.Kind != graph.KindImport {
+				res.SymbolsTotal++
+			}
+		}
+	}
+
+	// One pass-scoped read-through cache for every page applier below: the
+	// per-page hydration of the repo's shared type universe dominated whole-
+	// process CPU (48–62% measured) because each of the 4 phases re-fetched
+	// near-identical name groups and inheritance frontiers per 32-file page.
+	hot := newApplyHotCache(applyHotCacheBudget())
+	for phase := stagedSupers; phase <= stagedCalls; phase++ {
+		// Adjacency is only valid within one phase: the supers phase
+		// synthesizes inheritance edges that later phases' frontier walks
+		// must observe. Nodes and name groups survive phase boundaries —
+		// apply never creates nodes, and the shared pointers carry every
+		// same-pass Meta stamp.
+		hot.flushAdjacency()
+		after := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			page, last, stats, err := spool.page(ctx, after)
+			if err != nil {
+				return err
+			}
+			if len(page) == 0 {
+				break
+			}
+			ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+			switch phase {
+			case stagedSupers:
+				err = ap.applySupersPage(ctx, page, res)
+				res.SymbolsCovered += ap.coveredSymbols(page)
+			case stagedMetas:
+				err = ap.applyMetasPage(ctx, page, res)
+				ap.flush()
+			case stagedAliases:
+				var aliases []stagedResolvedAlias
+				aliases, err = ap.resolveAliasesPage(ctx, page)
+				if err == nil {
+					err = spool.appendAliases(aliases)
+				}
+			case stagedCalls:
+				// Prepare once so the alias query is driven by this page's exact
+				// receiver/type frontier, never by every alias in the repository.
+				ap.preload(page)
+				var aliases []stagedResolvedAlias
+				aliases, err = spool.aliasesForTypeIDs(ctx, ap.typeNodeIDs())
+				if err == nil {
+					err = ap.applyCallsPage(ctx, page, aliases, res)
+				}
+			}
+			if p.observePage != nil {
+				p.observePage(ap.pageStats(stats))
+			}
+			for i := range page {
+				page[i] = nil
+			}
+			if err != nil {
+				return err
+			}
+			after = last
+		}
+	}
+	if res.SymbolsTotal > 0 {
+		res.CoveragePercent = float64(res.SymbolsCovered) / float64(res.SymbolsTotal) * 100
+	}
+	return nil
+}

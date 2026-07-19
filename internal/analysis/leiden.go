@@ -448,10 +448,11 @@ func buildCommunityResult(
 	totalWeight float64,
 	degree map[string]float64,
 ) *CommunityResult {
-	nodes := graph.AllNodesLight(g)
-	nodeMap := make(map[string]*graph.Node, len(nodes))
-	for _, n := range nodes {
-		nodeMap[n.ID] = n
+	nodeMap := make(map[string]*graph.Node, len(finalComm))
+	for n := range graph.NodesLightSeq(g) {
+		if _, ok := finalComm[n.ID]; ok {
+			nodeMap[n.ID] = n
+		}
 	}
 
 	// Bucket original nodes by their final community.

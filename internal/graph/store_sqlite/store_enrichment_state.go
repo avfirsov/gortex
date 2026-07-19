@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -18,7 +19,7 @@ var _ graph.EnrichmentStateStore = (*Store)(nil)
 func (s *Store) SetEnrichmentState(st graph.EnrichmentState) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(`
+	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT OR REPLACE INTO enrichment_state
   (repo_prefix, provider, indexed_sha, completed_at, coverage)
 VALUES (?, ?, ?, ?, ?)`,

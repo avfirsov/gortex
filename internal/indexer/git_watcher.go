@@ -52,7 +52,8 @@ type GitWatcher struct {
 	rerun       bool
 	// drained is a test hook that fires after a reconcile completes
 	// with the number of files patched. nil in production.
-	drained func(int)
+	drained      func(int)
+	batchReindex watcherBatchReindex // MultiWatcher installs shared resolver + derived catch-up
 }
 
 // NewGitWatcher creates a watcher for repoPath/.git/HEAD. repoPath is
@@ -275,28 +276,30 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		return
 	}
 
-	// Resolve the batch. A commit-sized change set resolves only the
-	// files it touched (and their incoming refs) through the scoped
-	// incremental path -- the same one edit_file / fsnotify saves use --
-	// instead of a whole-graph ResolveAll that costs O(graph) no matter
-	// how few files moved. A large change set (branch switch, big merge)
-	// still takes one amortised whole-graph pass, where skipping the
-	// per-file resolver in applyChanges is the better trade.
+	// Every ref-sized change set now uses the same bounded multi-file
+	// parse/evict pipeline. The historical threshold remains observable so
+	// branch-switch tests and logs distinguish large reconciles, but it no
+	// longer selects the N-per-file + whole-graph fallback that caused the
+	// warm/storm regression.
 	changedPaths := gw.changedAbsPaths(changes)
-	var patched int
-	switch {
-	case len(changedPaths) > gitWatcherScopedResolveMaxFiles:
-		patched = gw.applyChanges(changes)
-		gw.indexer.ResolveAll()
-	default:
-		res, rerr := gw.indexer.IncrementalReindexPaths(gw.repoPath, changedPaths)
+	largeBatch := len(changedPaths) > gitWatcherScopedResolveMaxFiles
+	patched, failed := 0, 0
+	if len(changedPaths) > 0 {
+		res, rerr := gw.reindexChangedPaths(changedPaths)
 		if rerr != nil {
-			gw.logger.Warn("git-watcher: scoped reindex failed, falling back to whole-graph resolve",
-				zap.String("trigger", trigger), zap.Error(rerr))
-			patched = gw.applyChanges(changes)
-			gw.indexer.ResolveAll()
-		} else {
+			// The bounded pipeline isolates individual unreadable/parse-failed
+			// files in FailedFiles. A returned error is batch-level: keep the old
+			// SHA so the next ref notification retries instead of hiding drift.
+			gw.logger.Warn("git-watcher: batched reindex failed",
+				zap.String("trigger", trigger),
+				zap.Int("paths", len(changedPaths)),
+				zap.Bool("large_batch", largeBatch),
+				zap.Error(rerr))
+			return
+		}
+		if res != nil {
 			patched = res.StaleFileCount + res.DeletedFileCount
+			failed = len(res.FailedFiles)
 		}
 	}
 
@@ -315,6 +318,8 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		zap.String("from", oldSHA[:min(len(oldSHA), 12)]),
 		zap.String("to", newSHA[:min(len(newSHA), 12)]),
 		zap.Int("paths", patched),
+		zap.Int("failed", failed),
+		zap.Bool("large_batch", largeBatch),
 		zap.Duration("elapsed", time.Since(start)))
 
 	if drained != nil {
@@ -330,77 +335,24 @@ type gitChange struct {
 	OldPath string // only populated for R/C
 }
 
-// applyChanges dispatches the decoded diff to the indexer. Returns
-// the count of files touched (index + evict).
+// applyChanges is retained for in-package compatibility. It delegates the
+// entire diff to the bounded batch runner; it never loops through point
+// IndexFileNoResolve/EvictFile mutations.
 func (gw *GitWatcher) applyChanges(changes []gitChange) int {
-	n := 0
-	for _, c := range changes {
-		switch c.Status {
-		case 'A', 'M', 'T':
-			abs := filepath.Join(gw.repoPath, c.Path)
-			if _, err := os.Stat(abs); err != nil {
-				// Git says it's here, working tree disagrees —
-				// partial / sparse checkout. Skip without error.
-				continue
-			}
-			if err := gw.indexer.IndexFileNoResolve(abs); err != nil {
-				gw.logger.Warn("git-watcher: index failed",
-					zap.String("path", c.Path), zap.Error(err))
-				continue
-			}
-			n++
-		case 'D':
-			// A 'D' in the diff means the file left git tracking, not
-			// necessarily the disk. A file un-tracked (git rm --cached)
-			// or absent from the new branch but kept on disk is
-			// "untracked but visible" and must stay indexed. Only a
-			// file genuinely gone from disk is evicted; one still on
-			// disk is re-indexed unless it is now excluded.
-			abs := filepath.Join(gw.repoPath, c.Path)
-			_, statErr := os.Stat(abs)
-			switch {
-			case statErr != nil:
-				gw.indexer.EvictFile(abs)
-			case gw.indexer.shouldExclude(abs, gw.repoPath, false):
-				gw.indexer.EvictFile(abs)
-			default:
-				if err := gw.indexer.IndexFileNoResolve(abs); err != nil {
-					gw.logger.Warn("git-watcher: re-index of now-untracked file failed",
-						zap.String("path", c.Path), zap.Error(err))
-				}
-			}
-			n++
-		case 'R':
-			// Rename: evict the old path, index the new one. Git
-			// gives us the pair atomically — fsnotify would have
-			// surfaced this as a remove + create with no linkage.
-			if c.OldPath != "" {
-				gw.indexer.EvictFile(filepath.Join(gw.repoPath, c.OldPath))
-			}
-			abs := filepath.Join(gw.repoPath, c.Path)
-			if _, err := os.Stat(abs); err == nil {
-				if err := gw.indexer.IndexFileNoResolve(abs); err != nil {
-					gw.logger.Warn("git-watcher: index failed (rename)",
-						zap.String("path", c.Path), zap.Error(err))
-					continue
-				}
-			}
-			n++
-		case 'C':
-			// Copy: the source is unchanged; we only need to index
-			// the new file.
-			abs := filepath.Join(gw.repoPath, c.Path)
-			if _, err := os.Stat(abs); err == nil {
-				if err := gw.indexer.IndexFileNoResolve(abs); err != nil {
-					gw.logger.Warn("git-watcher: index failed (copy)",
-						zap.String("path", c.Path), zap.Error(err))
-					continue
-				}
-			}
-			n++
-		}
+	paths := gw.changedAbsPaths(changes)
+	if len(paths) == 0 {
+		return 0
 	}
-	return n
+	result, err := gw.reindexChangedPaths(paths)
+	if err != nil {
+		gw.logger.Warn("git-watcher: batched apply failed",
+			zap.Int("paths", len(paths)), zap.Error(err))
+		return 0
+	}
+	if result == nil {
+		return 0
+	}
+	return result.StaleFileCount + result.DeletedFileCount
 }
 
 // currentSHA returns the resolved commit SHA of HEAD. Shells out to

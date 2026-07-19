@@ -1,9 +1,11 @@
 package scip
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,6 +13,27 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+func TestSCIPContextHelper(t *testing.T) {
+	if os.Getenv("GORTEX_SCIP_CONTEXT_HELPER") != "1" {
+		return
+	}
+	time.Sleep(10 * time.Second)
+}
+
+func TestEnrichRepoContextCancelsIndexerProcess(t *testing.T) {
+	t.Setenv("GORTEX_SCIP_CONTEXT_HELPER", "1")
+	p := NewProvider(os.Args[0], []string{"-test.run=^TestSCIPContextHelper$", "--"}, []string{"go"}, 30, zap.NewNop())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	result, err := p.EnrichRepoContext(ctx, graph.New(), "", t.TempDir(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Partial)
+	assert.Contains(t, result.AbortReason, "deadline exceeded")
+	assert.Less(t, time.Since(start), 2*time.Second, "cancelled SCIP child must not outlive the manager deadline")
+}
 
 func TestSCIPProtobufRoundTrip(t *testing.T) {
 	index := &SCIPIndex{
@@ -170,6 +193,39 @@ func TestEnrichFromIndex(t *testing.T) {
 			assert.Equal(t, "EXTRACTED", e.ConfidenceLabel)
 		}
 	}
+}
+
+func TestEnrichFromIndexScopedUsesPrefixedMultiRepoPaths(t *testing.T) {
+	p := NewProvider("scip-go", nil, []string{"go"}, 120, zap.NewNop())
+	g := graph.New()
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		g.AddBatch([]*graph.Node{
+			{ID: repo + "/main.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: repo + "/main.go", StartLine: 10, EndLine: 20, Language: "go", RepoPrefix: repo},
+			{ID: repo + "/main.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: repo + "/main.go", StartLine: 22, EndLine: 30, Language: "go", RepoPrefix: repo},
+		}, []*graph.Edge{{
+			From: repo + "/main.go::Bar", To: repo + "/main.go::Foo", Kind: graph.EdgeCalls,
+			FilePath: repo + "/main.go", Line: 25, Confidence: 0.7, ConfidenceLabel: "INFERRED",
+		}})
+	}
+	index := &SCIPIndex{Documents: []SCIPDocument{{
+		RelativePath: "main.go",
+		Occurrences: []SCIPOccurrence{
+			{Range: []int32{9, 5, 9, 8}, Symbol: "main.Foo()", SymbolRoles: 1},
+			{Range: []int32{21, 5, 21, 8}, Symbol: "main.Bar()", SymbolRoles: 1},
+			{Range: []int32{24, 2, 24, 5}, Symbol: "main.Foo()"},
+		},
+	}}}
+
+	result := p.enrichFromIndexScoped(g, index, "repo-a", "/tmp/repo-a")
+
+	assert.Equal(t, 2, result.SymbolsTotal)
+	assert.Equal(t, 1, result.EdgesConfirmed)
+	repoAEdges := g.GetOutEdges("repo-a/main.go::Bar")
+	require.Len(t, repoAEdges, 1)
+	assert.Equal(t, 1.0, repoAEdges[0].Confidence)
+	repoBEdges := g.GetOutEdges("repo-b/main.go::Bar")
+	require.Len(t, repoBEdges, 1)
+	assert.Equal(t, 0.7, repoBEdges[0].Confidence, "sibling repo with the same relative path must remain untouched")
 }
 
 // TestEnrichFromIndex_DefinitionsOnly verifies the C# / .NET coverage

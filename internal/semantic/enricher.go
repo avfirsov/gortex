@@ -40,7 +40,16 @@ func PersistEdge(g graph.Store, e *graph.Edge) {
 // AddSemanticEdge adds a new edge discovered by semantic analysis. Origin is
 // tagged LSP-grade (see ConfirmEdge).
 func AddSemanticEdge(g graph.Store, from, to string, kind graph.EdgeKind, filePath string, line int, provider string) *graph.Edge {
-	e := &graph.Edge{
+	e := NewSemanticEdge(from, to, kind, filePath, line, provider)
+	g.AddEdge(e)
+	return e
+}
+
+// NewSemanticEdge constructs, but does not persist, a semantic edge. Providers
+// use it to stage bounded AddBatch writes instead of committing one store
+// transaction per compiler/LSP reference.
+func NewSemanticEdge(from, to string, kind graph.EdgeKind, filePath string, line int, provider string) *graph.Edge {
+	return &graph.Edge{
 		From:            from,
 		To:              to,
 		Kind:            kind,
@@ -53,8 +62,6 @@ func AddSemanticEdge(g graph.Store, from, to string, kind graph.EdgeKind, filePa
 			"semantic_source": provider,
 		},
 	}
-	g.AddEdge(e)
-	return e
 }
 
 // originForSemanticKind maps edge kind to the appropriate LSP-grade tier.
@@ -102,23 +109,25 @@ func FindEdgeByTarget(g graph.Store, from, to string) *graph.Edge {
 
 // NodesByLanguage returns all nodes in the graph that match the given language.
 func NodesByLanguage(g graph.Store, language string) []*graph.Node {
-	var result []*graph.Node
-	for _, n := range g.AllNodes() {
-		if n.Language == language {
-			result = append(result, n)
-		}
-	}
-	return result
+	return g.GetNodesByLanguage(language)
 }
 
 // EdgesByLanguage returns all edges whose source node matches the given language.
 func EdgesByLanguage(g graph.Store, language string) []*graph.Edge {
-	var result []*graph.Edge
-	for _, e := range g.AllEdges() {
-		fromNode := g.GetNode(e.From)
-		if fromNode != nil && fromNode.Language == language {
-			result = append(result, e)
+	nodes := g.GetNodesByLanguage(language)
+	if len(nodes) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			ids = append(ids, n.ID)
 		}
+	}
+	edgesBySource := g.GetOutEdgesByNodeIDs(ids)
+	var result []*graph.Edge
+	for _, id := range ids {
+		result = append(result, edgesBySource[id]...)
 	}
 	return result
 }

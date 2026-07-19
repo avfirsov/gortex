@@ -58,7 +58,7 @@ func Steady() {}
 func Steady() {}
 `)
 	require.NoError(t, os.Chtimes(path, future, future))
-	w.patchGraph(path, ChangeModified)
+	require.NoError(t, w.patchGraph(path, ChangeModified))
 
 	info, statErr := os.Stat(path)
 	require.NoError(t, statErr)

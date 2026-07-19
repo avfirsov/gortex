@@ -85,15 +85,83 @@ func stableSymbolKey(n *graph.Node) string {
 	return string(n.Kind) + "\x00" + n.Name
 }
 
-// symbolShapeFor derives the comparable shape string for a referenceable
-// symbol: the stamped signature (Go/C carry a parameter-bearing one), the
-// C++ parameter-shape Meta keys, and — language-agnostically — the
-// parameter and return structure the function-shape extractors emit as
-// graph nodes/edges around the definition. Folding the structure in is
-// what lets the delta detect a parameter or return-type change in a
-// language whose Meta["signature"] is absent or only a name-bearing
-// constant (Java, C#, Kotlin, Python, Rust, TS/JS, …).
+// symbolShapeAdjacency is the file-bounded graph slice needed to derive every
+// symbol shape in one changed file. Both adjacency directions and any parameter
+// endpoints are prefetched once and then reused for all definitions.
+type symbolShapeAdjacency struct {
+	inEdges  map[string][]*graph.Edge
+	outEdges map[string][]*graph.Edge
+	nodes    map[string]*graph.Node
+}
+
+// loadSymbolShapeAdjacency performs a constant number of bounded graph-store
+// reads regardless of the number of definitions or parameters in the file.
+// knownNodes should be the caller's already-loaded file/extraction nodes; using
+// them avoids decoding parameter nodes from SQLite a second time.
+func loadSymbolShapeAdjacency(g graph.Store, symbols, knownNodes []*graph.Node) symbolShapeAdjacency {
+	ids := make([]string, 0, len(symbols))
+	seenIDs := make(map[string]struct{}, len(symbols))
+	for _, n := range symbols {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		if _, seen := seenIDs[n.ID]; seen {
+			continue
+		}
+		seenIDs[n.ID] = struct{}{}
+		ids = append(ids, n.ID)
+	}
+	adj := symbolShapeAdjacency{
+		nodes: make(map[string]*graph.Node, len(knownNodes)),
+	}
+	if len(ids) > 0 {
+		adj.inEdges = g.GetInEdgesByNodeIDs(ids)
+		adj.outEdges = g.GetOutEdgesByNodeIDs(ids)
+	}
+	for _, n := range knownNodes {
+		if n != nil && n.ID != "" {
+			adj.nodes[n.ID] = n
+		}
+	}
+	missingSet := make(map[string]struct{})
+	for _, edges := range adj.inEdges {
+		for _, e := range edges {
+			if e == nil || e.Kind != graph.EdgeParamOf || e.From == "" {
+				continue
+			}
+			if _, known := adj.nodes[e.From]; !known {
+				missingSet[e.From] = struct{}{}
+			}
+		}
+	}
+	if len(missingSet) > 0 {
+		missing := make([]string, 0, len(missingSet))
+		for id := range missingSet {
+			missing = append(missing, id)
+		}
+		for id, n := range g.GetNodesByIDs(missing) {
+			adj.nodes[id] = n
+		}
+	}
+	return adj
+}
+
+// symbolShapeFor derives one comparable shape. Hot indexing paths load one
+// symbolShapeAdjacency for the whole file and call symbolShapeFromAdjacency;
+// this wrapper is retained for focused callers and tests.
 func symbolShapeFor(g graph.Store, n *graph.Node) string {
+	adj := loadSymbolShapeAdjacency(g, []*graph.Node{n}, []*graph.Node{n})
+	return symbolShapeFromAdjacency(n, adj)
+}
+
+// symbolShapeFromAdjacency derives the comparable shape string for a
+// referenceable symbol: the stamped signature (Go/C carry a parameter-bearing
+// one), the C++ parameter-shape Meta keys, and the language-agnostic parameter
+// and return structure emitted around the definition.
+func symbolShapeFromAdjacency(n *graph.Node, adj symbolShapeAdjacency) string {
+	if n == nil {
+		return ""
+	}
 	var b strings.Builder
 	if sig, _ := n.Meta["signature"].(string); sig != "" {
 		b.WriteString(sig)
@@ -128,11 +196,11 @@ func symbolShapeFor(g graph.Store, n *graph.Node) string {
 		variadic bool
 	}
 	var params []paramShape
-	for _, e := range g.GetInEdges(n.ID) {
+	for _, e := range adj.inEdges[n.ID] {
 		if e == nil || e.Kind != graph.EdgeParamOf {
 			continue
 		}
-		p := g.GetNode(e.From)
+		p := adj.nodes[e.From]
 		if p == nil || p.Kind != graph.KindParam {
 			continue
 		}
@@ -174,7 +242,7 @@ func symbolShapeFor(g graph.Store, n *graph.Node) string {
 		target string
 	}
 	var rets []retShape
-	for _, e := range g.GetOutEdges(n.ID) {
+	for _, e := range adj.outEdges[n.ID] {
 		if e == nil || e.Kind != graph.EdgeReturns {
 			continue
 		}
@@ -299,16 +367,25 @@ func (idx *Indexer) snapshotAffectedBy(graphPath string) *affectedBySnapshot {
 		refSources: make(map[string]map[string]struct{}),
 		idsByKey:   make(map[string][]string),
 	}
-	refIDs := make([]string, 0, len(nodes))
+	refNodes := make([]*graph.Node, 0, len(nodes))
 	keyByID := make(map[string]string, len(nodes))
 	ownIDs := make(map[string]struct{}, len(nodes))
 	for _, n := range nodes {
-		ownIDs[n.ID] = struct{}{}
+		if n != nil {
+			ownIDs[n.ID] = struct{}{}
+		}
 	}
 	for _, n := range nodes {
 		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
 			continue
 		}
+		refNodes = append(refNodes, n)
+	}
+	if len(refNodes) == 0 {
+		return nil
+	}
+	adj := loadSymbolShapeAdjacency(idx.graph, refNodes, nodes)
+	for _, n := range refNodes {
 		key := stableSymbolKey(n)
 		// A file can carry two same-name same-kind definitions (an
 		// overload); they share a stable key. Their shapes compose so the
@@ -317,17 +394,14 @@ func (idx *Indexer) snapshotAffectedBy(graphPath string) *affectedBySnapshot {
 		// under-firing leaves a stale edge).
 		cur := snap.symbols[key]
 		cur.kind = n.Kind
-		cur.shape += symbolShapeFor(idx.graph, n) + "\n"
+		cur.shape += symbolShapeFromAdjacency(n, adj) + "\n"
 		snap.symbols[key] = cur
 		snap.idsByKey[key] = append(snap.idsByKey[key], n.ID)
-		refIDs = append(refIDs, n.ID)
 		keyByID[n.ID] = key
 	}
-	if len(snap.symbols) == 0 {
-		return nil
-	}
-	inEdges := idx.graph.GetInEdgesByNodeIDs(refIDs)
-	for id, edges := range inEdges {
+	// Reuse the same inbound adjacency that supplied parameter shapes for the
+	// live referrer snapshot; no second backend query is needed.
+	for id, edges := range adj.inEdges {
 		key := keyByID[id]
 		if key == "" {
 			continue
@@ -358,14 +432,19 @@ func (idx *Indexer) snapshotAffectedBy(graphPath string) *affectedBySnapshot {
 // hold a stale reference to a symbol that did not exist.
 func affectedByDelta(g graph.Store, snap *affectedBySnapshot, newNodes []*graph.Node) []string {
 	current := make(map[string]symbolShape, len(newNodes))
+	refNodes := make([]*graph.Node, 0, len(newNodes))
 	for _, n := range newNodes {
 		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
 			continue
 		}
+		refNodes = append(refNodes, n)
+	}
+	adj := loadSymbolShapeAdjacency(g, refNodes, newNodes)
+	for _, n := range refNodes {
 		key := stableSymbolKey(n)
 		cur := current[key]
 		cur.kind = n.Kind
-		cur.shape += symbolShapeFor(g, n) + "\n"
+		cur.shape += symbolShapeFromAdjacency(n, adj) + "\n"
 		current[key] = cur
 	}
 	var delta []string

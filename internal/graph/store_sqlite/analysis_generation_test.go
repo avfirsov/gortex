@@ -209,7 +209,7 @@ func TestAnalysisGenerationCorruptionClearsActivePointer(t *testing.T) {
 	}
 	defer store.Close()
 	generationID := buildMinimalAnalysisGeneration(t, store, "corrupt", 1, true)
-	if _, err := store.db.Exec(`DELETE FROM analysis_generation_components WHERE generation_id = ? AND component = ?`, generationID, string(graph.AnalysisComponentNodes)); err != nil {
+	if _, err := store.writerDB.Exec(`DELETE FROM analysis_generation_components WHERE generation_id = ? AND component = ?`, generationID, string(graph.AnalysisComponentNodes)); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := store.LoadActiveAnalysisHeader(77); found || !errors.Is(err, graph.ErrAnalysisGenerationCorrupt) {
@@ -270,7 +270,7 @@ func TestAnalysisGenerationForeignKeysEnabledOnPoolAndNoLiveNodeFK(t *testing.T)
 		}
 	}
 	connections = nil
-	if _, err := store.db.ExecContext(ctx, `INSERT INTO analysis_nodes(generation_id,node_id,pagerank,authority,hub) VALUES(999,'orphan',0,0,0)`); err == nil {
+	if _, err := store.writerDB.ExecContext(ctx, `INSERT INTO analysis_nodes(generation_id,node_id,pagerank,authority,hub) VALUES(999,'orphan',0,0,0)`); err == nil {
 		t.Fatal("orphan analysis node bypassed generation FK")
 	}
 	store.AddNode(&graph.Node{ID: "same-id", Kind: graph.KindFunction, Name: "Same", FilePath: "same.go"})
@@ -291,7 +291,7 @@ func TestCheckpointWALPoolWaitHonorsContext(t *testing.T) {
 
 	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelAcquire()
-	poolSize := store.db.Stats().MaxOpenConnections
+	poolSize := store.writerDB.Stats().MaxOpenConnections
 	if poolSize < 1 {
 		t.Fatalf("invalid configured SQLite pool size: %d", poolSize)
 	}
@@ -302,7 +302,7 @@ func TestCheckpointWALPoolWaitHonorsContext(t *testing.T) {
 		}
 	}()
 	for i := 0; i < poolSize; i++ {
-		conn, err := store.db.Conn(acquireCtx)
+		conn, err := store.writerDB.Conn(acquireCtx)
 		if err != nil {
 			t.Fatalf("acquire pooled connection %d/%d: %v", i+1, poolSize, err)
 		}
@@ -335,7 +335,7 @@ func TestAnalysisGenerationV4MigrationPreservesGraphAndDropsProvisionalCache(t *
 		t.Fatal(err)
 	}
 	store.AddNode(&graph.Node{ID: "kept", Kind: graph.KindFunction, Name: "Kept", FilePath: "kept.go"})
-	if _, err := store.db.Exec(`CREATE TABLE analysis_cache(component TEXT PRIMARY KEY, format_version INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID; INSERT INTO analysis_cache(component,format_version,payload) VALUES('pagerank',1,'unreleased-v3')`); err != nil {
+	if _, err := store.writerDB.Exec(`CREATE TABLE analysis_cache(component TEXT PRIMARY KEY, format_version INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID; INSERT INTO analysis_cache(component,format_version,payload) VALUES('pagerank',1,'unreleased-v3')`); err != nil {
 		t.Fatal(err)
 	}
 	drop := `
@@ -351,10 +351,10 @@ func TestAnalysisGenerationV4MigrationPreservesGraphAndDropsProvisionalCache(t *
 		DROP TABLE analysis_communities;
 		DROP TABLE analysis_blobs;
 		DROP TABLE analysis_generations;`
-	if _, err := store.db.Exec(drop); err != nil {
+	if _, err := store.writerDB.Exec(drop); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`PRAGMA user_version = 3`); err != nil {
+	if _, err := store.writerDB.Exec(`PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -502,7 +502,7 @@ func TestAnalysisGenerationInvalidationLatchRunsOnce(t *testing.T) {
 	}
 	defer store.Close()
 	buildMinimalAnalysisGeneration(t, store, "latch", 0, true)
-	if _, err := store.db.Exec(`
+	if _, err := store.writerDB.Exec(`
 		CREATE TABLE analysis_invalidation_audit(n INTEGER);
 		CREATE TRIGGER analysis_active_deleted AFTER DELETE ON analysis_active_generation
 		BEGIN INSERT INTO analysis_invalidation_audit(n) VALUES(1); END;`); err != nil {

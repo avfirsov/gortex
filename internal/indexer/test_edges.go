@@ -7,6 +7,11 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// Keep graph reads bounded without falling back to one backend query per file
+// or annotation. SQLite applies its own lower SQL-variable chunks inside each
+// call; this cap bounds the Go-side adjacency retained by this whole-graph pass.
+const testMetadataLookupBatchSize = 512
+
 // markTestSymbolsAndEmitEdges runs after the resolver and before
 // community detection. It performs two passes over the graph:
 //
@@ -46,9 +51,17 @@ func markTestSymbolsAndEmitEdges(g graph.Store) (markedTests int, edgesEmitted i
 // (a cross-repo test→test call). Only Pass 2's driving EdgeCalls scan is scoped
 // — an EdgeTests edge is FROM a test function, so a changed repo owns exactly
 // the test edges its reindex dropped; an unchanged repo's persist on disk.
-func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string]bool) (markedTests int, edgesEmitted int) {
+func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string]bool, changedFiles ...string) (markedTests int, edgesEmitted int) {
 	if g == nil {
 		return 0, 0
+	}
+	// A normal partial index carries an exact file frontier. Keep its symbol
+	// classification, annotation lookups, and call walk proportional to those
+	// files; the repo-scoped/global path remains the cold-index oracle.
+	if len(changedFiles) > 0 {
+		g.ResolveMutex().Lock()
+		defer g.ResolveMutex().Unlock()
+		return markTestSymbolsAndEmitEdgesForFilesLocked(g, changedFiles)
 	}
 	// Serialise Node.Meta mutation against other graph-wide passes
 	// (detectClonesAndEmitEdges, ResolveTemporalCalls, reach.BuildIndex).
@@ -68,6 +81,254 @@ func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string
 	}
 	edgesEmitted = emitTestEdgesAndPersistLocked(g, testNodes, changedNodes, changedPrefixes)
 	return markedTests, edgesEmitted
+}
+
+// markTestSymbolsAndEmitEdgesForFilesLocked is the exact-file partial path.
+// Besides the changed symbols it includes only their incoming test callers: a
+// callee switching between production and test changes whether those callers'
+// parallel EdgeTests edges are valid. The caller holds ResolveMutex.
+func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []string) (int, int) {
+	files := make([]string, 0, len(changedFiles))
+	seenFiles := make(map[string]struct{}, len(changedFiles))
+	for _, file := range changedFiles {
+		if file == "" {
+			continue
+		}
+		if _, seen := seenFiles[file]; seen {
+			continue
+		}
+		seenFiles[file] = struct{}{}
+		files = append(files, file)
+	}
+	if len(files) == 0 {
+		return 0, 0
+	}
+
+	wantedKinds := map[graph.NodeKind]bool{
+		graph.KindFile: true, graph.KindFunction: true, graph.KindMethod: true,
+	}
+	var localNodes []*graph.Node
+	if finder, ok := g.(graph.NodesInFilesByKindFinder); ok {
+		localNodes = finder.NodesInFilesByKind(files, []graph.NodeKind{
+			graph.KindFile, graph.KindFunction, graph.KindMethod,
+		})
+	} else {
+		for _, nodes := range g.GetFileNodesByPaths(files) {
+			for _, node := range nodes {
+				if node != nil && wantedKinds[node.Kind] {
+					localNodes = append(localNodes, node)
+				}
+			}
+		}
+	}
+	if len(localNodes) == 0 {
+		return 0, 0
+	}
+
+	setMeta := func(n *graph.Node, key string, value any) bool {
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		switch want := value.(type) {
+		case bool:
+			if got, ok := n.Meta[key].(bool); ok && got == want {
+				return false
+			}
+		case string:
+			if got, ok := n.Meta[key].(string); ok && got == want {
+				return false
+			}
+		}
+		n.Meta[key] = value
+		return true
+	}
+	isStampedTest := func(n *graph.Node) bool {
+		if n == nil || n.Meta == nil {
+			return false
+		}
+		value, _ := n.Meta["is_test"].(bool)
+		return value
+	}
+
+	localIDs := make([]string, 0, len(localNodes))
+	changedSymbolIDs := make([]string, 0, len(localNodes))
+	for _, node := range localNodes {
+		localIDs = append(localIDs, node.ID)
+		if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
+			changedSymbolIDs = append(changedSymbolIDs, node.ID)
+		}
+	}
+	localAdjacency := g.GetOutEdgesByNodeIDs(localIDs)
+	testFiles := make(map[string]bool)
+	fileRunners := make(map[string]string)
+	var changedNodes []*graph.Node
+	for _, node := range localNodes {
+		if node.Kind != graph.KindFile || !IsTestFile(node.FilePath) {
+			continue
+		}
+		testFiles[node.ID] = true
+		testFiles[node.FilePath] = true
+		changed := setMeta(node, "is_test_file", true)
+		if runner := detectTestRunnerForFileEdges(node, localAdjacency[node.ID]); runner != "" {
+			changed = setMeta(node, "test_runner", runner) || changed
+			fileRunners[node.ID] = runner
+			fileRunners[node.FilePath] = runner
+		}
+		if changed {
+			changedNodes = append(changedNodes, node)
+		}
+	}
+
+	annotationTargets := make([]string, 0)
+	annotationRefs := make(map[string][]string)
+	seenAnnotationTargets := make(map[string]struct{})
+	for _, node := range localNodes {
+		if node.Kind != graph.KindFunction && node.Kind != graph.KindMethod {
+			continue
+		}
+		for _, edge := range localAdjacency[node.ID] {
+			if edge == nil || edge.Kind != graph.EdgeAnnotated {
+				continue
+			}
+			annotationRefs[node.ID] = append(annotationRefs[node.ID], edge.To)
+			if _, seen := seenAnnotationTargets[edge.To]; !seen {
+				seenAnnotationTargets[edge.To] = struct{}{}
+				annotationTargets = append(annotationTargets, edge.To)
+			}
+		}
+	}
+	annotationNodes := g.GetNodesByIDs(annotationTargets)
+	annotationRoles := make(map[string]string, len(annotationRefs))
+	for source, targets := range annotationRefs {
+		for _, target := range targets {
+			annotation := annotationNodes[target]
+			if annotation == nil {
+				continue
+			}
+			role := AnnotationTestRole(annotation.Language, annotation.Name)
+			if role == "" {
+				continue
+			}
+			if current := annotationRoles[source]; current == "" || (current == "benchmark" && role == "test") {
+				annotationRoles[source] = role
+			}
+		}
+	}
+
+	localTests := make(map[string]bool)
+	markedTests := 0
+	for _, node := range localNodes {
+		if node.Kind != graph.KindFunction && node.Kind != graph.KindMethod {
+			continue
+		}
+		var role, runner string
+		switch {
+		case testFiles[node.FilePath]:
+			role = TestRole(node.Name, node.Language)
+			if role == "" {
+				role = "test"
+			}
+			runner = fileRunners[node.FilePath]
+		case annotationRoles[node.ID] != "":
+			role = annotationRoles[node.ID]
+			runner = AnnotationTestRunner(node.Language)
+		default:
+			continue
+		}
+		changed := setMeta(node, "is_test", true)
+		changed = setMeta(node, "test_role", role) || changed
+		if runner != "" {
+			changed = setMeta(node, "test_runner", runner) || changed
+		}
+		if changed {
+			changedNodes = append(changedNodes, node)
+		}
+		localTests[node.ID] = true
+		markedTests++
+	}
+
+	// A changed callee's test classification can invalidate edges owned by an
+	// unchanged test caller. Pull that one-hop incoming neighborhood in one
+	// batch, then reconcile each affected caller's complete EdgeTests set.
+	callerIDs := make([]string, 0)
+	seenCallerIDs := make(map[string]struct{})
+	for _, edges := range g.GetInEdgesByNodeIDs(changedSymbolIDs) {
+		for _, edge := range edges {
+			if edge == nil || edge.Kind != graph.EdgeCalls {
+				continue
+			}
+			if _, seen := seenCallerIDs[edge.From]; seen {
+				continue
+			}
+			seenCallerIDs[edge.From] = struct{}{}
+			callerIDs = append(callerIDs, edge.From)
+		}
+	}
+	callerNodes := g.GetNodesByIDs(callerIDs)
+	testSources := make(map[string]bool, len(localTests)+len(callerNodes))
+	for id := range localTests {
+		testSources[id] = true
+	}
+	for id, node := range callerNodes {
+		if localTests[id] || isStampedTest(node) {
+			testSources[id] = true
+		}
+	}
+	if len(testSources) == 0 {
+		g.AddBatch(changedNodes, nil)
+		return markedTests, 0
+	}
+
+	sourceIDs := make([]string, 0, len(testSources))
+	for id := range testSources {
+		sourceIDs = append(sourceIDs, id)
+	}
+	sourceAdjacency := g.GetOutEdgesByNodeIDs(sourceIDs)
+	targetIDs := make([]string, 0)
+	seenTargets := make(map[string]struct{})
+	for _, source := range sourceIDs {
+		for _, edge := range sourceAdjacency[source] {
+			if edge == nil || edge.Kind != graph.EdgeCalls {
+				continue
+			}
+			if _, seen := seenTargets[edge.To]; !seen {
+				seenTargets[edge.To] = struct{}{}
+				targetIDs = append(targetIDs, edge.To)
+			}
+		}
+	}
+	targetNodes := g.GetNodesByIDs(targetIDs)
+	isTestTarget := func(id string) bool {
+		return localTests[id] || isStampedTest(targetNodes[id])
+	}
+
+	seenEdges := make(map[string]bool)
+	edges := make([]*graph.Edge, 0)
+	for _, source := range sourceIDs {
+		for _, edge := range sourceAdjacency[source] {
+			if edge == nil || edge.Kind != graph.EdgeCalls || isTestTarget(edge.To) {
+				continue
+			}
+			key := edge.From + "\x00" + edge.To
+			if seenEdges[key] {
+				continue
+			}
+			seenEdges[key] = true
+			edges = append(edges, &graph.Edge{
+				From: edge.From, To: edge.To, Kind: graph.EdgeTests,
+				FilePath: edge.FilePath, Line: edge.Line, Origin: graph.OriginASTInferred,
+			})
+		}
+	}
+	_, supported, err := graph.EvictEdgesFromSourcesByKindsBackground(
+		g, sourceIDs, []graph.EdgeKind{graph.EdgeTests},
+	)
+	if err != nil || !supported {
+		g.AddBatch(changedNodes, nil)
+		return markedTests, 0
+	}
+	g.AddBatch(changedNodes, edges)
+	return markedTests, len(edges)
 }
 
 // markTestSymbolsLocked runs Pass 1: it stamps test Meta on every test symbol
@@ -102,14 +363,24 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 	// in Pass 2 wouldn't see the is_test flag we set here.)
 	testFiles := map[string]bool{}     // file node ID → is test file
 	fileRunners := map[string]string{} // file FilePath → test runner
+	var testFileNodes []*graph.Node
 	for n := range g.NodesByKind(graph.KindFile) {
-		if n == nil {
-			continue
+		if n != nil && IsTestFile(n.FilePath) {
+			testFileNodes = append(testFileNodes, n)
 		}
-		if IsTestFile(n.FilePath) {
+	}
+	for start := 0; start < len(testFileNodes); start += testMetadataLookupBatchSize {
+		end := min(start+testMetadataLookupBatchSize, len(testFileNodes))
+		batch := testFileNodes[start:end]
+		ids := make([]string, 0, len(batch))
+		for _, n := range batch {
+			ids = append(ids, n.ID)
+		}
+		outEdges := g.GetOutEdgesByNodeIDs(ids)
+		for _, n := range batch {
 			testFiles[n.ID] = true
 			changed := setMeta(n, "is_test_file", true)
-			if runner := detectTestRunnerForFile(g, n); runner != "" {
+			if runner := detectTestRunnerForFileEdges(n, outEdges[n.ID]); runner != "" {
 				changed = setMeta(n, "test_runner", runner) || changed
 				fileRunners[n.FilePath] = runner
 			}
@@ -131,26 +402,57 @@ func markTestSymbolsLocked(g graph.Store) (testNodes map[string]bool, markedTest
 	// to get_test_targets / analyze kind=tests_as_edges / coverage_gaps.
 	annoTestRole := map[string]string{} // symbol node ID → test role
 	annoNodeRole := map[string]string{} // annotation node ID → role (cached resolution)
+	type annotationRef struct{ from, to string }
+	annotationBatch := make([]annotationRef, 0, testMetadataLookupBatchSize)
+	flushAnnotations := func() {
+		if len(annotationBatch) == 0 {
+			return
+		}
+		missingSet := make(map[string]struct{})
+		for _, ref := range annotationBatch {
+			if _, cached := annoNodeRole[ref.to]; !cached {
+				missingSet[ref.to] = struct{}{}
+			}
+		}
+		if len(missingSet) > 0 {
+			missing := make([]string, 0, len(missingSet))
+			for id := range missingSet {
+				missing = append(missing, id)
+			}
+			nodes := g.GetNodesByIDs(missing)
+			for id := range missingSet {
+				role := ""
+				if anno := nodes[id]; anno != nil {
+					role = AnnotationTestRole(anno.Language, anno.Name)
+				}
+				// Cache misses too, so a widely-used non-test annotation is never
+				// fetched again in a later bounded chunk.
+				annoNodeRole[id] = role
+			}
+		}
+		for _, ref := range annotationBatch {
+			role := annoNodeRole[ref.to]
+			if role == "" {
+				continue
+			}
+			// Prefer the more specific "test" over "benchmark" when a
+			// single symbol carries both (rare).
+			if existing := annoTestRole[ref.from]; existing == "" || (existing == "benchmark" && role == "test") {
+				annoTestRole[ref.from] = role
+			}
+		}
+		annotationBatch = annotationBatch[:0]
+	}
 	for e := range g.EdgesByKind(graph.EdgeAnnotated) {
 		if e == nil {
 			continue
 		}
-		role, cached := annoNodeRole[e.To]
-		if !cached {
-			if anno := g.GetNode(e.To); anno != nil {
-				role = AnnotationTestRole(anno.Language, anno.Name)
-			}
-			annoNodeRole[e.To] = role
-		}
-		if role == "" {
-			continue
-		}
-		// Prefer the more specific "test" over "benchmark" when a
-		// single symbol carries both (rare).
-		if existing := annoTestRole[e.From]; existing == "" || (existing == "benchmark" && role == "test") {
-			annoTestRole[e.From] = role
+		annotationBatch = append(annotationBatch, annotationRef{from: e.From, to: e.To})
+		if len(annotationBatch) == cap(annotationBatch) {
+			flushAnnotations()
 		}
 	}
+	flushAnnotations()
 
 	testNodes = map[string]bool{}
 	stampTestSymbol := func(n *graph.Node) {
@@ -247,13 +549,15 @@ func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, cha
 			process(e)
 		}
 	} else {
+		prefixes := make([]string, 0, len(changedPrefixes))
 		for prefix := range changedPrefixes {
 			if prefix == "" {
 				continue
 			}
-			for _, e := range g.GetRepoEdges(prefix) {
-				process(e)
-			}
+			prefixes = append(prefixes, prefix)
+		}
+		for _, row := range graph.ReadRepoEdgesByKinds(g, prefixes, []graph.EdgeKind{graph.EdgeCalls}) {
+			process(row.Edge)
 		}
 	}
 	edges := make([]*graph.Edge, 0, len(out))
@@ -271,31 +575,10 @@ func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, cha
 	return len(edges)
 }
 
-// detectTestRunnerForFile resolves the runner identifier for a test file
-// node by consulting three signals, in priority order:
-//
-//  1. The file node's own Meta["test_runner"] — stamped by the JS / TS
-//     extractors at parse time using DetectJSTSTestRunner. This is the
-//     strongest signal because it has the file bytes to disambiguate
-//     Mocha-TDD `suite(` from BDD `describe`.
-//
-//  2. Outgoing EdgeImports targets — the import path is preserved in
-//     the target ID (e.g. `unresolved::import::pytest`) until the
-//     resolver promotes the edge. Used as the primary signal for
-//     languages where the parser does not run the JS / TS classifier
-//     (Python: pytest vs unittest; Ruby: rspec vs minitest).
-//
-//  3. Language-level defaults that hold regardless of imports:
-//     - Go always uses `gotest` — `go test` is the only runner.
-//     - Python defaults to `pytest` (auto-discovery picks up unittest
-//     test cases too; rare files that import only `unittest` are
-//     caught by step 2).
-//     - Ruby falls back to `rspec` for `_spec.rb` and `minitest` for
-//     `_test.rb`.
-//
-// Returns "" when no signal applies; the caller leaves test_runner
-// unset rather than guessing.
-func detectTestRunnerForFile(g graph.Store, fileNode *graph.Node) string {
+// detectTestRunnerForFileEdges is the adjacency-prefetched form used by the
+// indexing pass. Keeping runner precedence here makes the batched and focused
+// entry points byte-for-byte equivalent.
+func detectTestRunnerForFileEdges(fileNode *graph.Node, outEdges []*graph.Edge) string {
 	if fileNode == nil {
 		return ""
 	}
@@ -306,7 +589,7 @@ func detectTestRunnerForFile(g graph.Store, fileNode *graph.Node) string {
 		}
 	}
 	// 2) Import-edge signal.
-	if runner := detectRunnerFromImportEdges(g, fileNode); runner != "" {
+	if runner := detectRunnerFromImportEdgeSlice(fileNode, outEdges); runner != "" {
 		return runner
 	}
 	// 3) Language-level defaults.
@@ -328,18 +611,12 @@ func detectTestRunnerForFile(g graph.Store, fileNode *graph.Node) string {
 	return ""
 }
 
-// detectRunnerFromImportEdges scans the outgoing EdgeImports of a test
-// file node and returns a runner ID inferred from import paths. The
-// import target ID format `unresolved::import::<path>` is preserved by
-// the extractors until the resolver promotes the edge, which never
-// happens for third-party / built-in modules — so this signal stays
-// valid for the runner identifiers we care about. Supports JS / TS
-// (mirrors DetectJSTSTestRunner so files compiled by a non-JS / TS
-// extractor still classify correctly), Python (pytest / unittest),
-// and Ruby (rspec / minitest).
-func detectRunnerFromImportEdges(g graph.Store, fileNode *graph.Node) string {
+func detectRunnerFromImportEdgeSlice(fileNode *graph.Node, edges []*graph.Edge) string {
+	if fileNode == nil {
+		return ""
+	}
 	const prefix = "unresolved::import::"
-	for _, e := range g.GetOutEdges(fileNode.ID) {
+	for _, e := range edges {
 		if e == nil || e.Kind != graph.EdgeImports {
 			continue
 		}

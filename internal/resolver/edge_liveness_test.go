@@ -27,22 +27,39 @@ func (c copyingStore) GetOutEdges(id string) []*graph.Edge {
 	return out
 }
 
-func TestEdgeStillLive_ValueIdentityOnCopyingStore(t *testing.T) {
+func (c copyingStore) GetEdgeCandidates(
+	endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite,
+) graph.EdgeCandidateSet {
+	src := c.Store.GetEdgeCandidates(endpoints, sites)
+	out := graph.NewEdgeCandidateSet()
+	for _, site := range sites {
+		for _, edge := range src.Site(site.From, site.Line, site.Kind) {
+			cp := *edge
+			out.AddSite(&cp)
+		}
+	}
+	return out
+}
+
+func TestEdgeLivenessBatch_ValueIdentityOnCopyingStore(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: "a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "a.go"})
 	live := &graph.Edge{From: "a.go::A", To: "unresolved::B", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 7}
 	g.AddEdge(live)
 
 	cs := copyingStore{Store: g}
-	assert.True(t, edgeStillLive(cs, live),
+	copied := loadEdgeLiveness(cs, []*graph.Edge{live})
+	assert.True(t, copied.containsEdge(live),
 		"a live edge must be recognised through a store that returns copies")
 
 	// Pointer identity still suffices on in-memory stores.
-	assert.True(t, edgeStillLive(g, live))
+	inMemory := loadEdgeLiveness(g, []*graph.Edge{live})
+	assert.True(t, inMemory.containsEdge(live))
 
 	gone := *live
 	gone.Line = 999
-	assert.False(t, edgeStillLive(cs, &gone),
+	missing := loadEdgeLiveness(cs, []*graph.Edge{&gone})
+	assert.False(t, missing.containsEdge(&gone),
 		"an edge that no longer exists at that call site must not count as live")
-	assert.False(t, edgeStillLive(cs, nil))
+	assert.False(t, missing.containsEdge(nil))
 }

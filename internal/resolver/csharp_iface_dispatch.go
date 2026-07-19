@@ -63,8 +63,38 @@ func csharpCallSiteKey(from, to, filePath string, line int) string {
 // implements-family out to all other members of that family. Returns the
 // number of fan-out edges landed.
 func ResolveCSharpInterfaceDispatch(g graph.Store) int {
+	return ResolveCSharpInterfaceDispatchScoped(g, nil)
+}
+
+// ResolveCSharpInterfaceDispatchScoped limits partial work to changed
+// repositories plus the in-repo interface families targeted by their calls.
+// Incoming calls to those exact family members form the reverse dependency
+// frontier. A nil scope preserves the full/cold whole-graph behavior.
+func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
+	}
+	familyScope := scope
+	scopedSourceCalls := []*graph.Edge(nil)
+	if scope != nil {
+		familyScope = make(map[string]bool, len(scope))
+		for prefix, enabled := range scope {
+			if enabled {
+				familyScope[prefix] = true
+			}
+		}
+		scopedSourceCalls = frameworkRepoEdges(g, scope, graph.EdgeCalls)
+		targetIDs := make([]string, 0, len(scopedSourceCalls))
+		for _, edge := range scopedSourceCalls {
+			if edge != nil && !graph.IsUnresolvedTarget(edge.To) {
+				targetIDs = append(targetIDs, edge.To)
+			}
+		}
+		for _, target := range g.GetNodesByIDs(targetIDs) {
+			if target != nil && target.Language == "csharp" && target.Kind == graph.KindMethod {
+				familyScope[target.RepoPrefix] = true
+			}
+		}
 	}
 
 	// Subtype adjacency over the resolved type hierarchy: super → subs.
@@ -84,24 +114,41 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 	// pipeline settles hierarchy targets across several later passes), so an
 	// `unresolved::Name` target is resolved here by an exact, same-repo,
 	// unique type/interface name lookup — ambiguity means skip, never guess.
-	children := map[string][]string{}
-	for _, kind := range []graph.EdgeKind{graph.EdgeImplements, graph.EdgeExtends} {
-		for e := range g.EdgesByKind(kind) {
-			if e == nil || e.From == "" || e.To == "" {
-				continue
-			}
-			if e.Meta != nil && e.Meta["via"] == MetaViaMethodSetInference {
-				continue
-			}
-			toID := e.To
-			if graph.IsUnresolvedTarget(toID) {
-				toID = csharpResolveHierarchyTarget(g, e.From, toID)
-				if toID == "" {
-					continue
-				}
-			}
-			children[toID] = append(children[toID], e.From)
+	hierarchyEdges := frameworkRepoEdges(g, familyScope, graph.EdgeImplements, graph.EdgeExtends)
+	hierarchySourceIDs := make([]string, 0, len(hierarchyEdges))
+	hierarchyNames := make([]string, 0)
+	seenHierarchyNames := map[string]bool{}
+	for _, edge := range hierarchyEdges {
+		if edge == nil {
+			continue
 		}
+		hierarchySourceIDs = append(hierarchySourceIDs, edge.From)
+		if graph.IsUnresolvedTarget(edge.To) {
+			name := graph.UnresolvedName(edge.To)
+			if name != "" && !seenHierarchyNames[name] {
+				seenHierarchyNames[name] = true
+				hierarchyNames = append(hierarchyNames, name)
+			}
+		}
+	}
+	hierarchySources := g.GetNodesByIDs(hierarchySourceIDs)
+	hierarchyByName := g.FindNodesByNames(hierarchyNames)
+	children := map[string][]string{}
+	for _, e := range hierarchyEdges {
+		if e == nil || e.From == "" || e.To == "" {
+			continue
+		}
+		if e.Meta != nil && e.Meta["via"] == MetaViaMethodSetInference {
+			continue
+		}
+		toID := e.To
+		if graph.IsUnresolvedTarget(toID) {
+			toID = csharpResolveHierarchyTargetPrefetched(hierarchySources[e.From], toID, hierarchyByName)
+			if toID == "" {
+				continue
+			}
+		}
+		children[toID] = append(children[toID], e.From)
 	}
 	if len(children) == 0 {
 		return 0
@@ -112,7 +159,20 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
 	// of them — a single-node-per-name projection would silently drop the
 	// overload the corpus actually calls through.
-	membersByType := csharpMemberMethodsAllByType(g)
+	memberEdges := frameworkRepoEdges(g, familyScope, graph.EdgeMemberOf)
+	memberNodeIDs := make([]string, 0, len(memberEdges))
+	for _, edge := range memberEdges {
+		if edge != nil {
+			memberNodeIDs = append(memberNodeIDs, edge.From)
+		}
+	}
+	memberNodes := g.GetNodesByIDs(memberNodeIDs)
+	var membersByType map[string]map[string][]*graph.Node
+	if scope == nil {
+		membersByType = csharpMemberMethodsAllByType(g)
+	} else {
+		membersByType = csharpMemberMethodsAllByTypeFromEdges(memberEdges, memberNodes)
+	}
 	if len(membersByType) == 0 {
 		return 0
 	}
@@ -128,11 +188,11 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 	}
 	anchorGroups := map[string]*anchorGroup{}
 	var anchorOrder []string
-	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
+	for _, e := range memberEdges {
 		if e == nil || graph.IsUnresolvedTarget(e.To) {
 			continue
 		}
-		m := g.GetNode(e.From)
+		m := memberNodes[e.From]
 		if m == nil || m.Kind != graph.KindMethod || m.Language != "csharp" || !csharpIsIfaceMember(m) {
 			continue
 		}
@@ -219,12 +279,29 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 	if len(families) == 0 {
 		return 0
 	}
+	callEdges := frameworkEdgesByKinds(g, graph.EdgeCalls)
+	if scope != nil {
+		callEdges = nil
+		callSeen := make(map[string]struct{})
+		callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, scopedSourceCalls...)
+		familyMemberIDs := make([]string, 0, len(famsOfMember))
+		for id := range famsOfMember {
+			familyMemberIDs = append(familyMemberIDs, id)
+		}
+		for _, incoming := range g.GetInEdgesByNodeIDs(familyMemberIDs) {
+			for _, edge := range incoming {
+				if edge != nil && edge.Kind == graph.EdgeCalls {
+					callEdges = appendUniqueFrameworkEdges(callEdges, callSeen, edge)
+				}
+			}
+		}
+	}
 
 	// Existing resolved call sites, keyed per line, so a fan-out edge never
 	// duplicates a real call at the same site (a caller that already reaches
 	// the member directly, or a prior run of this pass).
 	existing := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
 		}
@@ -233,7 +310,7 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 
 	var batch []*graph.Edge
 	seen := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
+	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
 		}
@@ -281,8 +358,8 @@ func ResolveCSharpInterfaceDispatch(g graph.Store) int {
 			}
 		}
 	}
-	for _, ne := range batch {
-		g.AddEdge(ne)
+	if len(batch) > 0 {
+		g.AddBatch(nil, batch)
 	}
 	return len(batch)
 }
@@ -348,9 +425,25 @@ func csharpMemberMethodsAllByType(g graph.Store) map[string]map[string][]*graph.
 		}
 		return out
 	}
-	out := map[string]map[string][]*graph.Node{}
+	var edges []*graph.Edge
+	methodIDs := make([]string, 0)
 	for e := range g.EdgesByKind(graph.EdgeMemberOf) {
-		method := g.GetNode(e.From)
+		if e == nil {
+			continue
+		}
+		edges = append(edges, e)
+		methodIDs = append(methodIDs, e.From)
+	}
+	return csharpMemberMethodsAllByTypeFromEdges(edges, g.GetNodesByIDs(methodIDs))
+}
+
+func csharpMemberMethodsAllByTypeFromEdges(edges []*graph.Edge, nodes map[string]*graph.Node) map[string]map[string][]*graph.Node {
+	out := map[string]map[string][]*graph.Node{}
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		method := nodes[e.From]
 		if method == nil || method.Kind != graph.KindMethod {
 			continue
 		}
@@ -375,25 +468,20 @@ func containsInt(xs []int, v int) bool {
 	return false
 }
 
-// csharpResolveHierarchyTarget binds an `unresolved::Name` base-list target to
-// the unique same-repo C# type/interface node with that exact name, or ""
-// when the caller is not C#, the name is unknown, or the name is ambiguous —
-// a wrong hierarchy link unions unrelated families, so no guess is ever made.
-func csharpResolveHierarchyTarget(g graph.Store, fromID, unresolvedTo string) string {
+func csharpResolveHierarchyTargetPrefetched(from *graph.Node, unresolvedTo string, byName map[string][]*graph.Node) string {
 	name := graph.UnresolvedName(unresolvedTo)
 	if name == "" {
 		return ""
 	}
-	from := g.GetNode(fromID)
 	if from == nil || from.Language != "csharp" {
 		return ""
 	}
 	var cand *graph.Node
-	for _, n := range g.FindNodesByNameInRepo(name, from.RepoPrefix) {
+	for _, n := range byName[name] {
 		if n == nil || (n.Kind != graph.KindType && n.Kind != graph.KindInterface) {
 			continue
 		}
-		if n.Language != "csharp" {
+		if n.Language != "csharp" || n.RepoPrefix != from.RepoPrefix {
 			continue
 		}
 		if cand != nil {

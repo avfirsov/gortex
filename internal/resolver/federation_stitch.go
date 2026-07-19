@@ -145,14 +145,5 @@ func (cr *CrossRepoResolver) proxyBudgetExceeded() bool {
 	if cr.proxyBudget <= 0 {
 		return false
 	}
-	count := 0
-	for _, n := range cr.graph.AllNodes() {
-		if graph.IsProxyNode(n) {
-			count++
-			if count >= cr.proxyBudget {
-				return true
-			}
-		}
-	}
-	return false
+	return cr.graph.ProxyNodeCountAtLeast(cr.proxyBudget)
 }

@@ -39,6 +39,27 @@ type SourceReader func(n *graph.Node) ([]byte, bool)
 // hands in is rebuilt on every ReconcileContractEdges call, so mutations
 // to it don't survive between invocations).
 func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract {
+	return inlineWrappers(reg, g, read, nil)
+}
+
+// InlineWrappersForFiles is the incremental counterpart. It follows the same
+// bounded wrapper-chain BFS, but only emits literal caller contracts owned by
+// the exact changed-file frontier. Bare-parameter wrapper hops may cross an
+// unchanged file so a changed leaf caller still reaches the original wrapper.
+func InlineWrappersForFiles(reg *Registry, g graph.Store, read SourceReader, files []string) []Contract {
+	allowed := make(map[string]struct{}, len(files))
+	for _, filePath := range files {
+		if filePath != "" {
+			allowed[filePath] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	return inlineWrappers(reg, g, read, allowed)
+}
+
+func inlineWrappers(reg *Registry, g graph.Store, read SourceReader, allowedFiles map[string]struct{}) []Contract {
 	if reg == nil || g == nil || read == nil {
 		return nil
 	}
@@ -54,18 +75,39 @@ func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract 
 	const maxPasses = 8
 
 	for pass := 0; pass < maxPasses && len(wrappers) > 0; pass++ {
+		wrapperIDs := make([]string, 0, len(wrappers))
+		for _, w := range wrappers {
+			wrapperIDs = append(wrapperIDs, w.SymbolID)
+		}
+		incomingByWrapper := g.GetInEdgesByNodeIDs(wrapperIDs)
+		nodeIDs := append([]string(nil), wrapperIDs...)
+		for _, w := range wrappers {
+			for _, edge := range incomingByWrapper[w.SymbolID] {
+				if edge != nil && edge.Kind == graph.EdgeCalls {
+					nodeIDs = append(nodeIDs, edge.From)
+				}
+			}
+		}
+		nodesByID := g.GetNodesByIDs(nodeIDs)
+		filePaths := make([]string, 0, len(nodeIDs))
+		for _, id := range nodeIDs {
+			if node := nodesByID[id]; node != nil && node.FilePath != "" {
+				filePaths = append(filePaths, node.FilePath)
+			}
+		}
+		fileNodes := g.GetFileNodesByPaths(filePaths)
 		var next []wrapperInfo
 		for _, w := range wrappers {
-			for _, edge := range g.GetInEdges(w.SymbolID) {
-				if edge.Kind != graph.EdgeCalls {
+			wrapperNode := nodesByID[w.SymbolID]
+			if wrapperNode == nil {
+				continue
+			}
+			for _, edge := range incomingByWrapper[w.SymbolID] {
+				if edge == nil || edge.Kind != graph.EdgeCalls {
 					continue
 				}
-				caller := g.GetNode(edge.From)
+				caller := nodesByID[edge.From]
 				if caller == nil {
-					continue
-				}
-				wrapperNode := g.GetNode(w.SymbolID)
-				if wrapperNode == nil {
 					continue
 				}
 				src, ok := read(caller)
@@ -75,6 +117,11 @@ func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract 
 				arg := extractFirstCallArg(src, edge.Line, wrapperNode.Name, caller.Language)
 				switch arg.Kind {
 				case argLiteral:
+					if allowedFiles != nil {
+						if _, allowed := allowedFiles[caller.FilePath]; !allowed {
+							continue
+						}
+					}
 					method := arg.Method
 					if method == "" {
 						method = "GET"
@@ -114,9 +161,8 @@ func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract 
 					// regex-detected consumer contract would. Without
 					// this the dashboard shows "not declared on this
 					// side" for every wrapper-routed call site.
-					enrichInlinedWrapperContract(&c, g, caller, src)
+					enrichInlinedWrapperContractWithFileNodes(&c, caller, src, fileNodes[caller.FilePath])
 					reg.Add(c)
-					commitInlinedContractToGraph(g, c)
 					added = append(added, c)
 				case argBareParam:
 					if !seen[caller.ID] {
@@ -128,6 +174,7 @@ func InlineWrappers(reg *Registry, g graph.Store, read SourceReader) []Contract 
 		}
 		wrappers = next
 	}
+	commitInlinedContractsToGraph(g, added)
 	return added
 }
 
@@ -136,16 +183,7 @@ type wrapperInfo struct {
 	SymbolID string
 }
 
-// enrichInlinedWrapperContract runs the schema enrichment pipeline
-// against the caller's body so inlined wrapper consumer contracts
-// carry the same request_type / response_type / query_params facts
-// that natively-detected consumer contracts do.
-//
-// Mirrors the enrichment chain HTTPExtractor.extract runs after
-// matching a regex pattern: lines + fileNodes + lang + tree feed
-// EnrichHTTPContractWithTree, which dispatches to the per-language
-// schema_enrich_*.go detectors and (for Go) the AST overlay.
-func enrichInlinedWrapperContract(c *Contract, g graph.Store, caller *graph.Node, src []byte) {
+func enrichInlinedWrapperContractWithFileNodes(c *Contract, caller *graph.Node, src []byte, fileNodes []*graph.Node) {
 	if c == nil || caller == nil || len(src) == 0 {
 		return
 	}
@@ -154,7 +192,6 @@ func enrichInlinedWrapperContract(c *Contract, g graph.Store, caller *graph.Node
 		return
 	}
 	lines := strings.Split(string(src), "\n")
-	fileNodes := g.GetFileNodes(caller.FilePath)
 	tree := ParseTreeForLang(lang, src)
 	defer tree.Release()
 	EnrichHTTPContractWithTree(c, lines, fileNodes, lang, tree)
@@ -188,50 +225,76 @@ func isWrapperPath(path string) bool {
 	return wrapperPathRE.MatchString(path)
 }
 
-// commitInlinedContractToGraph adds the contract as a graph node (if not
-// already present) and a symbol → contract EdgeConsumes edge (also
-// idempotent). Mirrors the commitContracts logic in the indexer but
-// runs at wrapper-inline time so late-emitted contracts appear in
-// contracts list output and in the matcher's graph view. Idempotency
-// matters because ReconcileContractEdges runs on every repo change —
-// without it each track/index would duplicate edges.
-func commitInlinedContractToGraph(g graph.Store, c Contract) {
-	if g == nil {
+func commitInlinedContractsToGraph(g graph.Store, contracts []Contract) {
+	if g == nil || len(contracts) == 0 {
 		return
 	}
-	if g.GetNode(c.ID) == nil {
-		g.AddNode(&graph.Node{
-			ID:          c.ID,
-			Kind:        graph.KindContract,
-			Name:        c.ID,
-			FilePath:    c.FilePath,
-			Language:    "contract",
-			RepoPrefix:  c.RepoPrefix,
-			WorkspaceID: c.EffectiveWorkspace(),
-			ProjectID:   c.EffectiveProject(),
-			Meta: map[string]any{
-				"type":          string(c.Type),
-				"role":          string(c.Role),
-				"symbol_id":     c.SymbolID,
-				"line":          c.Line,
-				"confidence":    c.Confidence,
-				"contract_meta": c.Meta,
-			},
-		})
-	}
-	if c.SymbolID == "" {
-		return
-	}
-	for _, existing := range g.GetOutEdges(c.SymbolID) {
-		if existing.Kind == graph.EdgeConsumes && existing.To == c.ID {
-			return
+	contractIDs := make([]string, 0, len(contracts))
+	symbolIDs := make([]string, 0, len(contracts))
+	for _, c := range contracts {
+		if c.ID != "" {
+			contractIDs = append(contractIDs, c.ID)
+		}
+		if c.SymbolID != "" {
+			symbolIDs = append(symbolIDs, c.SymbolID)
 		}
 	}
-	g.AddEdge(&graph.Edge{
-		From:     c.SymbolID,
-		To:       c.ID,
-		Kind:     graph.EdgeConsumes,
-		FilePath: c.FilePath,
-		Line:     c.Line,
-	})
+	existingNodes := g.GetNodesByIDs(contractIDs)
+	existingOut := g.GetOutEdgesByNodeIDs(symbolIDs)
+	type relationKey struct{ from, to string }
+	existingConsumes := make(map[relationKey]struct{})
+	for from, edges := range existingOut {
+		for _, edge := range edges {
+			if edge != nil && edge.Kind == graph.EdgeConsumes {
+				existingConsumes[relationKey{from: from, to: edge.To}] = struct{}{}
+			}
+		}
+	}
+	var nodes []*graph.Node
+	var edges []*graph.Edge
+	for _, c := range contracts {
+		if c.ID == "" {
+			continue
+		}
+		if existingNodes[c.ID] == nil {
+			node := &graph.Node{
+				ID:          c.ID,
+				Kind:        graph.KindContract,
+				Name:        c.ID,
+				FilePath:    c.FilePath,
+				Language:    "contract",
+				RepoPrefix:  c.RepoPrefix,
+				WorkspaceID: c.EffectiveWorkspace(),
+				ProjectID:   c.EffectiveProject(),
+				Meta: map[string]any{
+					"type":          string(c.Type),
+					"role":          string(c.Role),
+					"symbol_id":     c.SymbolID,
+					"line":          c.Line,
+					"confidence":    c.Confidence,
+					"contract_meta": c.Meta,
+				},
+			}
+			nodes = append(nodes, node)
+			existingNodes[c.ID] = node
+		}
+		if c.SymbolID == "" {
+			continue
+		}
+		key := relationKey{from: c.SymbolID, to: c.ID}
+		if _, exists := existingConsumes[key]; exists {
+			continue
+		}
+		existingConsumes[key] = struct{}{}
+		edges = append(edges, &graph.Edge{
+			From:     c.SymbolID,
+			To:       c.ID,
+			Kind:     graph.EdgeConsumes,
+			FilePath: c.FilePath,
+			Line:     c.Line,
+		})
+	}
+	if len(nodes) > 0 || len(edges) > 0 {
+		g.AddBatch(nodes, edges)
+	}
 }

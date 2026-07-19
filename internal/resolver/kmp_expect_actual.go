@@ -35,7 +35,12 @@ func ResolveKMPExpectActual(g graph.Store) int {
 	}
 	expects := map[key][]*graph.Node{}
 	actuals := map[key][]*graph.Node{}
-	for _, n := range g.AllNodes() {
+	for _, n := range nodesByKindsOrAll(g,
+		graph.KindFunction,
+		graph.KindMethod,
+		graph.KindType,
+		graph.KindInterface,
+	) {
 		if n == nil || n.Meta == nil || n.Name == "" {
 			continue
 		}
@@ -81,8 +86,8 @@ func ResolveKMPExpectActual(g graph.Store) int {
 		}
 	}
 
-	for _, e := range batch {
-		g.AddEdge(e)
+	if len(batch) > 0 {
+		g.AddBatch(nil, batch)
 	}
 	return paired
 }

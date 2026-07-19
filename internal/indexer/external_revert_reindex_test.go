@@ -78,7 +78,7 @@ func TestPatchGraph_ExternalAdd_InPlaceWrite_KeepsCrossFileCaller(t *testing.T) 
 	// In-place truncate+write: append a compilable probe that also calls
 	// the definition. Same inode; the watcher sees a bare modify.
 	writeFile(t, defPath, "package p\n\nfunc IsDebugging() {}\n\nfunc _probe() { IsDebugging() }\n")
-	w.patchGraph(defPath, ChangeModified)
+	require.NoError(t, w.patchGraph(defPath, ChangeModified))
 
 	require.NotNil(t, g.GetNode(defID), "IsDebugging survives the in-place ADD")
 	// Two callers now: cross-file Use and intra-file _probe.
@@ -107,14 +107,14 @@ func TestPatchGraph_ExternalRevert_RenameOver_KeepsCrossFileCaller(t *testing.T)
 
 	// ADD first (in-place), so the revert has something to undo.
 	writeFile(t, defPath, "package p\n\nfunc IsDebugging() {}\n\nfunc _probe() { IsDebugging() }\n")
-	w.patchGraph(defPath, ChangeModified)
+	require.NoError(t, w.patchGraph(defPath, ChangeModified))
 	require.Len(t, incomingCallEdges(t, g, defID), 2, "sanity: two callers after ADD")
 
 	// REVERT via rename-over: new inode, file present at the same path.
 	tmp := filepath.Join(dir, "debug.go.tmp")
 	writeFile(t, tmp, "package p\n\nfunc IsDebugging() {}\n")
 	require.NoError(t, os.Rename(tmp, defPath))
-	w.patchGraph(defPath, ChangeDeleted)
+	require.NoError(t, w.patchGraph(defPath, ChangeDeleted))
 
 	// The probe caller is gone with the revert; the cross-file caller must
 	// survive with its lsp tier.
@@ -133,13 +133,13 @@ func TestPatchGraph_ExternalRevert_UnlinkRecreate_KeepsCrossFileCaller(t *testin
 
 	// ADD first (in-place).
 	writeFile(t, defPath, "package p\n\nfunc IsDebugging() {}\n\nfunc _probe() { IsDebugging() }\n")
-	w.patchGraph(defPath, ChangeModified)
+	require.NoError(t, w.patchGraph(defPath, ChangeModified))
 	require.Len(t, incomingCallEdges(t, g, defID), 2, "sanity: two callers after ADD")
 
 	// REVERT via unlink + recreate.
 	require.NoError(t, os.Remove(defPath))
 	writeFile(t, defPath, "package p\n\nfunc IsDebugging() {}\n")
-	w.patchGraph(defPath, ChangeRenamed)
+	require.NoError(t, w.patchGraph(defPath, ChangeRenamed))
 
 	assertCrossFileCallerHealthy(t, g, defID)
 }
@@ -152,7 +152,7 @@ func TestPatchGraph_TrueDelete_StillEvicts(t *testing.T) {
 	w, g, defPath, defID := setupRevertWatcher(t)
 
 	require.NoError(t, os.Remove(defPath))
-	w.patchGraph(defPath, ChangeDeleted)
+	require.NoError(t, w.patchGraph(defPath, ChangeDeleted))
 
 	assert.Nil(t, g.GetNode(defID), "a genuine delete must evict the definition")
 	for _, e := range incomingCallEdges(t, g, defID) {

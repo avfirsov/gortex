@@ -1,0 +1,377 @@
+package lsp
+
+import (
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/semantic"
+)
+
+type lspEdgeKey struct {
+	from     string
+	to       string
+	kind     graph.EdgeKind
+	filePath string
+	line     int
+}
+
+// lspGraphView is a repo-scoped or explicitly bounded structural projection
+// used by LSP enrichment. It turns per-result point lookups into map reads while
+// retaining only nodes and edges the caller already selected from SQLite.
+type lspGraphView struct {
+	nodesByID   map[string]*graph.Node
+	nodesByFile map[string][]*graph.Node
+	outByID     map[string][]*graph.Edge
+	inByID      map[string][]*graph.Edge
+	fanInByID   map[string]int
+	edgeKeys    map[lspEdgeKey]struct{}
+}
+
+func newLSPGraphView(nodes []*graph.Node, edges []*graph.Edge) *lspGraphView {
+	v := &lspGraphView{
+		nodesByID:   make(map[string]*graph.Node, len(nodes)),
+		nodesByFile: make(map[string][]*graph.Node),
+		outByID:     make(map[string][]*graph.Edge),
+		inByID:      make(map[string][]*graph.Edge),
+		fanInByID:   make(map[string]int),
+		edgeKeys:    make(map[lspEdgeKey]struct{}, len(edges)),
+	}
+	v.addNodes(nodes)
+	v.addEdges(edges)
+	return v
+}
+
+func (v *lspGraphView) addNodes(nodes []*graph.Node) {
+	for _, n := range nodes {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		if old, exists := v.nodesByID[n.ID]; exists {
+			v.nodesByID[n.ID] = n
+			bucket := v.nodesByFile[old.FilePath]
+			for i, candidate := range bucket {
+				if candidate.ID != n.ID {
+					continue
+				}
+				if old.FilePath == n.FilePath {
+					bucket[i] = n
+					v.nodesByFile[old.FilePath] = bucket
+				} else {
+					v.nodesByFile[old.FilePath] = append(bucket[:i], bucket[i+1:]...)
+					v.nodesByFile[n.FilePath] = append(v.nodesByFile[n.FilePath], n)
+				}
+				break
+			}
+			continue
+		}
+		v.nodesByID[n.ID] = n
+		v.nodesByFile[n.FilePath] = append(v.nodesByFile[n.FilePath], n)
+	}
+}
+
+func (v *lspGraphView) addEdges(edges []*graph.Edge) {
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		key := lspEdgeIdentity(e)
+		if _, exists := v.edgeKeys[key]; exists {
+			continue
+		}
+		v.edgeKeys[key] = struct{}{}
+		v.outByID[e.From] = append(v.outByID[e.From], e)
+		v.inByID[e.To] = append(v.inByID[e.To], e)
+	}
+}
+
+func (v *lspGraphView) matchNodeByFileLine(filePath string, line int) *graph.Node {
+	var best *graph.Node
+	bestSize := int(^uint(0) >> 1)
+	for _, n := range v.nodesByFile[filePath] {
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		if n.StartLine <= line && line <= n.EndLine {
+			size := n.EndLine - n.StartLine
+			if size < bestSize {
+				best = n
+				bestSize = size
+			}
+		}
+	}
+	if best != nil {
+		return best
+	}
+	bestDist := int(^uint(0) >> 1)
+	for _, n := range v.nodesByFile[filePath] {
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			continue
+		}
+		dist := lspAbs(n.StartLine - line)
+		if dist < bestDist {
+			best = n
+			bestDist = dist
+		}
+	}
+	if bestDist <= 2 {
+		return best
+	}
+	return nil
+}
+
+func (v *lspGraphView) matchCallableByFileLine(filePath string, line int) *graph.Node {
+	callable := func(k graph.NodeKind) bool {
+		return k == graph.KindFunction || k == graph.KindMethod || k == graph.KindClosure
+	}
+	var best *graph.Node
+	bestSize := int(^uint(0) >> 1)
+	for _, n := range v.nodesByFile[filePath] {
+		if !callable(n.Kind) {
+			continue
+		}
+		if n.StartLine <= line && line <= n.EndLine {
+			size := n.EndLine - n.StartLine
+			if size < bestSize {
+				best = n
+				bestSize = size
+			}
+		}
+	}
+	if best != nil {
+		return best
+	}
+	bestDist := int(^uint(0) >> 1)
+	for _, n := range v.nodesByFile[filePath] {
+		if !callable(n.Kind) {
+			continue
+		}
+		dist := lspAbs(n.StartLine - line)
+		if dist < bestDist {
+			best = n
+			bestDist = dist
+		}
+	}
+	if bestDist <= 2 {
+		return best
+	}
+	return nil
+}
+
+func (v *lspGraphView) findDeclarationNode(filePath string, oneBasedLine int, name string) *graph.Node {
+	var near *graph.Node
+	for _, n := range v.nodesByFile[filePath] {
+		if n == nil || n.Name != name {
+			continue
+		}
+		if n.Kind == graph.KindFile || n.Kind == graph.KindImport || n.Kind == graph.KindParam {
+			continue
+		}
+		if n.StartLine == oneBasedLine {
+			return n
+		}
+		if near == nil && n.StartLine >= oneBasedLine-1 && n.StartLine <= oneBasedLine+1 {
+			near = n
+		}
+	}
+	return near
+}
+
+func (v *lspGraphView) findMatchingEdge(from, to string, kind graph.EdgeKind) *graph.Edge {
+	for _, e := range v.outByID[from] {
+		if e.To == to && e.Kind == kind {
+			return e
+		}
+	}
+	return nil
+}
+
+func (v *lspGraphView) edgeExistsAt(from, to string, kind graph.EdgeKind, line int) bool {
+	for _, e := range v.outByID[from] {
+		if e.To == to && e.Kind == kind && e.Line == line {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *lspGraphView) setFanInCounts(counts map[string]int) {
+	for id, count := range counts {
+		v.fanInByID[id] = count
+	}
+}
+
+func (v *lspGraphView) fanIn(id string) int {
+	if count, projected := v.fanInByID[id]; projected {
+		return count
+	}
+	return len(v.inByID[id])
+}
+
+func (v *lspGraphView) hasUnresolvedDemand(n *graph.Node) bool {
+	if n == nil || n.Name == "" || (n.Kind != graph.KindMethod && n.Kind != graph.KindFunction) {
+		return false
+	}
+	return len(v.inByID[graph.UnresolvedMarker+"*."+n.Name]) > 0
+}
+
+func (v *lspGraphView) callableIsDispatchRelevant(n *graph.Node) bool {
+	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+		return false
+	}
+	if isAbstractMarked(n) {
+		return true
+	}
+	var parentType string
+	for _, e := range v.outByID[n.ID] {
+		switch e.Kind {
+		case graph.EdgeOverrides:
+			return true
+		case graph.EdgeMemberOf:
+			parentType = e.To
+		}
+	}
+	for _, e := range v.inByID[n.ID] {
+		if e.Kind == graph.EdgeOverrides {
+			return true
+		}
+	}
+	if parentType == "" {
+		return false
+	}
+	for _, e := range v.outByID[parentType] {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	for _, e := range v.inByID[parentType] {
+		if e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *lspGraphView) stageAddedEdge(e *graph.Edge) bool {
+	if e == nil {
+		return false
+	}
+	key := lspEdgeIdentity(e)
+	if _, exists := v.edgeKeys[key]; exists {
+		return false
+	}
+	v.addEdges([]*graph.Edge{e})
+	return true
+}
+
+func (v *lspGraphView) reindexEdge(e *graph.Edge, oldTo string) {
+	if e == nil || oldTo == e.To {
+		return
+	}
+	oldKey := lspEdgeKey{from: e.From, to: oldTo, kind: e.Kind, filePath: e.FilePath, line: e.Line}
+	delete(v.edgeKeys, oldKey)
+	v.edgeKeys[lspEdgeIdentity(e)] = struct{}{}
+	oldIn := v.inByID[oldTo]
+	for i, candidate := range oldIn {
+		if candidate == e {
+			v.inByID[oldTo] = append(oldIn[:i], oldIn[i+1:]...)
+			break
+		}
+	}
+	v.inByID[e.To] = append(v.inByID[e.To], e)
+}
+
+// lspMutationBatch stages graph mutations so SQLite sees at most one
+// ReindexEdges and one AddBatch call per enrichment unit, not one transaction
+// per LSP result. The graph view is updated as edges are staged, preserving the
+// original within-pass deduplication semantics.
+type lspMutationBatch struct {
+	adds        []*graph.Edge
+	persists    []*graph.Edge
+	reindexes   []graph.EdgeReindex
+	addKeys     map[lspEdgeKey]struct{}
+	persistKeys map[lspEdgeKey]struct{}
+	reindexKeys map[lspEdgeKey]struct{}
+}
+
+func newLSPMutationBatch() *lspMutationBatch {
+	return &lspMutationBatch{
+		addKeys:     make(map[lspEdgeKey]struct{}),
+		persistKeys: make(map[lspEdgeKey]struct{}),
+		reindexKeys: make(map[lspEdgeKey]struct{}),
+	}
+}
+
+func (b *lspMutationBatch) stagePersist(e *graph.Edge) {
+	if e == nil {
+		return
+	}
+	key := lspEdgeIdentity(e)
+	if _, exists := b.persistKeys[key]; exists {
+		return
+	}
+	b.persistKeys[key] = struct{}{}
+	b.persists = append(b.persists, e)
+}
+
+func (b *lspMutationBatch) stageAdd(view *lspGraphView, e *graph.Edge) bool {
+	if !view.stageAddedEdge(e) {
+		return false
+	}
+	key := lspEdgeIdentity(e)
+	if _, exists := b.addKeys[key]; exists {
+		return false
+	}
+	b.addKeys[key] = struct{}{}
+	b.adds = append(b.adds, e)
+	return true
+}
+
+func (b *lspMutationBatch) stageReindex(view *lspGraphView, e *graph.Edge, oldTo string) {
+	if e == nil {
+		return
+	}
+	key := lspEdgeKey{from: e.From, to: oldTo, kind: e.Kind, filePath: e.FilePath, line: e.Line}
+	if _, exists := b.reindexKeys[key]; exists {
+		return
+	}
+	b.reindexKeys[key] = struct{}{}
+	b.reindexes = append(b.reindexes, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+	view.reindexEdge(e, oldTo)
+}
+
+func (b *lspMutationBatch) apply(g graph.Store, nodes []*graph.Node) {
+	if len(b.reindexes) > 0 {
+		g.ReindexEdges(b.reindexes)
+	}
+	if len(nodes) > 0 || len(b.adds) > 0 {
+		g.AddBatch(nodes, b.adds)
+	}
+	if len(b.persists) == 0 {
+		return
+	}
+	if batch, ok := g.(graph.EdgeMetaBatchPersister); ok {
+		batch.PersistEdgeAttributesBatch(b.persists)
+		return
+	}
+	// In-memory stores expose live edge pointers; their mutations are already
+	// durable. AddBatch is the set-oriented fallback for any other backend and
+	// avoids regressing to one PersistEdgeAttributes call per confirmation.
+	g.AddBatch(nil, b.persists)
+}
+
+func lspEdgeIdentity(e *graph.Edge) lspEdgeKey {
+	return lspEdgeKey{from: e.From, to: e.To, kind: e.Kind, filePath: e.FilePath, line: e.Line}
+}
+
+func lspAbs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func newLSPResolvedEdge(from, to string, kind graph.EdgeKind, filePath string, line int, provider, origin string) *graph.Edge {
+	e := semantic.NewSemanticEdge(from, to, kind, filePath, line, provider)
+	if origin != "" {
+		e.Origin = origin
+	}
+	return e
+}

@@ -28,13 +28,21 @@ func ResolveFlutterSetStateCalls(g graph.Store) int {
 		return 0
 	}
 
+	methods := nodesByKindsOrAll(g, graph.KindMethod)
+	methodIDs := make([]string, 0, len(methods))
+	for _, method := range methods {
+		if method != nil {
+			methodIDs = append(methodIDs, method.ID)
+		}
+	}
+	outByMethod := g.GetOutEdgesByNodeIDs(methodIDs)
 	classByMethod := map[string]string{}
 	buildByClass := map[string]*graph.Node{}
-	for _, n := range nodesByKindsOrAll(g, graph.KindMethod) {
+	for _, n := range methods {
 		if n == nil {
 			continue
 		}
-		for _, e := range g.GetOutEdges(n.ID) {
+		for _, e := range outByMethod[n.ID] {
 			if e == nil || e.Kind != graph.EdgeMemberOf {
 				continue
 			}
@@ -50,7 +58,7 @@ func ResolveFlutterSetStateCalls(g graph.Store) int {
 	}
 
 	var setStateMethods []*graph.Node
-	for _, n := range nodesByKindsOrAll(g, graph.KindMethod) {
+	for _, n := range methods {
 		if n == nil {
 			continue
 		}
@@ -58,7 +66,7 @@ func ResolveFlutterSetStateCalls(g graph.Store) int {
 		if build == nil || build.ID == n.ID {
 			continue
 		}
-		if !methodCallsSetState(g, n.ID) {
+		if !edgesCallSetState(outByMethod[n.ID]) {
 			continue
 		}
 		setStateMethods = append(setStateMethods, n)
@@ -75,8 +83,8 @@ func ResolveFlutterSetStateCalls(g graph.Store) int {
 		synthesized++
 	}
 
-	for _, e := range batch {
-		g.AddEdge(e)
+	if len(batch) > 0 {
+		g.AddBatch(nil, batch)
 	}
 	return synthesized
 }

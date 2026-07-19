@@ -147,28 +147,41 @@ func (s *Server) populateAnalysisLocked() analysisRunMetrics {
 			continue
 		}
 
-		analysisGraph := newAnalysisSnapshotStore(s.graph)
-		started := time.Now()
-		_ = analysisGraph.AllNodesLight()
-		_ = analysisGraph.AllEdgesLight()
-		metrics.snapshot = time.Since(started)
-
+		// Each analyzer now consumes a cursor-backed, predicate-scoped projection
+		// directly from the store. Do not retain a second complete node+edge
+		// corpus in Go: SQLite is the snapshot and its generation/revision gate
+		// below still provides the same atomic publication semantics.
+		analysisGraph := s.graph
 		candidate := persistedAnalysis{}
-		started = time.Now()
+		// Start breadcrumb per analyzer: these are whole-graph walks that can
+		// each run minutes on a large cold workspace, and metrics-only logging
+		// left the whole chain silent until it finished.
+		analyzerStart := func(pass string) {
+			if s.logger != nil {
+				s.logger.Info("analysis pass starting", zap.String("pass", pass))
+			}
+		}
+		analyzerStart("leiden_communities")
+		started := time.Now()
 		candidate.communities, candidate.leiden, _ = analysis.DetectCommunitiesLeidenIncremental(analysisGraph, s.leidenCache)
 		metrics.leiden = time.Since(started)
+		analyzerStart("processes")
 		started = time.Now()
 		candidate.processes = analysis.DiscoverProcesses(analysisGraph)
 		metrics.processes = time.Since(started)
+		analyzerStart("pagerank")
 		started = time.Now()
 		candidate.pageRank = analysis.ComputePageRank(analysisGraph)
 		metrics.pageRank = time.Since(started)
+		analyzerStart("adjacency")
 		started = time.Now()
 		candidate.adjacency = analysis.BuildAdjacencySnapshot(analysisGraph)
 		metrics.adjacency = time.Since(started)
+		analyzerStart("auto_concepts")
 		started = time.Now()
 		candidate.autoConcepts = search.BuildAutoConcepts(analysisGraph)
 		metrics.autoConcepts = time.Since(started)
+		analyzerStart("hits")
 		started = time.Now()
 		candidate.hits = analysis.ComputeHITS(analysisGraph)
 		metrics.hits = time.Since(started)

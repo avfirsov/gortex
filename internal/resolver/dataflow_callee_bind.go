@@ -84,7 +84,7 @@ func (r *Resolver) bindDataflowCalleeRefs() {
 // convergence, without scanning every function in the graph.
 func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 	idx := newCalleeIndex()
-	for _, n := range r.graph.GetFileNodes(filePath) {
+	for _, n := range r.incrementalFileNodes(filePath) {
 		if n == nil || n.Name == "" || n.FilePath == "" {
 			continue
 		}
@@ -96,7 +96,7 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 	// file in the directory, so each package file is visited exactly once.
 	dir := filepath.Dir(filePath)
 	for _, fileNode := range r.dirIndex[dir] {
-		for _, n := range r.graph.GetFileNodes(fileNode.FilePath) {
+		for _, n := range r.incrementalFileNodes(fileNode.FilePath) {
 			if n != nil && n.Kind == graph.KindFunction && n.Name != "" && n.FilePath != "" {
 				indexName(idx.byDir, dir, n.Name, n.ID)
 			}
@@ -117,9 +117,7 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: old})
 		}
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.persistAttributionReindexes(batch)
 }
 
 // calleeIndex holds the per-pass lookup tables bindDataflowCallee* uses.

@@ -2,6 +2,8 @@ package semantic
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,12 +15,10 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// TestManager_EnrichOne_AbandonsOnDeadline verifies the per-repo enrichment
-// deadline: a provider that blocks past the deadline is abandoned (the
-// enrichment WaitGroup proceeds) rather than pinning it indefinitely — the
-// MSBuild/Roslyn-stuck failure mode, generalised to "slow across many
-// symbols".
-func TestManager_EnrichOne_AbandonsOnDeadline(t *testing.T) {
+// TestManager_EnrichOne_DrainsLegacyProviderAtDeadline verifies that the
+// watchdog reports a legacy timeout without detaching its in-process graph
+// writer. EnrichAll cannot return (or advance) until that writer stops.
+func TestManager_EnrichOne_DrainsLegacyProviderAtDeadline(t *testing.T) {
 	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "50ms")
 
 	cfg := Config{
@@ -31,12 +31,14 @@ func TestManager_EnrichOne_AbandonsOnDeadline(t *testing.T) {
 
 	release := make(chan struct{})
 	var enrichReturned atomic.Bool
+	var mutations atomic.Int32
 	mgr.RegisterProvider(&mockProvider{
 		name:      "slow-go",
 		languages: []string{"go"},
 		available: true,
 		enrichFunc: func(g graph.Store, root string) (*EnrichResult, error) {
 			<-release // block well past the 50ms deadline
+			mutations.Add(1)
 			enrichReturned.Store(true)
 			return &EnrichResult{Provider: "slow-go", Language: "go"}, nil
 		},
@@ -52,19 +54,33 @@ func TestManager_EnrichOne_AbandonsOnDeadline(t *testing.T) {
 		resultCh <- res
 	}()
 
+	require.Eventually(t, func() bool {
+		statuses := mgr.EnrichmentStatuses()
+		return len(statuses) == 1 && statuses[0].State == EnrichStateDraining
+	}, time.Second, 5*time.Millisecond, "deadline must surface the draining watchdog state")
 	select {
-	case res := <-resultCh:
-		// The abandoned provider contributes no result.
-		assert.Empty(t, res, "enrichment past the per-repo deadline must be abandoned, yielding no result")
-	case <-time.After(3 * time.Second):
-		close(release)
-		t.Fatal("EnrichAll blocked on a slow provider instead of abandoning it at the deadline")
+	case <-resultCh:
+		t.Fatal("EnrichAll returned while the timed-out provider could still mutate")
+	default:
 	}
+	assert.True(t, mgr.EnrichmentActive(), "draining must keep concurrency/memory gates active")
 
-	// Unblock the detached goroutine so it unwinds cleanly.
 	close(release)
-	require.Eventually(t, enrichReturned.Load, time.Second, 10*time.Millisecond,
-		"the abandoned enrichment goroutine should still drain and return")
+	var results []*EnrichResult
+	select {
+	case results = <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("EnrichAll did not return after the provider stopped")
+	}
+	assert.Empty(t, results, "a timed-out legacy provider's terminal result is discarded")
+	require.True(t, enrichReturned.Load())
+	assert.Equal(t, int32(1), mutations.Load())
+	time.Sleep(25 * time.Millisecond)
+	assert.Equal(t, int32(1), mutations.Load(), "no provider mutation may occur after EnrichAll returns")
+	statuses := mgr.EnrichmentStatuses()
+	require.Len(t, statuses, 1)
+	assert.Equal(t, EnrichStateAbandoned, statuses[0].State)
+	assert.False(t, mgr.EnrichmentActive())
 }
 
 // TestManager_EnrichOne_DisabledDeadline verifies the bound can be switched
@@ -104,6 +120,23 @@ func TestManager_EnrichOne_DisabledDeadline(t *testing.T) {
 type mockCtxProvider struct {
 	mockProvider
 	enrichCtxFunc func(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error)
+}
+
+type preselectionCtxProvider struct {
+	mockCtxProvider
+}
+
+func (*preselectionCtxProvider) UsePreselectionDeadline() {}
+
+type closeUnblocksProvider struct {
+	mockProvider
+	release   chan struct{}
+	closeOnce sync.Once
+}
+
+func (p *closeUnblocksProvider) Close() error {
+	p.closeOnce.Do(func() { close(p.release) })
+	return nil
 }
 
 func (m *mockCtxProvider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error) {
@@ -180,11 +213,37 @@ func TestManager_EnrichOne_ContextProviderPartialIsCounted(t *testing.T) {
 	assert.Greater(t, statuses[0].DeadlineSeconds, 0.0)
 }
 
-// TestManager_EnrichOne_ContextProviderWedgedPastGraceIsAbandoned
-// verifies liveness: a ContextEnricher that ignores its cancellation
-// (wedged in an uncancellable call) is abandoned after the grace window
-// instead of pinning EnrichAll forever.
-func TestManager_EnrichOne_ContextProviderWedgedPastGraceIsAbandoned(t *testing.T) {
+func TestManager_PreselectionContextProviderKeepsNodeScaledDeadline(t *testing.T) {
+	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "")
+	mgr := NewManager(Config{Enabled: true}, zap.NewNop())
+	var observed time.Duration
+	provider := &preselectionCtxProvider{mockCtxProvider: mockCtxProvider{
+		mockProvider: mockProvider{name: "scip-go", languages: []string{"go"}, available: true},
+		enrichCtxFunc: func(ctx context.Context, _ graph.Store, _, _ string, _ EnrichDeadlinePolicy) (*EnrichResult, error) {
+			deadline, ok := ctx.Deadline()
+			if ok {
+				observed = time.Until(deadline)
+			}
+			return &EnrichResult{Provider: "scip-go", Language: "go"}, nil
+		},
+	}}
+
+	// 3,001 enrichable nodes had a 12m00.04s deadline before SCIP became
+	// context-aware. A fixed 120s inner timeout would silently cut this work.
+	nodeCount := 3001
+	want := scaleEnrichTimeout(nodeCount)
+	partial := make(map[string]bool)
+	results := mgr.runEnrichOne(graph.New(), "repo", t.TempDir(), "go", provider, nodeCount,
+		RepoEnrichState{}, nil, nil, partial)
+	require.Len(t, results, 1)
+	assert.Greater(t, observed, 120*time.Second)
+	assert.InDelta(t, want.Seconds(), observed.Seconds(), 0.25)
+	assert.False(t, partial["repo"])
+}
+
+// TestManager_EnrichOne_ContextProviderWedgedPastGraceIsDrained verifies that
+// even a ContextEnricher which ignores cancellation cannot outlive the pass.
+func TestManager_EnrichOne_ContextProviderWedgedPastGraceIsDrained(t *testing.T) {
 	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "20ms")
 	oldGrace := enrichCancelGrace
 	enrichCancelGrace = 30 * time.Millisecond
@@ -199,7 +258,6 @@ func TestManager_EnrichOne_ContextProviderWedgedPastGraceIsAbandoned(t *testing.
 	mgr := NewManager(cfg, zap.NewNop())
 
 	release := make(chan struct{})
-	defer close(release)
 	mgr.RegisterProvider(&mockCtxProvider{
 		mockProvider: mockProvider{
 			name:      "wedged-go",
@@ -221,21 +279,30 @@ func TestManager_EnrichOne_ContextProviderWedgedPastGraceIsAbandoned(t *testing.
 		done <- res
 	}()
 
+	require.Eventually(t, func() bool {
+		statuses := mgr.EnrichmentStatuses()
+		return len(statuses) == 1 && statuses[0].State == EnrichStateDraining
+	}, time.Second, 5*time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("EnrichAll returned while a context provider ignored cancellation")
+	default:
+	}
+	close(release)
 	select {
 	case res := <-done:
-		assert.Empty(t, res, "a provider wedged past deadline+grace must be abandoned")
-	case <-time.After(3 * time.Second):
-		t.Fatal("EnrichAll blocked on a wedged context provider instead of abandoning it")
+		assert.Empty(t, res, "a provider wedged past deadline+grace is discarded after it stops")
+	case <-time.After(time.Second):
+		t.Fatal("EnrichAll did not finish after the wedged provider was released")
 	}
-
 	statuses := mgr.EnrichmentStatuses()
 	require.Len(t, statuses, 1)
 	assert.Equal(t, EnrichStateAbandoned, statuses[0].State)
 }
 
 // TestManager_EnrichmentStatuses_AbandonedAndCompleted verifies the
-// health surface for the legacy detach path (abandoned — result
-// discarded) and the happy path (completed).
+// health surface for a timed-out legacy pass (drained then abandoned) and the
+// happy path. The second provider must not overlap the first writer.
 func TestManager_EnrichmentStatuses_AbandonedAndCompleted(t *testing.T) {
 	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "50ms")
 
@@ -249,7 +316,7 @@ func TestManager_EnrichmentStatuses_AbandonedAndCompleted(t *testing.T) {
 	mgr := NewManager(cfg, zap.NewNop())
 
 	release := make(chan struct{})
-	defer close(release)
+	fastStarted := make(chan struct{})
 	mgr.RegisterProvider(&mockProvider{
 		name:      "slow-go",
 		languages: []string{"go"},
@@ -264,6 +331,7 @@ func TestManager_EnrichmentStatuses_AbandonedAndCompleted(t *testing.T) {
 		languages: []string{"python"},
 		available: true,
 		enrichFunc: func(g graph.Store, root string) (*EnrichResult, error) {
+			close(fastStarted)
 			return &EnrichResult{Provider: "fast-py", Language: "python", EdgesAdded: 1}, nil
 		},
 	})
@@ -277,10 +345,24 @@ func TestManager_EnrichmentStatuses_AbandonedAndCompleted(t *testing.T) {
 		defer close(done)
 		_, _, _ = mgr.EnrichAll(g, map[string]string{"default": "/tmp/test"}, EnrichOptions{})
 	}()
+	require.Eventually(t, func() bool {
+		for _, status := range mgr.EnrichmentStatuses() {
+			if status.Provider == "slow-go" && status.State == EnrichStateDraining {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond)
+	select {
+	case <-fastStarted:
+		t.Fatal("the next provider overlapped a timed-out legacy writer")
+	default:
+	}
+	close(release)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("EnrichAll blocked instead of abandoning the slow provider")
+	case <-time.After(time.Second):
+		t.Fatal("EnrichAll did not finish after the slow provider stopped")
 	}
 
 	byProvider := map[string]EnrichmentStatus{}
@@ -293,6 +375,123 @@ func TestManager_EnrichmentStatuses_AbandonedAndCompleted(t *testing.T) {
 	assert.NotEmpty(t, byProvider["slow-go"].Detail)
 	assert.Equal(t, EnrichStateCompleted, byProvider["fast-py"].State)
 	assert.Equal(t, 1, byProvider["fast-py"].EdgesAdded)
+}
+
+func TestManager_CloseCancelsContextProviderAndWaitsForPass(t *testing.T) {
+	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "off")
+	mgr := NewManager(Config{
+		Enabled: true,
+		Providers: []ProviderConfig{
+			{Name: "ctx-go", Languages: []string{"go"}, Priority: 1, Enabled: true},
+		},
+	}, zap.NewNop())
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	mgr.RegisterProvider(&mockCtxProvider{
+		mockProvider: mockProvider{name: "ctx-go", languages: []string{"go"}, available: true},
+		enrichCtxFunc: func(ctx context.Context, _ graph.Store, _, _ string, _ EnrichDeadlinePolicy) (*EnrichResult, error) {
+			close(started)
+			<-ctx.Done()
+			close(returned)
+			return &EnrichResult{Provider: "ctx-go", Language: "go", Partial: true, AbortReason: ctx.Err().Error()}, nil
+		},
+	})
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, FilePath: "main.go", Language: "go"})
+	repoRoot := t.TempDir()
+	enrichDone := make(chan struct{})
+	go func() {
+		defer close(enrichDone)
+		_, _, _ = mgr.EnrichAll(g, map[string]string{"default": repoRoot}, EnrichOptions{})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("context provider did not start")
+	}
+	require.NoError(t, mgr.Close())
+	select {
+	case <-returned:
+	default:
+		t.Fatal("Close returned before the context provider stopped")
+	}
+	select {
+	case <-enrichDone:
+	default:
+		t.Fatal("Close returned before the complete manager-owned pass stopped")
+	}
+}
+
+func TestManager_CloseStopsLegacyProviderBeforeReturning(t *testing.T) {
+	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "off")
+	release := make(chan struct{})
+	started := make(chan struct{})
+	provider := &closeUnblocksProvider{
+		mockProvider: mockProvider{
+			name: "legacy-go", languages: []string{"go"}, available: true,
+			enrichFunc: func(_ graph.Store, _ string) (*EnrichResult, error) {
+				close(started)
+				<-release
+				return &EnrichResult{Provider: "legacy-go", Language: "go"}, nil
+			},
+		},
+		release: release,
+	}
+	mgr := NewManager(Config{
+		Enabled: true,
+		Providers: []ProviderConfig{
+			{Name: "legacy-go", Languages: []string{"go"}, Priority: 1, Enabled: true},
+		},
+	}, zap.NewNop())
+	mgr.RegisterProvider(provider)
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, FilePath: "main.go", Language: "go"})
+	repoRoot := t.TempDir()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = mgr.EnrichAll(g, map[string]string{"default": repoRoot}, EnrichOptions{})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("legacy provider did not start")
+	}
+	require.NoError(t, mgr.Close())
+	select {
+	case <-done:
+	default:
+		t.Fatal("Close returned before the legacy provider and pass stopped")
+	}
+}
+
+func TestManager_DeadlineDoesNotGrowProviderGoroutines(t *testing.T) {
+	t.Setenv("GORTEX_LSP_ENRICH_TIMEOUT", "1ms")
+	mgr := NewManager(Config{
+		Enabled: true,
+		Providers: []ProviderConfig{
+			{Name: "slow-go", Languages: []string{"go"}, Priority: 1, Enabled: true},
+		},
+	}, zap.NewNop())
+	mgr.RegisterProvider(&mockProvider{
+		name: "slow-go", languages: []string{"go"}, available: true,
+		enrichFunc: func(_ graph.Store, _ string) (*EnrichResult, error) {
+			time.Sleep(3 * time.Millisecond)
+			return &EnrichResult{Provider: "slow-go", Language: "go"}, nil
+		},
+	})
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "main.go::main", Kind: graph.KindFunction, FilePath: "main.go", Language: "go"})
+	repoRoot := t.TempDir()
+	baseline := runtime.NumGoroutine()
+	for range 40 {
+		_, _, err := mgr.EnrichAll(g, map[string]string{"default": repoRoot}, EnrichOptions{})
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= baseline+4
+	}, time.Second, 10*time.Millisecond, "deadline handling must drain, not accumulate provider goroutines")
 }
 
 // TestScaleEnrichTimeout is the table for the size-scaled per-repo

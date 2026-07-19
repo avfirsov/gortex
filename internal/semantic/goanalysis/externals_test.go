@@ -424,14 +424,14 @@ func TestExternals_GoModuleNodeID(t *testing.T) {
 
 func TestExternals_ShortModulePath(t *testing.T) {
 	tests := map[string]string{
-		"":                            "",
-		"fmt":                         "fmt",
-		"github.com/foo/bar":          "bar",
-		"github.com/foo/bar/v2":       "bar",
-		"github.com/foo/bar/v10":      "bar",
-		"github.com/foo/bar/sub":      "sub",
-		"single":                      "single",
-		"vibrant":                     "vibrant", // not a major-version segment
+		"":                       "",
+		"fmt":                    "fmt",
+		"github.com/foo/bar":     "bar",
+		"github.com/foo/bar/v2":  "bar",
+		"github.com/foo/bar/v10": "bar",
+		"github.com/foo/bar/sub": "sub",
+		"single":                 "single",
+		"vibrant":                "vibrant", // not a major-version segment
 	}
 	keys := make([]string, 0, len(tests))
 	for k := range tests {

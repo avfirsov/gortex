@@ -96,15 +96,24 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 		return true
 	}
 	// Seed: a method that directly writes a field of its own receiver type.
+	// Resolve all field endpoints in one point batch; a disk store must never
+	// pay one GetNode query per write edge.
+	var writes []*graph.Edge
+	var writeTargets []string
 	for e := range g.EdgesByKind(graph.EdgeWrites) {
 		if e == nil {
 			continue
 		}
-		owner, ok := recvType[e.From]
-		if !ok {
+		if _, ok := recvType[e.From]; !ok {
 			continue
 		}
-		fn := g.GetNode(e.To)
+		writes = append(writes, e)
+		writeTargets = append(writeTargets, e.To)
+	}
+	writeTargetNodes := g.GetNodesByIDs(writeTargets)
+	for _, e := range writes {
+		owner := recvType[e.From]
+		fn := writeTargetNodes[e.To]
 		if fn == nil || fn.Kind != graph.KindField {
 			continue
 		}
@@ -120,7 +129,8 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 		file                                  string
 		line                                  int
 	}
-	var ocalls []ocall
+	var callEdges []*graph.Edge
+	var callTargets []string
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.Meta == nil {
 			continue
@@ -133,8 +143,16 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 		if _, ok := recvType[e.From]; !ok {
 			continue
 		}
+		callEdges = append(callEdges, e)
+		callTargets = append(callTargets, e.To)
+	}
+	callTargetNodes := g.GetNodesByIDs(callTargets)
+	var ocalls []ocall
+	for _, e := range callEdges {
+		rf, _ := e.Meta["recv_field"].(string)
+		rs, _ := e.Meta["recv_self"].(bool)
 		name := bareCallName(e.To)
-		if cn := g.GetNode(e.To); cn != nil && cn.Kind == graph.KindMethod && cn.Name != "" {
+		if cn := callTargetNodes[e.To]; cn != nil && cn.Kind == graph.KindMethod && cn.Name != "" {
 			name = cn.Name
 		}
 		ocalls = append(ocalls, ocall{

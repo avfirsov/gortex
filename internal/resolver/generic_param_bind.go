@@ -78,7 +78,7 @@ func (r *Resolver) bindGenericParamRefs() {
 // (the dominant cost of an incremental edit on a large graph).
 func (r *Resolver) bindGenericParamRefsForFile(filePath string) {
 	owned := map[string]map[string]string{}
-	for _, n := range r.graph.GetFileNodes(filePath) {
+	for _, n := range r.incrementalFileNodes(filePath) {
 		if n == nil || n.Kind != graph.KindGenericParam || n.Language != "go" || n.Name == "" {
 			continue
 		}
@@ -109,9 +109,7 @@ func (r *Resolver) bindGenericParamRefsForFile(filePath string) {
 			}
 		}
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.persistAttributionReindexes(batch)
 }
 
 // tryBindGenericParam returns the old To value (for batched reindex)

@@ -73,6 +73,8 @@ func RunConformance(t *testing.T, factory Factory) {
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
+	t.Run("GetRepoNodesByLanguage", func(t *testing.T) { testGetRepoNodesByLanguage(t, factory) })
+	t.Run("DistinctExternalTargets", func(t *testing.T) { testDistinctExternalTargets(t, factory) })
 	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })
 	t.Run("DeadCodeCandidator", func(t *testing.T) { testDeadCodeCandidator(t, factory) })
 	t.Run("IfaceImplementsScanner", func(t *testing.T) { testIfaceImplementsScanner(t, factory) })
@@ -2122,6 +2124,65 @@ func testEdgesByKindsScanner(t *testing.T, factory Factory) {
 	}
 	if stopped != 1 {
 		t.Fatalf("early stop yielded %d before break, want 1", stopped)
+	}
+}
+
+func testGetRepoNodesByLanguage(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+
+	nodes := []*graph.Node{
+		{ID: "empty-go", Name: "empty-go", Kind: graph.KindFunction, FilePath: "a.go", Language: "go"},
+		{ID: "empty-py", Name: "empty-py", Kind: graph.KindFunction, FilePath: "a.py", Language: "python"},
+		{ID: "repo-go", Name: "repo-go", Kind: graph.KindFunction, FilePath: "repo/a.go", Language: "go", RepoPrefix: "repo"},
+		{ID: "repo-py", Name: "repo-py", Kind: graph.KindFunction, FilePath: "repo/a.py", Language: "python", RepoPrefix: "repo"},
+	}
+	for _, n := range nodes {
+		s.AddNode(n)
+	}
+
+	if got := s.GetRepoNodesByLanguage("", "go"); len(got) != 1 || got[0].ID != "empty-go" {
+		t.Fatalf("GetRepoNodesByLanguage(empty, go) = %#v, want empty-go", got)
+	}
+	if got := s.GetRepoNodesByLanguage("repo", "go"); len(got) != 1 || got[0].ID != "repo-go" {
+		t.Fatalf("GetRepoNodesByLanguage(repo, go) = %#v, want repo-go", got)
+	}
+	if got := s.GetRepoNodesByLanguage("repo", ""); len(got) != 0 {
+		t.Fatalf("GetRepoNodesByLanguage(repo, empty) yielded %d nodes, want 0", len(got))
+	}
+}
+
+func testDistinctExternalTargets(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	add := func(to string, kind graph.EdgeKind, line int) {
+		s.AddEdge(&graph.Edge{From: "caller", To: to, Kind: kind, FilePath: "a.go", Line: line})
+	}
+
+	add("dep::example.com/pkg::Call", graph.EdgeCalls, 1)
+	add("dep::example.com/pkg::Call", graph.EdgeReferences, 2) // duplicate target
+	add("stdlib::fmt::Sprintf", graph.EdgeReferences, 3)
+	add("repo::stdlib::net/http::Get", graph.EdgeReads, 4)
+	add("external::service/api", graph.EdgeCalls, 5)
+	add("external-call::dep::example.com/old", graph.EdgeCalls, 6)
+	add("local.go::resolved", graph.EdgeCalls, 7)
+	add("dep::wrong-kind::Call", graph.EdgeTests, 8)
+
+	got := s.DistinctExternalTargets([]graph.EdgeKind{
+		graph.EdgeCalls, graph.EdgeReferences, graph.EdgeReads, graph.EdgeCalls,
+	})
+	want := []string{
+		"dep::example.com/pkg::Call",
+		"external-call::dep::example.com/old",
+		"external::service/api",
+		"repo::stdlib::net/http::Get",
+		"stdlib::fmt::Sprintf",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("DistinctExternalTargets = %v, want %v", got, want)
+	}
+	if got := s.DistinctExternalTargets(nil); len(got) != 0 {
+		t.Fatalf("DistinctExternalTargets(nil) yielded %d targets, want 0", len(got))
 	}
 }
 

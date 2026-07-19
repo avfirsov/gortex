@@ -52,7 +52,7 @@ func Stable() {}
 // This comment block is brand new and shifts the line numbers.
 func Stable() {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	after := nodeByName(t, idx, "main.go", "Stable")
 	assert.Equal(t, 3, before.StartLine)
@@ -77,7 +77,7 @@ func KeepMe() {}
 
 
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	after := nodeByName(t, idx, "main.go", "KeepMe")
 	assert.Equal(t, 3, before.StartLine)
@@ -95,7 +95,7 @@ func Same() {}
 // freshly added doc line
 func Same() {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	select {
 	case ev := <-w.Events():
@@ -140,7 +140,7 @@ func Untouched() {}
 // a comment, nothing else
 func Untouched() {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -161,7 +161,7 @@ func OldName() {}
 
 func NewName() {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	assert.Empty(t, idx.graph.FindNodesByName("OldName"))
 	assert.NotEmpty(t, idx.graph.FindNodesByName("NewName"))
@@ -186,7 +186,7 @@ func First() {}
 
 func Second() {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	assert.NotEmpty(t, idx.graph.FindNodesByName("First"))
 	assert.NotEmpty(t, idx.graph.FindNodesByName("Second"))
 }
@@ -202,7 +202,7 @@ func Compute(a int) {}
 
 func Compute(a int, b string) {}
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	funcAfter := nodeByName(t, idx, "main.go", "Compute")
 	assert.NotSame(t, funcBefore, funcAfter)
 }
@@ -223,7 +223,7 @@ func Steady() {}
 func Steady() {}
 `)
 	require.NoError(t, os.Chtimes(path, future, future))
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	assert.Greater(t, idx.FileMtimes()["main.go"], mtimeBefore)
 }
 
@@ -245,7 +245,7 @@ func Target() {}
 // Caller invokes Target.
 func Caller() { Target() }
 `)
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 
 	after := callEdge(t, idx, caller.ID)
 	assert.Greater(t, after.Line, beforeLine)
@@ -279,13 +279,13 @@ func TestWatcher_OldDatabaseFirstPatchIsConservative(t *testing.T) {
 	require.NoError(t, err)
 
 	writeTestFile(t, path, "package main\n\n// first patch\nfunc Stable() {}\n")
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	first := <-w.Events()
 	assert.Equal(t, "structural", first.Classification)
 	assert.NotZero(t, first.NodesRemoved)
 
 	writeTestFile(t, path, "package main\n\n// second patch\n// now fingerprinted\nfunc Stable() {}\n")
-	w.patchGraph(path, ChangeModified)
+	_ = w.patchGraph(path, ChangeModified)
 	second := <-w.Events()
 	assert.Equal(t, "metadata_only", second.Classification)
 	assert.Zero(t, second.NodesRemoved)

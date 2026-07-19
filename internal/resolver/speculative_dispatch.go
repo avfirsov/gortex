@@ -1,6 +1,8 @@
 package resolver
 
 import (
+	"sort"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -21,110 +23,195 @@ const (
 	// speculativeFanoutCap: above this many candidates the confidence floors;
 	// above the hard cap the whole set is dropped as noise (codegraph's rule).
 	speculativeFanoutCap = 12
-	speculativeHardCap    = 40
+	speculativeHardCap   = 40
+
+	// Keep the opt-in pass's read maps and writes independent of total graph
+	// size. At most speculativeSiteChunk dynamic sites are resolved together;
+	// their fan-out is subsequently committed in speculativeWriteChunk slices.
+	speculativeSiteChunk  = 128
+	speculativeWriteChunk = 512
 )
 
+type speculativeDispatchSite struct {
+	from, file, shape, key string
+	line                   int
+}
+
+type speculativeEdgeSeq func(yield func(*graph.Edge) bool)
+
 // ResolveSpeculativeDispatch mints speculative call edges for the tagged
-// blind-spot call shapes. No-op when disabled. Returns the edge count.
+// blind-spot call shapes. No-op when disabled. Returns the number of new
+// logical edges staged by this invocation (an idempotent rerun returns zero).
 func ResolveSpeculativeDispatch(g graph.Store, enabled bool) int {
 	if g == nil || !enabled {
 		return 0
 	}
 
-	// Existing resolved call pairs, so a speculative edge never duplicates a
-	// real one from the same caller to the same target.
-	existing := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.IsSpeculative() {
-			continue
+	mu := g.ResolveMutex()
+	mu.Lock()
+	defer mu.Unlock()
+
+	sites := make([]speculativeDispatchSite, 0, speculativeSiteChunk)
+	resolved := 0
+	flush := func() {
+		if len(sites) == 0 {
+			return
 		}
-		if !graph.IsUnresolvedTarget(e.To) {
-			existing[e.From+"\x00"+e.To] = true
+
+		callerSeen := make(map[string]struct{}, len(sites))
+		callerIDs := make([]string, 0, len(sites))
+		nameSeen := make(map[string]struct{}, len(sites))
+		names := make([]string, 0, len(sites))
+		for _, site := range sites {
+			if _, seen := callerSeen[site.from]; !seen {
+				callerSeen[site.from] = struct{}{}
+				callerIDs = append(callerIDs, site.from)
+			}
+			if _, seen := nameSeen[site.key]; !seen {
+				nameSeen[site.key] = struct{}{}
+				names = append(names, site.key)
+			}
 		}
+		callers := g.GetNodesByIDs(callerIDs)
+		nodesByName := g.FindNodesByNames(names)
+
+		// Candidate output is bounded by siteChunk*hardCap. Dedupe is local
+		// to that bounded window; an edge written by an earlier window is
+		// visible through the batched adjacency read below and is therefore
+		// not staged twice.
+		proposed := make([]*graph.Edge, 0, len(sites)*speculativeHardCap)
+		proposedSeen := make(map[graph.EdgeEndpoint]struct{}, len(sites)*speculativeHardCap)
+		for _, site := range sites {
+			callerLang := ""
+			if caller := callers[site.from]; caller != nil {
+				callerLang = caller.Language
+			}
+			candidates, count := speculativeCandidatesFromNodes(nodesByName[site.key], callerLang)
+			if count == 0 || count > speculativeHardCap {
+				continue
+			}
+			conf := speculativeConfidence(count)
+			for _, candidate := range candidates {
+				endpoint := graph.EdgeEndpoint{From: site.from, To: candidate.ID}
+				if _, seen := proposedSeen[endpoint]; seen {
+					continue
+				}
+				proposedSeen[endpoint] = struct{}{}
+				proposed = append(proposed, &graph.Edge{
+					From: site.from, To: candidate.ID, Kind: graph.EdgeCalls,
+					FilePath: site.file, Line: site.line,
+					Origin:          graph.OriginSpeculative,
+					Confidence:      conf,
+					ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeCalls, conf),
+					Meta: map[string]any{
+						graph.MetaSpeculative: true,
+						MetaSynthesizedBy:     SynthSpeculative,
+						MetaProvenance:        ProvenanceHeuristic,
+						"via":                 "speculative." + site.shape,
+						"candidate_count":     count,
+						"dyn_key":             site.key,
+					},
+				})
+			}
+		}
+		if len(proposed) == 0 {
+			sites = sites[:0]
+			return
+		}
+
+		// Replace the former graph-wide existing-edge scan with one bounded
+		// adjacency batch for just this window's callers. Any real or already
+		// synthesized call to an endpoint makes the logical mutation a no-op.
+		outByCaller := g.GetOutEdgesByNodeIDs(callerIDs)
+		existing := make(map[graph.EdgeEndpoint]struct{}, len(proposed))
+		for _, edges := range outByCaller {
+			for _, edge := range edges {
+				if edge == nil || edge.Kind != graph.EdgeCalls || graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				endpoint := graph.EdgeEndpoint{From: edge.From, To: edge.To}
+				if _, wanted := proposedSeen[endpoint]; wanted {
+					existing[endpoint] = struct{}{}
+				}
+			}
+		}
+
+		write := proposed[:0]
+		for _, edge := range proposed {
+			endpoint := graph.EdgeEndpoint{From: edge.From, To: edge.To}
+			if _, found := existing[endpoint]; found {
+				continue
+			}
+			write = append(write, edge)
+		}
+		for start := 0; start < len(write); start += speculativeWriteChunk {
+			end := min(start+speculativeWriteChunk, len(write))
+			g.AddBatch(nil, write[start:end])
+		}
+		resolved += len(write)
+		sites = sites[:0]
 	}
 
-	type spec struct {
-		from, to, file, shape, key string
-		line, n                    int
-	}
-	var specs []spec
-	seen := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.Meta == nil {
+	for edge := range speculativeCallEdges(g) {
+		if edge == nil || edge.Meta == nil {
 			continue
 		}
-		shape, _ := e.Meta["dyn_shape"].(string)
+		shape, _ := edge.Meta["dyn_shape"].(string)
 		if shape == "" {
 			continue
 		}
 		// A precision-first synthesizer (object-registry) already bound this
 		// computed-member dispatch site; do not also mint a hidden guess.
-		if claimed, _ := e.Meta["registry_claimed"].(bool); claimed {
+		if claimed, _ := edge.Meta["registry_claimed"].(bool); claimed {
 			continue
 		}
-		key, _ := e.Meta["dyn_key"].(string)
+		key, _ := edge.Meta["dyn_key"].(string)
 		if key == "" {
 			continue // v1: literal-key shapes only (variable-key is unbounded)
 		}
-		callerLang := ""
-		if c := g.GetNode(e.From); c != nil {
-			callerLang = c.Language
-		}
-		cands := speculativeCandidates(g, key, callerLang)
-		if len(cands) == 0 || len(cands) > speculativeHardCap {
-			continue
-		}
-		for _, c := range cands {
-			if existing[e.From+"\x00"+c.ID] {
-				continue
-			}
-			k := e.From + "\x00" + c.ID
-			if seen[k] {
-				continue
-			}
-			seen[k] = true
-			specs = append(specs, spec{from: e.From, to: c.ID, file: e.FilePath, line: e.Line, shape: shape, key: key, n: len(cands)})
-		}
-	}
-
-	resolved := 0
-	for _, s := range specs {
-		conf := 1.0 / float64(s.n)
-		if s.n > speculativeFanoutCap {
-			conf = 0.05
-		}
-		if conf > 0.45 {
-			conf = 0.45
-		}
-		if conf < 0.05 {
-			conf = 0.05
-		}
-		g.AddEdge(&graph.Edge{
-			From: s.from, To: s.to, Kind: graph.EdgeCalls,
-			FilePath: s.file, Line: s.line,
-			Origin:          graph.OriginSpeculative,
-			Confidence:      conf,
-			ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeCalls, conf),
-			Meta: map[string]any{
-				graph.MetaSpeculative: true,
-				MetaSynthesizedBy:     SynthSpeculative,
-				MetaProvenance:        ProvenanceHeuristic,
-				"via":                 "speculative." + s.shape,
-				"candidate_count":     s.n,
-				"dyn_key":             s.key,
-			},
+		sites = append(sites, speculativeDispatchSite{
+			from: edge.From, file: edge.FilePath, line: edge.Line,
+			shape: shape, key: key,
 		})
-		resolved++
+		if len(sites) == speculativeSiteChunk {
+			flush()
+		}
 	}
+	flush()
 	return resolved
 }
 
-// speculativeCandidates returns the plausible targets for a literal dispatch
-// key: function/method definitions of that exact name, in the caller's
-// language family, excluding stubs.
-func speculativeCandidates(g graph.Store, key, callerLang string) []*graph.Node {
-	var out []*graph.Node
-	for _, n := range g.FindNodesByName(key) {
+// speculativeCallEdges performs one call-edge scan. Production SQLite uses
+// the keyset-paged repo/file/kind projection (including the empty-prefix
+// single-repo namespace); adapter stores keep their native kind iterator.
+func speculativeCallEdges(g graph.Store) speculativeEdgeSeq {
+	if _, ok := g.(graph.ScopedProjectionSequencer); ok {
+		repos := append(g.RepoPrefixes(), "")
+		sort.Strings(repos)
+		return func(yield func(*graph.Edge) bool) {
+			for row := range graph.EdgesInScopeSeq(g, repos, nil, graph.EdgeCalls) {
+				if row.Edge != nil && !yield(row.Edge) {
+					return
+				}
+			}
+		}
+	}
+	return func(yield func(*graph.Edge) bool) {
+		for edge := range g.EdgesByKind(graph.EdgeCalls) {
+			if edge != nil && !yield(edge) {
+				return
+			}
+		}
+	}
+}
+
+// speculativeCandidatesFromNodes filters one batched FindNodesByNames slot.
+// The returned slice never grows beyond hardCap+1; count remains exact so a
+// language-filtered over-cap name is still rejected with the legacy rule.
+func speculativeCandidatesFromNodes(nodes []*graph.Node, callerLang string) ([]*graph.Node, int) {
+	out := make([]*graph.Node, 0, min(len(nodes), speculativeHardCap+1))
+	count := 0
+	for _, n := range nodes {
 		if n == nil {
 			continue
 		}
@@ -137,7 +224,24 @@ func speculativeCandidates(g graph.Store, key, callerLang string) []*graph.Node 
 		if callerLang != "" && n.Language != "" && n.Language != callerLang {
 			continue
 		}
-		out = append(out, n)
+		count++
+		if len(out) <= speculativeHardCap {
+			out = append(out, n)
+		}
 	}
-	return out
+	return out, count
+}
+
+func speculativeConfidence(candidateCount int) float64 {
+	conf := 1.0 / float64(candidateCount)
+	if candidateCount > speculativeFanoutCap {
+		conf = 0.05
+	}
+	if conf > 0.45 {
+		conf = 0.45
+	}
+	if conf < 0.05 {
+		conf = 0.05
+	}
+	return conf
 }

@@ -7,14 +7,22 @@ import (
 
 // EdgeReindex is the per-edge payload for ReindexEdges. Edge points
 // at the (already mutated) Edge value the caller wants the store to
-// re-bind; OldTo is the To target the edge had BEFORE the mutation,
-// so the store can drop the stale in-edge index entry for OldTo
-// while writing the new one for Edge.To.
+// re-bind; OldFrom / OldTo are the endpoints the edge had BEFORE the
+// mutation, so the store can drop both stale adjacency entries while writing
+// the new identity. OldFrom may be empty when the source did not move; stores
+// then use Edge.From for backward compatibility with resolver callers.
 type EdgeReindex struct {
-	Edge  *Edge
-	OldTo string
+	Edge    *Edge
+	OldFrom string
+	OldTo   string
+	// OldKind is the persisted pre-mutation kind. It is required when a
+	// resolver changes the edge identity's Kind before handing the edge to
+	// ReindexEdges (for example Reads -> References). Empty preserves backward
+	// compatibility and means Edge.Kind did not change.
+	OldKind EdgeKind
 	// RefreshIdentity replaces the complete stored edge payload while moving
-	// its identity from (OldTo, OldFilePath, OldLine) to Edge's current key.
+	// its identity from (OldFrom, OldTo, OldFilePath, OldLine) to Edge's
+	// current key.
 	// Resolver callers leave it false and retain the historical To-only path.
 	RefreshIdentity bool
 	OldFilePath     string
@@ -29,6 +37,57 @@ type EdgeReindex struct {
 type EdgeProvenanceUpdate struct {
 	Edge      *Edge
 	NewOrigin string
+}
+
+// UnresolvedEdgeScan is the immutable boundary of one unresolved-edge pass.
+// HighWaterID is backend-owned and opaque to callers; SQLite uses the edge
+// rowid so rows inserted or reinserted while a chunked resolver yields cannot
+// leak into the pass. PendingBefore is the exact number of eligible rows at
+// that boundary and is diagnostic only.
+type UnresolvedEdgeScan struct {
+	HighWaterID   int64
+	PendingBefore int
+	// SkipTerminal, when set by the consumer between Begin and the first
+	// Read, asks the pager to exclude edges carrying a live durable
+	// resolve_terminal stamp AT THE STORE (the promoted column), so a pass
+	// that would drop them anyway (a scoped resolve outside
+	// GORTEX_WARMUP_FULL_RESOLVE) never loads, decodes, or allocates them.
+	// Pagers without column-level support may ignore it — every consumer
+	// keeps its own in-memory terminal filter as the semantic authority.
+	SkipTerminal bool
+	// ScopeAnchors carries the scoped pass's repo prefixes. Consumed by
+	// SkipTerminal (a stamped edge anchored to a scope repo in either
+	// endpoint is still returned) and by ScopeFilter below. Membership is
+	// tested against the from_repo / to_repo_unresolved generated columns —
+	// SQLite-side mirrors of graph.RepoPrefixOfID / UnresolvedRepoPrefix —
+	// with NULL always passing through (fail-open), so the consumer's exact
+	// in-memory filters remain the semantic authority.
+	ScopeAnchors []string
+	// ScopeFilter, when set with ScopeAnchors, asks the pager to drop rows a
+	// scoped resolve provably never reconsiders: source repo not in scope
+	// AND target repo-qualified (unresolved form) to a repo not in scope.
+	// Bare targets ('') and unrecognized shapes (NULL) always load — the
+	// same keep rule as the consumer's edgeInResolveScope, minus the shapes
+	// only Go can parse, which fail open.
+	ScopeFilter bool
+}
+
+// UnresolvedEdgePage is one bounded keyset page from an UnresolvedEdgeScan.
+// NextID advances monotonically even across gaps. Exhausted means no row at or
+// below the scan's high-water mark remains after this page.
+type UnresolvedEdgePage struct {
+	Edges     []*Edge
+	NextID    int64
+	Exhausted bool
+}
+
+// UnresolvedEdgePager is an optional disk-backend capability used by the
+// resolver's cold pass. Implementations must keyset-page a stable high-water
+// snapshot and honour both bounds (an individually oversized row may exceed
+// maxBytes so the cursor can still make progress).
+type UnresolvedEdgePager interface {
+	BeginUnresolvedEdgeScan() (UnresolvedEdgeScan, error)
+	ReadUnresolvedEdgePage(scan UnresolvedEdgeScan, afterID int64, maxRows, maxBytes int) (UnresolvedEdgePage, error)
 }
 
 // Store is the persistence-and-query backend the rest of gortex sees
@@ -67,6 +126,8 @@ type Store interface {
 	AddBatch(nodes []*Node, edges []*Edge)
 	AddEdge(e *Edge)
 	SetEdgeProvenance(e *Edge, newOrigin string) bool
+	// ReindexEdge is the legacy To-only mutation. Callers that change Kind
+	// must use ReindexEdges and provide EdgeReindex.OldKind.
 	ReindexEdge(e *Edge, oldTo string)
 	// Batched siblings of the per-edge mutators. Same semantics, but
 	// disk backends amortise the per-call transaction overhead by
@@ -77,7 +138,9 @@ type Store interface {
 	// Callers MUST first mutate the *Edge fields they want persisted
 	// (To / Kind / Origin / …) before handing the entry over — these
 	// methods read the post-mutation Edge state and update the
-	// backend's indexes accordingly.
+	// backend's indexes accordingly. When Kind changes, EdgeReindex.OldKind
+	// must carry the persisted pre-mutation kind so the old exact identity is
+	// removed; zero means Kind did not change.
 	ReindexEdges(batch []EdgeReindex)
 	SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int)
 	RemoveEdge(from, to string, kind EdgeKind) bool
@@ -113,7 +176,28 @@ type Store interface {
 	// need deterministic output sort the result.
 	FindNodesByNameContaining(substr string, limit int) []*Node
 	GetFileNodes(filePath string) []*Node
+	// GetFileNodesByPaths is the batched sibling of GetFileNodes. Backends
+	// dedupe empty/repeated paths and execute in implementation-sized chunks;
+	// missing paths are absent from the result map. Incremental resolution uses
+	// it to avoid one store round trip for every file in a changed-package
+	// frontier.
+	GetFileNodesByPaths(filePaths []string) map[string][]*Node
+	// GetRepoNodes returns nodes owned by the exact prefix. Empty prefix is
+	// the single-repository/shadow graph namespace, not a global wildcard.
 	GetRepoNodes(repoPrefix string) []*Node
+	// GetRepoNodesByLanguage returns only nodes owned by repoPrefix whose
+	// promoted Language column matches language. Empty repoPrefix is an exact
+	// query for single-repository graphs, not a request for every repository.
+	// Backends must implement the compound predicate natively so callers never
+	// materialise all repo nodes merely to discard other languages.
+	GetRepoNodesByLanguage(repoPrefix, language string) []*Node
+	// GetNodesByLanguage is the global language predicate. Backends must
+	// evaluate it natively; semantic helpers use it to avoid a repository loop
+	// and the edge helper performs one batched source adjacency lookup.
+	GetNodesByLanguage(language string) []*Node
+	// GetRepoNonContentNodes returns the code/search projection. Empty prefix is
+	// the global view; backends must exclude data_class=content natively.
+	GetRepoNonContentNodes(repoPrefix string) []*Node
 
 	// --- Edge adjacency --------------------------------------------
 
@@ -129,6 +213,18 @@ type Store interface {
 	// nil-slice semantics of map[k][]*Edge — range over nil is a no-op).
 	GetInEdgesByNodeIDs(ids []string) map[string][]*Edge
 	GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge
+
+	// GetEdgeCandidates resolves a batch of exact endpoint and source-site
+	// predicates without issuing one adjacency lookup per key. Backends must
+	// implement this natively: SQLite performs indexed joins and Graph scans
+	// its sharded adjacency buckets under one lock per shard.
+	GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet
+
+	// DistinctExternalTargets returns the unique external-shaped destination
+	// IDs used by the supplied edge kinds. Backends must push both the kind and
+	// target predicates down and project only the destination ID; no per-kind
+	// queries or full Edge materialisation are permitted.
+	DistinctExternalTargets(kinds []EdgeKind) []string
 
 	// GetRepoEdges returns every edge whose source node has the given
 	// RepoPrefix. Equivalent to GetRepoNodes(r) followed by
@@ -210,6 +306,9 @@ type Store interface {
 
 	NodeCount() int
 	EdgeCount() int
+	// ProxyNodeCountAtLeast answers the federation heap-budget gate without
+	// materialising nodes. Implementations may stop as soon as limit matches.
+	ProxyNodeCountAtLeast(limit int) bool
 	Stats() GraphStats
 	RepoStats() map[string]GraphStats
 	RepoPrefixes() []string
@@ -237,6 +336,32 @@ type Store interface {
 // fails fast here instead of at runtime when a different Store
 // implementation gets swapped in.
 var _ Store = (*Graph)(nil)
+
+// GoMethodReceiverRebinder is an optional capability for backends that can
+// repair Go member_of edges in one set-oriented operation. The Go extractor
+// initially targets a method at <method-file>::<receiver-name>; when the
+// receiver type is declared in another file of the package that target is a
+// phantom ID. The capability rewrites it to the unique canonical Go
+// type/interface in the same package directory.
+//
+// filePath scopes the source method nodes for an incremental pass. An empty
+// filePath means the whole graph. Implementations must leave ambiguous names,
+// non-Go methods, and already-canonical targets unchanged. The return value is
+// the number of old edge rows rewritten or removed by logical-key deduplication.
+//
+// This remains optional because the in-memory Graph is already efficient with
+// the predicate/batch fallback in resolver; disk backends should implement it
+// with indexed joins so no edge or node corpus crosses into Go memory.
+type GoMethodReceiverRebinder interface {
+	RebindGoMethodReceivers(filePath string) (changed int, err error)
+}
+
+// GoMethodReceiverBatchRebinder is the partial-index sibling: it limits the
+// same set-oriented receiver repair to a deduped changed-file frontier in one
+// backend transaction.
+type GoMethodReceiverBatchRebinder interface {
+	RebindGoMethodReceiversForFiles(filePaths []string) (changed int, err error)
+}
 
 // BackendResolver is an optional interface backends MAY implement to
 // drain the bulk-tractable subset of the resolver's work entirely
@@ -348,6 +473,15 @@ type BulkLoader interface {
 	FlushBulk() error
 }
 
+// CoordinatedBulkLoader extends BulkLoader with an outer window for a
+// multi-repository cold load. Implementations engage only on an empty store;
+// nested per-repository BulkLoader calls must leave the outer window open so
+// secondary indexes are rebuilt once after every repository drains.
+type CoordinatedBulkLoader interface {
+	BeginCoordinatedBulkLoad() bool
+	EndCoordinatedBulkLoad() error
+}
+
 // SymbolHit is a single full-text-search result: the matched node ID
 // plus its relevance score from the backend's scorer (BM25 in
 // the disk backend's FTS). Higher score = more relevant.
@@ -375,12 +509,15 @@ type SymbolFTSItem struct {
 //
 // Contract:
 //
-//   - UpsertSymbolFTS is the per-call write path used by incremental
-//     reindex. The store decides how to persist the pre-tokenised
-//     text (a sidecar table, an FTS column, an in-engine index —
-//     backend choice). Tokens are produced by
-//     internal/search.Tokenize so camelCase / snake_case / path-
-//     separator semantics match the existing BM25 corpus contract.
+//   - UpsertSymbolFTS is the compatibility single-item write path.
+//     Backends used for incremental indexing SHOULD also implement the
+//     separate SymbolFTSBatchUpserter capability: it replaces only supplied
+//     node IDs without wiping the rest of a repo, and bounds statement size
+//     instead of issuing one transaction or lookup per symbol. The store
+//     decides how to persist the pre-tokenised text (a sidecar table, an FTS
+//     column, an in-engine index — backend choice). Tokens are produced by
+//     internal/search.Tokenize so camelCase / snake_case / path-separator
+//     semantics match the existing BM25 corpus contract.
 //
 //   - BulkUpsertSymbolFTS is the cold-start fast path used by the
 //     indexer's shadow-swap drain. Implementations SHOULD use the
@@ -416,6 +553,39 @@ type SymbolSearcher interface {
 	SearchSymbols(query string, limit int) ([]SymbolHit, error)
 }
 
+// SymbolFTSBatchUpserter is the optional incremental fast path. It is kept
+// separate from SymbolSearcher so alternate search implementations and test
+// doubles retain source compatibility. Indexing paths use this capability as
+// one batch and never synthesize an N+1 loop from single-item upserts.
+type SymbolFTSBatchUpserter interface {
+	BatchUpsertSymbolFTS(items []SymbolFTSItem) error
+}
+
+// SymbolFTSRepoResetter starts an authoritative, bounded full-repository FTS
+// replacement by deleting only the selected repository's owned documents.
+// Cold shadow drains call it once, then append SymbolFTSBatchUpserter chunks;
+// separating reset from append avoids retaining a whole-repository token slice.
+type SymbolFTSRepoResetter interface {
+	ResetSymbolFTS(repoPrefix string) error
+}
+
+// SymbolFTSBatchDeleter removes a bounded set of symbol documents in one
+// backend transaction. Partial re-indexing uses it before the matching batch
+// upsert so renamed and line-keyed symbols cannot leave stale FTS rows, and a
+// multi-file reconcile never expands into one delete transaction per symbol.
+type SymbolFTSBatchDeleter interface {
+	BatchDeleteSymbolFTS(nodeIDs []string) error
+}
+
+// FileBatchEvicter is the set-oriented sibling of Store.EvictFile. The
+// partial/warm reconcile path parses a bounded file chunk first, then asks the
+// backend to remove every successfully parsed replacement in one atomic
+// mutation. Backends without this optional capability retain the per-file
+// fallback; SQLite implements it natively.
+type FileBatchEvicter interface {
+	EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int)
+}
+
 // ContentHit is one result from a ContentSearcher query: the content
 // section node's ID plus locating metadata (file + ordinal), its BM25
 // relevance score (higher = more relevant), and a short snippet excerpt
@@ -438,6 +608,28 @@ type ContentFTSItem struct {
 	FilePath string
 	Ordinal  int
 	Body     string
+}
+
+// ContentFTSFileReplacement is one authoritative file-level content-index
+// replacement. Items is the complete fresh section set for FilePath; an empty
+// Items slice deliberately removes every prior section for that file. The
+// replacement owns item paths, so backends persist FilePath even when an item
+// carries an empty or stale FilePath.
+type ContentFTSFileReplacement struct {
+	FilePath string
+	Items    []ContentFTSItem
+}
+
+// ContentFTSBatchReplacer is the set-oriented cold/partial content writer.
+// Implementations replace all supplied files in bounded, atomic groups so a
+// crash exposes either the old or new rows for each group, never a wipe-only
+// intermediate state. Duplicate FilePath entries are last-write-wins.
+//
+// It is separate from ContentSearcher so in-memory stores and compatibility
+// backends retain their existing per-file API. Indexers probe this optional
+// capability and fall back to WipeContentFile + AppendContent when absent.
+type ContentFTSBatchReplacer interface {
+	ReplaceContentFiles(repoPrefix string, files []ContentFTSFileReplacement) error
 }
 
 // ContentSearcher is an optional interface backends MAY implement to
@@ -989,6 +1181,16 @@ type NodesInFilesByKindFinder interface {
 	NodesInFilesByKind(files []string, kinds []NodeKind) []*Node
 }
 
+// NodesInFilesByKindStreamer is the streaming face of
+// NodesInFilesByKindFinder: the same projection grouped per file, yielded
+// in the caller's (deduped) file order, without materialising the combined
+// slice. Only files that contain at least one matching node are yielded, so
+// consumers that cache negative results diff the yielded set against their
+// request. Optional capability — callers fall back to the Finder form.
+type NodesInFilesByKindStreamer interface {
+	NodesInFilesByKindSeq(files []string, kinds []NodeKind) iter.Seq2[string, []*Node]
+}
+
 // FileMtimeWriter is an optional capability backends MAY implement to
 // persist the per-file modification time the indexer uses for its
 // incremental-reindex decisions. Lifting this state off the daemon's
@@ -1222,6 +1424,51 @@ type CloneShingleReader interface {
 	LoadCloneShingles(repoPrefix string) (map[string][]uint64, error)
 }
 
+// CloneCorpusRow is the compact, durable clone-analysis projection for one
+// function or method. Signature is meaningful only when Finalized is true;
+// an empty finalized signature records a body intentionally excluded by the
+// boilerplate filter, while a non-finalized row still needs the corpus pass.
+type CloneCorpusRow struct {
+	NodeID     string
+	RepoPrefix string
+	Shingles   []uint64
+	Signature  string
+	TokenCount int
+	Finalized  bool
+}
+
+// CloneCorpusWriter persists bounded clone projection batches. Implementations
+// also hydrate Node.Meta["clone_sig"] on ordinary node reads so callers outside
+// the clone detector retain the historical query surface.
+type CloneCorpusWriter interface {
+	BulkSetCloneCorpus(repoPrefix string, rows []CloneCorpusRow) error
+}
+
+// CloneCorpusRepoReplacer resets one repository's authoritative clone
+// projection before a full shadow drain. The empty replacement must clear
+// stale rows left by a prior index.
+type CloneCorpusRepoReplacer interface {
+	ReplaceCloneCorpus(repoPrefix string, rows []CloneCorpusRow) error
+}
+
+// UnresolvedInsertionCounter is an optional capability: a monotonic count of
+// edge writes whose target is unresolved-shaped (insert or reindex-to). It
+// may overcount (conflict-ignored duplicates included) but never undercounts,
+// so "counter unchanged across a window" proves no new unresolved work
+// appeared in that window — the deferred tail resolve uses this to skip a
+// whole-graph fallback pass that would provably resolve nothing.
+type UnresolvedInsertionCounter interface {
+	UnresolvedEdgeInsertions() uint64
+}
+
+// CloneCorpusPager reads one repository's projection in stable node-id order.
+// afterNodeID is exclusive; limit must bound the returned page. This avoids a
+// whole-repository node/Meta snapshot during cold finalisation and warm LSH
+// rebuilds.
+type CloneCorpusPager interface {
+	CloneCorpusPage(repoPrefix, afterNodeID string, limit int) ([]CloneCorpusRow, error)
+}
+
 // ConstantValueWriter is an optional capability backends MAY implement
 // to persist a KindConstant node's literal value (string / numeric)
 // keyed by node id, in a queryable sidecar rather than the gob-encoded
@@ -1237,6 +1484,14 @@ type CloneShingleReader interface {
 type ConstantValueWriter interface {
 	BulkSetConstantValues(repoPrefix string, rows []ConstantValueRow) error
 	DeleteConstantValuesByFiles(repoPrefix string, files []string) error
+}
+
+// ConstantValueRepoReplacer atomically replaces the authoritative compact
+// constant-value projection for one repository. Full shadow drains use this
+// instead of replaying per-file deletes, including the empty-set case that
+// must clear stale rows from a prior index.
+type ConstantValueRepoReplacer interface {
+	ReplaceConstantValues(repoPrefix string, rows []ConstantValueRow) error
 }
 
 // ConstantValueReader is the read side of ConstantValueWriter. Returns
@@ -1276,9 +1531,22 @@ type FileMetaWriter interface {
 	DeleteFileMetasByFiles(repoPrefix string, files []string) error
 }
 
+// FileMetaRepoReplacer atomically replaces the authoritative compact file
+// metadata projection for one repository after a full shadow drain.
+type FileMetaRepoReplacer interface {
+	ReplaceFileMetas(repoPrefix string, rows []FileMetaRow) error
+}
+
 // FileMetaReader is the read side: every recorded file row for a repo prefix.
 type FileMetaReader interface {
 	FileMetasForRepo(repoPrefix string) ([]FileMetaRow, error)
+}
+
+// FileMetaPathReader is the indexed read side for a bounded set of files.
+// Watchers use it to confirm an ambiguous equal-mtime event against the
+// persisted content receipt without scanning every file in the repository.
+type FileMetaPathReader interface {
+	FileMetasByPaths(repoPrefix string, filePaths []string) (map[string]FileMetaRow, error)
 }
 
 // RefFact is one durable resolved-reference fact: a reference edge from
@@ -1308,6 +1576,18 @@ type RefFact struct {
 type RefFactsWriter interface {
 	BulkSetRefFacts(repoPrefix string, facts []RefFact) error
 	DeleteRefFactsByFiles(repoPrefix string, files []string) error
+}
+
+// RefFactsRebuilder is the SQLite-first persistence path for the resolved-
+// reference sidecar. It derives facts inside the backend from the flat node
+// and edge columns, replacing the selected scope atomically without shipping
+// the graph corpus through Go. A nil repoPrefixes slice means every repository;
+// a non-nil empty slice is a no-op. ReplaceRefFactsForFiles always treats an
+// empty file slice as a no-op and scopes deletion by the exact repo prefix, so
+// a removed file cannot retain stale facts or erase a same-named file elsewhere.
+type RefFactsRebuilder interface {
+	RebuildRefFactsForRepos(repoPrefixes []string) error
+	ReplaceRefFactsForFiles(repoPrefix string, files []string) error
 }
 
 // RefFactsReader is the read side of RefFactsWriter: the persisted facts for a
@@ -1834,6 +2114,28 @@ type CrossRepoCandidateRow struct {
 // it.
 type CrossRepoCandidates interface {
 	CrossRepoCandidates(baseKinds []EdgeKind) []CrossRepoCandidateRow
+}
+
+// ScopedCrossRepoCandidates is the incremental counterpart to
+// CrossRepoCandidates. Implementations must apply the scope inside the
+// backend query: callers use it specifically to avoid re-reading every
+// cross-repository relationship after one repository or file changes.
+// Repository scope is incident (either endpoint belongs to one of the
+// prefixes), which preserves inbound relationships when a target repository
+// is newly indexed. File scope is likewise incident and also includes the
+// edge's source location.
+type ScopedCrossRepoCandidates interface {
+	CrossRepoCandidatesForRepos(baseKinds []EdgeKind, repoPrefixes []string) []CrossRepoCandidateRow
+	CrossRepoCandidatesForFiles(baseKinds []EdgeKind, filePaths []string) []CrossRepoCandidateRow
+}
+
+// CrossRepoFlagMarker persists the CrossRepo flag on existing base edges in
+// one or more set-oriented backend statements. DetectCrossRepoEdges mutates
+// the returned Edge pointers for the in-memory backend; disk backends return
+// projected values and implement this capability so the promoted column stays
+// durable without rewriting unrelated edge metadata.
+type CrossRepoFlagMarker interface {
+	MarkEdgesCrossRepo(edges []*Edge) (changed int)
 }
 
 // Direction selects which way a BFSCapable.BFS walk follows edges.

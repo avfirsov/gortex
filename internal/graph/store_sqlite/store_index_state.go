@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -15,7 +16,7 @@ func (s *Store) SetRepoIndexState(st graph.RepoIndexState) error {
 	if st.Dirty {
 		dirty = 1
 	}
-	_, err := s.db.Exec(`
+	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT OR REPLACE INTO repo_index_state
   (repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

@@ -242,6 +242,191 @@ func TestBulkLoadGatedToPopulatedStore(t *testing.T) {
 	}
 }
 
+func TestCoordinatedBulkLoadDefersNestedRepoFlushes(t *testing.T) {
+	s, _ := openTempStore(t)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage on empty store")
+	}
+	if !s.coordinatedBulkLoad || s.bulkConn == nil {
+		t.Fatal("coordinated bulk state not retained")
+	}
+
+	assertIndexesDropped := func(stage string) {
+		t.Helper()
+		present := indexNames(t, &connQuerier{ctx: context.Background(), c: s.bulkConn})
+		for _, idx := range bulkDroppableIndexes {
+			if present[idx.name] {
+				t.Fatalf("index %s rebuilt during %s", idx.name, stage)
+			}
+		}
+	}
+	assertIndexesDropped("outer begin")
+
+	// Mirror two concurrent-repository shadow drains. Their ordinary bulk
+	// boundaries must not close the outer window after repository one.
+	s.BeginBulkLoad()
+	s.AddBatch([]*graph.Node{{
+		ID: "repo-a/a.go::A", Kind: graph.KindFunction, Name: "A",
+		FilePath: "repo-a/a.go", RepoPrefix: "repo-a", Language: "go",
+	}}, nil)
+	if err := s.FlushBulk(); err != nil {
+		t.Fatalf("nested repo-a FlushBulk: %v", err)
+	}
+	assertIndexesDropped("repo-a flush")
+
+	s.BeginBulkLoad()
+	s.AddBatch([]*graph.Node{{
+		ID: "repo-b/b.go::B", Kind: graph.KindFunction, Name: "B",
+		FilePath: "repo-b/b.go", RepoPrefix: "repo-b", Language: "go",
+	}}, nil)
+	if err := s.FlushBulk(); err != nil {
+		t.Fatalf("nested repo-b FlushBulk: %v", err)
+	}
+	assertIndexesDropped("repo-b flush")
+
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+	if s.coordinatedBulkLoad || s.bulkConn != nil {
+		t.Fatal("coordinated bulk state not released")
+	}
+	rebuilt := indexNames(t, s.db)
+	for _, idx := range bulkDroppableIndexes {
+		if !rebuilt[idx.name] {
+			t.Fatalf("index %s not rebuilt at outer finalize", idx.name)
+		}
+	}
+	if got := s.NodeCount(); got != 2 {
+		t.Fatalf("node count = %d, want 2", got)
+	}
+	integrityOK(t, s.db)
+	if s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path engaged on populated warm store")
+	}
+}
+
+func TestCoordinatedBulkLoadRoutesSingleRowSidecarsOnPinnedConnection(t *testing.T) {
+	s, _ := openTempStore(t)
+	s.db.SetMaxOpenConns(1)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		if err := s.SetRepoIndexState(graph.RepoIndexState{RepoPrefix: "repo", IndexedSHA: "sha"}); err != nil {
+			done <- err
+			return
+		}
+		if err := s.SetFileMtime("repo", "a.go", 1); err != nil {
+			done <- err
+			return
+		}
+		if err := s.SetEnrichmentState(graph.EnrichmentState{RepoPrefix: "repo", Provider: "test"}); err != nil {
+			done <- err
+			return
+		}
+		done <- s.UpsertEmbedding("repo/a.go::A", []float32{1})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sidecar write: %v", err)
+		}
+	case <-time.After(time.Second):
+		// Let a legacy pool-routed writer drain so test cleanup cannot hang.
+		s.db.SetMaxOpenConns(2)
+		<-done
+		t.Fatal("single-row sidecar writer waited for a second pooled connection")
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+}
+
+func TestCloseFinalizesActiveCoordinatedBulkLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "close-active-bulk.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	s.AddBatch([]*graph.Node{{
+		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A",
+		FilePath: "repo/a.go", RepoPrefix: "repo", Language: "go",
+	}}, nil)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close with active coordinated load: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.NodeCount(); got != 1 {
+		t.Fatalf("node count after close/reopen = %d, want 1", got)
+	}
+	for _, idx := range bulkDroppableIndexes {
+		if !indexNames(t, reopened.db)[idx.name] {
+			t.Fatalf("index %s not rebuilt by Close", idx.name)
+		}
+	}
+	integrityOK(t, reopened.db)
+}
+
+func TestCoordinatedBulkLoadDefersFTSOptimizeUntilOuterEnd(t *testing.T) {
+	s, _ := openTempStore(t)
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	if err := s.BulkUpsertSymbolFTS("repo", []graph.SymbolFTSItem{{NodeID: "repo/a.go::Alpha", Tokens: "alpha symbol"}}); err != nil {
+		t.Fatalf("BulkUpsertSymbolFTS: %v", err)
+	}
+	if err := s.BuildSymbolIndex(); err != nil {
+		t.Fatalf("BuildSymbolIndex: %v", err)
+	}
+	if err := s.AppendContent("repo", []graph.ContentFTSItem{{
+		NodeID: "repo/docs.md::section", FilePath: "repo/docs.md", Body: "cold content marker",
+	}}); err != nil {
+		t.Fatalf("AppendContent: %v", err)
+	}
+	if err := s.BuildContentIndex(); err != nil {
+		t.Fatalf("BuildContentIndex: %v", err)
+	}
+	if !s.deferredFTSOptimize {
+		t.Fatal("per-repository symbol FTS optimize was not deferred")
+	}
+	if !s.deferredContentFTS {
+		t.Fatal("per-repository content FTS optimize was not deferred")
+	}
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+	if s.deferredFTSOptimize {
+		t.Fatal("deferred symbol FTS optimize was not consumed")
+	}
+	if s.deferredContentFTS {
+		t.Fatal("deferred content FTS optimize was not consumed")
+	}
+	hits, err := s.SearchSymbols("alpha", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbols: %v", err)
+	}
+	if len(hits) != 1 || hits[0].NodeID != "repo/a.go::Alpha" {
+		t.Fatalf("unexpected FTS hits after outer finalize: %#v", hits)
+	}
+	contentHits, err := s.SearchContent("marker", "repo", 10)
+	if err != nil {
+		t.Fatalf("SearchContent: %v", err)
+	}
+	if len(contentHits) != 1 || contentHits[0].NodeID != "repo/docs.md::section" {
+		t.Fatalf("unexpected content FTS hits after outer finalize: %#v", contentHits)
+	}
+}
+
 // TestBulkLoadInMemoryIsNoOp confirms in-memory stores never engage the fast
 // path (no WAL / on-disk B-tree to optimise).
 func TestBulkLoadInMemoryIsNoOp(t *testing.T) {

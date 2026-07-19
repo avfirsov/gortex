@@ -33,7 +33,7 @@ func (s *Store) BulkSetChurn(repoPrefix string, rows []graph.ChurnEnrichment) er
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func (s *Store) DeleteChurn(nodeIDs []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

@@ -231,16 +231,20 @@ func (r *Resolver) reconcileTerminalStamps() (stamped, unstamped int) {
 }
 
 // reconcileTerminalStampsExcluding applies the normal full-pass terminal
-// classification except for deferred LSP edges the pass budget did not let us
-// query. Those skips carry no terminality evidence and must remain retryable.
-func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPEdgeKey]struct{}) (stamped, unstamped int) {
+// classification except for deferred LSP edges the pass budget (or the
+// expensive-path cutoff) did not let us query. Those skips carry no
+// terminality evidence and must remain retryable. Exclusions are keyed by
+// the spool work key — {from, kind, file, line, target}, deliberately
+// To-less — so a record whose edge was heuristically bound and then
+// guard-reverted still matches its live, again-unresolved edge here.
+func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPWorkKey]struct{}) (stamped, unstamped int) {
 	var stillPending []*graph.Edge
 	var changed []*graph.Edge
 	for e := range r.graph.EdgesWithUnresolvedTarget() {
 		if e == nil {
 			continue
 		}
-		if _, skip := excluded[deferredLSPKey(e)]; skip {
+		if _, skip := excluded[deferredLSPWorkKeyForEdge(e)]; skip {
 			// A pass-budget skip is not evidence that the edge is terminal.
 			// Clear an older stamp so a later scoped pass may retry LSP.
 			if edgeTerminalFlag(e) {

@@ -83,6 +83,7 @@ func TestAddASTEdge_InferredYieldsToLSPEdge(t *testing.T) {
 		Meta:       map[string]any{"semantic_source": "lsp-gopls"},
 	}
 	g.AddEdge(strong)
+	a.loadAdjacency([]string{caller.ID})
 
 	got := a.addASTEdge(caller.ID, target.ID, graph.EdgeCalls, "p/a.go", 10, strategyInferred, inferredConfidence)
 
@@ -106,6 +107,7 @@ func TestAddASTEdge_InferredYieldsToLSPEdge(t *testing.T) {
 // yields rather than downgrading it.
 func TestAddASTEdge_InferredYieldsToDirectASTEdge(t *testing.T) {
 	a, g, caller, target := newGradedApplier(t)
+	a.loadAdjacency([]string{caller.ID})
 
 	direct := a.addASTEdge(caller.ID, target.ID, graph.EdgeCalls, "p/a.go", 10, strategyDirect, astConfidence)
 	if direct.Confidence != astConfidence {

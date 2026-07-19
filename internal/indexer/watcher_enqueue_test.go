@@ -79,3 +79,24 @@ func TestWatcherEnqueueFileMutationCancelledAdmissionLeavesNoWork(t *testing.T) 
 	require.Zero(t, pending)
 	require.Zero(t, generation)
 }
+
+func TestWatcherEnqueueFileMutationUnchangedCompletesWithoutPublishing(t *testing.T) {
+	dir, _, watcher := inertTestWatcher(t, "main.go", "package main\n\nfunc value() int { return 0 }\n")
+	path := filepath.Join(dir, "main.go")
+
+	ticket, err := watcher.EnqueueFileMutation(context.Background(), path)
+	require.NoError(t, err)
+	require.NotNil(t, ticket)
+
+	select {
+	case result := <-ticket.Done:
+		require.NoError(t, result.Err)
+		require.True(t, result.Reindexed)
+		require.Equal(t, ticket.Generation, result.RequestedGeneration)
+		require.Equal(t, ticket.Generation, result.AppliedGeneration)
+	case <-time.After(2 * time.Second):
+		t.Fatal("unchanged mutation ticket did not complete")
+	}
+	require.Empty(t, watcher.History())
+	requireNoWatcherEvent(t, watcher)
+}

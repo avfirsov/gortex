@@ -52,8 +52,13 @@ func seedRepoRows(t *testing.T, db *sql.DB, prefix string) {
 	exec(`INSERT INTO release_enrichment (node_id, repo_prefix, added_in) VALUES (?, ?, 'v1')`, nodeID, prefix)
 	exec(`INSERT INTO blame_enrichment (node_id, repo_prefix, email) VALUES (?, ?, 'a@b')`, nodeID, prefix)
 	exec(`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) VALUES (?, ?, 'x')`, nodeID, prefix)
-	exec(`INSERT INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES (?, ?, 1)`, nodeID, prefix)
+	var symbolRowid int64
+	require.NoError(t, db.QueryRow(`SELECT rowid FROM symbol_fts WHERE node_id = ?`, nodeID).Scan(&symbolRowid))
+	exec(`INSERT INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES (?, ?, ?)`, nodeID, prefix, symbolRowid)
 	exec(`INSERT INTO content_fts (node_id, repo_prefix, file_path, ordinal, body) VALUES (?, ?, 'a.go', 0, 'body')`, nodeID, prefix)
+	var contentRowid int64
+	require.NoError(t, db.QueryRow(`SELECT rowid FROM content_fts WHERE node_id = ?`, nodeID).Scan(&contentRowid))
+	exec(`INSERT INTO content_fts_rowid (fts_rowid, repo_prefix, file_path) VALUES (?, ?, 'a.go')`, contentRowid, prefix)
 }
 
 // countByPrefix reports how many rows a repo_prefix-keyed table holds for
@@ -80,16 +85,16 @@ var prefixKeyedTables = []string{
 	"file_mtimes", "repo_index_state", "enrichment_state", "clone_shingles",
 	"constant_values", "files", "ref_facts", "churn_enrichment",
 	"coverage_enrichment", "release_enrichment", "blame_enrichment",
-	"symbol_fts", "symbol_fts_rowid", "content_fts",
+	"symbol_fts", "symbol_fts_rowid", "content_fts", "content_fts_rowid",
 }
 
 func TestPurgeRepo_ClearsEveryTable_LeavesOthersAndGlobals(t *testing.T) {
 	s := openPurgeStore(t)
 	// Two real repos plus a shared '' global-external node the purge must
 	// never touch.
-	seedRepoRows(t, s.db, "repoA")
-	seedRepoRows(t, s.db, "repoB")
-	_, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path, repo_prefix) VALUES ('external_call::dep:shared', 'external', 'shared', '', '')`)
+	seedRepoRows(t, s.writerDB, "repoA")
+	seedRepoRows(t, s.writerDB, "repoB")
+	_, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path, repo_prefix) VALUES ('external_call::dep:shared', 'external', 'shared', '', '')`)
 	require.NoError(t, err)
 
 	require.NoError(t, s.PurgeRepo("repoA"))
@@ -117,7 +122,7 @@ func TestPurgeRepo_ClearsEveryTable_LeavesOthersAndGlobals(t *testing.T) {
 
 func TestPurgeRepo_RefusesEmptyPrefix(t *testing.T) {
 	s := openPurgeStore(t)
-	seedRepoRows(t, s.db, "")
+	seedRepoRows(t, s.writerDB, "")
 	require.Error(t, s.PurgeRepo(""), "PurgeRepo must refuse the empty prefix (global externals / solo data)")
 	// The '' rows are still there.
 	assert.Equal(t, 1, countByPrefix(t, s.db, "file_mtimes", ""), "'' file_mtimes untouched by refused purge")
@@ -128,13 +133,13 @@ func TestOrphanRepoPrefixes_SidecarOnlyResidue(t *testing.T) {
 	// gone: a repo whose NODES were evicted but whose sidecars linger — the
 	// exact leaked-untrack shape (residue in file_mtimes + repo_index_state,
 	// no nodes). live: a fully-present tracked repo.
-	_, err := s.db.Exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('gone', 'x.go', 1)`)
+	_, err := s.writerDB.Exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('gone', 'x.go', 1)`)
 	require.NoError(t, err)
-	_, err = s.db.Exec(`INSERT INTO repo_index_state (repo_prefix) VALUES ('gone')`)
+	_, err = s.writerDB.Exec(`INSERT INTO repo_index_state (repo_prefix) VALUES ('gone')`)
 	require.NoError(t, err)
-	seedRepoRows(t, s.db, "live")
+	seedRepoRows(t, s.writerDB, "live")
 	// A '' row must never be reported as an orphan.
-	_, err = s.db.Exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('', 'g.go', 1)`)
+	_, err = s.writerDB.Exec(`INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('', 'g.go', 1)`)
 	require.NoError(t, err)
 
 	orphans := s.OrphanRepoPrefixes([]string{"live"})
@@ -147,7 +152,7 @@ func TestOrphanRepoPrefixes_SidecarOnlyResidue(t *testing.T) {
 
 func TestRekeyRepoPrefix_MovesProvenanceDropsNodeIDKeyed(t *testing.T) {
 	s := openPurgeStore(t)
-	seedRepoRows(t, s.db, "") // solo repo: everything under ''
+	seedRepoRows(t, s.writerDB, "") // solo repo: everything under ''
 
 	require.NoError(t, s.RekeyRepoPrefix("", "drools"))
 
@@ -164,7 +169,7 @@ func TestRekeyRepoPrefix_MovesProvenanceDropsNodeIDKeyed(t *testing.T) {
 	dropTables := []string{
 		"clone_shingles", "constant_values", "ref_facts", "churn_enrichment",
 		"coverage_enrichment", "release_enrichment", "blame_enrichment",
-		"symbol_fts", "symbol_fts_rowid", "content_fts",
+		"symbol_fts", "symbol_fts_rowid", "content_fts", "content_fts_rowid",
 	}
 	for _, tbl := range dropTables {
 		assert.Equal(t, 0, countByPrefix(t, s.db, tbl, ""), "%s '' rows dropped", tbl)

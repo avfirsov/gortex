@@ -51,6 +51,22 @@ type externalsAttribution struct {
 	// form, which graph.IsStdlibStub / friends still recognise.
 	repoPrefix string
 
+	// edgeCandidates is replaced for each loaded package by EnrichRepo. The
+	// SQLite backend fills it with predicate-shaped queries, so stub claiming
+	// never issues GetOutEdges once per go/types use or retains a repository's
+	// full adjacency in memory.
+	edgeCandidates *graph.EdgeCandidateSet
+	// knownNodeIDs is populated once, in one batched store lookup, before
+	// processing Uses. It replaces the former GetNode call per unique external
+	// symbol/module and is updated as this pass creates nodes.
+	knownNodeIDs map[string]struct{}
+	// Pending mutations are drained once per loaded package. Keeping these
+	// bounded avoids one SQLite transaction per external symbol, module link,
+	// or stub rebind while preserving the exact edge payloads.
+	pendingNodes     []*graph.Node
+	pendingEdges     []*graph.Edge
+	pendingReindexes []graph.EdgeReindex
+
 	nodesAdded     int
 	edgesAdded     int
 	edgesUpgraded  int
@@ -62,9 +78,13 @@ type externalsAttribution struct {
 // newExternalsAttribution prepares externalsAttribution from the loaded
 // roots. Walking pkg.Imports collects every dep — stdlib and module-cache
 // alike — so resolveSymbol can find the owning *packages.Package for an
-// arbitrary types.Object.
-func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider string) *externalsAttribution {
-	pkgByPath := make(map[string]*packages.Package)
+// arbitrary types.Object. depIndex (may be nil) seeds the map with the
+// metadata-only closure (loadDepModuleIndex): under the export-data load the
+// roots' Imports maps hold ID-only stubs with an empty PkgPath, so the walk
+// alone would leave every dependency unclassifiable. Roots overlay the index
+// entries — they carry the fuller (typed) package for their own path.
+func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider, repoPrefix string, depIndex map[string]*packages.Package) *externalsAttribution {
+	pkgByPath := make(map[string]*packages.Package, len(depIndex))
 	var visit func(p *packages.Package)
 	visit = func(p *packages.Package) {
 		if p == nil || p.PkgPath == "" {
@@ -81,38 +101,63 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider 
 	for _, r := range roots {
 		visit(r)
 	}
+	// Walked packages win (roots carry types; a NeedDeps closure carries the
+	// full dep set); the metadata index only fills paths the walk never saw.
+	for path, pkg := range depIndex {
+		if _, seen := pkgByPath[path]; !seen {
+			pkgByPath[path] = pkg
+		}
+	}
 	return &externalsAttribution{
 		g:            g,
 		pkgByPath:    pkgByPath,
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
 		provider:     provider,
-		repoPrefix:   deriveRepoPrefix(g, roots),
+		repoPrefix:   repoPrefix,
+		knownNodeIDs: make(map[string]struct{}),
 	}
 }
 
-// deriveRepoPrefix peeks at the first source file across the
-// enrichment roots and reads its RepoPrefix from the graph.
-// All files belonging to a single semantic.Provider.Enrich call
-// share one repo, so a single sample suffices. Returns "" when no
-// matching file node is found — stubs then fall back to the
-// legacy un-prefixed form, which graph.IsStdlibStub still accepts.
-func deriveRepoPrefix(g graph.Store, roots []*packages.Package) string {
-	for _, r := range roots {
-		if r == nil {
+// prefetchExistingNodes collects every external symbol/module ID this repo's
+// Uses can touch and tests their existence in one batched store operation.
+// Only IDs stay resident; decoded nodes are discarded immediately.
+func (e *externalsAttribution) prefetchExistingNodes(pkgs []*packages.Package, objToNode map[types.Object]string) {
+	ids := make(map[string]struct{})
+	for _, root := range pkgs {
+		if root == nil || root.TypesInfo == nil {
 			continue
 		}
-		for _, f := range r.GoFiles {
-			if nodes := g.GetFileNodes(f); len(nodes) > 0 {
-				for _, n := range nodes {
-					if n != nil && n.RepoPrefix != "" {
-						return n.RepoPrefix
-					}
-				}
+		for _, obj := range root.TypesInfo.Uses {
+			if obj == nil || obj.Pkg() == nil {
+				continue
 			}
+			if _, internal := objToNode[obj]; internal {
+				continue
+			}
+			pkg := e.pkgByPath[obj.Pkg().Path()]
+			moduleID := externalModuleNodeID(pkg)
+			if moduleID == "" || externalNodeKind(obj) == "" {
+				continue
+			}
+			nodeID := externalNodeID(obj.Pkg().Path(), obj)
+			if nodeID == "" {
+				continue
+			}
+			ids[moduleID] = struct{}{}
+			ids[nodeID] = struct{}{}
 		}
 	}
-	return ""
+	if len(ids) == 0 {
+		return
+	}
+	batch := make([]string, 0, len(ids))
+	for id := range ids {
+		batch = append(batch, id)
+	}
+	for id := range graph.LookupExistingNodeIDs(e.g, batch) {
+		e.knownNodeIDs[id] = struct{}{}
+	}
 }
 
 // resolveSymbol returns the graph node ID for an external go/types object,
@@ -163,15 +208,16 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 		return ""
 	}
 
-	if existing := e.g.GetNode(nodeID); existing == nil {
-		e.g.AddNode(buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
+	if _, exists := e.knownNodeIDs[nodeID]; !exists {
+		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
+		e.knownNodeIDs[nodeID] = struct{}{}
 		e.nodesAdded++
 
 		// Attribute the symbol to its module via EdgeDependsOnModule. The
 		// schema's existing convention is "file/package/import →
 		// KindModule"; an external symbol is morally equivalent — it's
 		// a first-class entity that depends on the module providing it.
-		e.g.AddEdge(&graph.Edge{
+		e.pendingEdges = append(e.pendingEdges, &graph.Edge{
 			From:            nodeID,
 			To:              moduleID,
 			Kind:            graph.EdgeDependsOnModule,
@@ -230,16 +276,21 @@ func (e *externalsAttribution) claimAndUpgradeStub(callerID string, importPath s
 // claimByExactStub handles the canonical resolver-shaped targets. Pulled
 // out so the fuzzy pass can layer on top.
 func (e *externalsAttribution) claimByExactStub(callerID string, importPath string, obj types.Object, newTarget string) *graph.Edge {
+	if e.edgeCandidates == nil {
+		return nil
+	}
 	candidates := stubEdgeTargets(e.repoPrefix, importPath, obj)
+	kind := wantedEdgeKind(obj)
 	for _, target := range candidates {
-		edge := semantic.FindEdgeByTarget(e.g, callerID, target)
+		edge := e.edgeCandidates.EndpointKind(callerID, target, kind)
 		if edge == nil {
 			continue
 		}
 		oldTo := edge.To
 		edge.To = newTarget
-		e.g.ReindexEdge(edge, oldTo)
 		semantic.ConfirmEdge(edge, e.provider)
+		e.pendingReindexes = append(e.pendingReindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+		e.edgeCandidates.Add(edge)
 		e.edgesUpgraded++
 		return edge
 	}
@@ -256,7 +307,7 @@ func (e *externalsAttribution) claimByExactStub(callerID string, importPath stri
 // resolver-confirmed real edge — and only when both line and trailing
 // name match, which together pin the use-site uniquely.
 func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Object, newTarget string, line int) *graph.Edge {
-	if line <= 0 {
+	if line <= 0 || e.edgeCandidates == nil {
 		return nil
 	}
 	name := obj.Name()
@@ -264,7 +315,8 @@ func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Obj
 		return nil
 	}
 	expected := wantedEdgeKind(obj)
-	for _, edge := range e.g.GetOutEdges(callerID) {
+	candidates := e.edgeCandidates.Site(callerID, line, expected)
+	for _, edge := range candidates {
 		if edge.Line != line {
 			continue
 		}
@@ -279,8 +331,9 @@ func (e *externalsAttribution) claimByLineAndName(callerID string, obj types.Obj
 		}
 		oldTo := edge.To
 		edge.To = newTarget
-		e.g.ReindexEdge(edge, oldTo)
 		semantic.ConfirmEdge(edge, e.provider)
+		e.pendingReindexes = append(e.pendingReindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+		e.edgeCandidates.Add(edge)
 		e.edgesUpgraded++
 		return edge
 	}
@@ -358,8 +411,8 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 		// No module info → assume Go stdlib. The stdlib has no go.mod
 		// entry; one shared module node covers every stdlib package.
 		if !e.stdlibCreated {
-			if existing := e.g.GetNode(stdlibModuleID); existing == nil {
-				e.g.AddNode(&graph.Node{
+			if _, exists := e.knownNodeIDs[stdlibModuleID]; !exists {
+				e.pendingNodes = append(e.pendingNodes, &graph.Node{
 					ID:       stdlibModuleID,
 					Kind:     graph.KindModule,
 					Name:     "stdlib",
@@ -373,6 +426,7 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 						"semantic_source": e.provider,
 					},
 				})
+				e.knownNodeIDs[stdlibModuleID] = struct{}{}
 				e.nodesAdded++
 			}
 			e.stdlibCreated = true
@@ -393,7 +447,7 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 		mod = mod.Replace
 	}
 	moduleID := goModuleNodeID(mod.Path, mod.Version)
-	if existing := e.g.GetNode(moduleID); existing == nil {
+	if _, exists := e.knownNodeIDs[moduleID]; !exists {
 		meta := map[string]any{
 			"ecosystem":       "go",
 			"path":            mod.Path,
@@ -406,7 +460,7 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 			meta["replace"] = mod.Path + "@" + mod.Version
 			meta["replaced_path"] = pkg.Module.Path
 		}
-		e.g.AddNode(&graph.Node{
+		e.pendingNodes = append(e.pendingNodes, &graph.Node{
 			ID:       moduleID,
 			Kind:     graph.KindModule,
 			Name:     shortModulePath(mod.Path),
@@ -414,10 +468,41 @@ func (e *externalsAttribution) ensureModuleNode(pkg *packages.Package) string {
 			Language: "go",
 			Meta:     meta,
 		})
+		e.knownNodeIDs[moduleID] = struct{}{}
 		e.nodesAdded++
 	}
 	e.moduleByPath[importPath] = moduleID
 	return moduleID
+}
+
+func externalModuleNodeID(pkg *packages.Package) string {
+	if pkg == nil {
+		return ""
+	}
+	if pkg.Module == nil {
+		return stdlibModuleID
+	}
+	if pkg.Module.Main {
+		return ""
+	}
+	mod := pkg.Module
+	if mod.Replace != nil {
+		mod = mod.Replace
+	}
+	return goModuleNodeID(mod.Path, mod.Version)
+}
+
+func (e *externalsAttribution) drainPendingAdds() (nodes []*graph.Node, edges []*graph.Edge) {
+	nodes, edges = e.pendingNodes, e.pendingEdges
+	e.pendingNodes = nil
+	e.pendingEdges = nil
+	return nodes, edges
+}
+
+func (e *externalsAttribution) drainPendingReindexes() []graph.EdgeReindex {
+	reindexes := e.pendingReindexes
+	e.pendingReindexes = nil
+	return reindexes
 }
 
 // stubEdgeTargets enumerates every stub-string the resolver might have

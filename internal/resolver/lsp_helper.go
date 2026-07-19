@@ -7,9 +7,13 @@ import (
 )
 
 const (
-	// LSPResolvePassBudgetEnv overrides the total wall-clock budget for the
-	// deferred resolve-time LSP batch in ResolveAll. A zero/off/none value
-	// preserves the pre-budget unlimited behaviour.
+	// LSPResolvePassBudgetEnv overrides the helper-attempt budget for the
+	// deferred resolve-time LSP batch in ResolveAll. It bounds when new
+	// language-server calls may start — NOT the phase's wall clock: per-page
+	// spool/hydration/liveness overhead is bounded separately by the
+	// resolver's expensive-path cutoff (derived from this budget), after
+	// which remaining pages take a record-only drain. A zero/off/none value
+	// preserves the pre-budget unlimited behaviour and disables the cutoff.
 	LSPResolvePassBudgetEnv = "GORTEX_LSP_RESOLVE_PASS_BUDGET"
 
 	defaultLSPResolvePassBudget = 15 * time.Second

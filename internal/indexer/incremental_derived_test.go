@@ -44,14 +44,14 @@ func TestContractSetsEqualIncludesAccuracyBearingLocations(t *testing.T) {
 	}
 }
 
-func TestContractSourceNeedsFullRefreshOnlyForCrossFileConstructs(t *testing.T) {
+func TestContractSourceDependencyClassification(t *testing.T) {
 	if contractSourceNeedsFullRefresh("repo/a.go", "go", []byte("func f() {}")) {
-		t.Fatal("ordinary Go source requested a full contract pass")
+		t.Fatal("ordinary Go source requested a contract dependency frontier")
 	}
 	if !contractSourceNeedsFullRefresh("repo/router.py", "python", []byte("app.include_router(users)")) {
-		t.Fatal("cross-file router mount did not request conservative fallback")
+		t.Fatal("cross-file router mount did not request its contract dependency frontier")
 	}
-	if !contractRefreshAlwaysFull("repo/go.mod") {
-		t.Fatal("go.mod must keep dependency-contract fallback")
+	if contractSourceNeedsFullRefresh("repo/go.mod", "gomod", []byte("module example.com/repo")) {
+		t.Fatal("go.mod must stay on its exact dependency-contract file refresh")
 	}
 }

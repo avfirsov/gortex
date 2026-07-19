@@ -26,7 +26,7 @@ func (s *Store) BulkSetCoverage(repoPrefix string, rows []graph.CoverageEnrichme
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func (s *Store) DeleteCoverage(nodeIDs []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

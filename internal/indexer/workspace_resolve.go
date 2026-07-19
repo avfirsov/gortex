@@ -2,9 +2,13 @@ package indexer
 
 import (
 	"path/filepath"
+	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/resolver"
 )
@@ -206,23 +210,17 @@ func (mi *MultiIndexer) BackfillWorkspaceSlugs() (nodesStamped, contractsStamped
 		}
 	}
 
-	for _, n := range mi.graph.AllNodes() {
-		s, ok := bySlug[n.RepoPrefix]
-		if !ok {
-			continue
-		}
-		stamped := false
-		if n.WorkspaceID == "" && s.ws != "" {
-			n.WorkspaceID = s.ws
-			stamped = true
-		}
-		if n.ProjectID == "" && s.proj != "" {
-			n.ProjectID = s.proj
-			stamped = true
-		}
-		if stamped {
-			nodesStamped++
-		}
+	slugRows := make([]graph.WorkspaceSlug, 0, len(bySlug))
+	for prefix, s := range bySlug {
+		slugRows = append(slugRows, graph.WorkspaceSlug{
+			RepoPrefix: prefix,
+			Workspace:  s.ws,
+			Project:    s.proj,
+		})
+	}
+	sort.Slice(slugRows, func(i, j int) bool { return slugRows[i].RepoPrefix < slugRows[j].RepoPrefix })
+	if backfiller, ok := mi.graph.(graph.WorkspaceSlugBackfiller); ok {
+		nodesStamped = backfiller.BackfillWorkspaceSlugs(slugRows)
 	}
 
 	// Per-repo contract registries: rehydrated from snapshot they
@@ -298,7 +296,7 @@ func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 	}
 	cr := resolver.NewCrossRepo(mi.graph)
 	cr.SetLogger(mi.logger)
-	cr.SetCrossWorkspaceDepLookup(mi.crossWorkspaceLookup())
+	cr.SetCrossWorkspaceDepLookup(mi.crossWorkspacePassLookup())
 	cr.SetNpmAliasResolver(mi.npmAliasResolver())
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
@@ -320,55 +318,127 @@ func (mi *MultiIndexer) runCrossRepoResolve(reconcileContracts bool) {
 // `workspace`. Two repos can both declare workspace = "tuck" with
 // overlapping but possibly extended dep lists; the union forms the
 // effective rule set for source workspace "tuck".
-func (mi *MultiIndexer) crossWorkspaceLookup() resolver.CrossWorkspaceDepLookup {
+type crossWorkspaceRuleSnapshot struct {
+	revision         uint64
+	repoCount        int
+	rulesByWorkspace map[string][]resolver.CrossWorkspaceDepRule
+}
+
+func (mi *MultiIndexer) buildCrossWorkspaceRuleSnapshot() *crossWorkspaceRuleSnapshot {
+	if mi == nil || mi.configMgr == nil {
+		return &crossWorkspaceRuleSnapshot{rulesByWorkspace: make(map[string][]resolver.CrossWorkspaceDepRule)}
+	}
+
+	for {
+		revision := mi.configMgr.Revision()
+		rulesByWorkspace, repoCount := mi.collectCrossWorkspaceRules()
+		if revision == mi.configMgr.Revision() {
+			return &crossWorkspaceRuleSnapshot{
+				revision:         revision,
+				repoCount:        repoCount,
+				rulesByWorkspace: rulesByWorkspace,
+			}
+		}
+	}
+}
+
+func (mi *MultiIndexer) crossWorkspaceRepoCount() int {
+	if mi == nil {
+		return 0
+	}
+	mi.mu.RLock()
+	count := len(mi.repos)
+	mi.mu.RUnlock()
+	return count
+}
+
+func (mi *MultiIndexer) collectCrossWorkspaceRules() (map[string][]resolver.CrossWorkspaceDepRule, int) {
+	rulesByWorkspace := make(map[string][]resolver.CrossWorkspaceDepRule)
+	mi.mu.RLock()
+	repoPrefixes := make([]string, 0, len(mi.repos))
+	for prefix := range mi.repos {
+		repoPrefixes = append(repoPrefixes, prefix)
+	}
+	repoCount := len(mi.repos)
+	mi.mu.RUnlock()
+	sort.Strings(repoPrefixes)
+	// Per-repo crossWorkspaceLookup needs the same precedence as the
+	// stamp path: a global-config Workspace override changes which
+	// source-workspace bucket receives the repo's dependency rules.
+	entryByPrefix := make(map[string]config.RepoEntry)
+	if global := mi.configMgr.Global(); global != nil {
+		for _, e := range global.Repos {
+			p := config.ResolvePrefix(e)
+			if p == "" || p == "." {
+				continue
+			}
+			entryByPrefix[p] = e
+		}
+	}
+	for _, prefix := range repoPrefixes {
+		cfg := mi.configMgr.GetRepoConfig(prefix)
+		if cfg == nil {
+			continue
+		}
+		var entryPtr *config.RepoEntry
+		if e, ok := entryByPrefix[prefix]; ok {
+			entryCopy := e
+			entryPtr = &entryCopy
+		}
+		repoWS := resolveWorkspaceID(entryPtr, cfg, prefix)
+		for _, dep := range cfg.CrossWorkspaceDeps {
+			if dep.Workspace == "" {
+				continue
+			}
+			rulesByWorkspace[repoWS] = append(rulesByWorkspace[repoWS], resolver.CrossWorkspaceDepRule{
+				Workspace: dep.Workspace,
+				Modules:   append([]string(nil), dep.Modules...),
+			})
+		}
+	}
+	return rulesByWorkspace, repoCount
+}
+
+// crossWorkspacePassLookup freezes one immutable config snapshot for an
+// individual cross-repository pass, so a concurrent reload cannot change
+// eligibility rules halfway through that pass.
+func (mi *MultiIndexer) crossWorkspacePassLookup() resolver.CrossWorkspaceDepLookup {
+	snapshot := mi.buildCrossWorkspaceRuleSnapshot()
 	return func(sourceWS string) []resolver.CrossWorkspaceDepRule {
-		if mi == nil || mi.configMgr == nil {
-			return nil
+		return snapshot.rulesByWorkspace[sourceWS]
+	}
+}
+
+// crossWorkspaceLookup is the long-lived watcher lookup. It keeps its hot path
+// allocation-free while rebuilding the immutable snapshot once per config
+// revision so ConfigManager.Reload remains visible without watcher restart.
+func (mi *MultiIndexer) crossWorkspaceLookup() resolver.CrossWorkspaceDepLookup {
+	if mi == nil || mi.configMgr == nil {
+		return func(string) []resolver.CrossWorkspaceDepRule { return nil }
+	}
+
+	var current atomic.Pointer[crossWorkspaceRuleSnapshot]
+	var refreshMu sync.Mutex
+	current.Store(mi.buildCrossWorkspaceRuleSnapshot())
+
+	return func(sourceWS string) []resolver.CrossWorkspaceDepRule {
+		snapshot := current.Load()
+		configRevision := mi.configMgr.Revision()
+		repoCount := mi.crossWorkspaceRepoCount()
+		if snapshot.revision != configRevision || snapshot.repoCount != repoCount {
+			refreshMu.Lock()
+			snapshot = current.Load()
+			configRevision = mi.configMgr.Revision()
+			repoCount = mi.crossWorkspaceRepoCount()
+			if snapshot.revision != configRevision || snapshot.repoCount != repoCount {
+				snapshot = mi.buildCrossWorkspaceRuleSnapshot()
+				current.Store(snapshot)
+			}
+			refreshMu.Unlock()
 		}
-		var rules []resolver.CrossWorkspaceDepRule
-		mi.mu.RLock()
-		repoPrefixes := make([]string, 0, len(mi.repos))
-		for prefix := range mi.repos {
-			repoPrefixes = append(repoPrefixes, prefix)
-		}
-		mi.mu.RUnlock()
-		// Per-repo crossWorkspaceLookup needs the same precedence as the
-		// stamp path: a global-config Workspace override changes which
-		// repos count as belonging to `sourceWS`.
-		entryByPrefix := make(map[string]config.RepoEntry)
-		if mi.configMgr.Global() != nil {
-			for _, e := range mi.configMgr.Global().Repos {
-				p := config.ResolvePrefix(e)
-				if p == "" || p == "." {
-					continue
-				}
-				entryByPrefix[p] = e
-			}
-		}
-		for _, prefix := range repoPrefixes {
-			cfg := mi.configMgr.GetRepoConfig(prefix)
-			if cfg == nil {
-				continue
-			}
-			var entryPtr *config.RepoEntry
-			if e, ok := entryByPrefix[prefix]; ok {
-				entryCopy := e
-				entryPtr = &entryCopy
-			}
-			repoWS := resolveWorkspaceID(entryPtr, cfg, prefix)
-			if repoWS != sourceWS {
-				continue
-			}
-			for _, dep := range cfg.CrossWorkspaceDeps {
-				if dep.Workspace == "" {
-					continue
-				}
-				rules = append(rules, resolver.CrossWorkspaceDepRule{
-					Workspace: dep.Workspace,
-					Modules:   append([]string(nil), dep.Modules...),
-				})
-			}
-		}
-		return rules
+		// The snapshot is immutable after construction. Resolver consumers
+		// must treat the returned rules and their Modules slices as read-only;
+		// returning them directly keeps this hot lookup allocation-free.
+		return snapshot.rulesByWorkspace[sourceWS]
 	}
 }

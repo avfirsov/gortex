@@ -782,6 +782,14 @@ var promotedMetaColumns = []struct {
 	{"data_class", "data_class TEXT"},
 	{"semantic_type", "semantic_type TEXT"},
 	{"semantic_source", "semantic_source TEXT"},
+	{"clone_sig", "clone_sig TEXT"},
+	{"entry_point", "entry_point INTEGER"},
+	{"entry_point_kind", "entry_point_kind TEXT"},
+	{"search_signature", "search_signature TEXT"},
+	{"search_qual_name", "search_qual_name TEXT"},
+	{"search_doc", "search_doc TEXT"},
+	{"search_metadata_suppressed", "search_metadata_suppressed INTEGER"},
+	{"section_text", "section_text TEXT"},
 }
 
 // structNodeColumns are typed nodes columns read and written directly from
@@ -801,8 +809,11 @@ var structNodeColumns = []struct {
 // type and stayed in the blob).
 type promotedNodeMeta struct {
 	sig, vis, doc, returnType, dataClass                sql.NullString
-	semanticType, semanticSource                        sql.NullString
+	semanticType, semanticSource, cloneSig              sql.NullString
+	entryPointKind                                      sql.NullString
+	searchSig, searchQualName, searchDoc, sectionText   sql.NullString
 	external, isAsync, isStatic, isAbstract, isExported sql.NullBool
+	entryPoint, searchSuppressed                        sql.NullBool
 	updatedAt                                           sql.NullInt64
 }
 
@@ -915,6 +926,38 @@ func extractPromotedMeta(m map[string]any) (p promotedNodeMeta, rest map[string]
 			if nv, ok := str(v); ok {
 				p.semanticSource, promoted = nv, true
 			}
+		case "clone_sig":
+			if nv, ok := str(v); ok {
+				p.cloneSig, promoted = nv, true
+			}
+		case "entry_point":
+			if nv, ok := boolean(v); ok {
+				p.entryPoint, promoted = nv, true
+			}
+		case "entry_point_kind":
+			if nv, ok := str(v); ok {
+				p.entryPointKind, promoted = nv, true
+			}
+		case "search_signature":
+			if nv, ok := str(v); ok {
+				p.searchSig, promoted = nv, true
+			}
+		case "search_qual_name":
+			if nv, ok := str(v); ok {
+				p.searchQualName, promoted = nv, true
+			}
+		case "search_doc":
+			if nv, ok := str(v); ok {
+				p.searchDoc, promoted = nv, true
+			}
+		case "search_metadata_suppressed":
+			if nv, ok := boolean(v); ok {
+				p.searchSuppressed, promoted = nv, true
+			}
+		case "section_text":
+			if nv, ok := str(v); ok {
+				p.sectionText, promoted = nv, true
+			}
 		case "external":
 			if nv, ok := boolean(v); ok {
 				p.external, promoted = nv, true
@@ -972,9 +1015,11 @@ func metaToInt64(v any) (int64, bool) {
 func restorePromotedMeta(n *graph.Node, p promotedNodeMeta) {
 	if !p.sig.Valid && !p.vis.Valid && !p.doc.Valid && !p.returnType.Valid &&
 		!p.dataClass.Valid && !p.semanticType.Valid && !p.semanticSource.Valid &&
-		!p.external.Valid && !p.isAsync.Valid &&
+		!p.cloneSig.Valid && !p.external.Valid && !p.isAsync.Valid &&
 		!p.isStatic.Valid && !p.isAbstract.Valid && !p.isExported.Valid &&
-		!p.updatedAt.Valid {
+		!p.updatedAt.Valid && !p.entryPoint.Valid && !p.entryPointKind.Valid &&
+		!p.searchSig.Valid && !p.searchQualName.Valid && !p.searchDoc.Valid &&
+		!p.searchSuppressed.Valid && !p.sectionText.Valid {
 		return
 	}
 	if n.Meta == nil {
@@ -1001,6 +1046,30 @@ func restorePromotedMeta(n *graph.Node, p promotedNodeMeta) {
 	if p.semanticSource.Valid {
 		n.Meta["semantic_source"] = p.semanticSource.String
 	}
+	if p.cloneSig.Valid {
+		n.Meta["clone_sig"] = p.cloneSig.String
+	}
+	if p.entryPoint.Valid {
+		n.Meta["entry_point"] = p.entryPoint.Bool
+	}
+	if p.entryPointKind.Valid {
+		n.Meta["entry_point_kind"] = p.entryPointKind.String
+	}
+	if p.searchSig.Valid {
+		n.Meta["search_signature"] = p.searchSig.String
+	}
+	if p.searchQualName.Valid {
+		n.Meta["search_qual_name"] = p.searchQualName.String
+	}
+	if p.searchDoc.Valid {
+		n.Meta["search_doc"] = p.searchDoc.String
+	}
+	if p.searchSuppressed.Valid {
+		n.Meta["search_metadata_suppressed"] = p.searchSuppressed.Bool
+	}
+	if p.sectionText.Valid {
+		n.Meta["section_text"] = p.sectionText.String
+	}
 	if p.external.Valid {
 		n.Meta["external"] = p.external.Bool
 	}
@@ -1023,8 +1092,8 @@ func restorePromotedMeta(n *graph.Node, p promotedNodeMeta) {
 
 // -- promoted edge columns -------------------------------------------------
 //
-// resolve_terminal / resolve_terminal_reason (see resolver/terminal.go) are
-// the edge-side sibling of promotedMetaColumns above. A generated column
+// resolve_terminal / resolve_terminal_reason (see resolver/terminal.go) and
+// semantic_source are the edge-side sibling of promotedMetaColumns above. A generated column
 // deriving them from the meta blob via json_extract was tried first and
 // abandoned: encodeMeta's common case is a custom flat binary codec (see
 // "flat binary meta codec" below in this file), not JSON — JSON is only a
@@ -1044,10 +1113,11 @@ func restorePromotedMeta(n *graph.Node, p promotedNodeMeta) {
 type promotedEdgeMeta struct {
 	resolveTerminal       sql.NullBool
 	resolveTerminalReason sql.NullString
+	semanticSource        sql.NullString
 }
 
-// extractPromotedEdgeMeta splits resolve_terminal / resolve_terminal_reason
-// out of m into typed column values and returns the remaining map destined
+// extractPromotedEdgeMeta splits resolve_terminal / resolve_terminal_reason /
+// semantic_source out of m into typed column values and returns the remaining map destined
 // for the meta blob. m is not mutated; a copy is made only when one of the
 // promoted keys is present with the expected type.
 func extractPromotedEdgeMeta(m map[string]any) (p promotedEdgeMeta, rest map[string]any) {
@@ -1057,7 +1127,8 @@ func extractPromotedEdgeMeta(m map[string]any) (p promotedEdgeMeta, rest map[str
 	}
 	_, hasTerminal := m["resolve_terminal"]
 	_, hasReason := m["resolve_terminal_reason"]
-	if !hasTerminal && !hasReason {
+	_, hasSemanticSource := m["semantic_source"]
+	if !hasTerminal && !hasReason && !hasSemanticSource {
 		return
 	}
 	rest = make(map[string]any, len(m))
@@ -1072,6 +1143,10 @@ func extractPromotedEdgeMeta(m map[string]any) (p promotedEdgeMeta, rest map[str
 			if s, ok := v.(string); ok {
 				p.resolveTerminalReason, promoted = sql.NullString{String: s, Valid: true}, true
 			}
+		case "semantic_source":
+			if s, ok := v.(string); ok {
+				p.semanticSource, promoted = sql.NullString{String: s, Valid: true}, true
+			}
 		}
 		if !promoted {
 			rest[k] = v
@@ -1084,16 +1159,19 @@ func extractPromotedEdgeMeta(m map[string]any) (p promotedEdgeMeta, rest map[str
 // the edge's Meta. A NULL column is left alone so a pre-promotion row's
 // blob-carried value (if any) survives.
 func restorePromotedEdgeMeta(e *graph.Edge, p promotedEdgeMeta) {
-	if !p.resolveTerminal.Valid && !p.resolveTerminalReason.Valid {
+	if !p.resolveTerminal.Valid && !p.resolveTerminalReason.Valid && !p.semanticSource.Valid {
 		return
 	}
 	if e.Meta == nil {
-		e.Meta = make(map[string]any, 2)
+		e.Meta = make(map[string]any, 3)
 	}
 	if p.resolveTerminal.Valid {
 		e.Meta["resolve_terminal"] = p.resolveTerminal.Bool
 	}
 	if p.resolveTerminalReason.Valid {
 		e.Meta["resolve_terminal_reason"] = p.resolveTerminalReason.String
+	}
+	if p.semanticSource.Valid {
+		e.Meta["semantic_source"] = p.semanticSource.String
 	}
 }

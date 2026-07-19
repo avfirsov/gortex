@@ -1,6 +1,8 @@
 package contracts
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -37,14 +39,16 @@ func TestSpringConfigValueBindingRelaxed(t *testing.T) {
 		Meta: map[string]any{"spring_config_keys": []string{"db.*"}},
 	})
 
-	srcFor := func(p string) []byte {
-		if p == ymlPath {
-			return []byte(yml)
-		}
-		return nil
+	root := t.TempDir()
+	configPath := filepath.Join(root, filepath.FromSlash(ymlPath))
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	if n := BindSpringConfig(g, srcFor); n == 0 {
+	if n := BindSpringConfig(g, SpringConfigScope{RepoRoot: root}); n == 0 {
 		t.Fatal("BindSpringConfig added nothing")
 	}
 

@@ -35,17 +35,60 @@ func BindProviderSymbols(reg *Registry, g graph.Store) int {
 	if reg == nil || g == nil {
 		return 0
 	}
+	all := reg.All()
+	lookupNames := map[string]struct{}{}
+	contractIDs := map[string]struct{}{}
+	for _, c := range all {
+		if c.Role != RoleProvider || c.SymbolID != "" {
+			continue
+		}
+		var name string
+		switch c.Type {
+		case ContractGRPC:
+			name, _ = c.Meta["method"].(string)
+		case ContractOpenAPI:
+			name, _ = c.Meta["operationId"].(string)
+			if name == "" {
+				path, _ := c.Meta["path"].(string)
+				name = lastPathSegment(path)
+			}
+		}
+		if name != "" {
+			lookupNames[name] = struct{}{}
+		}
+		if c.ID != "" {
+			contractIDs[c.ID] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(lookupNames))
+	for name := range lookupNames {
+		names = append(names, name)
+	}
+	ids := make([]string, 0, len(contractIDs))
+	for id := range contractIDs {
+		ids = append(ids, id)
+	}
+	candidatesByName := g.FindNodesByNames(names)
+	existingContracts := g.GetNodesByIDs(ids)
+
 	bound := 0
-	for _, c := range reg.All() {
+	var providerEdges []*graph.Edge
+	for _, c := range all {
 		if c.Role != RoleProvider || c.SymbolID != "" {
 			continue
 		}
 		var newID string
 		switch c.Type {
 		case ContractGRPC:
-			newID = bindGRPCProvider(c, g)
+			method, _ := c.Meta["method"].(string)
+			newID = bindGRPCProviderCandidates(c, candidatesByName[method])
 		case ContractOpenAPI:
-			newID = bindOpenAPIProvider(c, g)
+			op, _ := c.Meta["operationId"].(string)
+			if op == "" {
+				path, _ := c.Meta["path"].(string)
+				op = lastPathSegment(path)
+			}
+			newID = bindOpenAPIProviderCandidates(c, candidatesByName[op])
 		}
 		if newID == "" {
 			continue
@@ -57,8 +100,8 @@ func BindProviderSymbols(reg *Registry, g graph.Store) int {
 		reg.Add(c)
 		// Also add the EdgeProvides from the symbol to the contract
 		// node so downstream tools see the link.
-		if g.GetNode(c.ID) != nil {
-			g.AddEdge(&graph.Edge{
+		if existingContracts[c.ID] != nil {
+			providerEdges = append(providerEdges, &graph.Edge{
 				From:     newID,
 				To:       c.ID,
 				Kind:     graph.EdgeProvides,
@@ -68,28 +111,19 @@ func BindProviderSymbols(reg *Registry, g graph.Store) int {
 		}
 		bound++
 	}
+	if len(providerEdges) > 0 {
+		g.AddBatch(nil, providerEdges)
+	}
 	return bound
 }
 
-// bindGRPCProvider returns the node ID of the Go/TS method implementing
-// the RPC, or "" if we can't uniquely pick one.
-//
-// Heuristic (highest-priority first):
-//  1. Method named <contract.Meta["method"]> whose receiver type is
-//     exactly `{Service}Server` (the common gRPC-generated server
-//     interface naming).
-//  2. Same method name, receiver type containing "Server" anywhere.
-//  3. Same method name, in a file that contains a
-//     `Register{Service}Server(` call.
-//  4. Same method name, any receiver — only if there's exactly one
-//     candidate in the repo.
-func bindGRPCProvider(c Contract, g graph.Store) string {
+func bindGRPCProviderCandidates(c Contract, byName []*graph.Node) string {
 	method, _ := c.Meta["method"].(string)
 	service, _ := c.Meta["service"].(string)
 	if method == "" || service == "" {
 		return ""
 	}
-	candidates := filterSameRepoMethods(g.FindNodesByName(method), c.RepoPrefix)
+	candidates := filterSameRepoMethods(byName, c.RepoPrefix)
 	if len(candidates) == 0 {
 		return ""
 	}
@@ -118,24 +152,8 @@ func bindGRPCProvider(c Contract, g graph.Store) string {
 	return ""
 }
 
-// bindOpenAPIProvider picks the Go/TS handler that implements the
-// OpenAPI-declared operation. Since operationId conventions vary
-// widely, this is lower-confidence than gRPC binding; a stricter
-// implementation would also check the Gin/Echo route registration
-// file, but v1 just name-matches. Returns "" if no unambiguous bind.
-func bindOpenAPIProvider(c Contract, g graph.Store) string {
-	op, _ := c.Meta["operationId"].(string)
-	if op == "" {
-		// Fall back to the last path segment; OpenAPI specs
-		// commonly use /{collection}/{action} and a handler named
-		// after the action (listUsers, createUser).
-		path, _ := c.Meta["path"].(string)
-		op = lastPathSegment(path)
-	}
-	if op == "" {
-		return ""
-	}
-	candidates := filterSameRepoMethods(g.FindNodesByName(op), c.RepoPrefix)
+func bindOpenAPIProviderCandidates(c Contract, byName []*graph.Node) string {
+	candidates := filterSameRepoMethods(byName, c.RepoPrefix)
 	if len(candidates) == 1 {
 		return candidates[0].ID
 	}

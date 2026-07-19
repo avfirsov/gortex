@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+	"iter"
 	"sort"
 	"strings"
 
@@ -91,15 +92,64 @@ func DiscoverProcesses(g graph.Store) *ProcessResult {
 // DiscoverProcessesWithLimits is DiscoverProcesses with explicit bounds. It is
 // primarily useful to tests and specialized callers that need a smaller result.
 func DiscoverProcessesWithLimits(g graph.Store, limits ProcessLimits) *ProcessResult {
-	return discoverProcesses(g.AllNodes(), graph.EdgesForKindsLight(g, graph.EdgeCalls), limits)
+	if g == nil {
+		return &ProcessResult{NodeToProcs: make(map[string][]string)}
+	}
+	return discoverProcessesProjected(
+		graph.NodesByKindsSeq(g, graph.KindFunction, graph.KindMethod),
+		graph.EdgesLightSeq(g, graph.EdgeCalls),
+		g.GetNodesByIDs,
+		limits,
+	)
 }
 
+// discoverProcesses keeps the slice-shaped test seam while production uses
+// the cursor-backed projections above. The lookup closure is bounded to the
+// final retained step set, matching the SQLite path.
 func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessLimits) *ProcessResult {
+	nodeByID := make(map[string]*graph.Node, len(nodes))
+	for _, node := range nodes {
+		if node != nil {
+			nodeByID[node.ID] = node
+		}
+	}
+	nodeSeq := func(yield func(*graph.Node) bool) {
+		for _, node := range nodes {
+			if node != nil && (node.Kind == graph.KindFunction || node.Kind == graph.KindMethod) && !yield(node) {
+				return
+			}
+		}
+	}
+	edgeSeq := func(yield func(*graph.Edge) bool) {
+		for _, edge := range edges {
+			if edge != nil && edge.Kind == graph.EdgeCalls && !yield(edge) {
+				return
+			}
+		}
+	}
+	lookup := func(ids []string) map[string]*graph.Node {
+		out := make(map[string]*graph.Node, len(ids))
+		for _, id := range ids {
+			if node := nodeByID[id]; node != nil {
+				out[id] = node
+			}
+		}
+		return out
+	}
+	return discoverProcessesProjected(nodeSeq, edgeSeq, lookup, limits)
+}
+
+func discoverProcessesProjected(
+	nodes iter.Seq[*graph.Node],
+	edges iter.Seq[*graph.Edge],
+	lookupNodes func([]string) map[string]*graph.Node,
+	limits ProcessLimits,
+) *ProcessResult {
 	limits = limits.normalized()
 
 	callees := make(map[string][]string)
 	callers := make(map[string][]string)
-	for _, e := range edges {
+	for e := range edges {
 		if e != nil && e.Kind == graph.EdgeCalls {
 			callees[e.From] = append(callees[e.From], e.To)
 			callers[e.To] = append(callers[e.To], e.From)
@@ -116,13 +166,8 @@ func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessL
 		score float64
 	}
 	var candidates []scored
-	nodeMap := make(map[string]*graph.Node, len(nodes))
-	for _, n := range nodes {
+	for n := range nodes {
 		if n == nil {
-			continue
-		}
-		nodeMap[n.ID] = n
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
 		}
 		score := scoreEntryPoint(n, len(callees[n.ID]), len(callers[n.ID]))
@@ -142,6 +187,7 @@ func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessL
 	totalSteps := 0
 	stepLimited := false
 	processLimited := false
+	stepIDs := make(map[string]struct{}, min(limits.MaxTotalSteps, 1024))
 	for i, c := range candidates {
 		if i >= limits.MaxProcesses {
 			processLimited = true
@@ -169,18 +215,6 @@ func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessL
 			stepLimited = true
 		}
 
-		fileSet := make(map[string]bool)
-		for _, step := range steps {
-			if n, ok := nodeMap[step.ID]; ok && n.FilePath != "" {
-				fileSet[n.FilePath] = true
-			}
-		}
-		files := make([]string, 0, len(fileSet))
-		for file := range fileSet {
-			files = append(files, file)
-		}
-		sort.Strings(files)
-
 		procID := fmt.Sprintf("process-%d", len(result.Processes))
 		result.Processes = append(result.Processes, Process{
 			ID:         procID,
@@ -188,13 +222,36 @@ func discoverProcesses(nodes []*graph.Node, edges []*graph.Edge, limits ProcessL
 			EntryPoint: c.node.ID,
 			Steps:      steps,
 			StepCount:  len(steps),
-			Files:      files,
 			Score:      c.score,
 			Truncated:  truncated,
 		})
 		for _, step := range steps {
+			stepIDs[step.ID] = struct{}{}
 			result.NodeToProcs[step.ID] = append(result.NodeToProcs[step.ID], procID)
 		}
+	}
+
+	// Process results retain at most MaxTotalSteps nodes. Resolve their file
+	// paths in one bounded batch after tracing instead of keeping metadata for
+	// every graph node alive during candidate scoring.
+	ids := make([]string, 0, len(stepIDs))
+	for id := range stepIDs {
+		ids = append(ids, id)
+	}
+	stepNodes := lookupNodes(ids)
+	for i := range result.Processes {
+		fileSet := make(map[string]struct{})
+		for _, step := range result.Processes[i].Steps {
+			if node := stepNodes[step.ID]; node != nil && node.FilePath != "" {
+				fileSet[node.FilePath] = struct{}{}
+			}
+		}
+		files := make([]string, 0, len(fileSet))
+		for file := range fileSet {
+			files = append(files, file)
+		}
+		sort.Strings(files)
+		result.Processes[i].Files = files
 	}
 
 	result.Truncated = stepLimited || processLimited

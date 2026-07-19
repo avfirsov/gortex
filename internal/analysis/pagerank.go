@@ -53,8 +53,13 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 	if g == nil {
 		return &PageRankResult{Scores: map[string]float64{}}
 	}
-	nodes := excludeProxyNodes(graph.AllNodesLight(g))
-	n := len(nodes)
+	ids := make([]string, 0, g.NodeCount())
+	for node := range graph.NodesLightSeq(g) {
+		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
+			ids = append(ids, node.ID)
+		}
+	}
+	n := len(ids)
 	if n == 0 {
 		return &PageRankResult{Scores: map[string]float64{}}
 	}
@@ -72,7 +77,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 	// Meta-less kind-scoped scan: this pass reads only e.Kind, endpoints, and
 	// graph.ProvenanceWeight — never arbitrary Meta — so it must not pay to decode
 	// every edge's meta blob on a warm-restart whole-graph run.
-	for _, e := range graph.EdgesForKindsLight(g, graph.EdgeCalls, graph.EdgeReferences) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
@@ -86,8 +91,8 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 
 	score := make(map[string]float64, n)
 	initial := 1.0 / float64(n)
-	for _, nd := range nodes {
-		score[nd.ID] = initial
+	for _, id := range ids {
+		score[id] = initial
 	}
 
 	base := (1 - pageRankDamping) / float64(n)
@@ -95,22 +100,22 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 		// Dangling nodes have nowhere to send their score; pool it
 		// and spread it across every node so no mass leaks.
 		var dangling float64
-		for _, nd := range nodes {
-			if outWeight[nd.ID] == 0 {
-				dangling += score[nd.ID]
+		for _, id := range ids {
+			if outWeight[id] == 0 {
+				dangling += score[id]
 			}
 		}
 		danglingShare := pageRankDamping * dangling / float64(n)
 
 		next := make(map[string]float64, n)
-		for _, nd := range nodes {
+		for _, id := range ids {
 			var sum float64
-			for _, src := range inLinks[nd.ID] {
+			for _, src := range inLinks[id] {
 				if d := outWeight[src.id]; d > 0 {
 					sum += score[src.id] * src.w / d
 				}
 			}
-			next[nd.ID] = base + danglingShare + pageRankDamping*sum
+			next[id] = base + danglingShare + pageRankDamping*sum
 		}
 		score = next
 	}

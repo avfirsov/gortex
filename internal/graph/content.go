@@ -25,28 +25,72 @@ type NonContentNodeReader interface {
 	GetRepoNonContentNodes(repoPrefix string) []*Node
 }
 
-// RepoCodeNodes returns repoPrefix's non-content nodes. It uses the store's
-// NonContentNodeReader fast path when available (the disk backend filters in
-// SQL, so 525k content sections never enter memory); otherwise it falls back
-// to materialising the repo's nodes and dropping content in Go — fine for the
-// in-memory store, which only backs small repos. An empty repoPrefix means
-// "all repos".
-func RepoCodeNodes(s Store, repoPrefix string) []*Node {
-	if r, ok := s.(NonContentNodeReader); ok {
-		return r.GetRepoNonContentNodes(repoPrefix)
-	}
-	var nodes []*Node
-	if repoPrefix != "" {
-		nodes = s.GetRepoNodes(repoPrefix)
-	}
-	if len(nodes) == 0 {
-		nodes = s.AllNodes()
-	}
-	out := make([]*Node, 0, len(nodes))
-	for _, n := range nodes {
-		if !IsContentNode(n) {
-			out = append(out, n)
+// ContentNodeReader is the inverse projection used by the content-link pass.
+// The repository predicate is exact, including the empty-prefix single-repo
+// case, and implementations must push data_class=content into the backend.
+type ContentNodeReader interface {
+	GetRepoContentNodes(repoPrefix string) []*Node
+}
+
+// GetRepoNonContentNodes implements NonContentNodeReader without allocating a
+// graph-wide snapshot. Empty prefix keeps the historical "all repos" semantics
+// used by global code/search passes; non-empty prefixes use the compact bucket.
+func (g *Graph) GetRepoNonContentNodes(repoPrefix string) []*Node {
+	var out []*Node
+	for _, s := range g.shards {
+		s.mu.RLock()
+		if repoPrefix == "" {
+			for _, n := range s.nodes {
+				if n != nil && !IsContentNode(n) {
+					out = append(out, n)
+				}
+			}
+		} else {
+			for _, n := range s.byRepo[repoPrefix] {
+				if n != nil && !IsContentNode(n) {
+					out = append(out, n)
+				}
+			}
 		}
+		s.mu.RUnlock()
 	}
 	return out
+}
+
+// GetRepoContentNodes implements ContentNodeReader with the exact repository
+// predicate. Empty-prefix nodes live outside byRepo, so that case reads shard
+// maps directly and retains only CONTENT sections.
+func (g *Graph) GetRepoContentNodes(repoPrefix string) []*Node {
+	var out []*Node
+	for _, s := range g.shards {
+		s.mu.RLock()
+		if repoPrefix == "" {
+			for _, n := range s.nodes {
+				if n != nil && n.RepoPrefix == "" && IsContentNode(n) {
+					out = append(out, n)
+				}
+			}
+		} else {
+			for _, n := range s.byRepo[repoPrefix] {
+				if n != nil && IsContentNode(n) {
+					out = append(out, n)
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
+var (
+	_ NonContentNodeReader = (*Graph)(nil)
+	_ ContentNodeReader    = (*Graph)(nil)
+)
+
+// RepoCodeNodes returns repoPrefix's non-content projection. The disk backend
+// filters in SQL so content-heavy repositories never ship their sections into
+// memory; the in-memory backend filters directly while holding shard locks.
+// Empty repoPrefix means "all repos".
+func RepoCodeNodes(s Store, repoPrefix string) []*Node {
+	return s.GetRepoNonContentNodes(repoPrefix)
 }

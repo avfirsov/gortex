@@ -155,6 +155,8 @@ func MaterializeContractBridges(g graph.Store, matched []contracts.CrossLink) in
 	})
 
 	minted := 0
+	bridgeNodes := make([]*graph.Node, 0, len(groupKeys))
+	var bridgeEdges []*graph.Edge
 	for _, key := range groupKeys {
 		grp := groups[key]
 		groupID := key.contractID
@@ -166,7 +168,7 @@ func MaterializeContractBridges(g graph.Store, matched []contracts.CrossLink) in
 		}
 		sort.Strings(repos)
 
-		g.AddNode(&graph.Node{
+		bridgeNodes = append(bridgeNodes, &graph.Node{
 			ID:          bridgeID,
 			Kind:        graph.KindContractBridge,
 			Name:        bridgeCanonicalKey(groupID, grp.contractType),
@@ -175,6 +177,7 @@ func MaterializeContractBridges(g graph.Store, matched []contracts.CrossLink) in
 			Language:    "contract",
 			RepoPrefix:  grp.providerRepo,
 			WorkspaceID: grp.workspaceID,
+			ProjectID:   grp.projectID,
 			Meta: map[string]any{
 				"contract_type":  string(grp.contractType),
 				"canonical_key":  bridgeCanonicalKey(groupID, grp.contractType),
@@ -216,7 +219,7 @@ func MaterializeContractBridges(g graph.Store, matched []contracts.CrossLink) in
 			case isCons:
 				side = "consumer"
 			}
-			g.AddEdge(&graph.Edge{
+			bridgeEdges = append(bridgeEdges, &graph.Edge{
 				From:            bridgeID,
 				To:              contractID,
 				Kind:            graph.EdgeBridges,
@@ -229,8 +232,143 @@ func MaterializeContractBridges(g graph.Store, matched []contracts.CrossLink) in
 			})
 		}
 	}
+	if len(bridgeNodes) > 0 || len(bridgeEdges) > 0 {
+		g.AddBatch(bridgeNodes, bridgeEdges)
+	}
 
 	return minted
+}
+
+// buildContractBridgeBatch constructs the deterministic bridge generation
+// without evicting or writing graph state. The incremental reconciler combines
+// this batch with exact match/topic replacement in one backend transaction.
+func buildContractBridgeBatch(matched []contracts.CrossLink) ([]*graph.Node, []*graph.Edge) {
+	groups := make(map[bridgeGroupKey]*bridgeGroup)
+	for _, match := range matched {
+		if match.ContractID == "" {
+			continue
+		}
+		key := bridgeGroupKey{
+			workspace:  match.Provider.EffectiveWorkspace(),
+			project:    match.Provider.EffectiveProject(),
+			contractID: match.ContractID,
+		}
+		group := groups[key]
+		if group == nil {
+			group = &bridgeGroup{
+				contractType: match.Provider.Type,
+				workspaceID:  key.workspace,
+				projectID:    key.project,
+				repos:        make(map[string]struct{}),
+				providerIDs:  make(map[string]struct{}),
+				consumerIDs:  make(map[string]struct{}),
+				providerKeys: make(map[string]struct{}),
+				consumerKeys: make(map[string]struct{}),
+			}
+			groups[key] = group
+		}
+		if match.Provider.RepoPrefix != "" {
+			group.repos[match.Provider.RepoPrefix] = struct{}{}
+			if group.providerRepo == "" || match.Provider.RepoPrefix < group.providerRepo {
+				group.providerRepo = match.Provider.RepoPrefix
+			}
+		}
+		if match.Consumer.RepoPrefix != "" {
+			group.repos[match.Consumer.RepoPrefix] = struct{}{}
+		}
+		if match.Provider.Line > 0 && (group.minLine == 0 || match.Provider.Line < group.minLine) {
+			group.minLine = match.Provider.Line
+		}
+		group.providerIDs[match.Provider.ID] = struct{}{}
+		group.consumerIDs[match.Consumer.ID] = struct{}{}
+		group.providerKeys[contractRecordKey(match.Provider)] = struct{}{}
+		group.consumerKeys[contractRecordKey(match.Consumer)] = struct{}{}
+		group.crossRepo = group.crossRepo || match.CrossRepo
+	}
+
+	keys := make([]bridgeGroupKey, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].workspace != keys[j].workspace {
+			return keys[i].workspace < keys[j].workspace
+		}
+		if keys[i].project != keys[j].project {
+			return keys[i].project < keys[j].project
+		}
+		return keys[i].contractID < keys[j].contractID
+	})
+
+	nodes := make([]*graph.Node, 0, len(keys))
+	var edges []*graph.Edge
+	for _, key := range keys {
+		group := groups[key]
+		bridgeID := bridgeNodeID(key)
+		repos := make([]string, 0, len(group.repos))
+		for repo := range group.repos {
+			repos = append(repos, repo)
+		}
+		sort.Strings(repos)
+		nodes = append(nodes, &graph.Node{
+			ID:          bridgeID,
+			Kind:        graph.KindContractBridge,
+			Name:        bridgeCanonicalKey(key.contractID, group.contractType),
+			FilePath:    ContractBridgeFilePath,
+			StartLine:   group.minLine,
+			Language:    "contract",
+			RepoPrefix:  group.providerRepo,
+			WorkspaceID: group.workspaceID,
+			ProjectID:   group.projectID,
+			Meta: map[string]any{
+				"contract_type":  string(group.contractType),
+				"canonical_key":  bridgeCanonicalKey(key.contractID, group.contractType),
+				"contract_id":    key.contractID,
+				"workspace":      group.workspaceID,
+				"project":        group.projectID,
+				"repos":          repos,
+				"provider_count": len(group.providerKeys),
+				"consumer_count": len(group.consumerKeys),
+				"cross_repo":     group.crossRepo,
+			},
+		})
+
+		contractIDs := make(map[string]struct{}, len(group.providerIDs)+len(group.consumerIDs))
+		for id := range group.providerIDs {
+			contractIDs[id] = struct{}{}
+		}
+		for id := range group.consumerIDs {
+			contractIDs[id] = struct{}{}
+		}
+		ordered := make([]string, 0, len(contractIDs))
+		for id := range contractIDs {
+			ordered = append(ordered, id)
+		}
+		sort.Strings(ordered)
+		for _, contractID := range ordered {
+			_, provider := group.providerIDs[contractID]
+			_, consumer := group.consumerIDs[contractID]
+			side := "provider"
+			switch {
+			case provider && consumer:
+				side = "both"
+			case consumer:
+				side = "consumer"
+			}
+			edges = append(edges, &graph.Edge{
+				From:            bridgeID,
+				To:              contractID,
+				Kind:            graph.EdgeBridges,
+				FilePath:        ContractBridgeFilePath,
+				Confidence:      1.0,
+				ConfidenceLabel: "EXTRACTED",
+				Origin:          graph.OriginASTResolved,
+				CrossRepo:       group.crossRepo,
+				Meta:            map[string]any{"side": side},
+			})
+		}
+	}
+	return nodes, edges
 }
 
 // bridgeNodeID renders the persisted node ID for a contract-bridge

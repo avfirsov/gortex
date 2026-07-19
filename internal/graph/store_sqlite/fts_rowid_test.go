@@ -120,16 +120,16 @@ func TestBackfillSymbolFTSRowidMap(t *testing.T) {
 	s.AddNode(mkFnNode(id, "AlphaWidget", "pkg/x.go"))
 
 	// Simulate the legacy state: a row in symbol_fts with no map entry.
-	if _, err := s.db.Exec(
+	if _, err := s.writerDB.Exec(
 		`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) VALUES (?, '', ?)`,
 		id, "alpha widget red"); err != nil {
 		t.Fatalf("seed legacy fts row: %v", err)
 	}
-	if _, err := s.db.Exec(`DELETE FROM symbol_fts_rowid`); err != nil {
+	if _, err := s.writerDB.Exec(`DELETE FROM symbol_fts_rowid`); err != nil {
 		t.Fatalf("clear map: %v", err)
 	}
 
-	if err := backfillSymbolFTSRowidMap(s.db); err != nil {
+	if err := backfillSymbolFTSRowidMap(s.writerDB); err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
 	if got := ftsRowCount(t, s, "symbol_fts_rowid", id); got != 1 {

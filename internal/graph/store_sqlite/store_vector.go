@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"container/heap"
+	"context"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -70,7 +71,7 @@ func decodeVec(b []byte) []float32 {
 func (s *Store) UpsertEmbedding(nodeID string, vec []float32) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(
+	_, err := s.execActiveWriteLocked(context.Background(),
 		`INSERT OR REPLACE INTO vectors (node_id, dims, vec) VALUES (?, ?, ?)`,
 		nodeID, len(vec), encodeVec(vec),
 	)
@@ -88,7 +89,7 @@ func (s *Store) BulkUpsertEmbeddings(items []graph.VectorItem) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,9 @@ func TypeScriptSpec() *LangSpec {
 	return &LangSpec{
 		ProviderName: "typescript-types",
 		Languages:    []string{"typescript", "javascript"},
+		CandidateLanguages: []string{
+			"typescript", "tsx", "ts", "javascript", "jsx", "js",
+		},
 		GrammarFor: func(filePath string) *sitter.Language {
 			lower := strings.ToLower(filePath)
 			switch {

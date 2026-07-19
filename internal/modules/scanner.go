@@ -920,7 +920,7 @@ func BuildGraphArtifacts(filePath string, specs []Spec) ([]*graph.Node, []*graph
 				Kind:     graph.KindModule,
 				Name:     shortName(s.Path),
 				FilePath: filePath,
-				Language: "go",
+				Language: ecosystemLanguage(s.Ecosystem),
 				Meta:     meta,
 			})
 		}
@@ -965,26 +965,18 @@ func LinkImportsIn(g graph.Store, importNodes []*graph.Node, specs []Spec, ownMo
 	if g == nil || len(specs) == 0 || len(importNodes) == 0 {
 		return 0
 	}
-	// Index specs by path for quick longest-prefix lookup. When two
-	// specs share a path (shouldn't happen in a well-formed go.mod,
-	// but guard against duplicates) the first wins — graph node
-	// dedup later handles any concrete conflict.
+	// Index specs by path once. When two specs share a path (which
+	// should not happen in a well-formed manifest), the first wins —
+	// matching the previous sorted-slice implementation.
 	specByPath := make(map[string]Spec, len(specs))
-	paths := make([]string, 0, len(specs))
 	for _, s := range specs {
 		if _, ok := specByPath[s.Path]; ok {
 			continue
 		}
 		specByPath[s.Path] = s
-		paths = append(paths, s.Path)
 	}
-	// Sort longest first so the prefix scan picks the most specific
-	// match without an O(n²) probe.
-	sort.Slice(paths, func(i, j int) bool {
-		return len(paths[i]) > len(paths[j])
-	})
 
-	emitted := 0
+	edges := make([]*graph.Edge, 0, len(importNodes))
 	for _, n := range importNodes {
 		if n.Kind != graph.KindImport {
 			continue
@@ -997,13 +989,12 @@ func LinkImportsIn(g graph.Store, importNodes []*graph.Node, specs []Spec, ownMo
 			strings.HasPrefix(importPath, ownModulePath+"/")) {
 			continue
 		}
-		matched := matchLongestPrefix(importPath, paths)
-		if matched == "" {
+		spec, ok, _ := matchLongestPrefix(importPath, specByPath)
+		if !ok {
 			continue
 		}
-		spec := specByPath[matched]
 		moduleID := ModuleNodeID(spec.Ecosystem, spec.Path, spec.Version)
-		g.AddEdge(&graph.Edge{
+		edges = append(edges, &graph.Edge{
 			From:     n.ID,
 			To:       moduleID,
 			Kind:     graph.EdgeDependsOnModule,
@@ -1011,25 +1002,53 @@ func LinkImportsIn(g graph.Store, importNodes []*graph.Node, specs []Spec, ownMo
 			Line:     n.StartLine,
 			Origin:   graph.OriginASTResolved,
 		})
-		emitted++
 	}
-	return emitted
+	g.AddBatch(nil, edges)
+	return len(edges)
 }
 
-// matchLongestPrefix returns the longest path from candidates that
-// matches importPath as either an exact match or a directory
-// prefix. Candidates must already be sorted by descending length;
-// the first hit wins.
-func matchLongestPrefix(importPath string, candidates []string) string {
-	for _, p := range candidates {
-		if importPath == p {
-			return p
+// matchLongestPrefix returns the spec whose path is the longest exact
+// path-segment prefix of importPath. It probes the exact import first,
+// then removes one slash-delimited segment at a time. The work is thus
+// bounded by import depth rather than the number of manifest entries.
+// probes is returned so scale tests can enforce that invariant directly.
+func matchLongestPrefix(importPath string, candidates map[string]Spec) (spec Spec, ok bool, probes int) {
+	candidate := importPath
+	for candidate != "" {
+		probes++
+		if spec, ok = candidates[candidate]; ok {
+			return spec, true, probes
 		}
-		if strings.HasPrefix(importPath, p+"/") {
-			return p
+		slash := strings.LastIndexByte(candidate, '/')
+		if slash < 0 {
+			break
 		}
+		candidate = candidate[:slash]
 	}
-	return ""
+	return Spec{}, false, probes
+}
+
+// ecosystemLanguage maps a dependency ecosystem to the source language its
+// modules belong to. Module nodes used to hardcode "go", which fabricated Go
+// presence in every repo whose manifest was merely a Cargo.toml or
+// package-lock.json — the per-repo language census then admitted whole
+// Go-compiler enrichment passes against repos with no Go source at all.
+// Unknown ecosystems carry no language claim.
+func ecosystemLanguage(ecosystem string) string {
+	switch ecosystem {
+	case "go":
+		return "go"
+	case "npm":
+		return "javascript"
+	case "pypi":
+		return "python"
+	case "cargo":
+		return "rust"
+	case "maven":
+		return "java"
+	default:
+		return ""
+	}
 }
 
 // shortName returns the last meaningful segment of a module path —

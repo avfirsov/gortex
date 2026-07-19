@@ -323,6 +323,39 @@ func ResolveTemporalCalls(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
+	// Presence probe, hoisted above the lock and the wrapper/executor
+	// pre-passes: every input any phase of this pass consumes is either a
+	// calls-edge whose RAW via carries the "temporal." prefix (stub / start /
+	// register / executor-field — tested before any kind/name filtering, so
+	// malformed stubs still count as presence) or a Java temporal annotation
+	// edge. A workspace with neither provably yields zero from every phase,
+	// and previously still paid the fixpoint's own full calls-scans
+	// (measured 43.9s for nothing on a temporal-free 28-repo workspace).
+	// Break-on-first-hit keeps temporal-using workspaces at ~zero extra cost.
+	temporalPresent := false
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); strings.HasPrefix(v, "temporal.") {
+			temporalPresent = true
+			break
+		}
+	}
+	if !temporalPresent {
+		for e := range g.EdgesByKind(graph.EdgeAnnotated) {
+			if e == nil {
+				continue
+			}
+			if r, m := temporalRoleForJavaAnnotation(e.To); r != "" || m != "" {
+				temporalPresent = true
+				break
+			}
+		}
+	}
+	if !temporalPresent {
+		return 0
+	}
 	// Serialise against other graph-wide passes that mutate Node.Meta
 	// (markTestSymbolsAndEmitEdges, detectClonesAndEmitEdges,
 	// reach.BuildIndex). stampTemporalRole below writes n.Meta on

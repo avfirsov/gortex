@@ -12,7 +12,10 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 )
 
-func TestDeferredEnrichmentReleasesRepoStatePerConcurrencyBatch(t *testing.T) {
+func TestDeferredEnrichmentReleasesEveryRepoStateAfterDrain(t *testing.T) {
+	// One node per fixture repo: disable the admission floor so the test
+	// exercises retain/release mechanics, not enrichment admission.
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
 	const repoCount = 9
 	g := graph.New()
 	provider := &retainingRepoProvider{
@@ -59,8 +62,13 @@ func TestDeferredEnrichmentReleasesRepoStatePerConcurrencyBatch(t *testing.T) {
 	releases := provider.releases
 	unleased := provider.unleased
 	provider.mu.Unlock()
-	if want := enrichConcurrency(repoCount); peak > want {
-		t.Fatalf("peak retained repo states = %d, want <= concurrency %d", peak, want)
+	// Contract passes now run only after the whole enrichment pool drains
+	// (no contract mutation may overlap enrichment), so every enriched
+	// repo's state is retained until its serial contract pass. That state
+	// is the compact binding projection — cheap to hold — and the bound is
+	// the repo count, not the lane count.
+	if peak > repoCount {
+		t.Fatalf("peak retained repo states = %d, want <= repo count %d", peak, repoCount)
 	}
 	if retained != 0 {
 		t.Fatalf("retained repo states after deferred batch = %d, want 0", retained)

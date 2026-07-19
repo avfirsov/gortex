@@ -29,6 +29,11 @@ func TestEnrichmentActive(t *testing.T) {
 	mgr.setEnrichStatus("repo-a", "gopls", "go", EnrichStateCompleted, 0, nil, "")
 	assert.False(t, mgr.EnrichmentActive(), "with no running pass EnrichmentActive must be false")
 
+	// A deadline does not make the pass inactive while its in-process writer is
+	// still draining; memory/concurrency gates must remain closed until it exits.
+	mgr.setEnrichStatus("repo-a", "gopls", "go", EnrichStateDraining, 0, nil, "")
+	assert.True(t, mgr.EnrichmentActive(), "a draining provider is still active")
+
 	// Terminal non-running states never read as active.
 	for _, state := range []string{EnrichStatePartial, EnrichStateAbandoned, EnrichStateFailed} {
 		mgr.setEnrichStatus("repo-a", "gopls", "go", state, 0, nil, "")

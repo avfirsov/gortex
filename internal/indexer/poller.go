@@ -268,12 +268,16 @@ func (p *Poller) pollGitHead() bool {
 			if _, statErr := os.Stat(abs); statErr != nil {
 				continue
 			}
-			p.watcher.patchGraph(abs, ChangeModified)
+			if err := p.watcher.patchGraph(abs, ChangeModified); err != nil && p.logger != nil {
+				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
+			}
 			n++
 		case 'D':
 			abs := filepath.Join(p.rootPath, c.Path)
 			if _, statErr := os.Stat(abs); statErr != nil {
-				p.watcher.patchGraph(abs, ChangeDeleted)
+				if err := p.watcher.patchGraph(abs, ChangeDeleted); err != nil && p.logger != nil {
+					p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
+				}
 				n++
 			}
 		}
@@ -305,7 +309,9 @@ func (p *Poller) pollFilesystem() int {
 		info, err := os.Stat(abs)
 		if err != nil {
 			// The file is gone — the delete event was missed.
-			p.watcher.patchGraph(abs, ChangeDeleted)
+			if patchErr := p.watcher.patchGraph(abs, ChangeDeleted); patchErr != nil && p.logger != nil {
+				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(patchErr))
+			}
 			n++
 			continue
 		}
@@ -315,7 +321,9 @@ func (p *Poller) pollFilesystem() int {
 		if info.ModTime().UnixNano() > recorded {
 			// The file changed on disk after we last indexed it —
 			// the modify event was missed.
-			p.watcher.patchGraph(abs, ChangeModified)
+			if err := p.watcher.patchGraph(abs, ChangeModified); err != nil && p.logger != nil {
+				p.logger.Warn("watcher: poller patch failed", zap.String("path", abs), zap.Error(err))
+			}
 			n++
 		}
 	}

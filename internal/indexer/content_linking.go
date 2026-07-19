@@ -83,14 +83,26 @@ func (idx *Indexer) linkContentToCode() {
 	} else {
 		// In-memory fallback: with no content index the full text is still on
 		// the nodes (streamContentSections leans only when a content searcher
-		// exists), so scan the graph nodes directly.
-		for _, chunk := range g.AllNodes() {
-			if !graph.IsContentNode(chunk) {
-				continue
+		// exists). Prefer the compound repo+content predicate; adapter stores
+		// still enumerate only KindDoc rows and never snapshot the node corpus.
+		visit := func(chunk *graph.Node) bool {
+			if !graph.IsContentNode(chunk) || chunk.RepoPrefix != idx.repoPrefix {
+				return true
 			}
 			text, _ := chunk.Meta["section_text"].(string)
-			if !emit(chunk.ID, chunk.FilePath, text) {
-				break
+			return emit(chunk.ID, chunk.FilePath, text)
+		}
+		if reader, ok := g.(graph.ContentNodeReader); ok {
+			for _, chunk := range reader.GetRepoContentNodes(idx.repoPrefix) {
+				if !visit(chunk) {
+					break
+				}
+			}
+		} else {
+			for chunk := range g.NodesByKind(graph.KindDoc) {
+				if !visit(chunk) {
+					break
+				}
 			}
 		}
 	}

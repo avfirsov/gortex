@@ -1,8 +1,7 @@
 package tstypes
 
 import (
-	"runtime"
-	"sync"
+	"context"
 	"time"
 
 	"go.uber.org/zap"
@@ -18,9 +17,13 @@ import (
 // with it, and only ever stamps AST-grade provenance, so a
 // compiler-grade pass running before or after never gets downgraded.
 type Provider struct {
-	spec   *LangSpec
-	logger *zap.Logger
+	spec         *LangSpec
+	logger       *zap.Logger
+	observePage  func(factPageStats) // synchronous test/diagnostic hook
+	observeSpool func(string)        // synchronous cleanup test hook
 }
+
+var _ semantic.ContextEnricher = (*Provider)(nil)
 
 // NewProvider wraps a LangSpec as a semantic provider.
 func NewProvider(spec *LangSpec, logger *zap.Logger) *Provider {
@@ -62,7 +65,7 @@ func (p *Provider) Supplemental() bool { return true }
 // It delegates to EnrichRepo with an empty prefix — the in-memory single
 // repo case where every real node carries RepoPrefix "".
 func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
-	return p.EnrichRepo(g, "", repoRoot)
+	return p.EnrichRepoContext(context.Background(), g, "", repoRoot, nil)
 }
 
 // EnrichRepo runs the full-repo pass: parse every file of the provider's
@@ -71,10 +74,17 @@ func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResul
 // goroutine. repoPrefix scopes file selection so a multi-repo graph with
 // a colliding relative path never reads the wrong repo's bytes.
 func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+	return p.EnrichRepoContext(context.Background(), g, repoPrefix, repoRoot, nil)
+}
+
+func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline semantic.EnrichDeadlinePolicy) (*semantic.EnrichResult, error) {
 	start := time.Now()
 	res := &semantic.EnrichResult{
 		Provider: p.Name(),
 		Language: p.spec.Languages[0],
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	// Toolchain-fallback gate: a spec that suppresses itself on this host
@@ -87,69 +97,115 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 	}
 
 	files := languageFiles(g, p.spec, repoPrefix, repoRoot)
+	// The budget is charged phase by phase against a movable deadline instead
+	// of arming one context up front: the wait for the graph-wide resolve
+	// mutex below is ANOTHER pass's work, and letting it burn this pass's
+	// budget turned a queued small repo into a partial with zero coverage
+	// (observed: a 641s "pass" that was ~630s of queueing behind a Go
+	// compiler apply). A parent context's own deadline still caps every
+	// phase — WithDeadline never extends the parent.
+	var deadlineAt time.Time
+	if deadline != nil {
+		if d := deadline(len(files)); d > 0 {
+			deadlineAt = start.Add(d)
+			res.BudgetSeconds = d.Seconds()
+		}
+	}
+	phaseCtx := func() (context.Context, context.CancelFunc) {
+		if deadlineAt.IsZero() {
+			return ctx, func() {}
+		}
+		return context.WithDeadline(ctx, deadlineAt)
+	}
+	if err := ctx.Err(); err != nil {
+		markContextPartial(res, err)
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res, nil
+	}
 	if len(files) > 0 {
-		workers := runtime.GOMAXPROCS(0)
-		if workers > 8 {
-			workers = 8
+		spool, err := newFactSpool()
+		if err != nil {
+			return nil, err
 		}
-		if workers > len(files) {
-			workers = len(files)
+		defer spool.close()
+		if p.observeSpool != nil {
+			p.observeSpool(spool.path)
 		}
-		jobs := make(chan fileRef)
-		factsCh := make(chan *fileFacts, workers)
-		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for ref := range jobs {
-					facts, err := analyzeFile(p.spec, ref)
-					if err != nil {
-						p.logger.Debug("tstypes: file analysis failed",
-							zap.String("provider", p.Name()),
-							zap.String("file", ref.node.FilePath),
-							zap.Error(err))
-						continue
-					}
-					if facts != nil {
-						factsCh <- facts
-					}
-				}
-			}()
-		}
-		go func() {
-			for _, ref := range files {
-				jobs <- ref
+		parseCtx, cancelParse := phaseCtx()
+		if err := p.stageRepoFacts(parseCtx, files, spool); err != nil {
+			parseErr := parseCtx.Err()
+			cancelParse()
+			if parseErr != nil {
+				markContextPartial(res, parseErr)
+				res.DurationMs = time.Since(start).Milliseconds()
+				return res, nil
 			}
-			close(jobs)
-			wg.Wait()
-			close(factsCh)
-		}()
-
-		var all []*fileFacts
-		for facts := range factsCh {
-			all = append(all, facts)
+			return nil, err
 		}
+		cancelParse()
 		// Parsing above is pure and fans out across workers; the apply
 		// phase mutates the shared graph (retargets edges, reindexes,
 		// stamps provenance) and MUST run under the graph-wide resolve
 		// mutex so it serialises against concurrent resolver / cross-repo
 		// passes — the same lock every other edge-mutating pass holds.
 		mu := g.ResolveMutex()
-		mu.Lock()
-		ap := newApplier(g, p.spec, p.Name())
-		ap.applyAll(all, res)
-		ap.flush()
-		analyzed := make(map[string]bool, len(all))
-		for _, facts := range all {
-			analyzed[facts.file] = true
+		lockStart := time.Now()
+		// Warmup apply barrier first (parks while the pool overlaps the
+		// resolve phase), then the mutex. Both waits are other passes' work,
+		// so both are excluded from this pass's budget below.
+		if err := semantic.ApplyGateWait(ctx); err != nil {
+			markContextPartial(res, err)
+			res.DurationMs = time.Since(start).Milliseconds()
+			return res, nil
 		}
-		p.countCoverage(g, repoPrefix, analyzed, res)
+		mu.Lock()
+		lockWait := time.Since(lockStart)
+		res.LockWaitMs = lockWait.Milliseconds()
+		if lockWait > 5*time.Second {
+			// The completion log's lock_wait_ms explains a long pass only
+			// after the fact; announce the wait as it resolves so a watcher
+			// can attribute the quiet stretch in real time.
+			p.logger.Info("tstypes: apply began after queueing",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Duration("queued", lockWait))
+		}
+		if !deadlineAt.IsZero() {
+			deadlineAt = deadlineAt.Add(lockWait)
+		}
+		applyCtx, cancelApply := phaseCtx()
+		if err := applyCtx.Err(); err != nil {
+			mu.Unlock()
+			cancelApply()
+			markContextPartial(res, err)
+			res.DurationMs = time.Since(start).Milliseconds()
+			return res, nil
+		}
+		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res)
 		mu.Unlock()
+		applyCtxErr := applyCtx.Err()
+		cancelApply()
+		if applyErr != nil {
+			if applyCtxErr != nil {
+				markContextPartial(res, applyCtxErr)
+				res.DurationMs = time.Since(start).Milliseconds()
+				return res, nil
+			}
+			return nil, applyErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		markContextPartial(res, err)
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()
 	return res, nil
+}
+
+func markContextPartial(res *semantic.EnrichResult, err error) {
+	res.Partial = true
+	res.AbortReason = err.Error()
+	res.BoundReason = semantic.EnrichBoundBudget
 }
 
 // EnrichFile runs the single-file incremental pass. filePath is the graph
@@ -213,13 +269,9 @@ func (p *Provider) countCoverage(g graph.Store, repoPrefix string, analyzed map[
 	for _, l := range p.spec.Languages {
 		langs[l] = true
 	}
-	// Indexed repo-scoped scan rather than a whole-graph AllNodes walk; the
-	// whole-graph form also counted every other repo's symbols against this
-	// repo's coverage. Fall back to AllNodes only for the embedded ("") path.
+	// Indexed exact-prefix scan; empty prefix is the embedded single-repository
+	// namespace rather than a graph-wide wildcard.
 	nodes := g.GetRepoNodes(repoPrefix)
-	if len(nodes) == 0 && repoPrefix == "" {
-		nodes = g.AllNodes()
-	}
 	for _, n := range nodes {
 		if n.RepoPrefix != repoPrefix || !langs[n.Language] || n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue

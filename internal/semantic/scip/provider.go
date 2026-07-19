@@ -1,6 +1,7 @@
 package scip
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,7 +21,6 @@ type Provider struct {
 	command   string
 	args      []string
 	languages []string
-	timeout   time.Duration
 	logger    *zap.Logger
 	// definitionsOnly runs the fast path: ingest only definition
 	// occurrences (the symbol map + coverage) and skip the expensive
@@ -30,16 +30,15 @@ type Provider struct {
 	definitionsOnly bool
 }
 
+var _ semantic.ContextEnricher = (*Provider)(nil)
+var _ semantic.PreselectionDeadlineEnricher = (*Provider)(nil)
+
 // NewProvider creates a SCIP provider for the given command and languages.
-func NewProvider(command string, args []string, languages []string, timeoutSec int, logger *zap.Logger) *Provider {
-	if timeoutSec <= 0 {
-		timeoutSec = 120
-	}
+func NewProvider(command string, args []string, languages []string, _ int, logger *zap.Logger) *Provider {
 	return &Provider{
 		command:   command,
 		args:      args,
 		languages: languages,
-		timeout:   time.Duration(timeoutSec) * time.Second,
 		logger:    logger,
 	}
 }
@@ -56,34 +55,68 @@ func (p *Provider) Name() string        { return "scip-" + p.languages[0] }
 func (p *Provider) Languages() []string { return p.languages }
 func (p *Provider) Close() error        { return nil }
 
+func (p *Provider) UsePreselectionDeadline() {}
+
 func (p *Provider) Available() bool {
 	_, err := exec.LookPath(p.command)
 	return err == nil
 }
 
 func (p *Provider) Enrich(g graph.Store, repoRoot string) (*semantic.EnrichResult, error) {
+	return p.EnrichRepoContext(context.Background(), g, "", repoRoot, nil)
+}
+
+func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*semantic.EnrichResult, error) {
+	return p.EnrichRepoContext(context.Background(), g, repoPrefix, repoRoot, nil)
+}
+
+// EnrichRepoContext makes both the external indexer and the in-process import
+// part of the Manager-owned lifecycle. CommandContext terminates the child on
+// cancellation; the graph import checks ctx before it begins mutating.
+func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, _ semantic.EnrichDeadlinePolicy) (*semantic.EnrichResult, error) {
 	start := time.Now()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	// Run the SCIP indexer.
-	indexFile, err := p.runIndexer(repoRoot)
+	indexFile, err := p.runIndexerContext(ctx, repoRoot)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return scipPartialResult(p, start, ctxErr), nil
+		}
 		return nil, fmt.Errorf("scip indexer failed: %w", err)
 	}
-	defer func() { _ = os.Remove(indexFile) }()
+	defer func() { _ = os.RemoveAll(filepath.Dir(indexFile)) }()
 
 	// Parse the SCIP index.
 	index, err := ParseSCIPFile(indexFile)
 	if err != nil {
 		return nil, fmt.Errorf("scip parse failed: %w", err)
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return scipPartialResult(p, start, ctxErr), nil
+	}
 
 	// Build symbol map and enrich the graph.
-	result := p.enrichFromIndex(g, index, repoRoot)
+	result := p.enrichFromIndexScoped(g, index, repoPrefix, repoRoot)
 	result.Provider = p.Name()
 	result.Language = p.languages[0]
 	result.DurationMs = time.Since(start).Milliseconds()
 
 	return result, nil
+}
+
+func scipPartialResult(p *Provider, start time.Time, err error) *semantic.EnrichResult {
+	result := &semantic.EnrichResult{
+		Provider:    p.Name(),
+		Language:    p.languages[0],
+		DurationMs:  time.Since(start).Milliseconds(),
+		Partial:     true,
+		AbortReason: err.Error(),
+		BoundReason: semantic.EnrichBoundBudget,
+	}
+	return result
 }
 
 func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semantic.EnrichResult, error) {
@@ -92,8 +125,7 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 	return nil, nil
 }
 
-// runIndexer executes the SCIP indexer and returns the path to the output file.
-func (p *Provider) runIndexer(repoRoot string) (string, error) {
+func (p *Provider) runIndexerContext(ctx context.Context, repoRoot string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "gortex-scip-*")
 	if err != nil {
 		return "", err
@@ -105,7 +137,7 @@ func (p *Provider) runIndexer(repoRoot string) (string, error) {
 	copy(args, p.args)
 	args = append(args, "--output", outputPath)
 
-	cmd := exec.Command(p.command, args...)
+	cmd := exec.CommandContext(ctx, p.command, args...)
 	cmd.Dir = repoRoot
 	cmd.Env = append(os.Environ(), "SCIP_OUTPUT="+outputPath)
 
@@ -143,23 +175,28 @@ func (p *Provider) runIndexer(repoRoot string) (string, error) {
 
 // enrichFromIndex maps SCIP data to the Gortex graph.
 func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot string) *semantic.EnrichResult {
+	return p.enrichFromIndexScoped(g, index, "", repoRoot)
+}
+
+func (p *Provider) enrichFromIndexScoped(g graph.Store, index *SCIPIndex, repoPrefix, repoRoot string) *semantic.EnrichResult {
 	result := &semantic.EnrichResult{}
 	symMap := semantic.NewSymbolMap()
+	nodesByFile, nodesByID := scipNodesForDocuments(g, index, repoPrefix, p.languages)
 
 	// Phase 1: Build symbol mapping from definitions.
 	for _, doc := range index.Documents {
-		relPath := doc.RelativePath
+		relPath := scipGraphPath(repoPrefix, doc.RelativePath)
 		for _, occ := range doc.Occurrences {
 			if !occ.IsDefinition() {
 				continue
 			}
 			line := occ.StartLine()
-			node := semantic.MatchNodeByFileLine(g, relPath, line)
+			node := matchSCIPNodeByLine(nodesByFile[relPath], line, true)
 			if node == nil {
 				// Try by name.
 				symName := extractSymbolName(occ.Symbol)
 				if symName != "" {
-					node = semantic.MatchNodeByNameInFile(g, symName, relPath)
+					node = matchSCIPNodeByName(nodesByFile[relPath], symName)
 				}
 			}
 			if node != nil {
@@ -169,20 +206,21 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 		}
 	}
 
-	// Count total symbols for coverage.
-	for _, n := range g.AllNodes() {
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+	// Count total symbols through language predicates. A provider language list
+	// is tiny, and each store evaluates it without materializing unrelated nodes.
+	seenLanguages := make(map[string]struct{}, len(p.languages))
+	for _, language := range p.languages {
+		if language == "" {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				langMatch = true
-				break
-			}
+		if _, duplicate := seenLanguages[language]; duplicate {
+			continue
 		}
-		if langMatch {
-			result.SymbolsTotal++
+		seenLanguages[language] = struct{}{}
+		for _, n := range g.GetRepoNodesByLanguage(repoPrefix, language) {
+			if n != nil && n.Kind != graph.KindFile && n.Kind != graph.KindImport {
+				result.SymbolsTotal++
+			}
 		}
 	}
 
@@ -200,9 +238,25 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 		return result
 	}
 
-	// Phase 2: Process reference occurrences — confirm/add edges.
+	type referenceCandidate struct {
+		refNode   *graph.Node
+		defNodeID string
+		filePath  string
+		line      int
+	}
+	var references []referenceCandidate
+	type implementationCandidate struct {
+		implID  string
+		ifaceID string
+	}
+	var implementations []implementationCandidate
+	var endpoints []graph.EdgeEndpoint
+
+	// Collect exact reference and implementation endpoint frontiers first. One
+	// predicate-shaped lookup below replaces point adjacency reads per SCIP
+	// occurrence and per relationship.
 	for _, doc := range index.Documents {
-		relPath := doc.RelativePath
+		relPath := scipGraphPath(repoPrefix, doc.RelativePath)
 		for _, occ := range doc.Occurrences {
 			if occ.IsDefinition() {
 				continue
@@ -210,7 +264,7 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 
 			// Find the Gortex node at the reference site.
 			refLine := occ.StartLine()
-			refNode := findContainingNode(g, relPath, refLine)
+			refNode := matchSCIPNodeByLine(nodesByFile[relPath], refLine, false)
 			if refNode == nil {
 				continue
 			}
@@ -220,26 +274,11 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 			if !ok {
 				continue
 			}
-
-			// Check if an edge already exists between these nodes.
-			existing := semantic.FindEdgeByTarget(g, refNode.ID, defNodeID)
-			if existing != nil {
-				if existing.Confidence < 1.0 {
-					semantic.ConfirmEdge(existing, p.Name())
-					result.EdgesConfirmed++
-				}
-			} else {
-				// Determine edge kind from context.
-				kind := inferEdgeKind(refNode, g.GetNode(defNodeID))
-				if kind != "" {
-					semantic.AddSemanticEdge(g, refNode.ID, defNodeID, kind, relPath, refLine, p.Name())
-					result.EdgesAdded++
-				}
-			}
+			references = append(references, referenceCandidate{refNode: refNode, defNodeID: defNodeID, filePath: relPath, line: refLine})
+			endpoints = append(endpoints, graph.EdgeEndpoint{From: refNode.ID, To: defNodeID})
 		}
 	}
 
-	// Phase 3: Process implementation relationships.
 	for _, doc := range index.Documents {
 		for _, sym := range doc.Symbols {
 			for _, rel := range sym.Relationships {
@@ -254,20 +293,50 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 				if !ok {
 					continue
 				}
-
-				existing := semantic.FindMatchingEdge(g, implID, ifaceID, graph.EdgeImplements)
-				if existing != nil {
-					semantic.ConfirmEdge(existing, p.Name())
-					result.EdgesConfirmed++
-				} else {
-					implNode := g.GetNode(implID)
-					if implNode != nil {
-						semantic.AddSemanticEdge(g, implID, ifaceID, graph.EdgeImplements,
-							implNode.FilePath, implNode.StartLine, p.Name())
-						result.EdgesAdded++
-					}
-				}
+				implementations = append(implementations, implementationCandidate{implID: implID, ifaceID: ifaceID})
+				endpoints = append(endpoints, graph.EdgeEndpoint{From: implID, To: ifaceID})
 			}
+		}
+	}
+
+	candidates := graph.LookupEdgeCandidates(g, endpoints, nil)
+	var confirmedEdges []*graph.Edge
+	var addedEdges []*graph.Edge
+
+	// Phase 2: Process reference occurrences — confirm/add edges.
+	for _, ref := range references {
+		existing := candidates.Endpoint(ref.refNode.ID, ref.defNodeID)
+		if existing != nil {
+			if existing.Confidence < 1.0 {
+				semantic.ConfirmEdge(existing, p.Name())
+				confirmedEdges = append(confirmedEdges, existing)
+				result.EdgesConfirmed++
+			}
+		} else {
+			// Determine edge kind from context.
+			kind := inferEdgeKind(ref.refNode, nodesByID[ref.defNodeID])
+			if kind != "" {
+				edge := semantic.NewSemanticEdge(ref.refNode.ID, ref.defNodeID, kind, ref.filePath, ref.line, p.Name())
+				addedEdges = append(addedEdges, edge)
+				candidates.Add(edge)
+				result.EdgesAdded++
+			}
+		}
+	}
+
+	// Phase 3: Process implementation relationships.
+	for _, implementation := range implementations {
+		existing := candidates.EndpointKind(implementation.implID, implementation.ifaceID, graph.EdgeImplements)
+		if existing != nil {
+			semantic.ConfirmEdge(existing, p.Name())
+			confirmedEdges = append(confirmedEdges, existing)
+			result.EdgesConfirmed++
+		} else if implNode := nodesByID[implementation.implID]; implNode != nil {
+			edge := semantic.NewSemanticEdge(implementation.implID, implementation.ifaceID, graph.EdgeImplements,
+				implNode.FilePath, implNode.StartLine, p.Name())
+			addedEdges = append(addedEdges, edge)
+			candidates.Add(edge)
+			result.EdgesAdded++
 		}
 	}
 
@@ -276,14 +345,14 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 	// end — EnrichNodeMeta mutates Node.Meta in place, which does not
 	// persist on disk backends (GetNode returns a per-call copy). See
 	// semantic.EnrichNodeMeta.
-	var stampedNodes []*graph.Node
+	stampedNodes := make(map[string]*graph.Node)
 	for _, doc := range index.Documents {
 		for _, sym := range doc.Symbols {
 			nodeID, ok := symMap.GortexID(sym.Symbol)
 			if !ok {
 				continue
 			}
-			node := g.GetNode(nodeID)
+			node := nodesByID[nodeID]
 			if node == nil {
 				continue
 			}
@@ -294,21 +363,105 @@ func (p *Provider) enrichFromIndex(g graph.Store, index *SCIPIndex, repoRoot str
 				if typeInfo != "" {
 					semantic.EnrichNodeMeta(node, "semantic_type", typeInfo, p.Name())
 					result.NodesEnriched++
-					stampedNodes = append(stampedNodes, node)
+					stampedNodes[node.ID] = node
 				}
 			}
 		}
 	}
-	if len(stampedNodes) > 0 {
-		g.AddBatch(stampedNodes, nil)
+	nodeBatch := make([]*graph.Node, 0, len(stampedNodes))
+	for _, node := range stampedNodes {
+		nodeBatch = append(nodeBatch, node)
+	}
+	if len(nodeBatch) > 0 || len(addedEdges) > 0 {
+		g.AddBatch(nodeBatch, addedEdges)
+	}
+	if len(confirmedEdges) > 0 {
+		if persister, ok := g.(graph.EdgeMetaBatchPersister); ok {
+			persister.PersistEdgeAttributesBatch(confirmedEdges)
+		} else {
+			// Core in-memory edges are live pointers. Adapter stores without the
+			// optional attribute capability retain compatibility through one
+			// batched upsert, never a persistence call per occurrence.
+			g.AddBatch(nil, confirmedEdges)
+		}
 	}
 
 	return result
 }
 
-// findContainingNode finds the innermost Gortex node that contains the given line.
-func findContainingNode(g graph.Store, filePath string, line int) *graph.Node {
-	nodes := g.GetFileNodes(filePath)
+var scipMatchNodeKinds = []graph.NodeKind{
+	graph.KindPackage, graph.KindFunction, graph.KindMethod, graph.KindType,
+	graph.KindInterface, graph.KindVariable, graph.KindContract, graph.KindField,
+	graph.KindParam, graph.KindClosure, graph.KindLocal, graph.KindBuiltin,
+	graph.KindConstant, graph.KindEnumMember, graph.KindGenericParam, graph.KindModule,
+	graph.KindTable, graph.KindColumn, graph.KindConfigKey, graph.KindFlag,
+	graph.KindEvent, graph.KindMigration, graph.KindFixture, graph.KindTodo,
+	graph.KindTeam, graph.KindRelease, graph.KindLicense, graph.KindString,
+	graph.KindResource, graph.KindKustomization, graph.KindImage, graph.KindArtifact,
+	graph.KindDoc, graph.KindRationale, graph.KindTopic, graph.KindMacro,
+	graph.KindContractBridge,
+}
+
+func scipNodesForDocuments(g graph.Store, index *SCIPIndex, repoPrefix string, languages []string) (map[string][]*graph.Node, map[string]*graph.Node) {
+	fileSet := make(map[string]struct{}, len(index.Documents))
+	files := make([]string, 0, len(index.Documents))
+	for _, doc := range index.Documents {
+		graphPath := scipGraphPath(repoPrefix, doc.RelativePath)
+		if graphPath == "" {
+			continue
+		}
+		if _, duplicate := fileSet[graphPath]; duplicate {
+			continue
+		}
+		fileSet[graphPath] = struct{}{}
+		files = append(files, graphPath)
+	}
+	var nodes []*graph.Node
+	if finder, ok := g.(graph.NodesInFilesByKindFinder); ok {
+		nodes = finder.NodesInFilesByKind(files, scipMatchNodeKinds)
+	} else {
+		seenLanguages := make(map[string]struct{}, len(languages))
+		for _, language := range languages {
+			if language == "" {
+				continue
+			}
+			if _, duplicate := seenLanguages[language]; duplicate {
+				continue
+			}
+			seenLanguages[language] = struct{}{}
+			for _, node := range g.GetNodesByLanguage(language) {
+				if node != nil {
+					if _, wanted := fileSet[node.FilePath]; wanted {
+						nodes = append(nodes, node)
+					}
+				}
+			}
+		}
+	}
+	byFile := make(map[string][]*graph.Node, len(files))
+	byID := make(map[string]*graph.Node, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		byFile[node.FilePath] = append(byFile[node.FilePath], node)
+		byID[node.ID] = node
+	}
+	return byFile, byID
+}
+
+func scipGraphPath(repoPrefix, relativePath string) string {
+	path := filepath.ToSlash(filepath.Clean(relativePath))
+	if path == "." || path == "" {
+		return ""
+	}
+	if repoPrefix == "" || path == repoPrefix || strings.HasPrefix(path, repoPrefix+"/") {
+		return path
+	}
+	return repoPrefix + "/" + strings.TrimPrefix(path, "/")
+}
+
+func matchSCIPNodeByLine(nodes []*graph.Node, line int, nearest bool) *graph.Node {
 	var best *graph.Node
 	bestSize := int(^uint(0) >> 1)
 	for _, n := range nodes {
@@ -323,7 +476,36 @@ func findContainingNode(g graph.Store, filePath string, line int) *graph.Node {
 			}
 		}
 	}
+	if best != nil || !nearest {
+		return best
+	}
+	bestDistance := int(^uint(0) >> 1)
+	for _, node := range nodes {
+		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
+			continue
+		}
+		distance := node.StartLine - line
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance < bestDistance {
+			best = node
+			bestDistance = distance
+		}
+	}
+	if bestDistance > 2 {
+		return nil
+	}
 	return best
+}
+
+func matchSCIPNodeByName(nodes []*graph.Node, name string) *graph.Node {
+	for _, node := range nodes {
+		if node != nil && node.Name == name {
+			return node
+		}
+	}
+	return nil
 }
 
 // inferEdgeKind determines the edge kind from the node types.

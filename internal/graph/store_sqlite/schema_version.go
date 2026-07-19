@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 4
+const currentSchemaVersion = 6
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -63,6 +63,240 @@ var schemaMigrations = []schemaMigration{
 	// explicit source-reindex boundary rather than a misleading in-place fix.
 	{version: 3, name: "restore topology after node replace writes", rebuild: true},
 	{version: 4, name: "add normalized analysis generations", inPlace: createAnalysisGenerationTables},
+	{version: 5, name: "backfill flat graph ownership, provenance, and clone corpus", inPlace: backfillSyntheticNodeRepoPrefixes},
+	{version: 6, name: "compact resolver edge indexes", inPlace: compactResolverEdgeIndexes},
+}
+
+// compactResolverEdgeIndexes removes the one-shot global Go receiver index and
+// replaces the dense Boolean unresolved index with an unresolved-only partial
+// index. Both changes are mechanically derivable from existing flat/generated
+// columns, so a populated v5 store upgrades transactionally without reindexing
+// source. A CREATE failure rolls the DROP operations back with the migration.
+func compactResolverEdgeIndexes(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS edges_go_member_receiver`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS edges_by_unresolved`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`CREATE INDEX edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`)
+	return err
+}
+
+// backfillSyntheticNodeRepoPrefixes repairs rows written before synthetic
+// resolver nodes consistently carried Node.RepoPrefix, then promotes legacy
+// edge semantic_source values through a bounded Meta migration. Repo-scoped stub IDs
+// have the form <repo>::<stub-kind>::..., so ownership is derivable without
+// reading Meta or source files. Shared legacy dep:: / external:: IDs start
+// directly with their kind and deliberately remain global.
+//
+// This is a single set-oriented UPDATE that runs once while upgrading v4 to
+// v5. Keeping it in the schema migration avoids both an N+1 rewrite and a
+// warm-start scan on every subsequent Open.
+func backfillSyntheticNodeRepoPrefixes(tx *sql.Tx) error {
+	if err := ensureCloneCorpusColumns(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+UPDATE nodes
+SET repo_prefix = substr(id, 1, instr(id, '::') - 1)
+WHERE repo_prefix = ''
+  AND instr(id, '::') > 0
+  AND (
+      substr(id, instr(id, '::') + 2) LIKE 'module::%'
+      OR substr(id, instr(id, '::') + 2) LIKE 'stdlib::%'
+      OR substr(id, instr(id, '::') + 2) LIKE 'builtin::%'
+      OR substr(id, instr(id, '::') + 2) LIKE 'external_call::%'
+  )`); err != nil {
+		return err
+	}
+	return backfillEdgeSemanticSources(tx)
+}
+
+// The v4→v5 edge provenance migration is deliberately bounded in two
+// dimensions. A page never retains more than pageRows candidate blobs or
+// pageBytes of their encoded Meta (apart from one individually oversized row),
+// while updateRows keeps each VALUES statement below SQLite's conservative
+// 999-host-parameter ceiling (300 * 3 = 900).
+//
+// The SQL query first searches the BLOB for the literal key bytes. All three
+// codecs accepted by decodeMeta — flat, JSON, and legacy gob — store map keys as
+// their UTF-8 bytes, so this is a no-false-negative prefilter. A value or nested
+// key may produce a harmless false positive; Go still performs the authoritative
+// top-level type check before rewriting a row.
+const (
+	edgeSemanticSourceMigrationPageRows   = 4096
+	edgeSemanticSourceMigrationPageBytes  = int64(8 << 20)
+	edgeSemanticSourceMigrationUpdateRows = 300
+	edgeSemanticSourceMetaMarker          = "semantic_source"
+)
+
+type edgeSemanticSourceMigrationRow struct {
+	id     int64
+	source string
+	meta   []byte
+}
+
+type edgeSemanticSourceMigrationLimits struct {
+	pageRows   int
+	pageBytes  int64
+	updateRows int
+}
+
+var defaultEdgeSemanticSourceMigrationLimits = edgeSemanticSourceMigrationLimits{
+	pageRows:   edgeSemanticSourceMigrationPageRows,
+	pageBytes:  edgeSemanticSourceMigrationPageBytes,
+	updateRows: edgeSemanticSourceMigrationUpdateRows,
+}
+
+// edgeSemanticSourceMigrationStats is intentionally package-private test
+// instrumentation. It makes the warm-up cost contract observable without a
+// driver-specific query hook or production logging.
+type edgeSemanticSourceMigrationStats struct {
+	PageQueries      int
+	RowsDecoded      int
+	BytesDecoded     int64
+	RowsUpdated      int
+	UpdateStatements int
+	MaxPageRows      int
+	MaxPageBytes     int64
+}
+
+// backfillEdgeSemanticSources lifts Meta["semantic_source"] into its flat edge
+// column without ever materialising the edge corpus. Pages advance by the
+// stable integer edge id, and each page is rewritten with one VALUES-driven
+// UPDATE in the caller's migration transaction. A failed page rolls the whole
+// migration back; rerunning is idempotent because already-promoted rows no
+// longer satisfy semantic_source IS NULL.
+func backfillEdgeSemanticSources(tx *sql.Tx) error {
+	_, err := backfillEdgeSemanticSourcesWithLimits(tx, defaultEdgeSemanticSourceMigrationLimits)
+	return err
+}
+
+func backfillEdgeSemanticSourcesWithLimits(
+	tx *sql.Tx,
+	limits edgeSemanticSourceMigrationLimits,
+) (edgeSemanticSourceMigrationStats, error) {
+	var stats edgeSemanticSourceMigrationStats
+	if limits.pageRows <= 0 || limits.pageBytes <= 0 || limits.updateRows <= 0 {
+		return stats, fmt.Errorf("invalid edge semantic_source migration limits: rows=%d bytes=%d updates=%d",
+			limits.pageRows, limits.pageBytes, limits.updateRows)
+	}
+
+	var afterID int64
+	for {
+		stats.PageQueries++
+		rows, err := tx.Query(`
+SELECT id, meta
+FROM edges
+WHERE id > ?
+  AND semantic_source IS NULL
+  AND meta IS NOT NULL
+  AND instr(CAST(meta AS BLOB), ?) > 0
+ORDER BY id
+LIMIT ?`, afterID, []byte(edgeSemanticSourceMetaMarker), limits.pageRows)
+		if err != nil {
+			return stats, err
+		}
+
+		read := 0
+		var pageBytes int64
+		byteLimited := false
+		updates := make([]edgeSemanticSourceMigrationRow, 0, min(limits.pageRows, limits.updateRows))
+		for rows.Next() {
+			var id int64
+			var blob []byte
+			if err := rows.Scan(&id, &blob); err != nil {
+				_ = rows.Close()
+				return stats, err
+			}
+			// Do not advance afterID until this row has actually been decoded. If
+			// accepting it would cross the byte cap, close this result and let
+			// the next keyset query return the same row as its first candidate.
+			// One row larger than the cap is accepted alone to guarantee progress.
+			blobBytes := int64(len(blob))
+			if read > 0 && pageBytes+blobBytes > limits.pageBytes {
+				byteLimited = true
+				break
+			}
+			read++
+			afterID = id
+			pageBytes += blobBytes
+			stats.RowsDecoded++
+			stats.BytesDecoded += blobBytes
+			meta, err := decodeMeta(blob)
+			if err != nil {
+				_ = rows.Close()
+				return stats, fmt.Errorf("decode edge %d meta: %w", id, err)
+			}
+			source, ok := meta["semantic_source"].(string)
+			if !ok {
+				if pageBytes >= limits.pageBytes {
+					byteLimited = true
+					break
+				}
+				continue
+			}
+			delete(meta, edgeSemanticSourceMetaMarker)
+			remaining, err := encodeMeta(meta)
+			if err != nil {
+				_ = rows.Close()
+				return stats, fmt.Errorf("encode edge %d meta: %w", id, err)
+			}
+			updates = append(updates, edgeSemanticSourceMigrationRow{id: id, source: source, meta: remaining})
+			if pageBytes >= limits.pageBytes {
+				byteLimited = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return stats, err
+		}
+		if err := rows.Close(); err != nil {
+			return stats, err
+		}
+
+		if read > stats.MaxPageRows {
+			stats.MaxPageRows = read
+		}
+		if pageBytes > stats.MaxPageBytes {
+			stats.MaxPageBytes = pageBytes
+		}
+		for start := 0; start < len(updates); start += limits.updateRows {
+			end := min(start+limits.updateRows, len(updates))
+			if err := applyEdgeSemanticSourceMigrationUpdates(tx, updates[start:end]); err != nil {
+				return stats, err
+			}
+			stats.UpdateStatements++
+			stats.RowsUpdated += end - start
+		}
+		if !byteLimited && read < limits.pageRows {
+			return stats, nil
+		}
+	}
+}
+
+func applyEdgeSemanticSourceMigrationUpdates(tx *sql.Tx, updates []edgeSemanticSourceMigrationRow) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	var values strings.Builder
+	args := make([]any, 0, len(updates)*3)
+	for i, update := range updates {
+		if i > 0 {
+			values.WriteByte(',')
+		}
+		values.WriteString("(?,?,?)")
+		args = append(args, update.id, update.source, update.meta)
+	}
+	query := `WITH updates(id, semantic_source, meta) AS (VALUES ` + values.String() + `)
+UPDATE edges AS e
+SET semantic_source = u.semantic_source, meta = u.meta
+FROM updates AS u
+WHERE e.id = u.id AND e.semantic_source IS NULL`
+	_, err := tx.Exec(query, args...)
+	return err
 }
 
 // createAnalysisGenerationTables is the explicit v4 in-place migration.

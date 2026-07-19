@@ -28,8 +28,8 @@ import (
 // rmu as soon as its references land, so a deadline cut loses only the
 // unvisited remainder. Runs under the caller's targeted context (the same
 // budget the confirm pass uses), before the per-file hover sweep.
-func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, session *docSession, result *semantic.EnrichResult) {
-	targets := selectReferencesAddTargets(g, langNodes)
+func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *lspGraphView, repoPrefix, absRoot string, langNodes []*graph.Node, rmu sync.Locker, session *docSession, result *semantic.EnrichResult) {
+	targets := selectReferencesAddTargets(view, langNodes)
 	if len(targets) == 0 {
 		return
 	}
@@ -37,16 +37,11 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPre
 
 	// Site-file contents cached for the cheap name-token guard, keyed by
 	// repo-relative path. Site files are read from disk, never opened on the
-	// server — attribution uses the graph, not the LSP.
+	// server — attribution uses the bounded repo graph projection.
 	siteSrc := map[string][]byte{}
-	// Within one pass a (caller, target) pair maps to a single edge: the
-	// first site wins its FilePath/Line, later sites are recorded on the
-	// edge's call_sites so find_usages still renders one row per site (see
-	// internal/graph/call_sites.go). Edges W2 minted accumulate call_sites;
-	// pre-existing edges (which the AST already emits per call site) are only
-	// promoted, so their per-line siblings carry the multiplicity.
 	mintedEdge := map[string]*graph.Edge{}
 	promoted := map[string]bool{}
+	mutations := newLSPMutationBatch()
 
 	for _, n := range targets {
 		if ctx.Err() != nil {
@@ -58,11 +53,8 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPre
 		}
 		rel := nodeRelPath(n)
 		if !p.servesFile(rel) {
-			continue // never open a file this server can't compile
+			continue
 		}
-		// Open the declaration file through the shared session so sibling
-		// declarations in the same file reuse one open document (the LRU
-		// absorbs the same-file repeats) instead of reopening per node.
 		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
 		if err != nil {
 			continue
@@ -74,52 +66,54 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPre
 			continue
 		}
 
-		rmu.Lock()
 		for _, loc := range refs {
 			sitePath := uriToPath(loc.URI, absRoot)
 			if sitePath == "" {
-				continue // reference outside the repo
+				continue
 			}
 			siteLine := loc.Range.Start.Line + 1
-			enclosing := semantic.MatchCallableByFileLine(g, scopedPath(repoPrefix, sitePath), siteLine)
+			enclosing := view.matchCallableByFileLine(scopedPath(repoPrefix, sitePath), siteLine)
 			if enclosing == nil || enclosing.ID == n.ID {
-				continue // unattributable, or the declaration's own identifier
+				continue
 			}
 			key := enclosing.ID + "\x00" + n.ID
-			// Cheap text guard: the site line must actually contain the
-			// target's whole name token, to defuse a stale position or a
-			// server bug before minting a compiler-grade edge.
 			if content := siteFileContent(siteSrc, absRoot, nodeRelPath(enclosing)); content != nil {
 				if _, found := identifierColumnStrict(content, siteLine, n.Name); !found {
 					continue
 				}
 			}
-			// A later site of an edge W2 already minted: record it on the edge
-			// instead of minting a duplicate.
 			if e0, ok := mintedEdge[key]; ok {
+				// The edge is still staged in mutations.adds; mutating that
+				// pointer carries every accumulated call site into the one insert.
 				graph.AppendCallSite(e0, enclosing.FilePath, siteLine)
-				semantic.PersistEdge(g, e0)
 				continue
 			}
-			// A later site of an edge the AST already produced per line — the
-			// promotion already ran, and its per-line siblings carry the sites.
 			if promoted[key] {
 				continue
 			}
-			if existing := semantic.FindMatchingEdge(g, enclosing.ID, n.ID, graph.EdgeCalls); existing != nil {
+			if existing := view.findMatchingEdge(enclosing.ID, n.ID, graph.EdgeCalls); existing != nil {
 				if graph.OriginRank(existing.Origin) < graph.OriginRank(graph.OriginLSPResolved) {
+					rmu.Lock()
 					semantic.ConfirmEdge(existing, p.Name())
 					existing.Origin = graph.OriginLSPResolved
-					semantic.PersistEdge(g, existing)
+					mutations.stagePersist(existing)
+					rmu.Unlock()
 					result.EdgesConfirmed++
 				}
 				promoted[key] = true
 				continue
 			}
-			mintedEdge[key] = semantic.AddSemanticEdge(g, enclosing.ID, n.ID, graph.EdgeCalls,
-				enclosing.FilePath, siteLine, p.Name())
-			result.EdgesAdded++
+			edge := newLSPResolvedEdge(enclosing.ID, n.ID, graph.EdgeCalls,
+				enclosing.FilePath, siteLine, p.Name(), graph.OriginLSPResolved)
+			if mutations.stageAdd(view, edge) {
+				mintedEdge[key] = edge
+				result.EdgesAdded++
+			}
 		}
+	}
+	if len(mutations.adds) > 0 || len(mutations.persists) > 0 {
+		rmu.Lock()
+		mutations.apply(g, nil)
 		rmu.Unlock()
 	}
 }
@@ -129,7 +123,7 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, repoPre
 // abstract-marked methods (tier 1), then plain methods (tier 0); within a
 // tier by descending fan-in so a deadline is spent on the most-referenced
 // declarations first.
-func selectReferencesAddTargets(g graph.Store, langNodes []*graph.Node) []*graph.Node {
+func selectReferencesAddTargets(view *lspGraphView, langNodes []*graph.Node) []*graph.Node {
 	// Interface / trait type names in the repo — a method whose receiver is
 	// one of these is a dispatch anchor the reference set fans out across.
 	dispatchOwners := map[string]bool{}
@@ -148,7 +142,6 @@ func selectReferencesAddTargets(g graph.Store, langNodes []*graph.Node) []*graph
 		fanIn int
 	}
 	var cand []scored
-	ids := make([]string, 0, len(langNodes))
 	for _, n := range langNodes {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
@@ -159,16 +152,10 @@ func selectReferencesAddTargets(g graph.Store, langNodes []*graph.Node) []*graph
 		} else if isAbstractMarked(n) {
 			tier = 1
 		}
-		cand = append(cand, scored{n: n, tier: tier})
-		ids = append(ids, n.ID)
+		cand = append(cand, scored{n: n, tier: tier, fanIn: view.fanIn(n.ID)})
 	}
 	if len(cand) == 0 {
 		return nil
-	}
-	// One batched store call for fan-in instead of a point lookup per node.
-	inEdges := g.GetInEdgesByNodeIDs(ids)
-	for i := range cand {
-		cand[i].fanIn = len(inEdges[cand[i].n.ID])
 	}
 	sort.SliceStable(cand, func(i, j int) bool {
 		if cand[i].tier != cand[j].tier {

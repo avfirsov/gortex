@@ -157,6 +157,11 @@ type applier struct {
 	spec         *LangSpec
 	provider     string
 	stampedNodes map[string]*graph.Node // collected for one AddBatch round-trip
+	// hot, when non-nil, is the pass-scoped read-through cache shared by
+	// every page applier of one streamed apply pass. It dedupes node, name
+	// and adjacency store reads across pages; see applyHotCache for the
+	// per-class safety model. Nil outside the streamed path.
+	hot *applyHotCache
 	// aliases maps a using type's node ID to its trait-use alias
 	// adaptations, built in the alias phase and consulted when a call's
 	// method name is not a direct or inherited member.
@@ -184,6 +189,22 @@ type applier struct {
 	// only for specs that set ExtensionFunctions.
 	extensions   map[extKey][]*graph.Node
 	extensionsOK bool
+	// The production apply path preloads one repo/language node projection and
+	// both adjacency directions in batches. These maps keep every ordered phase
+	// query-free; the loaded sets preserve a one-shot fallback for direct unit
+	// exercises that invoke an individual helper without applyAll.
+	nodesByFile          map[string][]*graph.Node
+	nodesByID            map[string]*graph.Node
+	nodesByName          map[typeCandidateKey][]*graph.Node
+	outByID              map[string][]*graph.Edge
+	inByID               map[string][]*graph.Edge
+	fileLoaded           map[string]bool
+	nodeLoaded           map[string]bool
+	nameLoaded           map[typeCandidateKey]bool
+	repoProjectionLoaded map[string]bool
+	outLoaded            map[string]bool
+	inLoaded             map[string]bool
+	allNodes             []*graph.Node
 }
 
 // extKey indexes an extension function by its receiver type name and its
@@ -213,14 +234,337 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 		}
 	}
 	return &applier{
-		g:                   g,
-		spec:                spec,
-		provider:            provider,
-		stampedNodes:        make(map[string]*graph.Node),
-		aliases:             make(map[string][]resolvedAlias),
-		languages:           languages,
-		typeCandidatesCache: make(map[typeCandidateKey][]*graph.Node),
-		methodCache:         make(map[methodLookupKey]*graph.Node),
+		g:                    g,
+		spec:                 spec,
+		provider:             provider,
+		stampedNodes:         make(map[string]*graph.Node),
+		aliases:              make(map[string][]resolvedAlias),
+		languages:            languages,
+		typeCandidatesCache:  make(map[typeCandidateKey][]*graph.Node),
+		methodCache:          make(map[methodLookupKey]*graph.Node),
+		nodesByFile:          make(map[string][]*graph.Node),
+		nodesByID:            make(map[string]*graph.Node),
+		nodesByName:          make(map[typeCandidateKey][]*graph.Node),
+		outByID:              make(map[string][]*graph.Edge),
+		inByID:               make(map[string][]*graph.Edge),
+		fileLoaded:           make(map[string]bool),
+		nodeLoaded:           make(map[string]bool),
+		nameLoaded:           make(map[typeCandidateKey]bool),
+		repoProjectionLoaded: make(map[string]bool),
+		outLoaded:            make(map[string]bool),
+		inLoaded:             make(map[string]bool),
+	}
+}
+
+var tstypesFileNodeKinds = []graph.NodeKind{
+	graph.KindPackage, graph.KindFunction, graph.KindMethod, graph.KindType,
+	graph.KindInterface, graph.KindVariable, graph.KindField, graph.KindParam,
+	graph.KindClosure, graph.KindLocal, graph.KindConstant, graph.KindEnumMember,
+	graph.KindGenericParam, graph.KindMacro,
+}
+
+func (a *applier) rememberNode(node *graph.Node) {
+	if node == nil || a.nodeLoaded[node.ID] {
+		return
+	}
+	a.nodeLoaded[node.ID] = true
+	a.nodesByID[node.ID] = node
+	a.allNodes = append(a.allNodes, node)
+	if node.FilePath != "" {
+		a.nodesByFile[node.FilePath] = append(a.nodesByFile[node.FilePath], node)
+	}
+	if node.Name != "" {
+		key := typeCandidateKey{repoPrefix: node.RepoPrefix, name: node.Name}
+		a.nodesByName[key] = append(a.nodesByName[key], node)
+	}
+}
+
+func (a *applier) preload(all []*fileFacts) {
+	a.preloadBounded(all)
+}
+
+// preloadApplicationFrontier loads exactly the adjacency the ordered apply
+// phases can traverse. The seed projection contains every symbol in the
+// analyzed repo/languages. From there the engine can only walk inheritance,
+// member_of, and param_of links; call targets and unrelated graph neighbors
+// are deliberately not expanded. The inheritance walk uses the same depth
+// bound as methodOn, keeping both SQL work and retained adjacency bounded.
+func (a *applier) preloadApplicationFrontier(seedIDs []string) {
+	seedIDs = uniqueSortedIDs(seedIDs)
+	a.loadAdjacency(seedIDs)
+
+	inheritKinds := a.spec.inheritEdgeKinds()
+	a.nodes(a.relevantEndpointIDs(seedIDs, inheritKinds))
+
+	parentKinds := a.supertypeKinds()
+	frontier := make([]string, 0, len(seedIDs))
+	for _, id := range seedIDs {
+		if node := a.nodesByID[id]; node != nil && parentKinds[node.Kind] {
+			frontier = append(frontier, id)
+		}
+	}
+	seenTypes := make(map[string]struct{}, len(frontier))
+	for depth := 0; depth <= extendsWalkDepth && len(frontier) > 0; depth++ {
+		for _, id := range frontier {
+			seenTypes[id] = struct{}{}
+		}
+
+		members := make(map[string]struct{})
+		parents := make(map[string]struct{})
+		for _, id := range frontier {
+			for _, edge := range a.inByID[id] {
+				if edge != nil && edge.Kind == graph.EdgeMemberOf && edge.From != "" {
+					members[edge.From] = struct{}{}
+				}
+			}
+			if depth == extendsWalkDepth {
+				continue
+			}
+			for _, edge := range a.outByID[id] {
+				if edge == nil || edge.To == "" || graph.IsUnresolvedTarget(edge.To) ||
+					!edgeKindIn(edge.Kind, inheritKinds) {
+					continue
+				}
+				if _, seen := seenTypes[edge.To]; !seen {
+					parents[edge.To] = struct{}{}
+				}
+			}
+		}
+
+		discoveredIDs := make([]string, 0, len(members)+len(parents))
+		for id := range members {
+			discoveredIDs = append(discoveredIDs, id)
+		}
+		for id := range parents {
+			discoveredIDs = append(discoveredIDs, id)
+		}
+		discovered := a.nodes(discoveredIDs)
+
+		adjacencyIDs := make([]string, 0, len(discoveredIDs))
+		for id := range members {
+			if node := discovered[id]; node != nil && node.Kind == graph.KindMethod {
+				adjacencyIDs = append(adjacencyIDs, id)
+			}
+		}
+		next := make([]string, 0, len(parents))
+		for id := range parents {
+			if node := discovered[id]; node != nil && parentKinds[node.Kind] {
+				adjacencyIDs = append(adjacencyIDs, id)
+				next = append(next, id)
+			}
+		}
+		adjacencyIDs = uniqueSortedIDs(adjacencyIDs)
+		a.loadAdjacency(adjacencyIDs)
+		a.nodes(a.relevantEndpointIDs(adjacencyIDs, inheritKinds))
+		frontier = uniqueSortedIDs(next)
+	}
+}
+
+// loadAdjacency merges bounded bulk reads into the mutation-aware caches.
+// Loaded IDs, including misses, are never queried again. Edge slices are
+// retained in store order so overload and edge arbitration semantics stay
+// identical to the underlying backend.
+func (a *applier) loadAdjacency(ids []string) {
+	ids = uniqueSortedIDs(ids)
+	outMissing := make([]string, 0, len(ids))
+	inMissing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !a.outLoaded[id] {
+			// Empty adjacency is cached too — repeated misses on leaf nodes
+			// are exactly the reads the per-page re-hydration kept paying.
+			if edges, ok := a.hot.getOut(id); ok {
+				a.outByID[id] = edges
+				a.outLoaded[id] = true
+			} else {
+				outMissing = append(outMissing, id)
+			}
+		}
+		if !a.inLoaded[id] {
+			if edges, ok := a.hot.getIn(id); ok {
+				a.inByID[id] = edges
+				a.inLoaded[id] = true
+			} else {
+				inMissing = append(inMissing, id)
+			}
+		}
+	}
+	if len(outMissing) > 0 {
+		loaded := a.g.GetOutEdgesByNodeIDs(outMissing)
+		for _, id := range outMissing {
+			a.outByID[id] = loaded[id]
+			a.outLoaded[id] = true
+			a.hot.putOut(id, loaded[id])
+		}
+	}
+	if len(inMissing) > 0 {
+		loaded := a.g.GetInEdgesByNodeIDs(inMissing)
+		for _, id := range inMissing {
+			a.inByID[id] = loaded[id]
+			a.inLoaded[id] = true
+			a.hot.putIn(id, loaded[id])
+		}
+	}
+}
+
+func (a *applier) relevantEndpointIDs(ids []string, inheritKinds []graph.EdgeKind) []string {
+	relevant := make(map[string]struct{})
+	for _, id := range ids {
+		for _, edge := range a.outByID[id] {
+			if edge == nil || edge.To == "" || graph.IsUnresolvedTarget(edge.To) {
+				continue
+			}
+			if edge.Kind == graph.EdgeMemberOf || edgeKindIn(edge.Kind, inheritKinds) {
+				relevant[edge.To] = struct{}{}
+			}
+		}
+		for _, edge := range a.inByID[id] {
+			if edge == nil || edge.From == "" {
+				continue
+			}
+			if edge.Kind == graph.EdgeMemberOf || edge.Kind == graph.EdgeParamOf {
+				relevant[edge.From] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(relevant))
+	for id := range relevant {
+		result = append(result, id)
+	}
+	return uniqueSortedIDs(result)
+}
+
+func uniqueSortedIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	sort.Strings(unique)
+	return unique
+}
+
+func (a *applier) fileNodes(filePath string) []*graph.Node {
+	if !a.fileLoaded[filePath] {
+		for _, node := range a.g.GetFileNodes(filePath) {
+			a.rememberNode(node)
+		}
+		a.fileLoaded[filePath] = true
+	}
+	return a.nodesByFile[filePath]
+}
+
+// withHotCache attaches the pass-scoped read-through cache. Chainable so the
+// streamed driver can attach it at construction without widening newApplier's
+// signature for the single-applier paths that need no cache.
+func (a *applier) withHotCache(hot *applyHotCache) *applier {
+	a.hot = hot
+	return a
+}
+
+func (a *applier) node(id string) *graph.Node {
+	return a.nodesByID[id]
+}
+
+func (a *applier) nodes(ids []string) map[string]*graph.Node {
+	missing := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" || a.nodeLoaded[id] {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		missing = append(missing, id)
+	}
+	if len(missing) > 0 {
+		// Serve pass-cached nodes first; only the residue pays a store read.
+		// Negative results stay per-applier — a missing ID is cheap to
+		// re-ask and never worth a cache slot.
+		residue := missing[:0]
+		for _, id := range missing {
+			if node, ok := a.hot.getNode(id); ok {
+				a.rememberNode(node)
+				a.nodeLoaded[id] = true
+				continue
+			}
+			residue = append(residue, id)
+		}
+		if len(residue) > 0 {
+			for _, node := range a.g.GetNodesByIDs(residue) {
+				a.rememberNode(node)
+				a.hot.putNode(node)
+			}
+			for _, id := range residue {
+				a.nodeLoaded[id] = true
+			}
+		}
+	}
+	out := make(map[string]*graph.Node, len(ids))
+	for _, id := range ids {
+		if node := a.nodesByID[id]; node != nil {
+			out[id] = node
+		}
+	}
+	return out
+}
+
+func (a *applier) outEdges(id string) []*graph.Edge {
+	return a.outByID[id]
+}
+
+func (a *applier) inEdges(id string) []*graph.Edge {
+	return a.inByID[id]
+}
+
+func (a *applier) reindexEdge(edge *graph.Edge, oldTo string) {
+	a.g.ReindexEdge(edge, oldTo)
+	if a.inLoaded[oldTo] {
+		filtered := a.inByID[oldTo][:0]
+		for _, candidate := range a.inByID[oldTo] {
+			if candidate != edge {
+				filtered = append(filtered, candidate)
+			}
+		}
+		a.inByID[oldTo] = filtered
+	}
+	if a.inLoaded[edge.To] {
+		a.inByID[edge.To] = append(a.inByID[edge.To], edge)
+	}
+}
+
+func (a *applier) removeEdge(edge *graph.Edge) {
+	if edge == nil || !a.g.RemoveEdge(edge.From, edge.To, edge.Kind) {
+		return
+	}
+	if a.outLoaded[edge.From] {
+		filtered := a.outByID[edge.From][:0]
+		for _, candidate := range a.outByID[edge.From] {
+			if candidate != edge {
+				filtered = append(filtered, candidate)
+			}
+		}
+		a.outByID[edge.From] = filtered
+	}
+	if a.inLoaded[edge.To] {
+		filtered := a.inByID[edge.To][:0]
+		for _, candidate := range a.inByID[edge.To] {
+			if candidate != edge {
+				filtered = append(filtered, candidate)
+			}
+		}
+		a.inByID[edge.To] = filtered
 	}
 }
 
@@ -269,7 +613,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			idx.imports[imp.Local] = imp.Path
 		}
 	}
-	for _, n := range a.g.GetFileNodes(facts.file) {
+	for _, n := range a.fileNodes(facts.file) {
 		if receiverTypeKinds[n.Kind] {
 			if _, dup := idx.types[n.Name]; !dup {
 				idx.types[n.Name] = n
@@ -293,6 +637,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 // return_type stamp) another file's facts just synthesized.
 func (a *applier) applyAll(all []*fileFacts, res *semantic.EnrichResult) {
 	sort.Slice(all, func(i, j int) bool { return all[i].file < all[j].file })
+	a.preload(all)
 	idxs := make([]*fileIndex, len(all))
 	for i, facts := range all {
 		idxs[i] = a.buildIndex(facts)
@@ -388,11 +733,7 @@ func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.No
 	key := typeCandidateKey{repoPrefix: idx.facts.repoPrefix, name: name}
 	raw, ok := a.typeCandidatesCache[key]
 	if !ok {
-		if idx.facts.repoPrefix != "" {
-			raw = a.g.FindNodesByNameInRepo(name, idx.facts.repoPrefix)
-		} else {
-			raw = a.g.FindNodesByName(name)
-		}
+		raw = a.namedNodes(idx.facts.repoPrefix, name)
 		a.typeCandidatesCache[key] = raw
 	}
 	lang := a.languageSet()
@@ -407,6 +748,25 @@ func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.No
 		out = append(out, c)
 	}
 	return out
+}
+
+func (a *applier) namedNodes(repoPrefix, name string) []*graph.Node {
+	key := typeCandidateKey{repoPrefix: repoPrefix, name: name}
+	if !a.nameLoaded[key] {
+		if !a.repoProjectionLoaded[repoPrefix] {
+			var nodes []*graph.Node
+			if repoPrefix != "" {
+				nodes = a.g.FindNodesByNameInRepo(name, repoPrefix)
+			} else {
+				nodes = a.g.FindNodesByName(name)
+			}
+			for _, node := range nodes {
+				a.rememberNode(node)
+			}
+		}
+		a.nameLoaded[key] = true
+	}
+	return a.nodesByName[key]
 }
 
 func (a *applier) languageSet() map[string]bool {
@@ -467,14 +827,19 @@ func (a *applier) methodOn(typeNode *graph.Node, method string, argCount, depth 
 	defer func() { a.methodCache[key] = result }()
 
 	var fromIDs []string
-	for _, e := range a.g.GetInEdges(typeNode.ID) {
+	for _, e := range a.inEdges(typeNode.ID) {
 		if e.Kind == graph.EdgeMemberOf {
 			fromIDs = append(fromIDs, e.From)
 		}
 	}
 	var matches []*graph.Node
 	if len(fromIDs) > 0 {
-		for _, n := range a.g.GetNodesByIDs(fromIDs) {
+		members := a.nodes(fromIDs)
+		for _, id := range fromIDs {
+			n := members[id]
+			if n == nil {
+				continue
+			}
 			// An extension function carries a synthetic member_of edge to
 			// its receiver type but is NOT a real member — a real member of
 			// the same name must shadow it. Exclude extensions here so the
@@ -499,12 +864,19 @@ func (a *applier) methodOn(typeNode *graph.Node, method string, argCount, depth 
 		// looping.
 		inheritKinds := a.spec.inheritEdgeKinds()
 		parentKinds := a.supertypeKinds()
+		parentIDs := make([]string, 0)
+		for _, edge := range a.outEdges(typeNode.ID) {
+			if !graph.IsUnresolvedTarget(edge.To) && edgeKindIn(edge.Kind, inheritKinds) {
+				parentIDs = append(parentIDs, edge.To)
+			}
+		}
+		parents := a.nodes(parentIDs)
 		var found *graph.Node
-		for _, e := range a.g.GetOutEdges(typeNode.ID) {
+		for _, e := range a.outEdges(typeNode.ID) {
 			if graph.IsUnresolvedTarget(e.To) || !edgeKindIn(e.Kind, inheritKinds) {
 				continue
 			}
-			parent := a.g.GetNode(e.To)
+			parent := parents[e.To]
 			if parent == nil || !parentKinds[parent.Kind] {
 				continue
 			}
@@ -572,12 +944,17 @@ func (a *applier) disambiguateByArity(matches []*graph.Node, argCount int) *grap
 // via the CallArgCount hook must emit parameter nodes for the count to
 // be meaningful.
 func (a *applier) paramArity(m *graph.Node) (count int, variadic bool) {
-	for _, e := range a.g.GetInEdges(m.ID) {
+	var paramIDs []string
+	for _, e := range a.inEdges(m.ID) {
 		if e.Kind != graph.EdgeParamOf {
 			continue
 		}
 		count++
-		if p := a.g.GetNode(e.From); p != nil && p.Meta != nil {
+		paramIDs = append(paramIDs, e.From)
+	}
+	params := a.nodes(paramIDs)
+	for _, id := range paramIDs {
+		if p := params[id]; p != nil && p.Meta != nil {
 			if v, _ := p.Meta["variadic"].(bool); v {
 				variadic = true
 			}
@@ -614,12 +991,7 @@ func (a *applier) callableReturnType(idx *fileIndex, callee string) (string, boo
 		}
 	}
 	if match == nil {
-		var raw []*graph.Node
-		if idx.facts.repoPrefix != "" {
-			raw = a.g.FindNodesByNameInRepo(callee, idx.facts.repoPrefix)
-		} else {
-			raw = a.g.FindNodesByName(callee)
-		}
+		raw := a.namedNodes(idx.facts.repoPrefix, callee)
 		lang := a.languageSet()
 		for _, c := range raw {
 			if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod {
@@ -822,9 +1194,9 @@ func (a *applier) effectiveReturnType(idx *fileIndex, m, receiver *graph.Node) *
 // ownerType returns the type a method is a member of, following its
 // EdgeMemberOf link; nil when the method has no resolved owner.
 func (a *applier) ownerType(m *graph.Node) *graph.Node {
-	for _, e := range a.g.GetOutEdges(m.ID) {
+	for _, e := range a.outEdges(m.ID) {
 		if e.Kind == graph.EdgeMemberOf {
-			if owner := a.g.GetNode(e.To); owner != nil {
+			if owner := a.node(e.To); owner != nil {
 				return owner
 			}
 		}
@@ -920,11 +1292,15 @@ func (a *applier) extensionMethod(typeNode *graph.Node, method string) *graph.No
 // ambiguous real overload set — which makes methodOn return nil without
 // meaning "no member" — never resolves to an extension instead.
 func (a *applier) typeHasRealMember(typeNode *graph.Node, method string) bool {
-	for _, e := range a.g.GetInEdges(typeNode.ID) {
-		if e.Kind != graph.EdgeMemberOf {
-			continue
+	var memberIDs []string
+	for _, e := range a.inEdges(typeNode.ID) {
+		if e.Kind == graph.EdgeMemberOf {
+			memberIDs = append(memberIDs, e.From)
 		}
-		n := a.g.GetNode(e.From)
+	}
+	members := a.nodes(memberIDs)
+	for _, id := range memberIDs {
+		n := members[id]
 		if n != nil && n.Kind == graph.KindMethod && n.Name == method && !nodeIsExtension(n) {
 			return true
 		}
@@ -943,7 +1319,7 @@ func (a *applier) buildExtensionIndex() {
 	a.extensionsOK = true
 	a.extensions = make(map[extKey][]*graph.Node)
 	lang := a.languageSet()
-	for n := range a.g.NodesByKind(graph.KindMethod) {
+	for _, n := range a.allNodes {
 		if n.Meta == nil || !lang[n.Language] || n.Name == "" {
 			continue
 		}
@@ -962,7 +1338,7 @@ func (a *applier) buildExtensionIndex() {
 // a fresh edge. Edges that already carry compiler/AST-grade provenance
 // pointing elsewhere are never overridden.
 func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, file string, res *semantic.EnrichResult, strategy resolutionStrategy, confidence float64) {
-	outs := a.g.GetOutEdges(caller.ID)
+	outs := a.outEdges(caller.ID)
 	for _, e := range outs {
 		if e.Kind == graph.EdgeCalls && e.To == target.ID {
 			if a.confirmCall(e, strategy, confidence) {
@@ -986,7 +1362,7 @@ func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, f
 		}
 		oldTo := e.To
 		e.To = target.ID
-		a.g.ReindexEdge(e, oldTo)
+		a.reindexEdge(e, oldTo)
 		a.confirmCall(e, strategy, confidence)
 		res.EdgesConfirmed++
 		return
@@ -1093,7 +1469,7 @@ func (a *applier) applySuper(idx *fileIndex, sf superFact, res *semantic.EnrichR
 			kind = graph.EdgeExtends
 		}
 	}
-	outs := a.g.GetOutEdges(typeNode.ID)
+	outs := a.outEdges(typeNode.ID)
 	for _, e := range outs {
 		if e.Kind == kind && e.To == superNode.ID {
 			if a.confirmAST(e) {
@@ -1115,7 +1491,7 @@ func (a *applier) applySuper(idx *fileIndex, sf superFact, res *semantic.EnrichR
 			// key (which folds Kind) keeps the same Kind on both sides.
 			oldTo := e.To
 			e.To = superNode.ID
-			a.g.ReindexEdge(e, oldTo)
+			a.reindexEdge(e, oldTo)
 			a.confirmAST(e)
 			res.EdgesConfirmed++
 			return
@@ -1129,7 +1505,7 @@ func (a *applier) applySuper(idx *fileIndex, sf superFact, res *semantic.EnrichR
 		// contradictory rows. Drop the old edge and add a fresh one of the
 		// correct kind instead, mirroring how the compiler-grade providers
 		// only ever add new edges rather than flip an existing one's kind.
-		a.g.RemoveEdge(e.From, e.To, e.Kind)
+		a.removeEdge(e)
 		a.addASTEdge(typeNode.ID, superNode.ID, kind, idx.facts.file, sf.line, strategyDirect, astConfidence)
 		res.EdgesAdded++
 		return
@@ -1166,7 +1542,7 @@ func (a *applier) applyMeta(idx *fileIndex, mf metaFact, res *semantic.EnrichRes
 // findMember locates the field/variable node for owner.name in the
 // file (extractor convention: Meta["receiver"] carries the owner).
 func (a *applier) findMember(idx *fileIndex, owner, name string) *graph.Node {
-	for _, n := range a.g.GetFileNodes(idx.facts.file) {
+	for _, n := range a.fileNodes(idx.facts.file) {
 		if n.Name != name {
 			continue
 		}
@@ -1292,6 +1668,12 @@ func (a *applier) addASTEdge(from, to string, kind graph.EdgeKind, file string, 
 		e.Meta["resolution_strategy"] = string(strategy)
 	}
 	a.g.AddEdge(e)
+	if a.outLoaded[from] {
+		a.outByID[from] = append(a.outByID[from], e)
+	}
+	if a.inLoaded[to] {
+		a.inByID[to] = append(a.inByID[to], e)
+	}
 	return e
 }
 
@@ -1305,7 +1687,7 @@ func (a *applier) addASTEdge(from, to string, kind graph.EdgeKind, file string, 
 // confidence) both win.
 func (a *applier) strongerEdge(from, to string, kind graph.EdgeKind, confidence float64) *graph.Edge {
 	gradedRank := graph.OriginRank(graph.OriginASTResolved)
-	for _, e := range a.g.GetOutEdges(from) {
+	for _, e := range a.outEdges(from) {
 		if e.Kind != kind || e.To != to {
 			continue
 		}

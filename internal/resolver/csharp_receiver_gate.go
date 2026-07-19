@@ -1,10 +1,6 @@
 package resolver
 
-import (
-	"strconv"
-
-	"github.com/zzet/gortex/internal/graph"
-)
+import "github.com/zzet/gortex/internal/graph"
 
 // Receiver-type gating for C# member-call attribution.
 //
@@ -20,109 +16,140 @@ import (
 // extension-method binding are both preserved, so the gate adds no false
 // negatives.
 //
-// The demotion re-writes the edge (remove + re-add as speculative) rather than
-// mutating it in place: an in-place Origin/Meta change is a no-op on the
-// non-memory backends, which return decoded copies from EdgesByKind. RemoveEdge
-// is keyed only by (from,to,kind), so every edge in an affected group is
-// snapshotted and re-added, preserving legitimately-typed sibling calls.
+// Demotions are persisted with one exact-identity ReindexEdges batch. That
+// updates detached SQLite edge copies without the coarse (from,to,kind)
+// RemoveEdge operation, so legitimate sibling call sites remain untouched.
 
 // demoteCSharpMisattributedMemberCalls demotes weak-tier C# member calls whose
 // bound target belongs to a type unrelated to the edge's receiver_type. Returns
 // the number of edges demoted.
 func demoteCSharpMisattributedMemberCalls(g graph.Store) int {
+	return demoteCSharpMisattributedMemberCallsScoped(g, nil)
+}
+
+// demoteCSharpMisattributedMemberCallsScoped evaluates only calls sourced by a
+// changed repository or targeting one of its changed methods. Endpoint, type,
+// and hierarchy state is fetched in bounded batches; a nil scope preserves the
+// full/cold whole-graph candidate set.
+func demoteCSharpMisattributedMemberCallsScoped(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
 	}
-	// C# type/interface name → node ids, and each type's super-type / interface
-	// (up) edges, for hierarchy-relatedness checks by name.
-	nameToTypeIDs := map[string][]string{}
-	for _, n := range nodesByKindsOrAll(g, graph.KindType, graph.KindInterface) {
-		if n == nil || n.Language != "csharp" || n.Name == "" {
+	calls := frameworkCallsForScope(g, scope)
+	if len(calls) == 0 {
+		return 0
+	}
+	endpointIDs := make([]string, 0, len(calls)*2)
+	for _, edge := range calls {
+		if edge != nil {
+			endpointIDs = append(endpointIDs, edge.From, edge.To)
+		}
+	}
+	nodes := g.GetNodesByIDs(endpointIDs)
+
+	// Only type names present on candidate receiver/target pairs can affect a
+	// demotion verdict. Resolve all of them through one name-index query.
+	typeNames := make([]string, 0)
+	seenNames := make(map[string]bool)
+	for _, edge := range calls {
+		if edge == nil || edge.Meta == nil {
 			continue
 		}
-		nameToTypeIDs[n.Name] = append(nameToTypeIDs[n.Name], n.ID)
+		if receiver, _ := edge.Meta["receiver_type"].(string); receiver != "" && !seenNames[receiver] {
+			seenNames[receiver] = true
+			typeNames = append(typeNames, receiver)
+		}
+		if target := nodes[edge.To]; target != nil && target.Meta != nil {
+			if receiver, _ := target.Meta["receiver"].(string); receiver != "" && !seenNames[receiver] {
+				seenNames[receiver] = true
+				typeNames = append(typeNames, receiver)
+			}
+		}
+	}
+	byName := g.FindNodesByNames(typeNames)
+	nameToTypeIDs := map[string][]string{}
+	hierarchyRepos := map[string]bool{}
+	for name, matches := range byName {
+		for _, node := range matches {
+			if node == nil || node.Language != "csharp" ||
+				(node.Kind != graph.KindType && node.Kind != graph.KindInterface) {
+				continue
+			}
+			nameToTypeIDs[name] = append(nameToTypeIDs[name], node.ID)
+			hierarchyRepos[node.RepoPrefix] = true
+		}
 	}
 	if len(nameToTypeIDs) == 0 {
 		return 0
 	}
+	hierarchyEdges := frameworkRepoEdges(
+		g,
+		func() map[string]bool {
+			if scope == nil {
+				return nil
+			}
+			return hierarchyRepos
+		}(),
+		graph.EdgeExtends,
+		graph.EdgeImplements,
+	)
+	hierarchyNodeIDs := make([]string, 0, len(hierarchyEdges)*2)
+	for _, edge := range hierarchyEdges {
+		if edge != nil {
+			hierarchyNodeIDs = append(hierarchyNodeIDs, edge.From)
+			if !graph.IsUnresolvedTarget(edge.To) {
+				hierarchyNodeIDs = append(hierarchyNodeIDs, edge.To)
+			}
+		}
+	}
+	for id, node := range g.GetNodesByIDs(hierarchyNodeIDs) {
+		nodes[id] = node
+	}
+
 	up := map[string][]string{}
 	// incompleteHier[name] marks a C# type that declares a base or interface the
 	// index could not resolve (an external assembly, a generic type parameter) —
 	// its hierarchy is only partially known, so an "unrelated to the target"
 	// verdict for a receiver of that type is unreliable.
 	incompleteHier := map[string]bool{}
-	for _, k := range []graph.EdgeKind{graph.EdgeExtends, graph.EdgeImplements} {
-		for e := range g.EdgesByKind(k) {
-			if e == nil || e.From == "" {
-				continue
-			}
-			if graph.IsUnresolvedTarget(e.To) {
-				if from := g.GetNode(e.From); from != nil && from.Language == "csharp" && from.Name != "" {
-					incompleteHier[from.Name] = true
-				}
-				continue
-			}
-			up[e.From] = append(up[e.From], e.To)
-		}
-	}
-
-	groupKey := func(from, to string, kind graph.EdgeKind) string {
-		return from + "\x00" + to + "\x00" + string(kind)
-	}
-	edgeKey := func(e *graph.Edge) string {
-		return e.From + "\x00" + e.To + "\x00" + string(e.Kind) + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line)
-	}
-
-	// Pass 1: which edges to demote, and which (from,to,kind) groups they touch.
-	demote := map[string]bool{}
-	affected := map[string]bool{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if !csharpShouldDemote(g, e, nameToTypeIDs, up, incompleteHier) {
+	for _, edge := range hierarchyEdges {
+		if edge == nil || edge.From == "" {
 			continue
 		}
-		demote[edgeKey(e)] = true
-		affected[groupKey(e.From, e.To, e.Kind)] = true
-	}
-	if len(affected) == 0 {
-		return 0
-	}
-
-	// Pass 2: snapshot every edge in an affected group (siblings included) so
-	// the coarse RemoveEdge can be reversed precisely.
-	groups := map[string][]*graph.Edge{}
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		gk := groupKey(e.From, e.To, e.Kind)
-		if affected[gk] {
-			groups[gk] = append(groups[gk], e)
-		}
-	}
-
-	demoted := 0
-	for _, edges := range groups {
-		if len(edges) == 0 {
+		if graph.IsUnresolvedTarget(edge.To) {
+			if from := nodes[edge.From]; from != nil && from.Language == "csharp" && from.Name != "" {
+				incompleteHier[from.Name] = true
+			}
 			continue
 		}
-		f := edges[0]
-		g.RemoveEdge(f.From, f.To, f.Kind)
-		for _, e := range edges {
-			if demote[edgeKey(e)] {
-				e.Origin = graph.OriginSpeculative
-				if e.Meta == nil {
-					e.Meta = map[string]any{}
-				}
-				e.Meta[graph.MetaSpeculative] = true
-				e.Meta["demoted"] = "receiver_type_mismatch"
-				demoted++
-			}
-			g.AddEdge(e)
-		}
+		up[edge.From] = append(up[edge.From], edge.To)
 	}
-	return demoted
+
+	reindex := make([]graph.EdgeReindex, 0)
+	for _, edge := range calls {
+		if !csharpShouldDemote(nodes, edge, nameToTypeIDs, up, incompleteHier) {
+			continue
+		}
+		edge.Origin = graph.OriginSpeculative
+		if edge.Meta == nil {
+			edge.Meta = map[string]any{}
+		}
+		edge.Meta[graph.MetaSpeculative] = true
+		edge.Meta["demoted"] = "receiver_type_mismatch"
+		reindex = append(reindex, graph.EdgeReindex{
+			Edge: edge, OldFrom: edge.From, OldTo: edge.To,
+			OldFilePath: edge.FilePath, OldLine: edge.Line, RefreshIdentity: true,
+		})
+	}
+	if len(reindex) > 0 {
+		g.ReindexEdges(reindex)
+	}
+	return len(reindex)
 }
 
 // csharpShouldDemote reports whether a resolved C# member-call edge is a
 // same-named-unrelated-type misattribution that should be demoted.
-func csharpShouldDemote(g graph.Store, e *graph.Edge, nameToTypeIDs, up map[string][]string, incompleteHier map[string]bool) bool {
+func csharpShouldDemote(nodes map[string]*graph.Node, e *graph.Edge, nameToTypeIDs, up map[string][]string, incompleteHier map[string]bool) bool {
 	if e == nil || e.Meta == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 		return false
 	}
@@ -145,11 +172,11 @@ func csharpShouldDemote(g graph.Store, e *graph.Edge, nameToTypeIDs, up map[stri
 	if graph.OriginRank(eff) > graph.OriginRank(graph.OriginASTInferred) {
 		return false
 	}
-	caller := g.GetNode(e.From)
+	caller := nodes[e.From]
 	if caller == nil || caller.Language != "csharp" {
 		return false
 	}
-	target := g.GetNode(e.To)
+	target := nodes[e.To]
 	if target == nil || target.Kind != graph.KindMethod || target.Language != "csharp" || target.Meta == nil {
 		return false
 	}

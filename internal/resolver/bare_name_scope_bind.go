@@ -112,7 +112,7 @@ func (r *Resolver) bindBareNameScopeRefs() {
 // graph (the single largest node kind).
 func (r *Resolver) bindBareNameScopeRefsForFile(filePath string) {
 	owned := map[string][]scopeNode{}
-	for _, n := range r.graph.GetFileNodes(filePath) {
+	for _, n := range r.incrementalFileNodes(filePath) {
 		if n.Kind != graph.KindLocal && n.Kind != graph.KindParam {
 			continue
 		}
@@ -137,9 +137,7 @@ func (r *Resolver) bindBareNameScopeRefsForFile(filePath string) {
 			}
 		}
 	}
-	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
-	}
+	r.persistAttributionReindexes(batch)
 }
 
 // tryBindBareName tries to rewrite e.To from `unresolved::<name>` to a

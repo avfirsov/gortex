@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,38 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+type receiverRebindCapabilityStore struct {
+	graph.Store
+	paths []string
+	err   error
+}
+
+func (s *receiverRebindCapabilityStore) RebindGoMethodReceivers(filePath string) (int, error) {
+	s.paths = append(s.paths, filePath)
+	return 0, s.err
+}
+
+func TestRebindGoMethodReceiversUsesBackendCapabilityAndFallsBack(t *testing.T) {
+	t.Run("global and scoped dispatch", func(t *testing.T) {
+		store := &receiverRebindCapabilityStore{Store: graph.New()}
+		r := New(store)
+		r.rebindGoMethodReceivers()
+		r.rebindGoMethodReceiversForFile("pkg/m.go")
+		assert.Equal(t, []string{"", "pkg/m.go"}, store.paths)
+	})
+
+	t.Run("capability error keeps correctness fallback", func(t *testing.T) {
+		g := graph.New()
+		g.AddNode(&graph.Node{ID: "pkg/type.go::T", Kind: graph.KindType, Name: "T", FilePath: "pkg/type.go", Language: "go"})
+		g.AddNode(&graph.Node{ID: "pkg/m.go::T.M", Kind: graph.KindMethod, Name: "M", FilePath: "pkg/m.go", Language: "go"})
+		edge := &graph.Edge{From: "pkg/m.go::T.M", To: "pkg/m.go::T", Kind: graph.EdgeMemberOf, FilePath: "pkg/m.go"}
+		g.AddEdge(edge)
+		store := &receiverRebindCapabilityStore{Store: g, err: errors.New("backend unavailable")}
+		New(store).rebindGoMethodReceivers()
+		assert.Equal(t, "pkg/type.go::T", edge.To)
+	})
+}
 
 // getFileNodesCounter wraps a graph.Store and counts GetFileNodes calls so a
 // test can prove the per-file receiver rebind builds a package's type index
@@ -138,6 +171,24 @@ func TestRebindGoMethodReceivers_CollapsesCrossFileMethods(t *testing.T) {
 	New(g2).rebindGoMethodReceivers()
 	assert.Equal(t, "pkg/foo.go::Foo", sameFileEdge.To,
 		"same-file method edge must be left unchanged")
+}
+
+func TestRebindGoMethodReceivers_IsolatedByRepo(t *testing.T) {
+	g := graph.New()
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		typeID := repo + "::types.go::T"
+		methodID := repo + "::methods.go::T.M"
+		g.AddNode(&graph.Node{ID: typeID, Kind: graph.KindType, Name: "T", FilePath: "types.go", Language: "go", RepoPrefix: repo})
+		g.AddNode(&graph.Node{ID: methodID, Kind: graph.KindMethod, Name: "M", FilePath: "methods.go", Language: "go", RepoPrefix: repo})
+		g.AddEdge(&graph.Edge{From: methodID, To: repo + "::methods.go::T", Kind: graph.EdgeMemberOf, FilePath: "methods.go", Line: 1})
+	}
+
+	r := New(g)
+	r.rebindGoMethodReceivers()
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		assert.Truef(t, hasEdgeKind(g, repo+"::methods.go::T.M", repo+"::types.go::T", graph.EdgeMemberOf),
+			"receiver in %s must bind only to its own repository", repo)
+	}
 }
 
 // TestRebindGoMethodReceivers_LanguageGated guards against the pass

@@ -289,8 +289,8 @@ func hasPathPrefix(path, prefix string) bool {
 // — this is just enough that an agent in the very first turn knows
 // to reach for graph tools first.
 func rulePreamble() string {
-	return "**Rule:** Call `explore` first for every code task. Inspect indexed code with `search`, `read`, `relations`, or `trace`; never Read/Grep/Glob it. " +
-		"Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
+	return "**Rule:** Call `explore` first for every code task. Inspect indexed code with `search`, `read`, `relations`, or `trace`. Use native read, search, or edit tools only when Gortex performance or integration is bad. " +
+		"Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
 		"Call `capabilities` only when exact operation fields are unknown.\n" +
 		toolref.MCPRequiredLine()
 }

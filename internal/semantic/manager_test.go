@@ -1,7 +1,9 @@
 package semantic
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,19 @@ type mockProvider struct {
 	available  bool
 	enrichFunc func(g graph.Store, root string) (*EnrichResult, error)
 	closed     bool
+}
+
+type contextBatchProvider struct {
+	*mockProvider
+	hadDeadline bool
+	deadline    time.Time
+	files       []string
+}
+
+func (p *contextBatchProvider) EnrichFilesContext(ctx context.Context, _ graph.Store, _, _ string, files []string) (*EnrichResult, error) {
+	p.deadline, p.hadDeadline = ctx.Deadline()
+	p.files = append([]string(nil), files...)
+	return &EnrichResult{Provider: p.name, Language: "go"}, nil
 }
 
 func (m *mockProvider) Name() string        { return m.name }
@@ -67,6 +82,28 @@ func TestManager_EnrichAll(t *testing.T) {
 	assert.Len(t, results, 1)
 	assert.Equal(t, "test-go", results[0].Provider)
 	assert.Equal(t, 5, results[0].EdgesConfirmed)
+}
+
+func TestManagerEnrichFilesPropagatesConfiguredDeadlineToContextBatch(t *testing.T) {
+	provider := &contextBatchProvider{mockProvider: &mockProvider{
+		name: "go-context", languages: []string{"go"}, available: true,
+	}}
+	manager := NewManager(Config{
+		Enabled:        true,
+		TimeoutSeconds: 5,
+		Providers: []ProviderConfig{{
+			Name: "go-context", Languages: []string{"go"}, Priority: 1, Enabled: true,
+		}},
+	}, zap.NewNop())
+	manager.RegisterProvider(provider)
+
+	_, err := manager.EnrichFiles(graph.New(), "repo", t.TempDir(), "go", []string{"repo/b.go", "repo/a.go", "repo/a.go"})
+	require.NoError(t, err)
+	require.True(t, provider.hadDeadline, "context-aware batch must inherit the manager deadline")
+	remaining := time.Until(provider.deadline)
+	require.Positive(t, remaining)
+	require.LessOrEqual(t, remaining, 5*time.Second)
+	assert.Equal(t, []string{"repo/a.go", "repo/b.go"}, provider.files)
 }
 
 func TestManager_PrioritySelection(t *testing.T) {

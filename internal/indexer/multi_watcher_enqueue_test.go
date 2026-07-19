@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 func TestMultiWatcherEnqueueFileMutationIgnoresUnrelatedDegradation(t *testing.T) {
@@ -28,6 +30,8 @@ func TestMultiWatcherEnqueueFileMutationIgnoresUnrelatedDegradation(t *testing.T
 	}
 
 	require.NotEmpty(t, watcher.DegradedReason())
+	callbackCount := 0
+	watcherB.OnSymbolChange(func(_ string, _, _ []*graph.Node) { callbackCount++ })
 	ticket, err := watcher.EnqueueFileMutation(context.Background(), filepath.Join(rootB, "b.go"))
 	require.NoError(t, err)
 	require.NotNil(t, ticket)
@@ -40,7 +44,12 @@ func TestMultiWatcherEnqueueFileMutationIgnoresUnrelatedDegradation(t *testing.T
 	case <-time.After(2 * time.Second):
 		t.Fatalf("mutation ticket generation %d did not complete", ticket.Generation)
 	}
-	require.Len(t, watcherB.History(), 1)
+	// Admission succeeded, but the owning repository was already at this exact
+	// content receipt. A no-op mutation completes its ticket without publishing
+	// a synthetic graph-history event.
+	require.Empty(t, watcherB.History())
+	require.Zero(t, callbackCount)
+	requireNoWatcherEvent(t, watcherB)
 	require.Empty(t, watcherA.History())
 }
 

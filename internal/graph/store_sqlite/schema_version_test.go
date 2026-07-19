@@ -139,7 +139,7 @@ func TestOpenRefusesWipeWithoutOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -207,7 +207,7 @@ func TestOpenV2RequiresTopologyIntegrityRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -319,7 +319,7 @@ func TestOpenAtCurrentVersionIsNoOp(t *testing.T) {
 			t.Fatalf("seed node: %v", err)
 		}
 	}
-	withRawSeed(s.db)
+	withRawSeed(s.writerDB)
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestOpenWithInPlaceMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES ('n1','func','Foo','f.go')`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -511,6 +511,222 @@ func TestSchemaMigrationsWellFormed(t *testing.T) {
 	}
 }
 
+func TestOpenV5CompactsResolverEdgeIndexesInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolver-index-v5.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("create current store: %v", err)
+	}
+	if _, err := s.writerDB.Exec(`INSERT INTO nodes (id, kind, name, file_path) VALUES
+		('source', 'function', 'source', 'a.go'),
+		('target', 'function', 'target', 'b.go')`); err != nil {
+		t.Fatalf("seed nodes: %v", err)
+	}
+	if _, err := s.writerDB.Exec(`INSERT INTO edges (from_id, to_id, kind, file_path, line) VALUES
+		('source', 'unresolved::target', 'calls', 'a.go', 1),
+		('source', 'target', 'calls', 'a.go', 2)`); err != nil {
+		t.Fatalf("seed edges: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	// Recreate the v5 shapes: one dense Boolean frontier index plus the
+	// one-shot global Go receiver index. The v6 migration must replace/drop
+	// them without wiping graph rows.
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS edges_by_unresolved`); err != nil {
+			t.Fatalf("drop current unresolved index: %v", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX edges_by_unresolved ON edges(is_unresolved)`); err != nil {
+			t.Fatalf("create v5 dense unresolved index: %v", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX edges_go_member_receiver ON edges(member_receiver_dir, member_receiver, from_id, to_id, id) WHERE kind = 'member_of' AND member_receiver IS NOT NULL AND member_receiver_dir IS NOT NULL`); err != nil {
+			t.Fatalf("create v5 receiver index: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
+			t.Fatalf("stamp v5: %v", err)
+		}
+	})
+
+	assertCompacted := func(store *Store) {
+		t.Helper()
+		if store.NeedsRebuild() {
+			t.Fatal("mechanical v5 index migration unexpectedly requested a rebuild")
+		}
+		var partial int
+		if err := store.db.QueryRow(`SELECT partial FROM pragma_index_list('edges') WHERE name = 'edges_by_unresolved'`).Scan(&partial); err != nil || partial != 1 {
+			t.Fatalf("edges_by_unresolved partial=%d err=%v, want 1,nil", partial, err)
+		}
+		var ddl string
+		if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'edges_by_unresolved'`).Scan(&ddl); err != nil {
+			t.Fatalf("read unresolved index DDL: %v", err)
+		}
+		if !strings.Contains(strings.ToLower(ddl), "where is_unresolved = 1") {
+			t.Fatalf("unresolved index is not frontier-partial: %s", ddl)
+		}
+		var obsolete, edges int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'edges_go_member_receiver'`).Scan(&obsolete); err != nil || obsolete != 0 {
+			t.Fatalf("obsolete receiver index count=%d err=%v, want 0,nil", obsolete, err)
+		}
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&edges); err != nil || edges != 2 {
+			t.Fatalf("edge count after in-place migration=%d err=%v, want 2,nil", edges, err)
+		}
+		plan := strings.ToLower(queryPlan(t, store, `SELECT id FROM edges WHERE id > ? AND is_unresolved = 1 ORDER BY id`, 0))
+		if !strings.Contains(plan, "edges_by_unresolved") || strings.Contains(plan, "scan edges") {
+			t.Fatalf("partial unresolved query plan is not indexed:\n%s", plan)
+		}
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("migrate v5 store: %v", err)
+	}
+	assertCompacted(s)
+	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("migrated user_version=%d err=%v, want %d,nil", v, err, currentSchemaVersion)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	// A normal warm reopen must preserve the compact shape and data without
+	// repeating or undoing the migration.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("warm reopen migrated store: %v", err)
+	}
+	defer s.Close()
+	assertCompacted(s)
+}
+
+func TestOpenBackfillsSyntheticNodeRepoPrefixes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		rows := []string{
+			"repo-a::module::go:net/http",
+			"repo-a::stdlib::net/http::Get",
+			"repo-b::builtin::len",
+			"repo-b::external_call::example.com/pkg::Run",
+			"dep::example.com/shared::Run",
+			"external::example.com/shared::Run",
+			"module::go:shared",
+			"ordinary::node",
+		}
+		for _, id := range rows {
+			if _, err := db.Exec(`INSERT INTO nodes (id, kind, name, file_path, repo_prefix) VALUES (?, 'function', ?, '', '')`, id, id); err != nil {
+				t.Fatalf("seed %q: %v", id, err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			t.Fatalf("reset user_version: %v", err)
+		}
+	})
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("open v4 store: %v", err)
+	}
+	defer s.Close()
+
+	want := map[string]string{
+		"repo-a::module::go:net/http":                 "repo-a",
+		"repo-a::stdlib::net/http::Get":               "repo-a",
+		"repo-b::builtin::len":                        "repo-b",
+		"repo-b::external_call::example.com/pkg::Run": "repo-b",
+		"dep::example.com/shared::Run":                "",
+		"external::example.com/shared::Run":           "",
+		"module::go:shared":                           "",
+		"ordinary::node":                              "",
+	}
+	rows, err := s.db.Query(`SELECT id, repo_prefix FROM nodes`)
+	if err != nil {
+		t.Fatalf("query migrated rows: %v", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]string, len(want))
+	for rows.Next() {
+		var id, repo string
+		if err := rows.Scan(&id, &repo); err != nil {
+			t.Fatalf("scan migrated row: %v", err)
+		}
+		seen[id] = repo
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migrated rows: %v", err)
+	}
+	for id, wantRepo := range want {
+		if got := seen[id]; got != wantRepo {
+			t.Errorf("repo_prefix for %q = %q, want %q", id, got, wantRepo)
+		}
+	}
+	if v, err := readUserVersion(s.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("user_version = %d (err %v), want %d", v, err, currentSchemaVersion)
+	}
+}
+
+func TestOpenV4AddsCloneCorpusProjectionInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS clone_shingles_by_repo`); err != nil {
+			t.Fatalf("drop clone index: %v", err)
+		}
+		if _, err := db.Exec(`DROP TABLE clone_shingles`); err != nil {
+			t.Fatalf("drop clone table: %v", err)
+		}
+		if _, err := db.Exec(`CREATE TABLE clone_shingles (
+node_id TEXT PRIMARY KEY, repo_prefix TEXT NOT NULL DEFAULT '', shingles BLOB
+) WITHOUT ROWID`); err != nil {
+			t.Fatalf("create v4 clone table: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO clone_shingles(node_id, repo_prefix, shingles) VALUES ('repo::f', 'repo', X'0100000000000000')`); err != nil {
+			t.Fatalf("seed v4 clone row: %v", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			t.Fatalf("set v4: %v", err)
+		}
+	})
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("open v4 store: %v", err)
+	}
+	defer store.Close()
+	page, err := store.CloneCorpusPage("repo", "", 10)
+	if err != nil {
+		t.Fatalf("read migrated clone projection: %v", err)
+	}
+	if len(page) != 1 || page[0].NodeID != "repo::f" || len(page[0].Shingles) != 1 || page[0].Shingles[0] != 1 {
+		t.Fatalf("migrated clone row = %#v, want preserved v4 shingle row", page)
+	}
+	if page[0].Finalized || page[0].TokenCount != 0 {
+		t.Fatalf("migrated clone defaults = finalized:%v tokens:%d, want pending/0", page[0].Finalized, page[0].TokenCount)
+	}
+	var indexCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='clone_shingles_by_repo'`).Scan(&indexCount); err != nil {
+		t.Fatalf("query clone repo index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("clone repo index count = %d, want 1", indexCount)
+	}
+}
+
 // TestOpenDedupesFnValuePlaceholders drives the shipped v2 migration through the
 // real Open composition: a store knocked back to the v1 baseline with duplicate
 // fn-value placeholder edges is deduped in place on reopen — one survivor per
@@ -548,7 +764,7 @@ func TestOpenDedupesFnValuePlaceholders(t *testing.T) {
 		{8, "a", "unresolved::Foo", "calls", 1},
 	}
 	for _, r := range seed {
-		if _, err := s.db.Exec(ins, r.id, r.from, r.to, r.kind, "f.go", r.line); err != nil {
+		if _, err := s.writerDB.Exec(ins, r.id, r.from, r.to, r.kind, "f.go", r.line); err != nil {
 			t.Fatalf("seed edge %d: %v", r.id, err)
 		}
 	}

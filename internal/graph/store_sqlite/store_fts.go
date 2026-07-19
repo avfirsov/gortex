@@ -1,7 +1,9 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -40,78 +42,294 @@ import (
 // implements them, routing search_symbols through on-disk FTS5 instead
 // of the in-process BM25 index.
 var (
-	_ graph.SymbolSearcher        = (*Store)(nil)
-	_ graph.SymbolBundleSearcher  = (*Store)(nil)
-	_ graph.BundleFingerprintSink = (*Store)(nil)
+	_ graph.SymbolSearcher         = (*Store)(nil)
+	_ graph.SymbolFTSBatchUpserter = (*Store)(nil)
+	_ graph.SymbolFTSRepoResetter  = (*Store)(nil)
+	_ graph.SymbolFTSBatchDeleter  = (*Store)(nil)
+	_ graph.SymbolBundleSearcher   = (*Store)(nil)
+	_ graph.BundleFingerprintSink  = (*Store)(nil)
 )
 
-// ftsInsertChunkRows bounds the rows per multi-row INSERT. Each row
-// binds 3 host params (node_id, repo_prefix, tokens); 300 rows is 900
-// params, comfortably under SQLite's default 999-variable limit so the
-// statement stays portable across builds.
-const ftsInsertChunkRows = 300
+// ftsInsertChunkRows bounds the rows per multi-row INSERT. Each FTS row
+// binds 4 host params (explicit rowid, node_id, repo_prefix, tokens); 240
+// rows is 960 params, below SQLite's conservative 999-variable limit.
+const ftsInsertChunkRows = 240
 
-// UpsertSymbolFTS records (or replaces) the pre-tokenised text for
-// nodeID. FTS5 offers no UPSERT on a table with UNINDEXED columns, so
-// the write is delete-then-insert. The delete targets the prior row's
-// FTS5 docid (rowid), looked up from the symbol_fts_rowid sidecar —
-// node_id is UNINDEXED, so "DELETE … WHERE node_id = ?" would full-scan
-// the whole index once per symbol, which is quadratic over a file's
-// symbols on the per-edit reindex hot path. The repo_prefix is derived
-// from the owning node (nodes.repo_prefix) so the per-repo staleness
-// wipe in BulkUpsertSymbolFTS can scope by prefix; if the node is absent
-// the prefix defaults to "".
+const deleteSymbolFTSForRepoSQL = `DELETE FROM symbol_fts
+WHERE rowid IN (
+    SELECT fts_rowid FROM symbol_fts_rowid WHERE repo_prefix = ?
+)`
+
+// nextFTSRowIDTx allocates a contiguous docid range while the caller holds
+// writeMu and a write transaction. Supplying rowids explicitly lets bulk FTS
+// writers populate their indexed ownership sidecars without selecting the
+// just-inserted rows back out of an UNINDEXED virtual-table column.
+func nextFTSRowIDTx(tx *sql.Tx, table string) (int64, error) {
+	var next int64
+	err := tx.QueryRow(`SELECT COALESCE(MAX(rowid), 0) + 1 FROM ` + table).Scan(&next)
+	return next, err
+}
+
+// UpsertSymbolFTS is the compatibility single-item entry point. Incremental
+// indexing uses BatchUpsertSymbolFTS so a file with N symbols does not pay N
+// transactions and 2*N point lookups.
 func (s *Store) UpsertSymbolFTS(nodeID, tokens string) error {
-	if nodeID == "" {
-		return nil
-	}
+	return s.BatchUpsertSymbolFTS([]graph.SymbolFTSItem{{NodeID: nodeID, Tokens: tokens}})
+}
+
+// symbolFTSBatchStats records the actual bounded SQL statements executed by
+// one incremental batch. It is returned by the internal implementation so
+// tests can enforce that statement count grows by chunks, never by symbols.
+type symbolFTSBatchStats struct {
+	allocatorQueries    int
+	lookupStatements    int
+	deleteStatements    int
+	insertStatements    int
+	ownershipStatements int
+	commits             int
+}
+
+// ResetSymbolFTS deletes one repository's FTS documents through the indexed
+// ownership sidecar. Cold shadow persistence calls this exactly once before
+// appending bounded BatchUpsertSymbolFTS chunks, so no chunk can erase an
+// earlier one and no whole-repository token slice is retained in Go.
+func (s *Store) ResetSymbolFTS(repoPrefix string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
-	var repoPrefix string
-	// A missing node (or a scan error) leaves repoPrefix == "" — the
-	// row is still indexable, it just won't be reachable by a per-repo
-	// prefix wipe. The graph.Store contract has no error channel for
-	// the indexer's incremental writes, so we don't surface this.
-	_ = s.db.QueryRow(`SELECT repo_prefix FROM nodes WHERE id = ?`, nodeID).Scan(&repoPrefix)
+// BatchUpsertSymbolFTS replaces only the supplied symbols. Unlike
+// BulkUpsertSymbolFTS it never wipes a repository, so it is safe for a watcher
+// or partial reconcile. IDs are deduped with last-write-wins semantics and all
+// SQLite work is set-oriented in bounded chunks under one transaction.
+func (s *Store) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
+	_, err := s.batchUpsertSymbolFTS(items)
+	return err
+}
 
-	// Delete the prior row by its docid (O(log n)) instead of by node_id
-	// (full FTS scan). A missing map entry means no prior row to drop —
-	// the sidecar is kept in lockstep with symbol_fts by every writer and
-	// backfilled at Open for databases built before it existed, so a miss
-	// here is a genuinely new symbol, not a stale row we're leaking.
-	var oldRowid int64
-	switch err := s.db.QueryRow(
-		`SELECT fts_rowid FROM symbol_fts_rowid WHERE node_id = ?`, nodeID,
-	).Scan(&oldRowid); err {
-	case nil:
-		if _, err := s.db.Exec(`DELETE FROM symbol_fts WHERE rowid = ?`, oldRowid); err != nil {
+// BatchDeleteSymbolFTS removes the supplied node documents through the
+// indexed ownership sidecar. Both the FTS rows and their ownership rows are
+// deleted in one transaction; duplicate IDs are harmless and empty IDs are
+// ignored.
+func (s *Store) BatchDeleteSymbolFTS(nodeIDs []string) error {
+	ids := make([]string, 0, len(nodeIDs))
+	seen := make(map[string]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
+			continue
+		}
+		if _, duplicate := seen[nodeID]; duplicate {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		ids = append(ids, nodeID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	for start := 0; start < len(ids); start += ftsInsertChunkRows {
+		end := minInt(start+ftsInsertChunkRows, len(ids))
+		chunk := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, len(chunk))
+		for i, nodeID := range chunk {
+			args[i] = nodeID
+		}
+		if _, err := tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
+SELECT fts_rowid FROM symbol_fts_rowid WHERE node_id IN (`+placeholders+`)
+)`, args...); err != nil {
 			return err
 		}
-	case sql.ErrNoRows:
-		// new symbol — nothing to delete
-	default:
-		return err
+		if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE node_id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatchStats, error) {
+	var stats symbolFTSBatchStats
+	if len(items) == 0 {
+		return stats, nil
 	}
 
-	res, err := s.db.Exec(
-		`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) VALUES (?, ?, ?)`,
-		nodeID, repoPrefix, tokens,
-	)
+	positions := make(map[string]int, len(items))
+	deduped := make([]graph.SymbolFTSItem, 0, len(items))
+	for _, item := range items {
+		if item.NodeID == "" {
+			continue
+		}
+		if pos, ok := positions[item.NodeID]; ok {
+			deduped[pos] = item
+			continue
+		}
+		positions[item.NodeID] = len(deduped)
+		deduped = append(deduped, item)
+	}
+	items = deduped
+	if len(items) == 0 {
+		return stats, nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	newRowid, err := res.LastInsertId()
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+
+	nextRowid, err := nextFTSRowIDTx(tx, "symbol_fts")
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if _, err := s.db.Exec(
-		`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES (?, ?, ?)`,
-		nodeID, repoPrefix, newRowid,
-	); err != nil {
-		return err
+	stats.allocatorQueries++
+
+	type rowState struct {
+		repoPrefix string
+		rowid      int64
+		exists     bool
 	}
-	return nil
+	for start := 0; start < len(items); start += ftsInsertChunkRows {
+		end := minInt(start+ftsInsertChunkRows, len(items))
+		chunk := items[start:end]
+
+		// Fetch owning repo prefixes and prior FTS docids with one indexed
+		// VALUES join for the whole chunk. This replaces the old two SELECTs
+		// per symbol while retaining the exact old rowid when one exists.
+		var lookup strings.Builder
+		lookup.WriteString(`WITH wanted(ord, node_id) AS (VALUES `)
+		lookupArgs := make([]any, 0, len(chunk)*2)
+		for i, item := range chunk {
+			if i > 0 {
+				lookup.WriteByte(',')
+			}
+			lookup.WriteString(`(?, ?)`)
+			lookupArgs = append(lookupArgs, i, item.NodeID)
+		}
+		lookup.WriteString(`)
+SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
+FROM wanted
+LEFT JOIN nodes ON nodes.id = wanted.node_id
+LEFT JOIN symbol_fts_rowid ON symbol_fts_rowid.node_id = wanted.node_id
+ORDER BY wanted.ord`)
+		rows, err := tx.Query(lookup.String(), lookupArgs...)
+		if err != nil {
+			return stats, err
+		}
+		states := make([]rowState, len(chunk))
+		seen := 0
+		for rows.Next() {
+			var ord int
+			var repoPrefix string
+			var oldRowid sql.NullInt64
+			if err := rows.Scan(&ord, &repoPrefix, &oldRowid); err != nil {
+				_ = rows.Close()
+				return stats, err
+			}
+			if ord < 0 || ord >= len(states) {
+				_ = rows.Close()
+				return stats, fmt.Errorf("symbol FTS batch lookup returned invalid ordinal %d", ord)
+			}
+			states[ord].repoPrefix = repoPrefix
+			if oldRowid.Valid {
+				states[ord].rowid = oldRowid.Int64
+				states[ord].exists = true
+			}
+			seen++
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return stats, err
+		}
+		_ = rows.Close()
+		stats.lookupStatements++
+		if seen != len(chunk) {
+			return stats, fmt.Errorf("symbol FTS batch lookup returned %d of %d rows", seen, len(chunk))
+		}
+
+		oldRowids := make([]any, 0, len(chunk))
+		for i := range states {
+			if states[i].exists {
+				oldRowids = append(oldRowids, states[i].rowid)
+				continue
+			}
+			states[i].rowid = nextRowid
+			nextRowid++
+		}
+		if len(oldRowids) > 0 {
+			var wipe strings.Builder
+			wipe.WriteString(`DELETE FROM symbol_fts WHERE rowid IN (`)
+			for i := range oldRowids {
+				if i > 0 {
+					wipe.WriteByte(',')
+				}
+				wipe.WriteByte('?')
+			}
+			wipe.WriteByte(')')
+			if _, err := tx.Exec(wipe.String(), oldRowids...); err != nil {
+				return stats, err
+			}
+			stats.deleteStatements++
+		}
+
+		var insert strings.Builder
+		insert.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
+		insertArgs := make([]any, 0, len(chunk)*4)
+		for i, item := range chunk {
+			if i > 0 {
+				insert.WriteByte(',')
+			}
+			insert.WriteString(`(?, ?, ?, ?)`)
+			insertArgs = append(insertArgs, states[i].rowid, item.NodeID, states[i].repoPrefix, item.Tokens)
+		}
+		if _, err := tx.Exec(insert.String(), insertArgs...); err != nil {
+			return stats, err
+		}
+		stats.insertStatements++
+
+		var ownership strings.Builder
+		ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
+		ownershipArgs := make([]any, 0, len(chunk)*3)
+		for i, item := range chunk {
+			if i > 0 {
+				ownership.WriteByte(',')
+			}
+			ownership.WriteString(`(?, ?, ?)`)
+			ownershipArgs = append(ownershipArgs, item.NodeID, states[i].repoPrefix, states[i].rowid)
+		}
+		if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
+			return stats, err
+		}
+		stats.ownershipStatements++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return stats, err
+	}
+	stats.commits++
+	return stats, nil
 }
 
 // BulkUpsertSymbolFTS is the cold-start fast path: wipe this repo's
@@ -153,7 +371,7 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 		return nil
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -164,12 +382,10 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 		}
 	}()
 
-	// Wipe this repo's prior rows so a clean rebuild of repo A doesn't
-	// leave phantom hits, while sibling repo B's corpus survives. The
-	// repo_prefix column is UNINDEXED but still stored, so the equality
-	// filter is a literal compare over the row set. Empty repoPrefix
-	// clears the whole table — the legacy single-repo wipe.
-	if _, err := tx.Exec(`DELETE FROM symbol_fts WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	// Drive the wipe through the indexed rowid sidecar. Filtering the FTS5
+	// table's UNINDEXED repo_prefix column here used to rescan the growing
+	// corpus once per repository during a cold multi-repo build.
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
 		return err
 	}
 	// Drop this repo's rowid-map entries in lockstep with the symbol_fts
@@ -178,36 +394,42 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
 		return err
 	}
+	nextRowid, err := nextFTSRowIDTx(tx, "symbol_fts")
+	if err != nil {
+		return err
+	}
 
 	for start := 0; start < len(items); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(items))
 		chunk := items[start:end]
 
 		var b strings.Builder
-		b.WriteString(`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) VALUES `)
-		args := make([]any, 0, len(chunk)*3)
+		b.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
+		args := make([]any, 0, len(chunk)*4)
 		for i, it := range chunk {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			b.WriteString(`(?,?,?)`)
-			args = append(args, it.NodeID, repoPrefix, it.Tokens)
+			b.WriteString(`(?,?,?,?)`)
+			args = append(args, nextRowid+int64(start+i), it.NodeID, repoPrefix, it.Tokens)
 		}
 		if _, err := tx.Exec(b.String(), args...); err != nil {
 			return err
 		}
-	}
 
-	// Rebuild the rowid map for this repo from the rows just inserted. A
-	// full multi-row INSERT only exposes the last docid, so we read the
-	// docids back in one pass (a linear filter over the UNINDEXED
-	// repo_prefix column — the cold/bulk path, not the per-edit hot path).
-	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid)
-		 SELECT node_id, repo_prefix, rowid FROM symbol_fts WHERE repo_prefix = ?`,
-		repoPrefix,
-	); err != nil {
-		return err
+		var rowids strings.Builder
+		rowids.WriteString(`INSERT INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
+		mapArgs := make([]any, 0, len(chunk)*3)
+		for i, it := range chunk {
+			if i > 0 {
+				rowids.WriteByte(',')
+			}
+			rowids.WriteString(`(?,?,?)`)
+			mapArgs = append(mapArgs, it.NodeID, repoPrefix, nextRowid+int64(start+i))
+		}
+		if _, err := tx.Exec(rowids.String(), mapArgs...); err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -254,7 +476,14 @@ func backfillSymbolFTSRowidMap(db *sql.DB) error {
 func (s *Store) BuildSymbolIndex() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, _ = s.db.Exec(`INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
+	if s.coordinatedBulkLoad {
+		// Multi-repository cold indexing calls this once per repository. A
+		// full optimize of the growing corpus after every repo is quadratic;
+		// the outer boundary performs one corpus-size-independent bounded merge.
+		s.deferredFTSOptimize = true
+		return nil
+	}
+	_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
 	return nil
 }
 

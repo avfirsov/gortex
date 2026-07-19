@@ -12,29 +12,56 @@ import (
 	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
-// disambiguateBareTypesViaImports is the post-pass that handles bare
-// type refs UpgradeBareTypeRefs left alone because the lookup
-// returned ≥2 same-repo candidates. The classic case is a TS web app
-// that defines two `DashboardSnapshot` types — one in
-// `web/src/lib/schema.ts` (a `type` alias) and one in
-// `web/src/lib/types.ts` (an `interface`). The bare name has two
-// graph nodes; only the consumer's own `import` statement decides
-// which one was actually referenced.
-//
-// We re-read the contract's source file, parse its TS / JS imports,
-// and pick the candidate whose graph FilePath matches an imported
-// module. When exactly one candidate matches, the meta entry is
-// rewritten to its fully-qualified ID so the downstream
-// attachInlinedShapes pass can fold its field shape into the
-// contract's Meta.
-//
-// Languages other than TS / JS are skipped — Go disambiguates
-// bare-name collisions via package qualification (`pkg.Type`) and the
-// in-file resolveTypeInFile pass already handles those.
-func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, g graph.Store) {
+// disambiguateBareTypesViaImportsBatch resolves every registry from one
+// FindNodesByNames projection. Registry indexes contain value copies and invoke
+// the resolver repeatedly; prefetching here prevents those copies—and multiple
+// repositories—from multiplying SQLite name queries.
+func (mi *MultiIndexer) disambiguateBareTypesViaImportsBatch(registries []*contracts.Registry, g graph.Store) {
 	srcCache := map[string][]byte{}
 	importCache := map[string]map[string]string{}
+	nameSet := map[string]struct{}{}
+	for _, cr := range registries {
+		if cr == nil {
+			continue
+		}
+		for _, c := range cr.All() {
+			if c.Meta == nil || !isImportResolvableLang(c.FilePath) {
+				continue
+			}
+			for _, key := range []string{"response_type", "request_type"} {
+				name, _ := c.Meta[key].(string)
+				if name == "" || strings.Contains(name, "::") {
+					continue
+				}
+				nameSet[name] = struct{}{}
+				if isRustFile(c.FilePath) {
+					for _, candidateName := range mi.rustImportCandidateNames(c.FilePath, name, srcCache) {
+						nameSet[candidateName] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	candidatesByName := g.FindNodesByNames(names)
 
+	for _, cr := range registries {
+		if cr == nil {
+			continue
+		}
+		mi.disambiguateBareTypesViaImportsPrefetched(cr, srcCache, importCache, candidatesByName)
+	}
+}
+
+func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
+	cr *contracts.Registry,
+	srcCache map[string][]byte,
+	importCache map[string]map[string]string,
+	candidatesByName map[string][]*graph.Node,
+) {
 	for _, c := range cr.All() {
 		if c.Meta == nil {
 			continue
@@ -53,7 +80,7 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImports(cr *contracts.Registry, 
 				if name == "" || strings.Contains(name, "::") {
 					continue
 				}
-				resolved := mi.resolveBareTypeViaImports(c.FilePath, name, g, srcCache, importCache)
+				resolved := mi.resolveBareTypeViaImportsPrefetched(c.FilePath, name, srcCache, importCache, candidatesByName)
 				if resolved == "" {
 					continue
 				}
@@ -78,6 +105,19 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 ) string {
+	names := []string{name}
+	if isRustFile(srcFile) {
+		names = append(names, mi.rustImportCandidateNames(srcFile, name, srcCache)...)
+	}
+	return mi.resolveBareTypeViaImportsPrefetched(srcFile, name, srcCache, importCache, g.FindNodesByNames(names))
+}
+
+func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
+	srcFile, name string,
+	srcCache map[string][]byte,
+	importCache map[string]map[string]string,
+	candidatesByName map[string][]*graph.Node,
+) string {
 	if isRustFile(srcFile) {
 		src := mi.cachedSource(srcFile, srcCache)
 		if len(src) == 0 {
@@ -87,10 +127,10 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 		if !ok {
 			return ""
 		}
-		return mi.resolveRustUseFactsTarget(rustFacts, g, srcCache)
+		return mi.resolveRustUseFactsTargetPrefetched(rustFacts, candidatesByName, srcCache)
 	}
 
-	candidates := g.FindNodesByName(name)
+	candidates := candidatesByName[name]
 	if len(candidates) == 0 {
 		return ""
 	}
@@ -143,7 +183,11 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	return hit
 }
 
-func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.Store, srcCache map[string][]byte) string {
+func (mi *MultiIndexer) resolveRustUseFactsTargetPrefetched(
+	facts []rustUseFact,
+	candidatesByName map[string][]*graph.Node,
+	srcCache map[string][]byte,
+) string {
 	seen := map[string]bool{}
 	var hit string
 	for _, fact := range facts {
@@ -153,7 +197,7 @@ func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.S
 		}
 		for file, names := range chain.names {
 			for name := range names {
-				for _, node := range g.FindNodesByName(name) {
+				for _, node := range candidatesByName[name] {
 					if node == nil || node.FilePath != file || seen[node.ID] {
 						continue
 					}
@@ -170,6 +214,31 @@ func (mi *MultiIndexer) resolveRustUseFactsTarget(facts []rustUseFact, g graph.S
 		}
 	}
 	return hit
+}
+
+func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache map[string][]byte) []string {
+	src := mi.cachedSource(srcFile, srcCache)
+	if len(src) == 0 {
+		return nil
+	}
+	facts, ok := rustImportFactsForName(string(src), srcFile, name)
+	if !ok {
+		return nil
+	}
+	set := map[string]struct{}{}
+	for _, fact := range facts {
+		chain := mi.followReExportChainDetailed(fact.fromFile, fact.sourceName, srcCache)
+		for _, names := range chain.names {
+			for candidateName := range names {
+				set[candidateName] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for candidateName := range set {
+		out = append(out, candidateName)
+	}
+	return out
 }
 
 // tsAliasCache caches the per-repo Collection of tsconfig/jsconfig

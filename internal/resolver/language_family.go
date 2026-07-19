@@ -66,25 +66,34 @@ func gateFrameworkResult(synth, fromLang, toLang string) bool {
 // that coincidentally bound a TypeScript component), keeping bridge-synthesizer
 // edges and call/config edges. Returns the number of edges dropped.
 func applyFrameworkFamilyGate(g graph.Store) int {
+	return applyFrameworkFamilyGateScoped(g, nil)
+}
+
+// applyFrameworkFamilyGateScoped is the partial-index form. Only edges owned
+// by changed repositories can have been newly synthesized in the scoped settle
+// window; incoming edges to replaced targets are removed by file eviction.
+// A nil scope preserves the full/cold whole-graph reconciliation.
+func applyFrameworkFamilyGateScoped(g graph.Store, scope map[string]bool) int {
+	if g == nil {
+		return 0
+	}
 	type cand struct {
 		edge  *graph.Edge
 		synth string
 	}
 	var cands []cand
 	endpointIDs := map[string]struct{}{}
-	for _, kind := range []graph.EdgeKind{graph.EdgeReferences, graph.EdgeImports} {
-		for e := range g.EdgesByKind(kind) {
-			if e == nil || e.Meta == nil {
-				continue
-			}
-			synth, _ := e.Meta[MetaSynthesizedBy].(string)
-			if synth == "" || frameworkBridgeSynths[synth] {
-				continue
-			}
-			cands = append(cands, cand{edge: e, synth: synth})
-			endpointIDs[e.From] = struct{}{}
-			endpointIDs[e.To] = struct{}{}
+	for _, e := range frameworkRepoEdges(g, scope, graph.EdgeReferences, graph.EdgeImports) {
+		if e == nil || e.Meta == nil {
+			continue
 		}
+		synth, _ := e.Meta[MetaSynthesizedBy].(string)
+		if synth == "" || frameworkBridgeSynths[synth] {
+			continue
+		}
+		cands = append(cands, cand{edge: e, synth: synth})
+		endpointIDs[e.From] = struct{}{}
+		endpointIDs[e.To] = struct{}{}
 	}
 	if len(cands) == 0 {
 		return 0
@@ -100,13 +109,11 @@ func applyFrameworkFamilyGate(g graph.Store) int {
 		}
 		return ""
 	}
-	dropped := 0
+	toDrop := make([]*graph.Edge, 0, len(cands))
 	for _, c := range cands {
 		if gateFrameworkResult(c.synth, langOf(c.edge.From), langOf(c.edge.To)) {
-			if g.RemoveEdge(c.edge.From, c.edge.To, c.edge.Kind) {
-				dropped++
-			}
+			toDrop = append(toDrop, c.edge)
 		}
 	}
-	return dropped
+	return graph.RemoveEdgesExact(g, toDrop)
 }

@@ -34,21 +34,79 @@ const isUnresolvedColumnDDL = `is_unresolved INTEGER GENERATED ALWAYS AS (
     CASE WHEN (to_id >= 'unresolved::' AND to_id < 'unresolved:;') OR to_id LIKE '%::unresolved::%' THEN 1 ELSE 0 END
 ) VIRTUAL`
 
+// memberReceiver* are virtual projections of the final `<file>::<type>`
+// segment carried by a Go member_of edge target. rtrim(X, replace(X, ':',
+// ”)) stops at X's final colon, which gives the final `::` delimiter without
+// a reverse() user function. All graph IDs use colons only as `::`
+// separators, so the two substrings exactly mirror strings.LastIndex(to,
+// "::") in the resolver fallback while remaining indexable by SQLite.
+const (
+	memberReceiverPrefixExpr = `rtrim(to_id, replace(to_id, ':', ''))`
+	memberReceiverFileExpr   = `substr(to_id, 1, length(` + memberReceiverPrefixExpr + `) - 2)`
+	memberReceiverNameExpr   = `substr(to_id, length(` + memberReceiverPrefixExpr + `) + 1)`
+
+	memberReceiverColumnDDL = `member_receiver TEXT GENERATED ALWAYS AS (
+    CASE WHEN kind = 'member_of' AND instr(to_id, '::') > 1
+              AND ` + memberReceiverNameExpr + ` <> ''
+         THEN ` + memberReceiverNameExpr + ` ELSE NULL END
+) VIRTUAL`
+
+	// filepath.Dir for normalized graph paths, expressed with built-in SQLite
+	// string functions so it can back an index on existing databases without
+	// materializing or backfilling another copy of the value.
+	memberReceiverDirColumnDDL = `member_receiver_dir TEXT GENERATED ALWAYS AS (
+    CASE WHEN kind <> 'member_of' OR instr(to_id, '::') <= 1
+              OR ` + memberReceiverNameExpr + ` = '' THEN NULL
+         WHEN instr(` + memberReceiverFileExpr + `, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(` + memberReceiverFileExpr + `,
+                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(` + memberReceiverFileExpr + `,
+                         replace(` + memberReceiverFileExpr + `, '/', '')), '/') END
+) VIRTUAL`
+)
+
 // edgeGeneratedColumns is the set of edges.* generated columns ensureEdgeColumns
 // adds to a table created before they existed — which, since none of them are
 // in schemaSQL's CREATE TABLE, includes a freshly created table too.
+// fromRepoColumnDDL mirrors graph.RepoPrefixOfID exactly: the substring
+// before the first '/' when that slash is past position 1, else '' (bare
+// unresolved sentinels and single-repo-mode ids). Same rationale as
+// isUnresolvedColumnDDL: computed by SQLite from from_id, no Go call site
+// can forget to keep it in sync, and the scoped resolver pushdown can test
+// repo membership as a plain column. Parity is asserted against the Go
+// helper by TestEdgeScopeColumnsMirrorGoHelpers.
+const fromRepoColumnDDL = `from_repo TEXT GENERATED ALWAYS AS (
+    CASE WHEN instr(from_id, '/') > 1 THEN substr(from_id, 1, instr(from_id, '/') - 1) ELSE '' END
+) VIRTUAL`
+
+// toRepoUnresolvedColumnDDL mirrors graph.UnresolvedRepoPrefix exactly for
+// the shapes the pending scan can see (is_unresolved = 1 guarantees one of
+// the two unresolved encodings): '' for the bare `unresolved::` prefix form,
+// the leading `<repo>` for the `<repo>::unresolved::` infix form, NULL for
+// anything else. NULL is deliberately fail-open — a consumer predicate must
+// treat it as "load the row and let the Go filter decide".
+const toRepoUnresolvedColumnDDL = `to_repo_unresolved TEXT GENERATED ALWAYS AS (
+    CASE WHEN to_id >= 'unresolved::' AND to_id < 'unresolved:;' THEN ''
+         WHEN instr(to_id, '::unresolved::') > 1 THEN substr(to_id, 1, instr(to_id, '::unresolved::') - 1)
+         ELSE NULL END
+) VIRTUAL`
+
 var edgeGeneratedColumns = []struct {
 	name string
 	ddl  string
 }{
 	{"is_unresolved", isUnresolvedColumnDDL},
+	{"member_receiver", memberReceiverColumnDDL},
+	{"member_receiver_dir", memberReceiverDirColumnDDL},
+	{"from_repo", fromRepoColumnDDL},
+	{"to_repo_unresolved", toRepoUnresolvedColumnDDL},
 }
 
 // edgePromotedColumns lifts the resolver's resolve_terminal /
-// resolve_terminal_reason Meta keys (see resolver/terminal.go) out of the
-// meta blob into their own nullable columns — the edge-side sibling of
-// promotedMetaColumns on nodes (see meta_json.go's "promoted edge columns"
-// section for extractPromotedEdgeMeta/restorePromotedEdgeMeta and why a
+// resolve_terminal_reason keys and semantic_source provenance out of Meta
+// into nullable columns — the edge-side sibling of promotedMetaColumns on
+// nodes (see meta_json.go's "promoted edge columns" section for
+// extractPromotedEdgeMeta/restorePromotedEdgeMeta and why a
 // json_extract-derived generated column was tried first and abandoned:
 // encodeMeta's common case is a custom flat binary codec, not JSON, so
 // json_extract/json_valid against a real store's meta blobs evaluates to
@@ -68,6 +126,7 @@ var edgePromotedColumns = []struct {
 }{
 	{"resolve_terminal", "resolve_terminal INTEGER"},
 	{"resolve_terminal_reason", "resolve_terminal_reason TEXT"},
+	{"semantic_source", "semantic_source TEXT"},
 }
 
 // ensureEdgeColumns adds edgeGeneratedColumns + edgePromotedColumns to an
@@ -145,6 +204,17 @@ const isStubColumnDDL = `is_stub INTEGER GENERATED ALWAYS AS (
     THEN 1 ELSE 0 END
 ) VIRTUAL`
 
+// fileDirColumnDDL promotes filepath.Dir(file_path) into an indexable virtual
+// column. It adds no row payload and is migration-safe on populated stores;
+// the receiver-rebind join uses it to seek directly to Go types/interfaces in
+// the phantom receiver's package instead of loading every type into memory.
+const fileDirColumnDDL = `file_dir TEXT GENERATED ALWAYS AS (
+    CASE WHEN file_path = '' THEN NULL
+         WHEN instr(file_path, '/') = 0 THEN '.'
+         WHEN rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') = '' THEN '/'
+         ELSE rtrim(rtrim(file_path, replace(file_path, '/', '')), '/') END
+) VIRTUAL`
+
 // nodeGeneratedColumns is the nodes-table sibling of edgeGeneratedColumns.
 // Kept as its own list (and ensureNodeGeneratedColumns as its own function,
 // rather than folded into ensureNodeColumns) because ensureNodeColumns
@@ -157,6 +227,7 @@ var nodeGeneratedColumns = []struct {
 	ddl  string
 }{
 	{"is_stub", isStubColumnDDL},
+	{"file_dir", fileDirColumnDDL},
 }
 
 // ensureNodeGeneratedColumns adds nodeGeneratedColumns to a nodes table
@@ -415,6 +486,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_exported   INTEGER,
     updated_at    INTEGER,
     data_class    TEXT,
+    clone_sig     TEXT,
     meta          BLOB
 ) WITHOUT ROWID;
 
@@ -504,8 +576,12 @@ CREATE TABLE IF NOT EXISTS enrichment_state (
 CREATE TABLE IF NOT EXISTS clone_shingles (
     node_id     TEXT PRIMARY KEY,
     repo_prefix TEXT NOT NULL DEFAULT '',
-    shingles    BLOB
+    shingles    BLOB,
+    signature   TEXT,
+    token_count INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS clone_shingles_by_repo
+    ON clone_shingles(repo_prefix, node_id);
 
 -- constant_values is the per-KindConstant literal-value sidecar: one row
 -- per constant whose RHS is a string / numeric literal, keyed by node_id
@@ -523,6 +599,20 @@ CREATE TABLE IF NOT EXISTS constant_values (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS constant_values_by_file ON constant_values(repo_prefix, file_path);
+
+-- semantic_binding_types is the compact compiler-type sidecar consumed by
+-- contract extraction. It replaces retained go/packages programs with one
+-- bare type string per source binding. The composite primary key supports
+-- exact batched joins by repository, graph-scoped file, line, and name;
+-- WITHOUT ROWID makes that primary key the table itself.
+CREATE TABLE IF NOT EXISTS semantic_binding_types (
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    file_path   TEXT NOT NULL,
+    line        INTEGER NOT NULL DEFAULT 0,
+    name        TEXT NOT NULL DEFAULT '',
+    type_name   TEXT NOT NULL,
+    PRIMARY KEY (repo_prefix, file_path, line, name)
+) WITHOUT ROWID;
 
 -- files is the per-file metadata sidecar: one row per indexed file carrying
 -- the BLAKE3 content hash (the Merkle leaf), byte size, extracted node count,
@@ -657,6 +747,10 @@ CREATE TABLE IF NOT EXISTS symbol_fts_rowid (
     repo_prefix TEXT NOT NULL DEFAULT '',
     fts_rowid   INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS symbol_fts_rowid_by_rowid
+    ON symbol_fts_rowid(fts_rowid);
+CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_repo
+    ON symbol_fts_rowid(repo_prefix, fts_rowid);
 
 -- content_fts is the FTS5 full-text index over CONTENT (data_class=
 -- "content") section bodies — text / pdf / pptx / xlsx chunks. It is
@@ -666,7 +760,24 @@ CREATE TABLE IF NOT EXISTS symbol_fts_rowid (
 -- section nodes, and streaming their bodies here (per file, on disk)
 -- instead of into symbol_fts + graph nodes keeps the code index and the
 -- graph passes bounded. Only "body" is indexed for matching; node_id /
--- repo_prefix / file_path / ordinal ride UNINDEXED so the per-repo and
--- per-file staleness wipes hit literal columns without a b-tree.
+-- repo_prefix / file_path / ordinal ride UNINDEXED. Staleness deletes never
+-- filter those virtual-table columns directly: content_fts_rowid below maps
+-- their indexed ownership keys to FTS docids, avoiding one virtual-table scan
+-- per streamed file.
 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(node_id UNINDEXED, repo_prefix UNINDEXED, file_path UNINDEXED, ordinal UNINDEXED, body);
+
+-- content_fts_rowid is the ownership index for content FTS docids. A content
+-- file may emit many sections with the same node/ordinal across append calls,
+-- so the FTS docid itself is the primary key; repository/file indexes make
+-- whole-repo, per-file, and end-of-walk stale deletes set-oriented. AppendContent
+-- assigns explicit FTS rowids and writes this sidecar in the same transaction.
+CREATE TABLE IF NOT EXISTS content_fts_rowid (
+    fts_rowid   INTEGER PRIMARY KEY,
+    repo_prefix TEXT NOT NULL DEFAULT '',
+    file_path   TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS content_fts_rowid_by_repo_file
+    ON content_fts_rowid(repo_prefix, file_path, fts_rowid);
+CREATE INDEX IF NOT EXISTS content_fts_rowid_by_file
+    ON content_fts_rowid(file_path, fts_rowid);
 ` + analysisGenerationSchemaSQL

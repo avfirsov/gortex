@@ -31,6 +31,29 @@ func ResolveObjectRegistryCalls(g graph.Store) int {
 	if g == nil {
 		return 0
 	}
+	// Placeholders are collected BEFORE the indexes are built: a workspace
+	// with no object-registry placeholders (the common case) pays only this
+	// scan — the EdgeMemberOf scan, the whole-graph method/function index,
+	// and the dyn_shape site index are skipped, and with zero placeholders
+	// the resolve loop below is vacuously identical. The indexes built after
+	// collection see the identical graph, so the run case is unchanged.
+	var placeholders []*graph.Edge
+	for e := range g.EdgesByKind(graph.EdgeCalls) {
+		if e == nil || e.Meta == nil {
+			continue
+		}
+		if v, _ := e.Meta["via"].(string); v != objectRegistryVia {
+			continue
+		}
+		if className, _ := e.Meta["registry_value"].(string); className == "" {
+			continue
+		}
+		placeholders = append(placeholders, e)
+	}
+	if len(placeholders) == 0 {
+		return 0
+	}
+
 	// methodIndex: className → method-name → method nodes, built from the
 	// EdgeMemberOf edges that link a method to its class.
 	classByMethod := map[string]string{}
@@ -75,17 +98,8 @@ func ResolveObjectRegistryCalls(g graph.Store) int {
 	resolved := 0
 	claimed := map[string]bool{}
 	var reindex []graph.EdgeReindex
-	for e := range g.EdgesByKind(graph.EdgeCalls) {
-		if e == nil || e.Meta == nil {
-			continue
-		}
-		if v, _ := e.Meta["via"].(string); v != objectRegistryVia {
-			continue
-		}
+	for _, e := range placeholders {
 		className, _ := e.Meta["registry_value"].(string)
-		if className == "" {
-			continue
-		}
 		method, _ := e.Meta["registry_method"].(string)
 		target := pickRegistryMethod(g, e, className, method, methodIndex)
 

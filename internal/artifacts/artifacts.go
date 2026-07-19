@@ -164,19 +164,18 @@ func ScanSymbolRefs(data []byte, nameIndex map[string][]string) []string {
 // node IDs that declare it, scoped to repoPrefix.
 func buildSymbolIndex(g graph.Store, repoPrefix string) map[string][]string {
 	index := make(map[string][]string)
-	for _, n := range g.AllNodes() {
-		switch n.Kind {
-		case graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface:
-		default:
+	for row := range graph.NodeIDNamesByKindsSeq(g, repoPrefix,
+		graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface) {
+		if len(row.Name) < minRefTokenLen {
 			continue
 		}
-		if repoPrefix != "" && n.RepoPrefix != repoPrefix {
-			continue
-		}
-		if len(n.Name) < minRefTokenLen {
-			continue
-		}
-		index[n.Name] = append(index[n.Name], n.ID)
+		index[row.Name] = append(index[row.Name], row.ID)
+	}
+	// Both in-memory kind buckets and adapter-store fallbacks may yield in a
+	// backend-specific order. Sort colliding declarations once so callers see
+	// the same deterministic name index as the SQLite ORDER BY path.
+	for name := range index {
+		sort.Strings(index[name])
 	}
 	return index
 }

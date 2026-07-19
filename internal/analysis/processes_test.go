@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+	"iter"
 	"reflect"
 	"testing"
 
@@ -38,6 +39,76 @@ func processFixture(entryCount, leafCount int) ([]*graph.Node, []*graph.Edge) {
 		}
 	}
 	return nodes, edges
+}
+
+type processProjectionCountingStore struct {
+	*graph.Graph
+	allNodesCalls       int
+	allEdgesCalls       int
+	nodeProjectionCalls int
+	edgeProjectionCalls int
+	batchLookupCalls    int
+	maxBatchLookupIDs   int
+}
+
+func (s *processProjectionCountingStore) NodesByKindsSeq(kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	s.nodeProjectionCalls++
+	return s.Graph.NodesByKindsSeq(kinds...)
+}
+
+func (s *processProjectionCountingStore) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
+	s.edgeProjectionCalls++
+	return s.Graph.EdgesLightSeq(kinds...)
+}
+
+func (s *processProjectionCountingStore) AllNodes() []*graph.Node {
+	s.allNodesCalls++
+	return nil
+}
+
+func (s *processProjectionCountingStore) AllEdges() []*graph.Edge {
+	s.allEdgesCalls++
+	return nil
+}
+
+func (s *processProjectionCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	s.batchLookupCalls++
+	if len(ids) > s.maxBatchLookupIDs {
+		s.maxBatchLookupIDs = len(ids)
+	}
+	return s.Graph.GetNodesByIDs(ids)
+}
+
+func TestDiscoverProcessesUsesScopedProjectionsAndBoundedStepLookup(t *testing.T) {
+	nodes, edges := processFixture(12, 80)
+	limits := ProcessLimits{
+		MaxProcesses:       10,
+		MaxDepth:           15,
+		MaxStepsPerProcess: 32,
+		MaxTotalSteps:      128,
+	}
+
+	want := discoverProcesses(nodes, edges, limits)
+	base := graph.New()
+	base.AddBatch(nodes, edges)
+	store := &processProjectionCountingStore{Graph: base}
+	got := DiscoverProcessesWithLimits(store, limits)
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("projection result differs from slice reference:\n got: %#v\nwant: %#v", got, want)
+	}
+	if store.allNodesCalls != 0 || store.allEdgesCalls != 0 {
+		t.Fatalf("global snapshots used: AllNodes=%d AllEdges=%d", store.allNodesCalls, store.allEdgesCalls)
+	}
+	if store.nodeProjectionCalls != 1 || store.edgeProjectionCalls != 1 {
+		t.Fatalf("projection queries: nodes=%d edges=%d, want one each", store.nodeProjectionCalls, store.edgeProjectionCalls)
+	}
+	if store.batchLookupCalls != 1 {
+		t.Fatalf("step metadata lookups = %d, want one bounded batch", store.batchLookupCalls)
+	}
+	if store.maxBatchLookupIDs > limits.MaxTotalSteps {
+		t.Fatalf("step metadata batch = %d IDs, limit %d", store.maxBatchLookupIDs, limits.MaxTotalSteps)
+	}
 }
 
 func TestDiscoverProcessesKeepsSmallGraphComplete(t *testing.T) {

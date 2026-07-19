@@ -34,6 +34,27 @@ func TestAddAndGetNode(t *testing.T) {
 	assert.Nil(t, g.GetNode("nonexistent"))
 }
 
+func TestEmptyRepoLanguageLookupDoesNotDuplicateShadowIndex(t *testing.T) {
+	g := New()
+	goNode := makeNode("a.go::Go", "Go", KindFunction, "a.go", "go")
+	pyNode := makeNode("a.py::Py", "Py", KindFunction, "a.py", "python")
+	g.AddBatch([]*Node{goNode, pyNode}, nil)
+
+	for _, s := range g.shards {
+		s.mu.RLock()
+		if len(s.byRepo[""]) != 0 || len(s.byRepoIdx[""]) != 0 {
+			s.mu.RUnlock()
+			t.Fatal("empty-prefix shadow nodes were duplicated into the byRepo index")
+		}
+		s.mu.RUnlock()
+	}
+	assert.Equal(t, []*Node{goNode}, g.GetRepoNodesByLanguage("", "go"))
+	if nodes, edges := g.EvictRepo(""); nodes != 0 || edges != 0 {
+		t.Fatalf("EvictRepo(empty) removed nodes=%d edges=%d, want historical no-op", nodes, edges)
+	}
+	assert.Equal(t, goNode, g.GetNode(goNode.ID))
+}
+
 func TestAddAndGetEdge(t *testing.T) {
 	g := New()
 	n1 := makeNode("a.go::Foo", "Foo", KindFunction, "a.go", "go")
@@ -208,8 +229,9 @@ func TestAddNode_EmptyRepoPrefix(t *testing.T) {
 	n := makeNode("a.go::Foo", "Foo", KindFunction, "a.go", "go")
 	g.AddNode(n)
 
-	// Nodes without RepoPrefix should not appear in byRepo.
-	assert.Empty(t, g.GetRepoNodes(""))
+	// Nodes without RepoPrefix are not duplicated in byRepo, but the exact
+	// empty-prefix projection still reads them from the shard map.
+	assert.Equal(t, []*Node{n}, g.GetRepoNodes(""))
 	assert.Empty(t, g.RepoPrefixes())
 }
 

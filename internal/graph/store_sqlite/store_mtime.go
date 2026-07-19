@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -29,7 +30,7 @@ const mtimeChunk = 300
 func (s *Store) SetFileMtime(repoPrefix, filePath string, mtimeNs int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(
+	_, err := s.execActiveWriteLocked(context.Background(),
 		`INSERT OR REPLACE INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES (?, ?, ?)`,
 		repoPrefix, filePath, mtimeNs,
 	)
@@ -49,7 +50,7 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -80,7 +81,7 @@ func (s *Store) ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -110,7 +111,7 @@ func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

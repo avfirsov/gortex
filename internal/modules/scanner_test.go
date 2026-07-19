@@ -1,6 +1,8 @@
 package modules
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -885,6 +887,145 @@ func TestLinkImports_SkipsWhenNoMatch(t *testing.T) {
 
 	if got := LinkImports(g, specs, ""); got != 0 {
 		t.Errorf("stdlib import shouldn't match external module, got %d edges", got)
+	}
+}
+
+type linkImportBatchRecorder struct {
+	graph.Store
+	calls int
+	edges []*graph.Edge
+}
+
+func (r *linkImportBatchRecorder) AddBatch(_ []*graph.Node, edges []*graph.Edge) {
+	r.calls++
+	r.edges = append(r.edges, edges...)
+}
+
+func TestLinkImportsIn_NPMScopesAliasesAndBoundaries(t *testing.T) {
+	store := &linkImportBatchRecorder{Store: graph.New()}
+	imports := []*graph.Node{
+		{ID: "skip-kind", Kind: graph.KindFunction, Meta: map[string]any{"path": "@acme/ui"}},
+		{ID: "own", Kind: graph.KindImport, Meta: map[string]any{"path": "@ours/app/internal"}},
+		{ID: "scoped", Kind: graph.KindImport, FilePath: "ui.ts", StartLine: 3, Meta: map[string]any{"path": "@acme/ui/theme/dark"}},
+		{ID: "boundary", Kind: graph.KindImport, Meta: map[string]any{"path": "@acme/ui-kit"}},
+		{ID: "alias", Kind: graph.KindImport, FilePath: "widget.ts", StartLine: 7, Meta: map[string]any{"path": "widget/runtime"}},
+		{ID: "alias-target", Kind: graph.KindImport, Meta: map[string]any{"path": "@vendor/widget/runtime"}},
+	}
+	specs := []Spec{
+		{Ecosystem: "npm", Path: "@acme/ui", Version: "2.0.0"},
+		{Ecosystem: "npm", Path: "widget", Version: "1.4.0", Alias: "@vendor/widget"},
+	}
+
+	if got := LinkImportsIn(store, imports, specs, "@ours/app"); got != 2 {
+		t.Fatalf("emitted %d edges, want 2", got)
+	}
+	if store.calls != 1 {
+		t.Fatalf("AddBatch called %d times, want one batched write", store.calls)
+	}
+	if len(store.edges) != 2 {
+		t.Fatalf("recorded %d edges, want 2", len(store.edges))
+	}
+	want := []struct {
+		from string
+		to   string
+		line int
+	}{
+		{"scoped", "module::npm:@acme/ui@2.0.0", 3},
+		{"alias", "module::npm:widget@1.4.0", 7},
+	}
+	for i, edge := range store.edges {
+		if edge.From != want[i].from || edge.To != want[i].to || edge.Line != want[i].line {
+			t.Errorf("edge[%d] = (%q, %q, line %d), want (%q, %q, line %d)",
+				i, edge.From, edge.To, edge.Line, want[i].from, want[i].to, want[i].line)
+		}
+		if edge.Kind != graph.EdgeDependsOnModule || edge.Origin != graph.OriginASTResolved {
+			t.Errorf("edge[%d] lost module-link metadata: %+v", i, edge)
+		}
+	}
+}
+
+func TestMatchLongestPrefix_ReferenceParity(t *testing.T) {
+	specs := []Spec{
+		{Ecosystem: "go", Path: "github.com/acme/lib", Version: "v1"},
+		{Ecosystem: "go", Path: "github.com/acme/lib/v2", Version: "v2"},
+		{Ecosystem: "npm", Path: "@scope/pkg", Version: "3"},
+		{Ecosystem: "npm", Path: "alias", Version: "4", Alias: "@scope/real"},
+		{Ecosystem: "cargo", Path: "serde", Version: "1"},
+	}
+	candidates := make(map[string]Spec, len(specs))
+	for _, spec := range specs {
+		if _, exists := candidates[spec.Path]; !exists {
+			candidates[spec.Path] = spec
+		}
+	}
+	reference := func(importPath string) (Spec, bool) {
+		bestLength := -1
+		var best Spec
+		for _, spec := range specs {
+			if importPath != spec.Path && !strings.HasPrefix(importPath, spec.Path+"/") {
+				continue
+			}
+			if len(spec.Path) > bestLength {
+				bestLength = len(spec.Path)
+				best = spec
+			}
+		}
+		return best, bestLength >= 0
+	}
+	imports := []string{
+		"github.com/acme/lib",
+		"github.com/acme/lib/internal",
+		"github.com/acme/lib/v2/sub/package",
+		"github.com/acme/library",
+		"@scope/pkg",
+		"@scope/pkg/subpath/deep",
+		"@scope/pkg-extra",
+		"alias/runtime",
+		"@scope/real/runtime",
+		"serde",
+		"serde_json",
+		"missing/dependency/path",
+	}
+	for _, importPath := range imports {
+		want, wantOK := reference(importPath)
+		got, gotOK, _ := matchLongestPrefix(importPath, candidates)
+		if gotOK != wantOK || (gotOK && got != want) {
+			t.Errorf("matchLongestPrefix(%q) = (%+v, %v), want (%+v, %v)",
+				importPath, got, gotOK, want, wantOK)
+		}
+	}
+}
+
+func TestMatchLongestPrefix_WorkIndependentOfDependencyCount(t *testing.T) {
+	sparse := map[string]Spec{
+		"dep-09999":  {Path: "dep-09999"},
+		"@scope/pkg": {Path: "@scope/pkg"},
+	}
+	large := make(map[string]Spec, 10_002)
+	for i := 0; i < 10_000; i++ {
+		path := fmt.Sprintf("dep-%05d", i)
+		large[path] = Spec{Path: path}
+	}
+	large["@scope/pkg"] = Spec{Path: "@scope/pkg"}
+
+	imports := []string{
+		"dep-09999/sub/deep",
+		"@scope/pkg/internal/file",
+		"missing/dependency/with/depth",
+	}
+	sparseProbes := 0
+	largeProbes := 0
+	for _, importPath := range imports {
+		_, _, probes := matchLongestPrefix(importPath, sparse)
+		sparseProbes += probes
+		_, _, probes = matchLongestPrefix(importPath, large)
+		largeProbes += probes
+	}
+	if largeProbes != sparseProbes {
+		t.Fatalf("10k dependencies changed lookup work: large=%d probes, sparse=%d", largeProbes, sparseProbes)
+	}
+	if largeProbes > 12 {
+		t.Fatalf("lookup made %d probes for three shallow imports; want work bounded by path depth", largeProbes)
 	}
 }
 

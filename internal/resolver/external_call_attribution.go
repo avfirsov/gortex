@@ -75,10 +75,8 @@ func (r *Resolver) attributeGoExternalCalls() {
 		return
 	}
 	seen := map[extKey]struct{}{}
-	for _, k := range goExternalAttribKinds {
-		for e := range r.graph.EdgesByKind(k) {
-			collectGoExternalTarget(e, seen)
-		}
+	for _, target := range r.graph.DistinctExternalTargets(goExternalAttribKinds) {
+		collectGoExternalTargetID(target, seen)
 	}
 	r.materializeGoExternalSeen(seen)
 }
@@ -105,43 +103,40 @@ func collectGoExternalTarget(e *graph.Edge, seen map[extKey]struct{}) {
 	if e == nil || e.To == "" {
 		return
 	}
-	prefix, importPath, symbol := splitGoExternalTarget(e.To)
+	collectGoExternalTargetID(e.To, seen)
+}
+
+func collectGoExternalTargetID(target string, seen map[extKey]struct{}) {
+	if target == "" {
+		return
+	}
+	prefix, importPath, symbol := splitGoExternalTarget(target)
 	if prefix == "" {
 		return
 	}
-	seen[extKey{graph.StubRepoPrefix(e.To), prefix, importPath, symbol}] = struct{}{}
+	seen[extKey{graph.StubRepoPrefix(target), prefix, importPath, symbol}] = struct{}{}
 }
 
 // materializeGoExternalSeen turns the collected external targets into
-// KindModule + KindFunction nodes and their EdgeMemberOf links. All
-// AddNode / AddEdge calls are idempotent on ID, so a second run (e.g. a
-// re-resolve of the same file) is a no-op.
+// KindModule + KindFunction nodes and their EdgeMemberOf links. Mutations are
+// flushed in bounded batches so a large workspace does not issue one SQLite
+// transaction per external target or retain the entire materialization in
+// memory. AddBatch remains idempotent, so re-resolve is a no-op topologically.
 func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 	if len(seen) == 0 {
 		return
 	}
 
-	// Materialise the parent KindModule for each unique import path,
-	// then the per-symbol KindFunction. Module-side dedupe is via
-	// the `modules` map; the per-symbol nodes are unique by (prefix,
-	// path, symbol) by construction.
-	// Module IDs are also per-repo now — a module node carries the
-	// same SDK-version sensitivity its symbols do. Key includes the
-	// repo prefix so two repos importing the same path get distinct
-	// module nodes.
-	modules := map[modKey]string{}
+	// Build the desired node/edge identity sets first. ExistingNodeIDs projects
+	// only primary keys and GetEdgeCandidates returns only exact membership
+	// links, so warm runs do not decode or rewrite every external node again.
+	modules := make(map[modKey]*graph.Node)
+	symbols := make(map[string]*graph.Node)
+	endpointSet := make(map[graph.EdgeEndpoint]struct{}, len(seen))
 	for k := range seen {
-		modKey := modKey{repoPrefix: k.repoPrefix, importPath: k.importPath}
-		moduleID, ok := modules[modKey]
-		if !ok {
-			// Ecosystem + path are ONE stub segment joined by a single
-			// colon (`go:<importPath>`), matching the npm convention
-			// (`module::npm:<pkg>`) and every module-id consumer
-			// (tools_analyze_external_calls). Passing them as two
-			// StubID parts would emit `module::go::<path>` (double
-			// colon) — the form that broke the attribution tests.
-			moduleID = graph.StubID(k.repoPrefix, graph.StubKindModule, "go:"+k.importPath)
-			modules[modKey] = moduleID
+		mk := modKey{repoPrefix: k.repoPrefix, importPath: k.importPath}
+		module := modules[mk]
+		if module == nil {
 			role := "external"
 			switch k.prefix {
 			case "stdlib::":
@@ -149,54 +144,111 @@ func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 			case "dep::":
 				role = "dep"
 			}
-			r.graph.AddNode(&graph.Node{
-				ID:       moduleID,
-				Kind:     graph.KindModule,
-				Name:     lastImportSegment(k.importPath),
-				Language: "go",
+			module = &graph.Node{
+				ID:         graph.StubID(k.repoPrefix, graph.StubKindModule, "go:"+k.importPath),
+				Kind:       graph.KindModule,
+				Name:       lastImportSegment(k.importPath),
+				Language:   "go",
+				RepoPrefix: k.repoPrefix,
 				Meta: map[string]any{
 					"ecosystem":   "go",
 					"role":        role,
 					"import_path": k.importPath,
 				},
-			})
+			}
+			modules[mk] = module
 		}
+		// A package-only target creates its module but no malformed empty-name
+		// function. This keeps partial file attribution identical to the global
+		// pass, whose edge-kind scope normally excludes import-only targets.
+		if k.symbol == "" {
+			continue
+		}
+
 		var symbolID string
+		symbolRepoPrefix := ""
 		switch k.prefix {
 		case "stdlib::":
 			symbolID = graph.StubID(k.repoPrefix, graph.StubKindStdlib, k.importPath, k.symbol)
+			symbolRepoPrefix = k.repoPrefix
 		default:
-			// dep:: / external:: keep their legacy unprefixed form for
-			// now — they aren't covered by the stub-prefix migration
-			// (different module paths already provide repo-level
-			// distinction; same version pinning is enforced by go.mod
-			// per-repo).
+			// dep:: / external:: keep their shared legacy ID. Their node remains
+			// global while per-repo module links preserve workspace ownership.
 			symbolID = k.prefix + k.importPath + "::" + k.symbol
 		}
-		r.graph.AddNode(&graph.Node{
-			ID:       symbolID,
-			Kind:     graph.KindFunction,
-			Name:     k.symbol,
-			Language: "go",
-			Meta: map[string]any{
-				"external":    true,
-				"module_path": k.importPath,
-				"module_role": map[string]string{
-					"stdlib::":   "stdlib",
-					"dep::":      "dep",
-					"external::": "external",
-				}[k.prefix],
-			},
-		})
-		// EdgeMemberOf: symbol → module. AddEdge is idempotent on the
-		// edge-key tuple so a re-run doesn't duplicate.
-		r.graph.AddEdge(&graph.Edge{
-			From:   symbolID,
-			To:     moduleID,
-			Kind:   graph.EdgeMemberOf,
-			Origin: graph.OriginASTResolved,
-		})
+		if symbols[symbolID] == nil {
+			symbols[symbolID] = &graph.Node{
+				ID:         symbolID,
+				Kind:       graph.KindFunction,
+				Name:       k.symbol,
+				Language:   "go",
+				RepoPrefix: symbolRepoPrefix,
+				Meta: map[string]any{
+					"external":    true,
+					"module_path": k.importPath,
+					"module_role": map[string]string{
+						"stdlib::":   "stdlib",
+						"dep::":      "dep",
+						"external::": "external",
+					}[k.prefix],
+				},
+			}
+		}
+		endpointSet[graph.EdgeEndpoint{From: symbolID, To: module.ID}] = struct{}{}
 	}
+
+	ids := make([]string, 0, len(modules)+len(symbols))
+	for _, module := range modules {
+		ids = append(ids, module.ID)
+	}
+	for id := range symbols {
+		ids = append(ids, id)
+	}
+	existingNodes := graph.LookupExistingNodeIDs(r.graph, ids)
+	endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
+	endpointsBySymbol := make(map[string][]graph.EdgeEndpoint, len(symbols))
+	for endpoint := range endpointSet {
+		endpoints = append(endpoints, endpoint)
+		endpointsBySymbol[endpoint.From] = append(endpointsBySymbol[endpoint.From], endpoint)
+	}
+	existingEdges := graph.LookupEdgeCandidates(r.graph, endpoints, nil)
+
+	const materializeBatchSize = 5000
+	nodes := make([]*graph.Node, 0, materializeBatchSize)
+	edges := make([]*graph.Edge, 0, materializeBatchSize)
+	flush := func() {
+		if len(nodes) == 0 && len(edges) == 0 {
+			return
+		}
+		r.graph.AddBatch(nodes, edges)
+		nodes = nodes[:0]
+		edges = edges[:0]
+	}
+	for _, module := range modules {
+		if _, exists := existingNodes[module.ID]; !exists {
+			nodes = append(nodes, module)
+		}
+		if len(nodes) >= materializeBatchSize {
+			flush()
+		}
+	}
+	for id, symbol := range symbols {
+		if _, exists := existingNodes[id]; !exists {
+			nodes = append(nodes, symbol)
+		}
+		for _, endpoint := range endpointsBySymbol[id] {
+			if existingEdges.EndpointKind(endpoint.From, endpoint.To, graph.EdgeMemberOf) == nil {
+				edges = append(edges, &graph.Edge{
+					From: endpoint.From, To: endpoint.To,
+					Kind: graph.EdgeMemberOf, Origin: graph.OriginASTResolved,
+				})
+			}
+		}
+		if len(nodes) >= materializeBatchSize || len(edges) >= materializeBatchSize {
+			flush()
+		}
+	}
+	flush()
 }
 
 // splitGoExternalTarget recognises the three external-target prefixes

@@ -6,6 +6,16 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+const dataflowRewriteBatchSize = 2048
+
+// dataflowBatchScanner is implemented by disk stores that can close each
+// bounded read cursor before the callback mutates edge identities. The SQLite
+// implementation also captures a row-id high-water mark, so rewritten rows
+// cannot re-enter the same pass under their newly inserted row id.
+type dataflowBatchScanner interface {
+	ScanDataflowEdgesBatched(batchSize int, yield func([]*graph.Edge) bool)
+}
+
 // materializeDataflowParams runs after the regular call resolver
 // pass to lift the placeholder targets carried by EdgeArgOf and
 // EdgeReturnsTo edges to concrete graph IDs. The Go dataflow
@@ -40,16 +50,44 @@ import (
 // re-run of this pass becomes a no-op.
 func (idx *Indexer) materializeDataflowParams() {
 	g := idx.graph
-	// Only arg_of / returns_to edges are rewritten here. Fetch exactly
-	// those kinds — each an edges_by_kind index probe on the sqlite
-	// backend — instead of scanning (and meta-decoding) the whole edge
-	// set; every other edge in the graph is irrelevant to this pass.
-	for e := range g.EdgesByKind(graph.EdgeArgOf) {
-		rewriteArgOf(g, e)
+	forEachDataflowEdgeBatch(g, dataflowRewriteBatchSize, func(edges []*graph.Edge) bool {
+		rewriteDataflowBatch(g, edges)
+		return true
+	})
+}
+
+func forEachDataflowEdgeBatch(g graph.Store, batchSize int, yield func([]*graph.Edge) bool) {
+	if scanner, ok := g.(dataflowBatchScanner); ok {
+		scanner.ScanDataflowEdgesBatched(batchSize, yield)
+		return
 	}
-	for e := range g.EdgesByKind(graph.EdgeReturnsTo) {
-		rewriteReturnsTo(g, e)
+	if batchSize <= 0 {
+		batchSize = 1
 	}
+	batch := make([]*graph.Edge, 0, batchSize)
+	keepGoing := true
+	flush := func() {
+		if len(batch) == 0 || !keepGoing {
+			return
+		}
+		keepGoing = yield(batch)
+		batch = make([]*graph.Edge, 0, batchSize)
+	}
+	for _, kind := range []graph.EdgeKind{graph.EdgeArgOf, graph.EdgeReturnsTo} {
+		for edge := range g.EdgesByKind(kind) {
+			if edge == nil {
+				continue
+			}
+			batch = append(batch, edge)
+			if len(batch) == batchSize {
+				flush()
+				if !keepGoing {
+					return
+				}
+			}
+		}
+	}
+	flush()
 }
 
 // materializeDataflowParamsForFile is the single-file equivalent of
@@ -99,37 +137,23 @@ func (idx *Indexer) materializeDataflowParamsForFile(graphPath string, fileEdges
 	for id := range fromSet {
 		froms = append(froms, id)
 	}
-	// A synthetic From can be shared across files, so restrict the rewrite
-	// to edges this file actually emitted: every arg_of / returns_to edge
-	// carries its call-site FilePath, so the filter keeps the set exactly
-	// the file's own. Collect the file's arg_of / returns_to edges plus the
-	// distinct callees the arg_of rewrites target, so the per-callee param
-	// lookup is batched once instead of re-fetched per argument.
-	var argEdges, retEdges []*graph.Edge
-	callees := make(map[string]struct{})
+	// A synthetic From can be shared across files, so restrict the rewrite to
+	// edges this file actually emitted. The union adjacency read is one batched
+	// query; rewriteDataflowBatch then performs the same bounded joins and one
+	// identity-write batch as the cold path.
+	var dataflowEdges []*graph.Edge
 	for _, edges := range g.GetOutEdgesByNodeIDs(froms) {
 		for _, e := range edges {
 			if e == nil || e.FilePath != graphPath {
 				continue
 			}
 			switch e.Kind {
-			case graph.EdgeArgOf:
-				argEdges = append(argEdges, e)
-				if callee, _, ok := argOfRewriteTarget(e); ok {
-					callees[callee] = struct{}{}
-				}
-			case graph.EdgeReturnsTo:
-				retEdges = append(retEdges, e)
+			case graph.EdgeArgOf, graph.EdgeReturnsTo:
+				dataflowEdges = append(dataflowEdges, e)
 			}
 		}
 	}
-	paramIdx := buildParamPositionIndex(g, callees)
-	for _, e := range argEdges {
-		rewriteArgOfIndexed(g, e, paramIdx)
-	}
-	for _, e := range retEdges {
-		rewriteReturnsTo(g, e)
-	}
+	rewriteDataflowBatch(g, dataflowEdges)
 }
 
 // argOfRewriteTarget reports whether an arg_of edge is a rewrite
@@ -156,47 +180,101 @@ func argOfRewriteTarget(e *graph.Edge) (calleeID string, pos int, ok bool) {
 	return to, pos, true
 }
 
-// rewriteArgOf walks the resolved callee's incoming param_of edges
-// and lifts the edge target from the function node to the param
-// node at the recorded position. Edges that already point at a
-// param node are left alone. Used by the whole-graph (cold) pass; the
-// per-file pass uses the batched rewriteArgOfIndexed instead.
-func rewriteArgOf(g graph.Store, e *graph.Edge) {
-	calleeID, pos, ok := argOfRewriteTarget(e)
-	if !ok {
-		return
-	}
-	paramID := paramNodeAtPosition(g, calleeID, pos)
-	if paramID == "" {
-		return
-	}
-	oldTo := e.To
-	g.RemoveEdge(e.From, oldTo, e.Kind)
-	e.To = paramID
-	g.AddEdge(e)
+type dataflowParamEdgeBatchStore interface {
+	GetDataflowParamEdgesByOwnerIDs(ownerIDs []string) map[string][]*graph.Edge
 }
 
-// rewriteArgOfIndexed is rewriteArgOf with the callee→position→param
-// lookup served from a prebuilt index instead of a per-edge
-// paramNodeAtPosition (which re-fetched the callee's entire in-edge list
-// once per argument). Same rewrite, same guards.
-func rewriteArgOfIndexed(g graph.Store, e *graph.Edge, paramIdx map[string]map[int]string) {
-	calleeID, pos, ok := argOfRewriteTarget(e)
-	if !ok {
-		return
+type dataflowCallEdgeBatchStore interface {
+	GetDataflowCallEdgesByCallerIDs(callerIDs []string) map[string][]*graph.Edge
+}
+
+type pendingReturnsTo struct {
+	edge       *graph.Edge
+	callerID   string
+	callLine   int
+	calleeText string
+}
+
+// rewriteDataflowBatch performs every lookup and mutation at batch
+// granularity. At most one parameter-adjacency query, one parameter-node
+// query, one call-adjacency query, and one ReindexEdges call are made for a
+// batch, regardless of how many arg_of / returns_to edges it contains.
+func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
+	if len(edges) == 0 {
+		return 0
 	}
-	m := paramIdx[calleeID]
-	if m == nil {
-		return
+	var argEdges []*graph.Edge
+	var returns []pendingReturnsTo
+	callees := make(map[string]struct{})
+	callers := make(map[string]struct{})
+	for _, edge := range edges {
+		switch {
+		case edge == nil:
+			continue
+		case edge.Kind == graph.EdgeArgOf:
+			if calleeID, _, ok := argOfRewriteTarget(edge); ok {
+				argEdges = append(argEdges, edge)
+				callees[calleeID] = struct{}{}
+			}
+		case edge.Kind == graph.EdgeReturnsTo:
+			callerID, callLine, calleeText, ok := returnsToRewriteTarget(edge)
+			if ok {
+				returns = append(returns, pendingReturnsTo{
+					edge: edge, callerID: callerID,
+					callLine: callLine, calleeText: calleeText,
+				})
+				callers[callerID] = struct{}{}
+			}
+		}
 	}
-	paramID := m[pos]
-	if paramID == "" {
-		return
+
+	paramIdx := buildParamPositionIndex(g, callees)
+	callIdx := buildCallTargetIndex(g, callers)
+	reindexes := make([]graph.EdgeReindex, 0, len(argEdges)+len(returns))
+	// A bounded input batch can contain duplicate pointers when a synthetic
+	// source is shared. Stage each stored identity once so ordered delete/insert
+	// semantics stay deterministic.
+	seen := make(map[*graph.Edge]struct{}, len(edges))
+	for _, edge := range argEdges {
+		if _, duplicate := seen[edge]; duplicate {
+			continue
+		}
+		seen[edge] = struct{}{}
+		calleeID, pos, _ := argOfRewriteTarget(edge)
+		paramID := paramIdx[calleeID][pos]
+		if paramID == "" || paramID == edge.To {
+			continue
+		}
+		oldFrom, oldTo := edge.From, edge.To
+		oldFilePath, oldLine := edge.FilePath, edge.Line
+		edge.To = paramID
+		reindexes = append(reindexes, graph.EdgeReindex{
+			Edge: edge, OldFrom: oldFrom, OldTo: oldTo,
+			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
+		})
 	}
-	oldTo := e.To
-	g.RemoveEdge(e.From, oldTo, e.Kind)
-	e.To = paramID
-	g.AddEdge(e)
+	for _, pending := range returns {
+		edge := pending.edge
+		if _, duplicate := seen[edge]; duplicate {
+			continue
+		}
+		seen[edge] = struct{}{}
+		resolvedCallee := callIdx.resolve(pending.callerID, pending.callLine, pending.calleeText)
+		if resolvedCallee == "" || resolvedCallee == edge.From {
+			continue
+		}
+		oldFrom, oldTo := edge.From, edge.To
+		oldFilePath, oldLine := edge.FilePath, edge.Line
+		edge.From = resolvedCallee
+		reindexes = append(reindexes, graph.EdgeReindex{
+			Edge: edge, OldFrom: oldFrom, OldTo: oldTo,
+			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
+		})
+	}
+	if len(reindexes) > 0 {
+		g.ReindexEdges(reindexes)
+	}
+	return len(reindexes)
 }
 
 // buildParamPositionIndex maps each callee id to its argument
@@ -215,7 +293,12 @@ func buildParamPositionIndex(g graph.Store, callees map[string]struct{}) map[str
 	for id := range callees {
 		ids = append(ids, id)
 	}
-	inEdges := g.GetInEdgesByNodeIDs(ids)
+	var inEdges map[string][]*graph.Edge
+	if reader, ok := g.(dataflowParamEdgeBatchStore); ok {
+		inEdges = reader.GetDataflowParamEdgesByOwnerIDs(ids)
+	} else {
+		inEdges = g.GetInEdgesByNodeIDs(ids)
+	}
 	type ownerParam struct{ owner, param string }
 	var pairs []ownerParam
 	paramSet := make(map[string]struct{})
@@ -257,121 +340,125 @@ func buildParamPositionIndex(g graph.Store, callees map[string]struct{}) map[str
 	return idx
 }
 
-// rewriteReturnsTo lifts the placeholder From by joining on the
-// resolved EdgeCalls edge from the same caller and line.
-func rewriteReturnsTo(g graph.Store, e *graph.Edge) {
+func returnsToRewriteTarget(e *graph.Edge) (callerID string, callLine int, calleeText string, ok bool) {
 	if e == nil || e.Meta == nil {
-		return
+		return "", 0, "", false
 	}
 	if _, ok := e.Meta["returns_to_call"]; !ok {
-		return
+		return "", 0, "", false
 	}
-	callLine, _ := intFromMeta(e.Meta, "call_line")
+	callLine, _ = intFromMeta(e.Meta, "call_line")
 	if callLine == 0 {
 		callLine = e.Line
 	}
-	callerID := e.From
-	calleeText, _ := e.Meta["callee_target"].(string)
-	resolvedCallee := findCallTarget(g, callerID, callLine, calleeText)
-	if resolvedCallee == "" {
+	calleeText, _ = e.Meta["callee_target"].(string)
+	return e.From, callLine, calleeText, e.From != ""
+}
+
+type dataflowCallTargets struct {
+	fallback string
+	byName   map[string]string
+}
+
+func (targets *dataflowCallTargets) add(to string) {
+	if targets.fallback == "" {
+		targets.fallback = to
+	}
+	name := resolvedCallTargetName(to)
+	if name == "" {
 		return
 	}
-	oldFrom := e.From
-	g.RemoveEdge(oldFrom, e.To, e.Kind)
-	e.From = resolvedCallee
-	g.AddEdge(e)
+	if targets.byName == nil {
+		targets.byName = make(map[string]string)
+	}
+	if _, exists := targets.byName[name]; !exists {
+		targets.byName[name] = to
+	}
 }
 
-// findCallTarget returns the resolved To of the EdgeCalls edge
-// originating from callerID at the given line. When `calleeText`
-// is non-empty it's used as a tie-breaker against the original
-// unresolved target string so we don't lift to the wrong call when
-// two calls live on the same line. Falls back to the first match
-// otherwise.
-// outEdgeLightStore is implemented by backends that can return a node's
-// out-edges without decoding the per-edge Meta blob. findCallTarget reads
-// only endpoints/kind/line, so it opts into the cheaper fetch when the
-// backend offers it (the sqlite backend, where the Meta JSON-decode
-// otherwise dominates this hot lookup); other stores fall back.
-type outEdgeLightStore interface {
-	GetOutEdgesLight(nodeID string) []*graph.Edge
+func (targets *dataflowCallTargets) resolve(calleeText string) string {
+	if targets == nil {
+		return ""
+	}
+	if name := recordedCallTargetName(calleeText); name != "" {
+		if target := targets.byName[name]; target != "" {
+			return target
+		}
+	}
+	return targets.fallback
 }
 
-func findCallTarget(g graph.Store, callerID string, line int, calleeText string) string {
-	var out []*graph.Edge
-	if ls, ok := g.(outEdgeLightStore); ok {
-		out = ls.GetOutEdgesLight(callerID)
+type dataflowCallTargetIndex struct {
+	allByCaller  map[string]*dataflowCallTargets
+	lineByCaller map[string]map[int]*dataflowCallTargets
+}
+
+func buildCallTargetIndex(g graph.Store, callers map[string]struct{}) dataflowCallTargetIndex {
+	idx := dataflowCallTargetIndex{
+		allByCaller:  make(map[string]*dataflowCallTargets, len(callers)),
+		lineByCaller: make(map[string]map[int]*dataflowCallTargets, len(callers)),
+	}
+	if len(callers) == 0 {
+		return idx
+	}
+	ids := make([]string, 0, len(callers))
+	for id := range callers {
+		ids = append(ids, id)
+	}
+	var outgoing map[string][]*graph.Edge
+	if reader, ok := g.(dataflowCallEdgeBatchStore); ok {
+		outgoing = reader.GetDataflowCallEdgesByCallerIDs(ids)
 	} else {
-		out = g.GetOutEdges(callerID)
+		outgoing = g.GetOutEdgesByNodeIDs(ids)
 	}
-	var fallback string
-	for _, e := range out {
-		if e.Kind != graph.EdgeCalls {
-			continue
-		}
-		if line != 0 && e.Line != line {
-			continue
-		}
-		if strings.HasPrefix(e.To, "unresolved::") {
-			continue
-		}
-		if calleeText != "" && callTargetMatches(e, calleeText) {
-			return e.To
-		}
-		if fallback == "" {
-			fallback = e.To
+	for callerID, edges := range outgoing {
+		for _, edge := range edges {
+			if edge == nil || edge.Kind != graph.EdgeCalls || strings.HasPrefix(edge.To, "unresolved::") {
+				continue
+			}
+			all := idx.allByCaller[callerID]
+			if all == nil {
+				all = &dataflowCallTargets{}
+				idx.allByCaller[callerID] = all
+			}
+			all.add(edge.To)
+			byLine := idx.lineByCaller[callerID]
+			if byLine == nil {
+				byLine = make(map[int]*dataflowCallTargets)
+				idx.lineByCaller[callerID] = byLine
+			}
+			lineTargets := byLine[edge.Line]
+			if lineTargets == nil {
+				lineTargets = &dataflowCallTargets{}
+				byLine[edge.Line] = lineTargets
+			}
+			lineTargets.add(edge.To)
 		}
 	}
-	return fallback
+	return idx
 }
 
-// callTargetMatches reports whether a resolved call edge's text
-// shape lines up with the dataflow edge's recorded callee_target.
-// We compare the trailing path component of the resolved To
-// against the unresolved::… form used at extraction time. Used as
-// a same-line tie-breaker when more than one call lives on a
-// single source line (e.g. `f(g())`).
-func callTargetMatches(call *graph.Edge, calleeText string) bool {
-	if call == nil || calleeText == "" {
-		return false
+func (idx dataflowCallTargetIndex) resolve(callerID string, line int, calleeText string) string {
+	if line == 0 {
+		return idx.allByCaller[callerID].resolve(calleeText)
 	}
+	return idx.lineByCaller[callerID][line].resolve(calleeText)
+}
+
+func recordedCallTargetName(calleeText string) string {
 	bare := strings.TrimPrefix(calleeText, "unresolved::")
 	bare = strings.TrimPrefix(bare, "extern::")
-	bare = strings.TrimPrefix(bare, "*.")
-	if bare == "" {
-		return false
-	}
-	to := call.To
+	return strings.TrimPrefix(bare, "*.")
+}
+
+func resolvedCallTargetName(to string) string {
 	if i := strings.LastIndex(to, "::"); i >= 0 {
 		to = to[i+2:]
 	}
 	if i := strings.LastIndex(to, "."); i >= 0 {
 		to = to[i+1:]
 	}
-	return to == bare
-}
-
-// paramNodeAtPosition returns the param node ID with the recorded
-// position attached to ownerID via EdgeParamOf.
-func paramNodeAtPosition(g graph.Store, ownerID string, pos int) string {
-	in := g.GetInEdges(ownerID)
-	for _, e := range in {
-		if e.Kind != graph.EdgeParamOf {
-			continue
-		}
-		n := g.GetNode(e.From)
-		if n == nil || n.Kind != graph.KindParam {
-			continue
-		}
-		p, ok := intFromMeta(n.Meta, "position")
-		if !ok {
-			continue
-		}
-		if p == pos {
-			return n.ID
-		}
-	}
-	return ""
+	return to
 }
 
 // argPositionFromMeta extracts the recorded argument position. The

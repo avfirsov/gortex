@@ -55,6 +55,33 @@ func IsLowValueForEnrichment(filePath string, userGlobs []string) bool {
 	return false
 }
 
+// fixtureCensusSegments are path segments whose contents are test corpora —
+// a parser's sample files, a tool's fixture repositories — not product code.
+var fixtureCensusSegments = []string{
+	"/testdata/",
+	"/test/resources/",
+	"/fixtures/",
+	"/test_repositories/",
+}
+
+// IsFixtureCensusPath reports whether a file lives in a test-fixture tree.
+// It gates ONLY the enrichment admission census (which languages a repo is
+// considered to contain), never indexing, search, or per-file enrichment: a
+// Go repo that carries TypeScript parser fixtures must not admit a whole
+// TypeScript type-inference pass on their evidence alone.
+func IsFixtureCensusPath(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+	lower := "/" + strings.ToLower(filepath.ToSlash(filePath))
+	for _, seg := range fixtureCensusSegments {
+		if strings.Contains(lower, seg) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchExcludeGlob matches a user-supplied glob against a slash path.
 // Supports `*` / `?` / `[...]` (within a segment, via path.Match) and `**`
 // (across segments). A pattern with no glob metacharacters matches as a

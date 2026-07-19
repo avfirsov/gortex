@@ -1,0 +1,90 @@
+package store_sqlite
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+func plannerStatRows(t *testing.T, s *Store) int {
+	t.Helper()
+	var hasTable bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1')`).Scan(&hasTable); err != nil {
+		t.Fatalf("probe sqlite_stat1: %v", err)
+	}
+	if !hasTable {
+		return 0
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_stat1`).Scan(&rows); err != nil {
+		t.Fatalf("count sqlite_stat1: %v", err)
+	}
+	return rows
+}
+
+func seedPlannerStatsNodes(s *Store) {
+	var nodes []*graph.Node
+	for i := 0; i < 64; i++ {
+		nodes = append(nodes, &graph.Node{
+			ID:       fmt.Sprintf("pkg/a.go::sym%02d", i),
+			Name:     fmt.Sprintf("sym%02d", i),
+			Kind:     graph.KindFunction,
+			FilePath: "pkg/a.go",
+			Language: "go",
+		})
+	}
+	s.AddBatch(nodes, nil)
+}
+
+// A coordinated cold load must leave planner statistics behind: every
+// post-load phase plans against the store, and a stats-blind planner picks
+// indexes by IN-probe count alone (the round-7 whale).
+func TestCoordinatedBulkFinalizeRefreshesPlannerStats(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "stats_bulk.sqlite"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("BeginCoordinatedBulkLoad refused")
+	}
+	seedPlannerStatsNodes(s)
+	if err := s.EndCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+	}
+	if rows := plannerStatRows(t, s); rows == 0 {
+		t.Fatal("bulk finalize left no sqlite_stat1 rows")
+	}
+}
+
+// A populated store written before the engine kept planner statistics must
+// be healed at Open — a warm restart never passes through bulk finalize.
+func TestOpenHealsPlannerStats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats_heal.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	seedPlannerStatsNodes(s)
+	// Erase any statistics so the reopen sees the pre-heal state.
+	if _, err := s.writerDB.Exec(`DELETE FROM sqlite_stat1`); err != nil {
+		// The table only exists once ANALYZE has run; absence is the state
+		// under test, not a failure.
+		t.Logf("clear sqlite_stat1: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if rows := plannerStatRows(t, reopened); rows == 0 {
+		t.Fatal("open did not heal sqlite_stat1 for a populated store")
+	}
+}

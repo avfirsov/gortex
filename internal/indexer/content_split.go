@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"sync"
 	"unicode/utf8"
 
 	"go.uber.org/zap"
@@ -15,6 +16,16 @@ import (
 // get_symbol_source) — so a repo of hundreds of thousands of sections
 // holds ~240 B × N in the graph instead of ~4 KB × N (~17× less text).
 const contentSnippetCap = 240
+
+// Cold content writes are accumulated only to these bounded thresholds. The
+// SQLite capability applies one atomic file-replacement transaction per
+// group; keeping the indexer group smaller than the store's own bounds avoids
+// a second split and caps retained full section text while workers continue.
+const (
+	parseContentBatchFiles = 32
+	parseContentBatchItems = 1024
+	parseContentBatchBytes = 4 << 20
+)
 
 // isContentNode is the indexer-local alias for graph.IsContentNode — the
 // shared predicate for a CONTENT section node (KindDoc, data_class=content).
@@ -133,6 +144,226 @@ func (idx *Indexer) contentSearcher() graph.ContentSearcher {
 		return cs
 	}
 	return nil
+}
+
+// repoContentPresenceReader is the narrow, repo-scoped projection used to
+// decide whether a full parse has any old content to replace. SQLite answers
+// it with one indexed EXISTS query over its content ownership sidecar. A
+// backend without this capability keeps the conservative historical behavior.
+type repoContentPresenceReader interface {
+	ContentRepoHasRows(repoPrefix string) (bool, error)
+}
+
+type repoContentFileWiper interface {
+	WipeContentFileInRepo(repoPrefix, filePath string) error
+}
+
+// prepareFullContentFileWiper performs the presence projection once, before
+// parse workers start, and returns the per-file callback used by the fallback
+// streaming path. On a genuinely empty repo the callback still records every
+// streamed file for the authoritative end sweep, but avoids one empty DELETE
+// transaction per file. Existing, partially written, and unknown stores retain
+// crash-safe per-file replacement. Projection errors fail conservative.
+func prepareFullContentFileWiper(
+	cs graph.ContentSearcher,
+	repoPrefix string,
+	recordFile func(string),
+) (wipeFile func(string) error, projectionErr error, ok bool) {
+	wiper, ok := cs.(repoContentFileWiper)
+	if !ok {
+		return nil, nil, false
+	}
+
+	hasPriorContent := true
+	if reader, projected := cs.(repoContentPresenceReader); projected {
+		hasPriorContent, projectionErr = reader.ContentRepoHasRows(repoPrefix)
+		if projectionErr != nil {
+			hasPriorContent = true
+		}
+	}
+
+	return func(filePath string) error {
+		recordFile(filePath)
+		if !hasPriorContent {
+			return nil
+		}
+		return wiper.WipeContentFileInRepo(repoPrefix, filePath)
+	}, projectionErr, true
+}
+
+type stagedContentFile struct {
+	replacement graph.ContentFTSFileReplacement
+	nodes       []*graph.Node
+	edges       []*graph.Edge
+	onDurable   func()
+}
+
+// parseContentBatch couples the content sidecar commit with the corresponding
+// graph AddBatch. Content-bearing files wait in a small bounded group; after
+// the sidecar replacement commits, lean node copies and all edges land in one
+// graph batch. If the sidecar fails, the original full-body nodes land instead,
+// preserving the search fallback. Workers may keep inspecting their extractor
+// results because only copies are leaned.
+type parseContentBatch struct {
+	idx      *Indexer
+	replacer graph.ContentFTSBatchReplacer
+
+	mu        sync.Mutex
+	pending   []stagedContentFile
+	itemCount int
+	bodyBytes int
+}
+
+func newParseContentBatch(idx *Indexer) *parseContentBatch {
+	cs := idx.contentSearcher()
+	if cs == nil {
+		return nil
+	}
+	replacer, ok := cs.(graph.ContentFTSBatchReplacer)
+	if !ok {
+		return nil
+	}
+	return &parseContentBatch{idx: idx, replacer: replacer}
+}
+
+func (b *parseContentBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurable func()) bool {
+	items := collectContentItems(nodes)
+	if len(items) == 0 {
+		return false
+	}
+	filePath := items[0].FilePath
+	if filePath == "" {
+		return false
+	}
+	bytes := 0
+	for _, item := range items {
+		bytes += len(item.NodeID) + len(item.FilePath) + len(item.Body) + 32
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.pending) > 0 && (len(b.pending) >= parseContentBatchFiles ||
+		b.itemCount+len(items) > parseContentBatchItems ||
+		b.bodyBytes+bytes > parseContentBatchBytes) {
+		b.flushLocked()
+	}
+	b.pending = append(b.pending, stagedContentFile{
+		replacement: graph.ContentFTSFileReplacement{FilePath: filePath, Items: items},
+		nodes:       nodes,
+		edges:       edges,
+		onDurable:   onDurable,
+	})
+	b.itemCount += len(items)
+	b.bodyBytes += bytes
+	if len(b.pending) >= parseContentBatchFiles ||
+		b.itemCount >= parseContentBatchItems || b.bodyBytes >= parseContentBatchBytes {
+		b.flushLocked()
+	}
+	return true
+}
+
+func (b *parseContentBatch) flush() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+}
+
+func (b *parseContentBatch) flushLocked() {
+	if len(b.pending) == 0 {
+		return
+	}
+	replacements := make([]graph.ContentFTSFileReplacement, len(b.pending))
+	nodeCount, edgeCount := 0, 0
+	for i, file := range b.pending {
+		replacements[i] = file.replacement
+		nodeCount += len(file.nodes)
+		edgeCount += len(file.edges)
+	}
+	err := b.replacer.ReplaceContentFiles(b.idx.RepoPrefix(), replacements)
+
+	nodes := make([]*graph.Node, 0, nodeCount)
+	edges := make([]*graph.Edge, 0, edgeCount)
+	for _, file := range b.pending {
+		if err == nil {
+			for _, node := range file.nodes {
+				if !isContentNode(node) {
+					nodes = append(nodes, node)
+					continue
+				}
+				cp := *node
+				cp.Meta = make(map[string]any, len(node.Meta))
+				for key, value := range node.Meta {
+					cp.Meta[key] = value
+				}
+				leanContentNode(&cp)
+				nodes = append(nodes, &cp)
+			}
+		} else {
+			nodes = append(nodes, file.nodes...)
+		}
+		edges = append(edges, file.edges...)
+	}
+	if err != nil {
+		b.idx.logger.Warn("indexer: batched content replacement failed; retaining full section text on nodes",
+			zap.Int("files", len(b.pending)), zap.Error(err))
+	}
+	b.idx.graph.AddBatch(nodes, edges)
+	for _, file := range b.pending {
+		if file.onDurable != nil {
+			file.onDurable()
+		}
+	}
+	b.pending = b.pending[:0]
+	b.itemCount = 0
+	b.bodyBytes = 0
+}
+
+// replaceContentSections is the atomic one-file path used by partial indexing
+// and the compatibility cold fallback. An explicit filePath makes an empty
+// section set authoritative, removing stale content when a document becomes
+// empty or changes classification.
+func (idx *Indexer) replaceContentSections(filePath string, nodes []*graph.Node, repoScoped bool) bool {
+	cs := idx.contentSearcher()
+	if cs == nil || filePath == "" {
+		return false
+	}
+	items := collectContentItems(nodes)
+	var err error
+	if replacer, ok := cs.(graph.ContentFTSBatchReplacer); ok {
+		err = replacer.ReplaceContentFiles(idx.RepoPrefix(), []graph.ContentFTSFileReplacement{{
+			FilePath: filePath,
+			Items:    items,
+		}})
+	} else {
+		if repoScoped {
+			if wiper, ok := cs.(interface {
+				WipeContentFileInRepo(repoPrefix, filePath string) error
+			}); ok {
+				err = wiper.WipeContentFileInRepo(idx.RepoPrefix(), filePath)
+			} else {
+				err = cs.WipeContentFile(filePath)
+			}
+		} else {
+			err = cs.WipeContentFile(filePath)
+		}
+		if err == nil && len(items) > 0 {
+			err = cs.AppendContent(idx.RepoPrefix(), items)
+		}
+	}
+	if err != nil {
+		idx.logger.Warn("indexer: content file replacement failed; leaving section text on nodes",
+			zap.String("file", filePath), zap.Error(err))
+		return false
+	}
+	for _, node := range nodes {
+		if isContentNode(node) {
+			leanContentNode(node)
+		}
+	}
+	return true
 }
 
 // streamContentSections is the per-file content path: it streams a parsed

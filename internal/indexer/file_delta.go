@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"hash"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -36,11 +35,12 @@ type fileDeltaFingerprints struct {
 // parsed twice. src is the transformed source, matching indexFile's input to
 // extractFile.
 type preparedExtraction struct {
-	absPath string
-	relPath string
-	lang    string
-	src     []byte
-	result  *parser.ExtractionResult
+	absPath     string
+	relPath     string
+	lang        string
+	src         []byte
+	result      *parser.ExtractionResult
+	readVersion fileReadVersion
 }
 
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
@@ -52,6 +52,7 @@ type fileDeltaProbe struct {
 	extract         time.Duration
 	coverage        time.Duration
 	fingerprintTime time.Duration
+	readVersion     fileReadVersion
 }
 
 // prepareFileDelta parses the current file once and caches that exact
@@ -68,7 +69,7 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 	relPath := idx.relKey(absPath)
 
 	started := time.Now()
-	src, err := os.ReadFile(absPath)
+	src, readVersion, err := readFileWithVersion(absPath)
 	probe.read = time.Since(started)
 	if err != nil {
 		return probe, false
@@ -124,13 +125,15 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 		idx.prepared = make(map[string]*preparedExtraction)
 	}
 	idx.prepared[absPath] = &preparedExtraction{
-		absPath: absPath,
-		relPath: relPath,
-		lang:    lang,
-		src:     append([]byte(nil), src...),
-		result:  result,
+		absPath:     absPath,
+		relPath:     relPath,
+		lang:        lang,
+		src:         append([]byte(nil), src...),
+		result:      result,
+		readVersion: readVersion,
 	}
 	idx.preparedMu.Unlock()
+	probe.readVersion = readVersion
 	return probe, true
 }
 
@@ -157,7 +160,7 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	if prepared == nil {
 		return nil, false
 	}
-	current, err := os.ReadFile(absPath)
+	current, readVersion, err := readFileWithVersion(absPath)
 	if err != nil {
 		return nil, false
 	}
@@ -165,6 +168,7 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	if !bytes.Equal(current, prepared.src) {
 		return nil, false
 	}
+	prepared.readVersion = readVersion
 	return prepared, true
 }
 
@@ -645,10 +649,10 @@ func metadataEdgeRefreshes(g graph.Store, graphPath string, priorNodes, freshNod
 // applyPreparedMetadataRefresh updates source-owned node metadata/locations and
 // stable edge spans without evicting the file or invoking the resolver. A
 // shape mismatch is conservative: the caller falls back to structural reindex.
-func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*graph.Node) ([]*graph.Node, bool) {
+func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*graph.Node) ([]*graph.Node, bool, bool) {
 	prepared, ok := idx.takePreparedRefresh(filePath)
 	if !ok || prepared.result == nil {
-		return nil, false
+		return nil, false, false
 	}
 	result := prepared.result
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -661,15 +665,15 @@ func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*
 		}
 	}
 	if len(priorByID) != len(result.Nodes) {
-		return nil, false
+		return nil, false, false
 	}
 	for i, fresh := range result.Nodes {
 		if fresh == nil {
-			return nil, false
+			return nil, false, false
 		}
 		old := priorByID[fresh.ID]
 		if old == nil {
-			return nil, false
+			return nil, false, false
 		}
 		cp := *fresh
 		cp.Meta = mergeRefreshMeta(old.Meta, fresh.Meta)
@@ -684,21 +688,21 @@ func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*
 
 	edgeUpdates, ok := metadataEdgeRefreshes(idx.graph, graphPath, priorNodes, result.Nodes, result.Edges)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-	if cs := idx.contentSearcher(); cs != nil {
-		if fp := firstContentFilePath(result.Nodes); fp != "" {
-			if err := cs.WipeContentFile(fp); err != nil {
-				return nil, false
-			}
-		}
+	if idx.contentSearcher() != nil && !idx.replaceContentSections(graphPath, result.Nodes, false) &&
+		len(collectContentItems(result.Nodes)) > 0 {
+		return nil, false, false
 	}
-	idx.streamContentSections(result.Nodes)
 	idx.graph.AddBatch(result.Nodes, nil)
 	idx.graph.ReindexEdges(edgeUpdates)
 	idx.persistFileMeta(prepared.relPath, prepared.src, result)
 
-	searcher, _ := idx.graph.(graph.SymbolSearcher)
+	batcher, _ := idx.graph.(graph.SymbolFTSBatchUpserter)
+	var ftsItems []graph.SymbolFTSItem
+	if batcher != nil {
+		ftsItems = make([]graph.SymbolFTSItem, 0, len(result.Nodes))
+	}
 	for _, n := range result.Nodes {
 		if !idx.shouldIndexForSearch(n) {
 			continue
@@ -707,12 +711,18 @@ func (idx *Indexer) applyPreparedMetadataRefresh(filePath string, priorNodes []*
 			idx.search.Remove(n.ID)
 			idx.search.Add(n.ID, searchIndexFields(n, idx.projectName)...)
 		}
-		if searcher != nil {
-			if err := searcher.UpsertSymbolFTS(n.ID, ftsTokensFor(n, idx.projectName)); err != nil {
-				return nil, false
-			}
+		if batcher != nil {
+			ftsItems = append(ftsItems, graph.SymbolFTSItem{
+				NodeID: n.ID,
+				Tokens: ftsTokensFor(n, idx.projectName),
+			})
 		}
 	}
-	idx.recordFileMtime(prepared.relPath, prepared.absPath)
-	return idx.graph.GetFileNodes(graphPath), true
+	if len(ftsItems) > 0 {
+		if err := batcher.BatchUpsertSymbolFTS(ftsItems); err != nil {
+			return nil, false, false
+		}
+	}
+	fresh := idx.recordFileReadVersion(prepared.relPath, prepared.absPath, prepared.readVersion)
+	return idx.graph.GetFileNodes(graphPath), true, fresh
 }

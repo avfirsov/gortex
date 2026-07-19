@@ -28,20 +28,35 @@ const (
 
 func (f DerivedInvalidationFlags) Has(flag DerivedInvalidationFlags) bool { return f&flag != 0 }
 
+// ContractGroupFrontier is the exact matcher bucket affected by a contract
+// refresh. Contract IDs alone are not sufficient: identical routes/topics/RPC
+// names in different workspace/project boundaries must remain isolated.
+type ContractGroupFrontier struct {
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	ProjectID   string `json:"project_id,omitempty"`
+	ContractID  string `json:"contract_id,omitempty"`
+}
+
 // DerivedInvalidationPlan is the bounded work contract carried from extraction
-// through reconcile. Files and TypeIDs are exact frontiers, not repo-wide hints.
+// through reconcile. Files, TypeIDs, contract groups, and contract symbols are
+// exact frontiers, not repo-wide hints.
 type DerivedInvalidationPlan struct {
-	Flags             DerivedInvalidationFlags `json:"flags,omitempty"`
-	Files             []string                 `json:"files,omitempty"`
-	TypeIDs           []string                 `json:"type_ids,omitempty"`
-	BodyOnlyFiles     int                      `json:"body_only_files,omitempty"`
-	MetadataOnlyFiles int                      `json:"metadata_only_files,omitempty"`
-	InertFiles        int                      `json:"inert_files,omitempty"`
-	LegacyFallback    bool                     `json:"legacy_fallback,omitempty"`
+	Flags                 DerivedInvalidationFlags `json:"flags,omitempty"`
+	Files                 []string                 `json:"files,omitempty"`
+	TypeIDs               []string                 `json:"type_ids,omitempty"`
+	ContractGroups        []ContractGroupFrontier  `json:"contract_groups,omitempty"`
+	ContractSymbolIDs     []string                 `json:"contract_symbol_ids,omitempty"`
+	ContractBridgeNodeIDs []string                 `json:"contract_bridge_node_ids,omitempty"`
+	BodyOnlyFiles         int                      `json:"body_only_files,omitempty"`
+	MetadataOnlyFiles     int                      `json:"metadata_only_files,omitempty"`
+	InertFiles            int                      `json:"inert_files,omitempty"`
+	LegacyFallback        bool                     `json:"legacy_fallback,omitempty"`
 }
 
 func (p DerivedInvalidationPlan) Empty() bool {
-	return p.Flags == 0 && len(p.Files) == 0 && p.BodyOnlyFiles == 0 && p.MetadataOnlyFiles == 0 && p.InertFiles == 0
+	return p.Flags == 0 && len(p.Files) == 0 && len(p.ContractGroups) == 0 &&
+		len(p.ContractSymbolIDs) == 0 && len(p.ContractBridgeNodeIDs) == 0 &&
+		p.BodyOnlyFiles == 0 && p.MetadataOnlyFiles == 0 && p.InertFiles == 0
 }
 
 func (p *DerivedInvalidationPlan) Merge(other DerivedInvalidationPlan) {
@@ -55,6 +70,31 @@ func (p *DerivedInvalidationPlan) Merge(other DerivedInvalidationPlan) {
 	p.LegacyFallback = p.LegacyFallback || other.LegacyFallback
 	p.Files = appendUniqueSorted(p.Files, other.Files...)
 	p.TypeIDs = appendUniqueSorted(p.TypeIDs, other.TypeIDs...)
+	p.ContractGroups = mergeContractGroups(p.ContractGroups, other.ContractGroups...)
+	p.ContractSymbolIDs = appendUniqueSorted(p.ContractSymbolIDs, other.ContractSymbolIDs...)
+	p.ContractBridgeNodeIDs = appendUniqueSorted(p.ContractBridgeNodeIDs, other.ContractBridgeNodeIDs...)
+}
+
+func mergeContractGroups(dst []ContractGroupFrontier, values ...ContractGroupFrontier) []ContractGroupFrontier {
+	seen := make(map[string]ContractGroupFrontier, len(dst)+len(values))
+	for _, group := range append(append([]ContractGroupFrontier(nil), dst...), values...) {
+		if group.ContractID == "" {
+			continue
+		}
+		seen[contractGroupKey(group)] = group
+	}
+	out := make([]ContractGroupFrontier, 0, len(seen))
+	for _, group := range seen {
+		out = append(out, group)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return contractGroupKey(out[i]) < contractGroupKey(out[j])
+	})
+	return out
+}
+
+func contractGroupKey(group ContractGroupFrontier) string {
+	return group.WorkspaceID + "\x00" + group.ProjectID + "\x00" + group.ContractID
 }
 
 func appendUniqueSorted(dst []string, values ...string) []string {

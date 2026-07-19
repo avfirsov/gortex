@@ -106,6 +106,9 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	if err != nil {
 		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
 	}
+	w.batchReindex = func(paths []string) (*IndexResult, error) {
+		return mw.multi.IncrementalReindexRepo(prefix, paths)
+	}
 
 	mw.watchers[prefix] = w
 	return nil
@@ -176,6 +179,11 @@ func (mw *MultiWatcher) Start() error {
 			// worktrees, tarball checkouts) simply skip it.
 			if idx := mw.multi.GetIndexer(prefix); idx != nil {
 				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
+				if err == nil {
+					gw.batchReindex = func(paths []string) (*IndexResult, error) {
+						return mw.multi.IncrementalReindexRepo(prefix, paths)
+					}
+				}
 				if err != nil {
 					mw.logger.Debug("git-watcher: init failed",
 						zap.String("prefix", prefix), zap.Error(err))

@@ -1,6 +1,9 @@
 package contracts
 
 import (
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -33,6 +36,44 @@ func canonicalizeSpringKey(key string) string {
 // springConfigKeyID is the canonical KindConfigKey node ID for a Spring property.
 func springConfigKeyID(key string) string {
 	return "cfg::spring::" + canonicalizeSpringKey(key)
+}
+
+// SpringConfigScope identifies the repository boundary for one binding pass.
+// RepoRoot is the on-disk root used to resolve graph paths; RepoPrefix and
+// WorkspaceID are persisted on synthetic nodes and form their multi-repo ID
+// namespace. An empty RepoPrefix retains the legacy single-repository IDs.
+type SpringConfigScope struct {
+	RepoPrefix  string
+	RepoRoot    string
+	WorkspaceID string
+}
+
+func scopedSpringConfigKeyID(scope SpringConfigScope, key string) string {
+	canonical := canonicalizeSpringKey(key)
+	if scope.RepoPrefix == "" {
+		return "cfg::spring::" + canonical
+	}
+	workspace := scope.WorkspaceID
+	if workspace == "" {
+		workspace = scope.RepoPrefix
+	}
+	return "cfg::spring::" + workspace + "::" + scope.RepoPrefix + "::" + canonical
+}
+
+func springConfigSource(scope SpringConfigScope, graphPath string) []byte {
+	path := strings.ReplaceAll(graphPath, "\\", "/")
+	if scope.RepoPrefix != "" {
+		path = strings.TrimPrefix(path, strings.TrimSuffix(scope.RepoPrefix, "/")+"/")
+	}
+	path = filepath.Clean(filepath.FromSlash(path))
+	if path == "." || filepath.IsAbs(path) || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(scope.RepoRoot, path))
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 // springConfigFile reports whether path is a Spring application config file and
@@ -92,96 +133,203 @@ func ExtractSpringConfigKeys(filePath string, src []byte, profile string) []*gra
 	return out
 }
 
-// BindSpringConfig emits the Spring config-key nodes from every application
-// config file in the graph (read via srcFor) and a reads_config edge from each
-// bean that carries spring_config_keys Meta (stamped by the Java extractor on a
+// BindSpringConfig emits Spring config-key nodes from application config files
+// in one explicit repository/workspace (read below scope.RepoRoot) and a
+// reads_config edge from each scoped bean carrying spring_config_keys Meta
+// (stamped by the Java extractor on a
 // @Value / @ConfigurationProperties bean) to the key it reads — with relaxed
 // canonicalization so spelling differences still bind, and a `*` suffix
 // (@ConfigurationProperties prefix) fanning out to every key under the prefix.
 // Returns the number of nodes + edges added.
-func BindSpringConfig(g graph.Store, srcFor func(string) []byte) int {
-	if g == nil || srcFor == nil {
+func BindSpringConfig(g graph.Store, scope SpringConfigScope) int {
+	if g == nil || scope.RepoRoot == "" {
 		return 0
 	}
 
-	added := 0
-	// Canonical prefix -> the key IDs declared under it, for prefix-read fanout.
-	byPrefix := map[string][]string{}
-	for fn := range g.NodesByKind(graph.KindFile) {
-		if fn == nil {
-			continue
-		}
-		profile, ok := springConfigFile(fn.FilePath)
+	type target struct {
+		desired string
+		legacy  string
+	}
+	projectedFiles := graph.ReadRepoFilePaths(g, scope.RepoPrefix, scope.WorkspaceID, []string{"java"}, []string{".yml", ".yaml", ".properties"})
+	if len(projectedFiles) == 0 {
+		return 0
+	}
+	currentFiles := make(map[string]struct{}, len(projectedFiles))
+	desiredNodes := make(map[string]*graph.Node)
+	legacyIDs := make(map[string]struct{})
+	byPrefix := make(map[string][]target)
+	for _, filePath := range projectedFiles {
+		profile, ok := springConfigFile(filePath)
 		if !ok {
 			continue
 		}
-		src := srcFor(fn.FilePath)
+		currentFiles[filePath] = struct{}{}
+		src := springConfigSource(scope, filePath)
 		if src == nil {
 			continue
 		}
-		for _, kn := range ExtractSpringConfigKeys(fn.FilePath, src, profile) {
-			if g.GetNode(kn.ID) == nil {
-				g.AddNode(kn)
-				added++
+		for _, node := range ExtractSpringConfigKeys(filePath, src, profile) {
+			legacyID := node.ID
+			node.ID = scopedSpringConfigKeyID(scope, node.Name)
+			node.RepoPrefix = scope.RepoPrefix
+			node.WorkspaceID = scope.WorkspaceID
+			if _, duplicate := desiredNodes[node.ID]; !duplicate {
+				desiredNodes[node.ID] = node
 			}
-			canon := strings.TrimPrefix(kn.ID, "cfg::spring::")
-			if dot := strings.LastIndexByte(canon, '.'); dot >= 0 {
-				prefix := canon[:dot]
-				byPrefix[prefix] = append(byPrefix[prefix], kn.ID)
+			if legacyID != node.ID {
+				legacyIDs[legacyID] = struct{}{}
+			}
+			canonical := canonicalizeSpringKey(node.Name)
+			if dot := strings.LastIndexByte(canonical, '.'); dot >= 0 {
+				prefix := canonical[:dot]
+				byPrefix[prefix] = append(byPrefix[prefix], target{desired: node.ID, legacy: legacyID})
 			}
 		}
 	}
+	for prefix, targets := range byPrefix {
+		sort.Slice(targets, func(i, j int) bool {
+			if targets[i].desired != targets[j].desired {
+				return targets[i].desired < targets[j].desired
+			}
+			return targets[i].legacy < targets[j].legacy
+		})
+		unique := targets[:0]
+		for _, candidate := range targets {
+			if len(unique) == 0 || unique[len(unique)-1] != candidate {
+				unique = append(unique, candidate)
+			}
+		}
+		byPrefix[prefix] = unique
+	}
 
-	edges := 0
-	seenEdge := map[string]bool{}
-	emit := func(from, keyID, raw string) {
-		k := from + "\x00" + keyID
-		if seenEdge[k] {
+	lookupIDs := make([]string, 0, len(desiredNodes)+len(legacyIDs))
+	for id := range desiredNodes {
+		lookupIDs = append(lookupIDs, id)
+	}
+	for id := range legacyIDs {
+		lookupIDs = append(lookupIDs, id)
+	}
+	sort.Strings(lookupIDs)
+	existingNodes := g.GetNodesByIDs(lookupIDs)
+	pendingNodes := make([]*graph.Node, 0, len(desiredNodes))
+	for _, id := range lookupIDs {
+		if node := desiredNodes[id]; node != nil && existingNodes[id] == nil {
+			pendingNodes = append(pendingNodes, node)
+		}
+	}
+
+	readers := springReaderNodes(g, scope)
+	readerIDs := make([]string, 0, len(readers))
+	legacyTargets := make(map[string]map[string]struct{}, len(readers))
+	desiredEdges := make([]*graph.Edge, 0)
+	seenDesired := make(map[string]struct{})
+	emit := func(reader *graph.Node, candidate target, raw string) {
+		identity := reader.ID + "\x00" + candidate.desired
+		if _, duplicate := seenDesired[identity]; duplicate {
 			return
 		}
-		seenEdge[k] = true
-		fromNode := g.GetNode(from)
-		fp, line := "", 0
-		if fromNode != nil {
-			fp, line = fromNode.FilePath, fromNode.StartLine
-		}
-		g.AddEdge(&graph.Edge{
-			From: from, To: keyID, Kind: graph.EdgeReadsConfig,
-			FilePath: fp, Line: line,
+		seenDesired[identity] = struct{}{}
+		desiredEdges = append(desiredEdges, &graph.Edge{
+			From: reader.ID, To: candidate.desired, Kind: graph.EdgeReadsConfig,
+			FilePath: reader.FilePath, Line: reader.StartLine,
 			Meta: map[string]any{"via": "spring_value", "raw_key": raw},
 		})
-		edges++
+		if candidate.legacy != candidate.desired {
+			targets := legacyTargets[reader.ID]
+			if targets == nil {
+				targets = make(map[string]struct{})
+				legacyTargets[reader.ID] = targets
+			}
+			targets[candidate.legacy] = struct{}{}
+		}
 	}
-
-	for _, n := range springReaderNodes(g) {
-		for _, key := range springConfigKeysOf(n) {
+	for _, reader := range readers {
+		readerIDs = append(readerIDs, reader.ID)
+		for _, key := range springConfigKeysOf(reader) {
 			if strings.HasSuffix(key, "*") {
-				// @ConfigurationProperties(prefix) — bind to every key under it.
 				prefix := canonicalizeSpringKey(strings.TrimSuffix(strings.TrimSuffix(key, "*"), "."))
-				for _, keyID := range byPrefix[prefix] {
-					emit(n.ID, keyID, key)
+				for _, candidate := range byPrefix[prefix] {
+					emit(reader, candidate, key)
 				}
 				continue
 			}
-			emit(n.ID, springConfigKeyID(key), key)
+			emit(reader, target{
+				desired: scopedSpringConfigKeyID(scope, key),
+				legacy:  springConfigKeyID(key),
+			}, key)
 		}
 	}
-	return added + edges
-}
 
-// springReaderNodes returns every node that carries a spring_config_keys hint.
-func springReaderNodes(g graph.Store) []*graph.Node {
-	var out []*graph.Node
-	for _, kind := range []graph.NodeKind{graph.KindField, graph.KindType, graph.KindInterface, graph.KindMethod} {
-		for n := range g.NodesByKind(kind) {
-			if n != nil && n.Meta != nil {
-				if _, ok := n.Meta["spring_config_keys"]; ok {
-					out = append(out, n)
+	endpoints := make([]graph.EdgeEndpoint, 0, len(desiredEdges))
+	sites := make([]graph.EdgeSite, 0, len(desiredEdges))
+	for _, edge := range desiredEdges {
+		endpoints = append(endpoints, graph.EdgeEndpoint{From: edge.From, To: edge.To})
+		sites = append(sites, graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: edge.Kind})
+	}
+	candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
+	pendingEdges := make([]*graph.Edge, 0, len(desiredEdges))
+	for _, edge := range desiredEdges {
+		exists := false
+		for _, existing := range candidates.Site(edge.From, edge.Line, edge.Kind) {
+			if existing != nil && existing.To == edge.To && existing.FilePath == edge.FilePath {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			pendingEdges = append(pendingEdges, edge)
+		}
+	}
+
+	if scope.RepoPrefix != "" && len(readerIDs) > 0 {
+		outgoing := g.GetOutEdgesByNodeIDs(readerIDs)
+		var staleEdges []*graph.Edge
+		for _, readerID := range readerIDs {
+			for _, edge := range outgoing[readerID] {
+				if edge == nil || edge.Kind != graph.EdgeReadsConfig {
+					continue
+				}
+				if _, stale := legacyTargets[readerID][edge.To]; stale {
+					staleEdges = append(staleEdges, edge)
 				}
 			}
 		}
+		if remover, ok := g.(graph.ExactEdgeBatchRemover); ok && len(staleEdges) > 0 {
+			remover.RemoveEdgesExact(staleEdges)
+		}
 	}
-	return out
+
+	if scope.RepoPrefix != "" && len(legacyIDs) > 0 {
+		staleNodes := make([]string, 0, len(legacyIDs))
+		for id := range legacyIDs {
+			node := existingNodes[id]
+			if node == nil || node.Kind != graph.KindConfigKey || node.Meta == nil || node.Meta["source"] != "spring" {
+				continue
+			}
+			_, currentFile := currentFiles[node.FilePath]
+			currentScope := node.RepoPrefix == scope.RepoPrefix && (scope.WorkspaceID == "" || node.WorkspaceID == scope.WorkspaceID)
+			if currentFile || currentScope {
+				staleNodes = append(staleNodes, id)
+			}
+		}
+		sort.Strings(staleNodes)
+		if evicter, ok := g.(graph.ConfigNodeBatchEvicter); ok && len(staleNodes) > 0 {
+			evicter.EvictConfigNodesByIDs(staleNodes)
+		}
+	}
+
+	if len(pendingNodes) > 0 || len(pendingEdges) > 0 {
+		g.AddBatch(pendingNodes, pendingEdges)
+	}
+	return len(pendingNodes) + len(pendingEdges)
+}
+
+// springReaderNodes returns the repository/workspace-scoped nodes carrying a
+// spring_config_keys hint through one backend projection.
+func springReaderNodes(g graph.Store, scope SpringConfigScope) []*graph.Node {
+	return graph.ReadRepoNodesByKindsWithMetaKey(g, scope.RepoPrefix, scope.WorkspaceID, []graph.NodeKind{
+		graph.KindField, graph.KindType, graph.KindInterface, graph.KindMethod,
+	}, "spring_config_keys")
 }
 
 // springConfigKeysOf coerces the spring_config_keys Meta value into a slice.

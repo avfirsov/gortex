@@ -1,7 +1,10 @@
 package graph
 
 import (
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -25,6 +28,22 @@ type MutationReceipt struct {
 	TargetNames        []string `json:"target_names,omitempty"`
 	TargetIDs          []string `json:"target_ids,omitempty"`
 	ImportCandidates   []string `json:"import_candidates,omitempty"`
+	// IncompleteReason names the FIRST mutation shape that voided the
+	// receipt (a writer call site, or a semantic slug like
+	// "edge_missing_file"). An incomplete receipt forces a whole-graph
+	// fallback resolve; without the reason, finding which writer inside a
+	// minutes-long window caused a 200s+ fallback needs a debugger.
+	IncompleteReason string `json:"incomplete_reason,omitempty"`
+}
+
+// ReceiptIncompleteCallerReason names the writer that voided a receipt by
+// its call site (two frames up: the caller of the mark function) — cheap,
+// and only paid on the (rare) incomplete path. Shared by both backends.
+func ReceiptIncompleteCallerReason() string {
+	if _, file, line, ok := runtime.Caller(2); ok {
+		return filepath.Base(file) + ":" + strconv.Itoa(line)
+	}
+	return "unknown_writer"
 }
 
 // ResolutionFiles returns the deduplicated exact file frontier needed by
@@ -60,12 +79,21 @@ type MutationReceiptStore interface {
 
 type mutationReceiptAccumulator struct {
 	complete           bool
+	incompleteReason   string
 	resolutionRelevant bool
 	changedFiles       map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
+}
+
+// noteIncomplete voids the receipt, keeping the FIRST cause.
+func (a *mutationReceiptAccumulator) noteIncomplete(reason string) {
+	a.complete = false
+	if a.incompleteReason == "" {
+		a.incompleteReason = reason
+	}
 }
 
 func newMutationReceiptAccumulator() *mutationReceiptAccumulator {
@@ -82,6 +110,7 @@ func newMutationReceiptAccumulator() *mutationReceiptAccumulator {
 func (a *mutationReceiptAccumulator) receipt() MutationReceipt {
 	return MutationReceipt{
 		Complete:           a.complete,
+		IncompleteReason:   a.incompleteReason,
 		ResolutionRelevant: a.resolutionRelevant,
 		ChangedFiles:       sortedReceiptKeys(a.changedFiles),
 		DefinitionFiles:    sortedReceiptKeys(a.definitionFiles),
@@ -153,7 +182,7 @@ func (g *Graph) EndMutationReceipt(token MutationReceiptToken) MutationReceipt {
 	defer g.mutationReceipts.mu.Unlock()
 	acc := g.mutationReceipts.active[token]
 	if acc == nil {
-		return MutationReceipt{Complete: false}
+		return MutationReceipt{Complete: false, IncompleteReason: "unknown_receipt_token"}
 	}
 	delete(g.mutationReceipts.active, token)
 	g.mutationReceipts.activeCount.Store(uint64(len(g.mutationReceipts.active)))
@@ -203,7 +232,7 @@ func (g *Graph) recordAddedNodeForReceipts(n *Node, definition, exact bool) {
 			acc.definitionFiles[n.FilePath] = struct{}{}
 		}
 		if !exact || n.FilePath == "" {
-			acc.complete = false
+			acc.noteIncomplete("node_write_without_exact_file")
 		}
 	}
 }
@@ -239,7 +268,7 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 		}
 		acc.resolutionRelevant = true
 		if exactFile == "" {
-			acc.complete = false
+			acc.noteIncomplete("edge_write_without_exact_file")
 		}
 	}
 }
@@ -248,10 +277,11 @@ func (g *Graph) markMutationReceiptsIncomplete() {
 	if g.mutationReceipts.activeCount.Load() == 0 {
 		return
 	}
+	reason := ReceiptIncompleteCallerReason()
 	g.mutationReceipts.mu.Lock()
 	defer g.mutationReceipts.mu.Unlock()
 	for _, acc := range g.mutationReceipts.active {
-		acc.complete = false
+		acc.noteIncomplete(reason)
 	}
 }
 

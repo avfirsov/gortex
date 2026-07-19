@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -8,10 +9,10 @@ import (
 
 // This file adds the repo-scoped store hygiene the base eviction path lacks.
 // EvictRepo (store.go) deletes ONLY nodes+edges, but a repo owns fifteen
-// other repo_prefix-keyed sidecar tables (file_mtimes, repo_index_state,
-// enrichment_state, clone_shingles, constant_values, files, ref_facts,
-// vectors, churn/coverage/release/blame_enrichment, symbol_fts,
-// symbol_fts_rowid, content_fts — see schema.go). Untracking a repo through
+// other sidecar tables (file_mtimes, repo_index_state,
+// enrichment_state, semantic_binding_types, clone_shingles, constant_values,
+// files, ref_facts, vectors, churn/coverage/release/blame_enrichment,
+// symbol_fts, symbol_fts_rowid, content_fts — see schema.go). Untracking a repo through
 // EvictRepo leaks every one of them, so a long-lived store accumulates
 // sidecar rows for repos removed from config long ago. PurgeRepo clears a
 // repo whole; OrphanRepoPrefixes finds prefixes that outlived their config
@@ -36,6 +37,7 @@ var purgeSidecarTables = []string{
 	"file_mtimes",
 	"repo_index_state",
 	"enrichment_state",
+	"semantic_binding_types",
 	"clone_shingles",
 	"constant_values",
 	"files",
@@ -47,10 +49,11 @@ var purgeSidecarTables = []string{
 	"symbol_fts",
 	"symbol_fts_rowid",
 	"content_fts",
+	"content_fts_rowid",
 }
 
-// PurgeRepo deletes EVERY row a repo owns — nodes, edges, and all fifteen
-// repo_prefix-keyed sidecar tables (purgeSidecarTables + vectors) — in one
+// PurgeRepo deletes EVERY row a repo owns — nodes, edges, all fifteen
+// repo_prefix-keyed sidecar tables, and vectors — in one
 // transaction. It is the complete form of EvictRepo (which drops only
 // nodes+edges), wired into UntrackRepo so removing a repo from config leaves
 // no residue. Refuses prefix=="" (shared global externals / solo-mode live
@@ -67,15 +70,21 @@ func (s *Store) PurgeRepo(prefix string) error {
 	// persisted whole-graph analysis before the transaction can delete live graph
 	// rows. The preflight is safe under writeMu and avoids touching analysis state
 	// for sidecar-only purges.
+	conn, release, err := s.activeWriteConnLocked(context.Background())
+	if err != nil {
+		return fmt.Errorf("store_sqlite: PurgeRepo writer preflight connection: %w", err)
+	}
 	var hasGraphRows int
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? LIMIT 1)`, prefix).Scan(&hasGraphRows); err != nil {
+	err = conn.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? LIMIT 1)`, prefix).Scan(&hasGraphRows)
+	release()
+	if err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo graph preflight: %w", err)
 	}
 	if hasGraphRows != 0 && !s.invalidateAnalysisBeforeMutationLocked() {
 		return fmt.Errorf("store_sqlite: PurgeRepo could not invalidate active analysis")
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -83,7 +92,7 @@ func (s *Store) PurgeRepo(prefix string) error {
 
 	// Collect this repo's node IDs first: edges and vectors are keyed off
 	// them (edges by from_id/to_id, vectors by node_id — neither carries a
-	// repo_prefix column). Edge deletion semantics mirror evictByScopeLocked
+	// repo_prefix column). Edge deletion semantics mirror scope eviction's
 	// (store.go): delete every edge touching one of these nodes, then the
 	// nodes themselves.
 	ids, err := repoNodeIDsTx(tx, prefix)
@@ -127,11 +136,12 @@ func (s *Store) PurgeRepo(prefix string) error {
 }
 
 // orphanScanTables are the tables OrphanRepoPrefixes unions DISTINCT
-// repo_prefix over. These five span the residue space: nodes (the primary
+// repo_prefix over. These six span the residue space: nodes (the primary
 // keyed store), file_mtimes + repo_index_state (the warm-restart provenance
 // that lingers when nodes are gone but sidecars survive — the exact shape a
-// leaked untrack leaves), enrichment_state (per-provider provenance), and
-// files (per-file metadata). A prefix whose nodes are gone but whose
+// leaked untrack leaves), enrichment_state (per-provider provenance), files
+// (per-file metadata), and semantic_binding_types (compiler-derived contract
+// bindings). A prefix whose nodes are gone but whose
 // sidecars remain is invisible to a nodes-only scan, which is why the
 // sidecar tables are unioned in; scanning still more tables would only
 // rediscover the same prefixes at higher cost.
@@ -141,6 +151,7 @@ var orphanScanTables = []string{
 	"repo_index_state",
 	"enrichment_state",
 	"files",
+	"semantic_binding_types",
 }
 
 // OrphanRepoPrefixes returns every repo_prefix present in the store but
@@ -211,18 +222,19 @@ var rekeyMoveTables = []string{
 }
 
 // rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than
-// relabels) for old. Every one is keyed by node_id, and the solo->multi
-// re-mint changes every node id (unprefixed `pkg::X` -> `<new>::pkg::X`), so
-// these old-id rows are already dangling against the evicted unprefixed
-// nodes. Relabeling their repo_prefix would just move dangling rows under
-// new — and let, e.g., the clone reseed load a shingle set for a node that
-// no longer exists. Dropping them is correct: the re-mint re-index rewrites
-// the index-time sidecars (constant_values, ref_facts, clone_shingles) under
-// the new node ids, and the enrichment sidecars (churn/coverage/release/
-// blame) must re-run for the new ids regardless. The FTS vtables sit here
+// relabels) for old. Most are keyed by node_id, and the solo->multi re-mint
+// changes every node id (unprefixed `pkg::X` -> `<new>::pkg::X`), so their
+// old-id rows are already dangling against the evicted unprefixed nodes.
+// semantic_binding_types is the exception: it is keyed by repo_prefix and
+// file_path, but the migration scopes every file path (`main.go` becomes
+// `<new>/main.go`), so relabeling would preserve unusable stale keys.
+// Dropping these tables is correct: re-index rewrites index-time sidecars
+// and semantic bindings under the new IDs and paths, while enrichment
+// sidecars must re-run for the new IDs regardless. The FTS vtables sit here
 // too — their rows carry the old node ids, and UPDATE over an FTS5 UNINDEXED
 // column is awkward, so delete-then-reindex is the clean path.
 var rekeyDropTables = []string{
+	"semantic_binding_types",
 	"clone_shingles",
 	"constant_values",
 	"ref_facts",
@@ -233,16 +245,17 @@ var rekeyDropTables = []string{
 	"symbol_fts",
 	"symbol_fts_rowid",
 	"content_fts",
+	"content_fts_rowid",
 }
 
 // RekeyRepoPrefix moves a repo's sidecar residue from old to new the moment a
 // solo (unprefixed) repo earns a real prefix because a second repo joined —
 // the migrateLoneUnprefixedRepoCtx path. The prefix/path-keyed provenance
 // tables (rekeyMoveTables) are relabeled so warm restart finds the repo's
-// mtimes + freshness under new instead of full-re-tracking it; the
-// node_id-keyed tables (rekeyDropTables) are dropped because the re-mint
-// changed every node id out from under them (see the two table lists for the
-// per-table rationale).
+// mtimes + freshness under new instead of full-re-tracking it; stale
+// ID/path-keyed tables (rekeyDropTables) are dropped because the re-mint
+// changes every node ID and file path out from under them (see the two table
+// lists for the per-table rationale).
 //
 // Refuses new=="" (cannot rekey INTO the protected empty prefix). old=="" IS
 // allowed — that is the whole point, since solo repos index unprefixed — and
@@ -260,7 +273,7 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -328,7 +341,7 @@ func repoNodeIDsTx(tx *sql.Tx, repoPrefix string) ([]string, error) {
 
 // deleteByIDColumnsTx deletes rows from table where ANY of cols matches one
 // of ids, chunked so each statement stays under SQLite's 999 bound-variable
-// limit. Mirrors evictByScopeLocked's chunked from_id/to_id edge delete
+// limit. Mirrors scope eviction's separate from_id/to_id edge deletes
 // (store.go) — the semantics source for edge eviction. Empty ids is a no-op.
 func deleteByIDColumnsTx(tx *sql.Tx, table string, cols, ids []string) error {
 	if len(ids) == 0 {

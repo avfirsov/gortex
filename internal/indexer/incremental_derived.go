@@ -111,28 +111,24 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 	}
 
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
-		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes)
+		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 	}
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
-		readsEnv, execProc, fields := synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes)
+		readsEnv, execProc, fields := synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
 		report.Capability = readsEnv + execProc + fields
 	}
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
-		framework := resolver.RunFrameworkSynthesizersScoped(mi.graph, scopedPrefixes)
+		framework := resolver.RunFrameworkSynthesizersScopedForFiles(mi.graph, scopedPrefixes, merged.Files)
 		report.Framework = framework.Total
-		if scopedPrefixes == nil {
-			report.ExternalCalls = resolver.SynthesizeExternalCalls(mi.graph, mi.externalCallSynthesisEnabled())
-		} else {
-			report.ExternalCalls = resolver.SynthesizeExternalCallsForRepos(
-				mi.graph, mi.externalCallSynthesisEnabled(), scopedPrefixes,
-			)
-		}
+		report.ExternalCalls = resolver.SynthesizeExternalCallsForFiles(
+			mi.graph, mi.externalCallSynthesisEnabled(), merged.Files,
+		)
 		report.CrossRepo = resolver.DetectCrossRepoEdgesForFiles(mi.graph, merged.Files)
 	}
 	if merged.Flags.Has(DerivedInvalidatesContracts) {
-		report.Contracts = mi.ReconcileContractEdges()
+		report.Contracts = mi.ReconcileContractEdgesForFrontier(merged)
 	}
 
 	report.DurationMs = time.Since(started).Milliseconds()

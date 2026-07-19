@@ -80,11 +80,11 @@ type confirmGroup struct {
 // skipFile, when non-nil, drops any referent file the predicate rejects —
 // the compile-database-degraded pass passes it to keep clangd from opening
 // header translation units it cannot resolve without a database.
-func (p *Provider) groupConfirmTargets(g graph.Store, targets []enrichTarget, skipFile func(rel string) bool) []*confirmGroup {
+func (p *Provider) groupConfirmTargets(nodesByID map[string]*graph.Node, targets []enrichTarget, skipFile func(rel string) bool) []*confirmGroup {
 	byFile := map[string]*confirmGroup{}
 	var order []*confirmGroup
 	for _, t := range targets {
-		toNode := g.GetNode(t.edge.To)
+		toNode := nodesByID[t.edge.To]
 		if toNode == nil {
 			continue
 		}

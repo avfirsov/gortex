@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -569,8 +570,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
 		// continues in this goroutine afterward and finishes at MarkEnriched.
+		// Once-guarded: the warmup fires it from inside the master resolver
+		// (at compute-done, the earliest queryable point) AND from its
+		// unconditional post-resolve fallback, whichever comes first.
 		var queryableElapsed time.Duration
-		markReady := func() {
+		markReady := sync.OnceFunc(func() {
 			elapsed := time.Since(start)
 			queryableElapsed = elapsed
 			controller.MarkReady(elapsed)
@@ -580,7 +584,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_seconds": int64(elapsed.Seconds()),
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
-		}
+		})
 		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is

@@ -69,8 +69,13 @@ func ComputeHITS(g graph.Store) *HITSResult {
 	if g == nil {
 		return &HITSResult{Authorities: map[string]float64{}, Hubs: map[string]float64{}}
 	}
-	nodes := excludeProxyNodes(graph.AllNodesLight(g))
-	n := len(nodes)
+	ids := make([]string, 0, g.NodeCount())
+	for node := range graph.NodesLightSeq(g) {
+		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
+			ids = append(ids, node.ID)
+		}
+	}
+	n := len(ids)
 	if n == 0 {
 		return &HITSResult{Authorities: map[string]float64{}, Hubs: map[string]float64{}}
 	}
@@ -87,7 +92,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 	inLinks := make(map[string][]weightedLink)
 	// Meta-less kind-scoped scan (see LightEdgeScanner): only e.Kind, endpoints,
 	// and graph.ProvenanceWeight are read here.
-	for _, e := range graph.EdgesForKindsLight(g, graph.EdgeCalls, graph.EdgeReferences) {
+	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
@@ -101,31 +106,31 @@ func ComputeHITS(g graph.Store) *HITSResult {
 
 	auth := make(map[string]float64, n)
 	hub := make(map[string]float64, n)
-	for _, nd := range nodes {
-		auth[nd.ID] = 1.0
-		hub[nd.ID] = 1.0
+	for _, id := range ids {
+		auth[id] = 1.0
+		hub[id] = 1.0
 	}
 
 	for iter := 0; iter < hitsIterations; iter++ {
 		// Authority update: a node's authority is the sum of the hub
 		// scores of the nodes pointing at it.
 		nextAuth := make(map[string]float64, n)
-		for _, nd := range nodes {
+		for _, id := range ids {
 			var sum float64
-			for _, src := range inLinks[nd.ID] {
+			for _, src := range inLinks[id] {
 				sum += src.w * hub[src.id]
 			}
-			nextAuth[nd.ID] = sum
+			nextAuth[id] = sum
 		}
 		// Hub update: a node's hub score is the sum of the (just
 		// updated) authority scores of the nodes it points at.
 		nextHub := make(map[string]float64, n)
-		for _, nd := range nodes {
+		for _, id := range ids {
 			var sum float64
-			for _, dst := range outLinks[nd.ID] {
+			for _, dst := range outLinks[id] {
 				sum += dst.w * nextAuth[dst.id]
 			}
-			nextHub[nd.ID] = sum
+			nextHub[id] = sum
 		}
 		normalizeL2(nextAuth)
 		normalizeL2(nextHub)

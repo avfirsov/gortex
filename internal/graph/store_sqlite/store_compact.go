@@ -54,7 +54,7 @@ func (s *Store) CompactStats() (freeBytes, totalBytes int64) {
 // error as skip-and-continue rather than fatal.
 func (s *Store) Compact() error {
 	s.writeMu.Lock()
-	_, err := s.db.Exec(`VACUUM`)
+	_, err := s.writerDB.Exec(`VACUUM`)
 	s.writeMu.Unlock()
 	if err != nil {
 		return err

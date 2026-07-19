@@ -30,25 +30,43 @@ func (idx *Indexer) scopedGlobalPassesEnabled() bool {
 // (every type must be re-checked against a changed interface). Re-checking
 // every (type, interface) pair with an endpoint in these sets re-lands exactly
 // the edges eviction dropped — add-parity with the full pass.
+const affectedSetReadBatchSize = 256
+
 func (idx *Indexer) affectedTypeSet(graphPaths []string) (types, ifaces map[string]bool) {
 	types = map[string]bool{}
 	ifaces = map[string]bool{}
-	for _, p := range graphPaths {
-		for _, n := range idx.graph.GetFileNodes(p) {
-			if n == nil {
-				continue
-			}
-			switch n.Kind {
-			case graph.KindType, graph.KindInterface:
-				types[n.ID] = true
-				if n.Kind == graph.KindInterface {
-					ifaces[n.ID] = true
+	for start := 0; start < len(graphPaths); start += affectedSetReadBatchSize {
+		end := start + affectedSetReadBatchSize
+		if end > len(graphPaths) {
+			end = len(graphPaths)
+		}
+		chunk := graphPaths[start:end]
+		nodesByFile := idx.graph.GetFileNodesByPaths(chunk)
+		var methodIDs []string
+		for _, p := range chunk {
+			for _, n := range nodesByFile[p] {
+				if n == nil {
+					continue
 				}
-			case graph.KindMethod:
-				for _, e := range idx.graph.GetOutEdges(n.ID) {
-					if e.Kind == graph.EdgeMemberOf {
-						types[e.To] = true
+				switch n.Kind {
+				case graph.KindType, graph.KindInterface:
+					types[n.ID] = true
+					if n.Kind == graph.KindInterface {
+						ifaces[n.ID] = true
 					}
+				case graph.KindMethod:
+					methodIDs = append(methodIDs, n.ID)
+				}
+			}
+		}
+		if len(methodIDs) == 0 {
+			continue
+		}
+		edgesByMethod := idx.graph.GetOutEdgesByNodeIDs(methodIDs)
+		for _, methodID := range methodIDs {
+			for _, e := range edgesByMethod[methodID] {
+				if e != nil && e.Kind == graph.EdgeMemberOf {
+					types[e.To] = true
 				}
 			}
 		}
@@ -65,10 +83,19 @@ func (idx *Indexer) affectedTypeSet(graphPaths []string) (types, ifaces map[stri
 // no structural nodes contributes no calls / reads / writes / dispatch
 // sites, which is the only input those synthesizers read.
 func (idx *Indexer) staleFilesAffectDerivedEdges(staleFiles []string) bool {
-	for _, p := range idx.graphFilePaths(staleFiles) {
-		for _, n := range idx.graph.GetFileNodes(p) {
-			if n != nil && isStructuralKind(n.Kind) {
-				return true
+	graphPaths := idx.graphFilePaths(staleFiles)
+	for start := 0; start < len(graphPaths); start += affectedSetReadBatchSize {
+		end := start + affectedSetReadBatchSize
+		if end > len(graphPaths) {
+			end = len(graphPaths)
+		}
+		chunk := graphPaths[start:end]
+		nodesByFile := idx.graph.GetFileNodesByPaths(chunk)
+		for _, p := range chunk {
+			for _, n := range nodesByFile[p] {
+				if n != nil && isStructuralKind(n.Kind) {
+					return true
+				}
 			}
 		}
 	}

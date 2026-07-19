@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -486,6 +487,10 @@ type Graph struct {
 	// upgraded Origin). The count is the tamper-evidence surface:
 	// provenance cannot churn without it moving.
 	edgeIdentityRevisions atomic.Int64
+	// builtinSeen records ::builtin:: sentinel targets already materialised
+	// as KindBuiltin stub nodes (see BuiltinStubNodes), so re-indexing the
+	// same files doesn't re-upsert identical stubs on every batch.
+	builtinSeen sync.Map
 	// edgeMutGen bumps whenever the AllEdges output would change —
 	// new edge inserted, existing edge removed, or an edge's
 	// canonical key changed via ReindexEdge. Origin-only updates
@@ -495,6 +500,11 @@ type Graph struct {
 	// share one materialised slice instead of each rebuilding the
 	// 4 M-edge snapshot.
 	edgeMutGen atomic.Uint64
+	// nodeMutGen advances once per accepted node mutation batch (including
+	// same-ID replacements and scoped evictions). Resolver instances combine it
+	// with edgeMutGen to detect cache-invalidating watcher work performed by a
+	// different Resolver while the shared resolve mutex was yielded.
+	nodeMutGen atomic.Uint64
 
 	allEdgesCacheMu  sync.Mutex
 	allEdgesCache    []*Edge
@@ -550,6 +560,9 @@ type Graph struct {
 type cloneShingleEntry struct {
 	repoPrefix string
 	shingles   []uint64
+	signature  string
+	tokenCount int
+	finalized  bool
 }
 
 // constValueEntry is one in-memory constant_values row: the owning repo
@@ -566,6 +579,8 @@ type constValueEntry struct {
 var (
 	_ CloneShingleWriter       = (*Graph)(nil)
 	_ CloneShingleReader       = (*Graph)(nil)
+	_ CloneCorpusWriter        = (*Graph)(nil)
+	_ CloneCorpusPager         = (*Graph)(nil)
 	_ ChurnEnrichmentWriter    = (*Graph)(nil)
 	_ ChurnEnrichmentReader    = (*Graph)(nil)
 	_ CoverageEnrichmentWriter = (*Graph)(nil)
@@ -661,15 +676,31 @@ func (g *Graph) ResolveMutex() *sync.Mutex {
 // straight loop; the value of the batch API lives in the disk
 // backends, where it collapses N transaction commits into one.
 func (g *Graph) ReindexEdges(batch []EdgeReindex) {
+	mutated := false
 	for _, r := range batch {
 		if r.Edge == nil {
 			continue
 		}
+		mutated = true
+		oldKind := r.OldKind
+		if oldKind == "" {
+			oldKind = r.Edge.Kind
+		}
 		if !r.RefreshIdentity {
-			g.ReindexEdge(r.Edge, r.OldTo)
+			g.reindexEdge(r.Edge, r.OldTo, oldKind)
 			continue
 		}
-		g.refreshEdgeIdentity(r.Edge, r.OldTo, r.OldFilePath, r.OldLine)
+		oldFrom := r.OldFrom
+		if oldFrom == "" {
+			oldFrom = r.Edge.From
+		}
+		g.refreshEdgeIdentity(r.Edge, oldFrom, r.OldTo, oldKind, r.OldFilePath, r.OldLine)
+	}
+	if mutated {
+		// ReindexEdges also persists non-key payload changes. The lower-level
+		// helpers already advance edgeMutGen for key moves; this coarse bump
+		// covers same-key metadata/quality updates as a safe invalidation.
+		g.edgeMutGen.Add(1)
 	}
 }
 
@@ -677,16 +708,20 @@ func (g *Graph) ReindexEdges(batch []EdgeReindex) {
 // out/in identity sidecars. Keeping the stored pointer preserves AllEdges cache
 // coherence; the watcher uses this for source-span/meta refreshes that must not
 // discard a resolver-selected target.
-func (g *Graph) refreshEdgeIdentity(e *Edge, oldTo, oldFilePath string, oldLine int) {
+func (g *Graph) refreshEdgeIdentity(e *Edge, oldFrom, oldTo string, oldKind EdgeKind, oldFilePath string, oldLine int) {
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
 	}
 	g.markMutationReceiptsIncomplete()
+	if oldFrom != e.From {
+		g.moveEdgeIdentity(e, oldFrom, oldTo, oldKind, oldFilePath, oldLine)
+		return
+	}
 	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
 	defer unlock()
 
-	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: e.Kind, FilePath: oldFilePath, Line: oldLine})
+	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: oldKind, FilePath: oldFilePath, Line: oldLine})
 	newKey := hashEdgeKey(keyOf(e))
 	sFrom := g.shardFor(e.From)
 	fromIdx := sFrom.outEdgeIdx[e.From]
@@ -713,6 +748,68 @@ func (g *Graph) refreshEdgeIdentity(e *Edge, oldTo, oldFilePath string, oldLine 
 	*stored = *e
 }
 
+// moveEdgeIdentity is the source-moving sibling of refreshEdgeIdentity. A
+// returns_to materialization changes From from the enclosing caller to the
+// resolved callee, so both adjacency buckets and the source-repository count
+// must move together. The old identity is removed exactly (including source
+// location) and the new identity keeps AddEdge's collision semantics.
+func (g *Graph) moveEdgeIdentity(e *Edge, oldFrom, oldTo string, oldKind EdgeKind, oldFilePath string, oldLine int) {
+	unlock := g.lockFourWrite(oldFrom, e.From, oldTo, e.To)
+	defer unlock()
+
+	oldKey := hashEdgeKey(edgeKey{
+		From: oldFrom, To: oldTo, Kind: oldKind,
+		FilePath: oldFilePath, Line: oldLine,
+	})
+	sOldFrom := g.shardFor(oldFrom)
+	fromIdx := sOldFrom.outEdgeIdx[oldFrom]
+	pos, ok := fromIdx[oldKey]
+	if !ok || pos >= len(sOldFrom.outEdges[oldFrom]) {
+		return
+	}
+	stored := sOldFrom.outEdges[oldFrom][pos]
+	if stored == nil {
+		return
+	}
+	oldStored := *stored
+	oldStored.From = oldFrom
+	oldStored.To = oldTo
+	oldStored.Kind = oldKind
+	oldStored.FilePath = oldFilePath
+	oldStored.Line = oldLine
+	var oldRepo string
+	if src := sOldFrom.nodes[oldFrom]; src != nil {
+		oldRepo = src.RepoPrefix
+	}
+
+	removeEdgeFromBucket(sOldFrom.outEdges, sOldFrom.outEdgeKeys, sOldFrom.outEdgeIdx, oldFrom, oldKey)
+	sOldTo := g.shardFor(oldTo)
+	removeEdgeFromBucket(sOldTo.inEdges, sOldTo.inEdgeKeys, sOldTo.inEdgeIdx, oldTo, oldKey)
+	sOldFrom.repoEdgeRemove(oldRepo, &oldStored)
+
+	*stored = *e
+	sNewFrom := g.shardFor(e.From)
+	inserted, originChanged := addEdgeToBucket(
+		sNewFrom.outEdges, sNewFrom.outEdgeKeys, sNewFrom.outEdgeIdx, e.From, stored,
+	)
+	sNewTo := g.shardFor(e.To)
+	addEdgeToBucket(sNewTo.inEdges, sNewTo.inEdgeKeys, sNewTo.inEdgeIdx, e.To, stored)
+	if inserted {
+		var newRepo string
+		if src := sNewFrom.nodes[e.From]; src != nil {
+			newRepo = src.RepoPrefix
+		}
+		sNewFrom.repoEdgeAdd(newRepo, stored)
+	}
+	if originChanged {
+		g.edgeIdentityRevisions.Add(1)
+	}
+	// Moving source buckets (or collapsing onto an existing identity) changes
+	// the materialized edge set even though the stored pointer is reused.
+	g.edgeMutGen.Add(1)
+	g.edgeIdentityRevisions.Add(1)
+}
+
 // BulkSetCloneShingles is the in-memory implementation of
 // CloneShingleWriter. It records every (nodeID -> shingles) entry for
 // one repo prefix, replacing any prior value in place. Slices are
@@ -730,9 +827,84 @@ func (g *Graph) BulkSetCloneShingles(repoPrefix string, rows map[string][]uint64
 	for id, sh := range rows {
 		cp := make([]uint64, len(sh))
 		copy(cp, sh)
-		g.cloneShingles[id] = cloneShingleEntry{repoPrefix: repoPrefix, shingles: cp}
+		prior := g.cloneShingles[id]
+		entry := cloneShingleEntry{repoPrefix: repoPrefix, shingles: cp}
+		if prior.repoPrefix == repoPrefix && slices.Equal(prior.shingles, sh) {
+			entry.signature = prior.signature
+			entry.tokenCount = prior.tokenCount
+			entry.finalized = prior.finalized
+		}
+		g.cloneShingles[id] = entry
 	}
 	return nil
+}
+
+// BulkSetCloneCorpus is the in-memory compact clone projection writer. Rows
+// are copied on ingress and replace the matching node-id entries atomically.
+func (g *Graph) BulkSetCloneCorpus(repoPrefix string, rows []CloneCorpusRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	if g.cloneShingles == nil {
+		g.cloneShingles = make(map[string]cloneShingleEntry, len(rows))
+	}
+	for _, row := range rows {
+		if row.NodeID == "" {
+			continue
+		}
+		cp := append([]uint64(nil), row.Shingles...)
+		g.cloneShingles[row.NodeID] = cloneShingleEntry{
+			repoPrefix: repoPrefix,
+			shingles:   cp,
+			signature:  row.Signature,
+			tokenCount: row.TokenCount,
+			finalized:  row.Finalized,
+		}
+	}
+	return nil
+}
+
+// CloneCorpusPage is the in-memory CloneCorpusPager: one repo's projection
+// in stable node-id order, afterNodeID exclusive. Serving the paged corpus
+// here flips the clone finalise / warm-rebuild paths onto sidecar TokenCount
+// on this backend too, so the durable Meta["clone_tokens"] copy is only ever
+// read on pre-projection stores.
+func (g *Graph) CloneCorpusPage(repoPrefix, afterNodeID string, limit int) ([]CloneCorpusRow, error) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	g.cloneShinglesMu.Lock()
+	ids := make([]string, 0, len(g.cloneShingles))
+	for id, entry := range g.cloneShingles {
+		if entry.repoPrefix == repoPrefix && id > afterNodeID {
+			ids = append(ids, id)
+		}
+	}
+	g.cloneShinglesMu.Unlock()
+	sort.Strings(ids)
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	rows := make([]CloneCorpusRow, 0, len(ids))
+	g.cloneShinglesMu.Lock()
+	defer g.cloneShinglesMu.Unlock()
+	for _, id := range ids {
+		entry, ok := g.cloneShingles[id]
+		if !ok {
+			continue
+		}
+		rows = append(rows, CloneCorpusRow{
+			NodeID:     id,
+			RepoPrefix: entry.repoPrefix,
+			Shingles:   append([]uint64(nil), entry.shingles...),
+			Signature:  entry.signature,
+			TokenCount: entry.tokenCount,
+			Finalized:  entry.finalized,
+		})
+	}
+	return rows, nil
 }
 
 // DeleteCloneShingles is the in-memory implementation of the
@@ -773,6 +945,63 @@ func (g *Graph) LoadCloneShingles(repoPrefix string) (map[string][]uint64, error
 	return out, nil
 }
 
+// DrainCloneCorpusBatches removes one repository's compact clone projection
+// and yields bounded node-id-sorted batches. It streams directly from the
+// existing sidecar map, so a shadow drain never builds a second repo-sized
+// clone corpus in memory.
+func (g *Graph) DrainCloneCorpusBatches(repoPrefix string, maxRows int, maxBytes uint64) iter.Seq[[]CloneCorpusRow] {
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	return func(yield func([]CloneCorpusRow) bool) {
+		g.cloneShinglesMu.Lock()
+		defer g.cloneShinglesMu.Unlock()
+
+		batch := make([]CloneCorpusRow, 0, maxRows)
+		var batchBytes uint64
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			slices.SortFunc(batch, func(a, b CloneCorpusRow) int {
+				return strings.Compare(a.NodeID, b.NodeID)
+			})
+			if !yield(batch) {
+				return false
+			}
+			batch = make([]CloneCorpusRow, 0, maxRows)
+			batchBytes = 0
+			return true
+		}
+		for nodeID, entry := range g.cloneShingles {
+			if entry.repoPrefix != repoPrefix {
+				continue
+			}
+			delete(g.cloneShingles, nodeID)
+			row := CloneCorpusRow{
+				NodeID: nodeID, RepoPrefix: entry.repoPrefix,
+				Shingles:  append([]uint64(nil), entry.shingles...),
+				Signature: entry.signature, TokenCount: entry.tokenCount,
+				Finalized: entry.finalized,
+			}
+			nextBytes := uint64(len(row.NodeID) + len(row.Signature) + len(row.Shingles)*8 + 48)
+			if len(batch) > 0 && (len(batch) >= maxRows || maxBytes > 0 && batchBytes+nextBytes > maxBytes) {
+				if !flush() {
+					return
+				}
+			}
+			batch = append(batch, row)
+			batchBytes += nextBytes
+			if len(batch) >= maxRows || maxBytes > 0 && batchBytes >= maxBytes {
+				if !flush() {
+					return
+				}
+			}
+		}
+		flush()
+	}
+}
+
 // BulkSetConstantValues is the in-memory ConstantValueWriter. It records
 // every (nodeID -> value) row for one repo prefix, replacing any prior
 // value in place. Empty input is a no-op.
@@ -790,6 +1019,32 @@ func (g *Graph) BulkSetConstantValues(repoPrefix string, rows []ConstantValueRow
 			continue
 		}
 		g.constValues[r.NodeID] = constValueEntry{repoPrefix: repoPrefix, filePath: r.FilePath, value: r.Value}
+	}
+	return nil
+}
+
+// ReplaceConstantValues atomically swaps the in-memory repository projection.
+// Empty rows deliberately clear the prior projection.
+func (g *Graph) ReplaceConstantValues(repoPrefix string, rows []ConstantValueRow) error {
+	g.constValuesMu.Lock()
+	defer g.constValuesMu.Unlock()
+	if g.constValues == nil {
+		g.constValues = make(map[string]constValueEntry, len(rows))
+	}
+	for id, entry := range g.constValues {
+		if entry.repoPrefix == repoPrefix {
+			delete(g.constValues, id)
+		}
+	}
+	for _, row := range rows {
+		if row.NodeID == "" {
+			continue
+		}
+		g.constValues[row.NodeID] = constValueEntry{
+			repoPrefix: repoPrefix,
+			filePath:   row.FilePath,
+			value:      row.Value,
+		}
 	}
 	return nil
 }
@@ -862,6 +1117,24 @@ func (g *Graph) SetFileMetas(repoPrefix string, rows []FileMetaRow) error {
 	return nil
 }
 
+// ReplaceFileMetas atomically swaps the in-memory repository projection.
+// Empty rows deliberately clear the prior projection.
+func (g *Graph) ReplaceFileMetas(repoPrefix string, rows []FileMetaRow) error {
+	byFile := make(map[string]FileMetaRow, len(rows))
+	for _, row := range rows {
+		if row.FilePath != "" {
+			byFile[row.FilePath] = row
+		}
+	}
+	g.fileMetasMu.Lock()
+	defer g.fileMetasMu.Unlock()
+	if g.fileMetas == nil {
+		g.fileMetas = make(map[string]map[string]FileMetaRow)
+	}
+	g.fileMetas[repoPrefix] = byFile
+	return nil
+}
+
 // DeleteFileMetasByFiles drops the rows for the supplied files in one repo
 // prefix so a reindex replaces them cleanly.
 func (g *Graph) DeleteFileMetasByFiles(repoPrefix string, files []string) error {
@@ -889,6 +1162,24 @@ func (g *Graph) FileMetasForRepo(repoPrefix string) ([]FileMetaRow, error) {
 	out := make([]FileMetaRow, 0, len(byFile))
 	for _, r := range byFile {
 		out = append(out, r)
+	}
+	return out, nil
+}
+
+// FileMetasByPaths returns only the requested metadata rows. The result is
+// keyed by the canonical stored file path; missing paths are omitted.
+func (g *Graph) FileMetasByPaths(repoPrefix string, filePaths []string) (map[string]FileMetaRow, error) {
+	out := make(map[string]FileMetaRow, len(filePaths))
+	if len(filePaths) == 0 {
+		return out, nil
+	}
+	g.fileMetasMu.Lock()
+	defer g.fileMetasMu.Unlock()
+	byFile := g.fileMetas[repoPrefix]
+	for _, filePath := range filePaths {
+		if row, ok := byFile[filePath]; ok {
+			out[filePath] = row
+		}
 	}
 	return out, nil
 }
@@ -1079,33 +1370,36 @@ func (g *Graph) BlameRows(repoPrefix string) []BlameEnrichment {
 	return out
 }
 
-// EdgesByKind yields every edge whose Kind matches. In-memory
-// implementation iterates the materialised AllEdges() slice and
-// filters; the algorithmic cost is identical to a hand-written
-// "for _, e := range g.AllEdges() { if e.Kind == kind }" loop, which
-// is what most call sites used before the predicate API existed.
-// Disk backends override this with an index-backed scan.
+// EdgesByKind yields every edge whose Kind matches. The in-memory
+// implementation snapshots only matching edges one shard at a time;
+// callbacks run after releasing the shard lock so they may safely mutate
+// the graph. Disk backends override this with an index-backed scan.
 func (g *Graph) EdgesByKind(kind EdgeKind) iter.Seq[*Edge] {
 	return func(yield func(*Edge) bool) {
-		for _, e := range g.AllEdges() {
-			if e == nil || e.Kind != kind {
-				continue
+		for _, s := range g.shards {
+			s.mu.RLock()
+			var matches []*Edge
+			for _, edges := range s.outEdges {
+				for _, e := range edges {
+					if e != nil && e.Kind == kind {
+						matches = append(matches, e)
+					}
+				}
 			}
-			if !yield(e) {
-				return
+			s.mu.RUnlock()
+
+			for _, e := range matches {
+				if !yield(e) {
+					return
+				}
 			}
 		}
 	}
 }
 
 // EdgesByKinds is the in-memory reference implementation of
-// EdgesByKindsScanner. Single pass over AllEdges with a small
-// pre-built kind set — same algorithmic cost as the legacy `for _, e
-// := range g.AllEdges() { if e.Kind == X || e.Kind == Y }` loop the
-// edge-driven analyzers used before this capability existed. Disk
-// backends override with a single `WHERE kind IN $kinds` query so the
-// edge-driven analyzers stop firing one EdgesByKind per kind (or
-// worse, scanning AllEdges and filtering Go-side).
+// EdgesByKindsScanner. It snapshots only matching edges one shard at a
+// time. Disk backends override with one indexed WHERE kind IN query.
 //
 // Empty kinds yields nothing — matches the disk contract.
 func (g *Graph) EdgesByKinds(kinds []EdgeKind) iter.Seq[*Edge] {
@@ -1123,30 +1417,97 @@ func (g *Graph) EdgesByKinds(kinds []EdgeKind) iter.Seq[*Edge] {
 		return func(yield func(*Edge) bool) {}
 	}
 	return func(yield func(*Edge) bool) {
-		for _, e := range g.AllEdges() {
-			if e == nil {
-				continue
+		for _, s := range g.shards {
+			s.mu.RLock()
+			var matches []*Edge
+			for _, edges := range s.outEdges {
+				for _, e := range edges {
+					if e == nil {
+						continue
+					}
+					if _, ok := set[e.Kind]; ok {
+						matches = append(matches, e)
+					}
+				}
 			}
-			if _, ok := set[e.Kind]; !ok {
-				continue
-			}
-			if !yield(e) {
-				return
+			s.mu.RUnlock()
+
+			for _, e := range matches {
+				if !yield(e) {
+					return
+				}
 			}
 		}
 	}
 }
 
-// NodesByKind yields every node whose Kind matches. Same semantics
-// and same in-memory cost story as EdgesByKind.
+// DistinctExternalTargets returns the unique external-shaped destinations for
+// kinds in one shard walk. It keeps only target strings in memory and never
+// materialises the graph's full edge set.
+func (g *Graph) DistinctExternalTargets(kinds []EdgeKind) []string {
+	if len(kinds) == 0 {
+		return nil
+	}
+	kindSet := make(map[EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if kind != "" {
+			kindSet[kind] = struct{}{}
+		}
+	}
+	if len(kindSet) == 0 {
+		return nil
+	}
+
+	targetSet := make(map[string]struct{})
+	for _, s := range g.shards {
+		s.mu.RLock()
+		for _, edges := range s.outEdges {
+			for _, e := range edges {
+				if e == nil || !isExternalTargetID(e.To) {
+					continue
+				}
+				if _, ok := kindSet[e.Kind]; ok {
+					targetSet[e.To] = struct{}{}
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	targets := make([]string, 0, len(targetSet))
+	for target := range targetSet {
+		targets = append(targets, target)
+	}
+	slices.Sort(targets)
+	return targets
+}
+
+func isExternalTargetID(id string) bool {
+	return strings.HasPrefix(id, "dep::") ||
+		strings.HasPrefix(id, "external::") ||
+		strings.HasPrefix(id, "stdlib::") ||
+		strings.Contains(id, "::stdlib::") ||
+		strings.HasPrefix(id, "external-call::")
+}
+
+// NodesByKind yields every node whose Kind matches. It snapshots only
+// matching nodes one shard at a time and never materialises the full graph.
 func (g *Graph) NodesByKind(kind NodeKind) iter.Seq[*Node] {
 	return func(yield func(*Node) bool) {
-		for _, n := range g.AllNodes() {
-			if n == nil || n.Kind != kind {
-				continue
+		for _, s := range g.shards {
+			s.mu.RLock()
+			matches := make([]*Node, 0)
+			for _, n := range s.nodes {
+				if n != nil && n.Kind == kind {
+					matches = append(matches, n)
+				}
 			}
-			if !yield(n) {
-				return
+			s.mu.RUnlock()
+
+			for _, n := range matches {
+				if !yield(n) {
+					return
+				}
 			}
 		}
 	}
@@ -1208,21 +1569,46 @@ func (g *Graph) FindNodesByNames(names []string) map[string][]*Node {
 // itself via EdgesByKind(references).
 func (g *Graph) EdgesWithUnresolvedTarget() iter.Seq[*Edge] {
 	return func(yield func(*Edge) bool) {
-		for _, e := range g.AllEdges() {
-			if e == nil {
-				continue
+		const snapshotRows = 2048
+		for _, shard := range g.shards {
+			// Snapshot only source IDs, never the shard's edge corpus. Each
+			// adjacency bucket is then copied in bounded pieces so callbacks may
+			// safely reindex without running under the shard read lock.
+			shard.mu.RLock()
+			sources := make([]string, 0, len(shard.outEdges))
+			for from := range shard.outEdges {
+				sources = append(sources, from)
 			}
-			// IsUnresolvedTarget matches both the bare `unresolved::<name>`
-			// form and the multi-repo `<repoPrefix>::unresolved::<name>`
-			// form that the disk backend's bulk-load rewrite produces. A bare
-			// HasPrefix check silently skipped every prefixed stub, so the
-			// Go resolver never got a second pass at multi-repo edges.
-			// IsFnValuePlaceholder drops the gate-owned fnvalue sub-namespace.
-			if !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
-				continue
-			}
-			if !yield(e) {
-				return
+			shard.mu.RUnlock()
+			sort.Strings(sources)
+
+			for _, from := range sources {
+				for offset := 0; ; {
+					shard.mu.RLock()
+					edges := shard.outEdges[from]
+					if offset >= len(edges) {
+						shard.mu.RUnlock()
+						break
+					}
+					end := offset + snapshotRows
+					if end > len(edges) {
+						end = len(edges)
+					}
+					window := append([]*Edge(nil), edges[offset:end]...)
+					offset = end
+					shard.mu.RUnlock()
+
+					for _, e := range window {
+						// IsUnresolvedTarget matches both bare and repo-qualified
+						// stubs; fn-value placeholders belong to their own gate.
+						if e == nil || !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
+							continue
+						}
+						if !yield(e) {
+							return
+						}
+					}
+				}
 			}
 		}
 	}
@@ -2026,6 +2412,38 @@ func (g *Graph) lockThreeWrite(idA, idB, idC string) func() {
 	}
 }
 
+// lockFourWrite locks the source and target shards for a complete edge
+// identity move. ReindexEdge only changes To and needs three shards;
+// returns_to materialization can also change From and therefore needs four.
+func (g *Graph) lockFourWrite(idA, idB, idC, idD string) func() {
+	idxs := [4]int{
+		g.shardIdx(idA), g.shardIdx(idB),
+		g.shardIdx(idC), g.shardIdx(idD),
+	}
+	// Four-element insertion sort stays allocation-free and makes lock order
+	// deterministic across every source/target collision shape.
+	for i := 1; i < len(idxs); i++ {
+		for j := i; j > 0 && idxs[j] < idxs[j-1]; j-- {
+			idxs[j], idxs[j-1] = idxs[j-1], idxs[j]
+		}
+	}
+	n := 1
+	for i := 1; i < len(idxs); i++ {
+		if idxs[i] != idxs[n-1] {
+			idxs[n] = idxs[i]
+			n++
+		}
+	}
+	for i := 0; i < n; i++ {
+		g.shards[idxs[i]].mu.Lock()
+	}
+	return func() {
+		for i := n - 1; i >= 0; i-- {
+			g.shards[idxs[i]].mu.Unlock()
+		}
+	}
+}
+
 // lockAllWrite / lockAllRead take every shard's lock in order. Used by
 // operations that have to touch the whole graph (AllNodes, Stats,
 // EvictRepo). Callers must match with unlockAllWrite / unlockAllRead.
@@ -2070,6 +2488,7 @@ func (g *Graph) AddNode(n *Node) {
 	old := s.nodes[n.ID]
 	g.addNodeLocked(s, n)
 	s.mu.Unlock()
+	g.nodeMutGen.Add(1)
 
 	if old == nil {
 		g.recordAddedNodeForReceipts(n, IsReferenceableSymbol(n.Kind), true)
@@ -2111,7 +2530,7 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 				delete(s.byQual, prev.QualName)
 			}
 		}
-		if prev.RepoPrefix != n.RepoPrefix && prev.RepoPrefix != "" {
+		if prev.RepoPrefix != n.RepoPrefix {
 			// Preserve a previously-set RepoPrefix rather than letting
 			// an empty-prefix re-add silently strip the node out of its
 			// byRepo bucket. The downgrade-to-empty case has no
@@ -2125,7 +2544,7 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 			// stays populated. The legitimate RepoPrefix-change case
 			// (snapshot prefix → new prefix because config moved) still
 			// works because n.RepoPrefix is non-empty there.
-			if n.RepoPrefix == "" {
+			if prev.RepoPrefix != "" && n.RepoPrefix == "" {
 				n.RepoPrefix = prev.RepoPrefix
 			} else {
 				removeNodeFromBucket(s.byRepo, s.byRepoIdx, prev.RepoPrefix, n.ID)
@@ -2138,6 +2557,11 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 	if n.QualName != "" {
 		s.byQual[n.QualName] = n
 	}
+	// Empty-prefix nodes are the single-repo/shadow-graph case. Keeping every
+	// such node in byRepo duplicates the full node set and adds an ID→position
+	// map entry per node, which is substantial during SQLite cold indexing.
+	// The only empty-prefix compound query scans the shard's native node map
+	// directly; byRepo remains a compact index for real non-empty prefixes.
 	if n.RepoPrefix != "" {
 		addNodeToBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID, n)
 	}
@@ -2165,6 +2589,21 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	if len(nodes) == 0 && len(edges) == 0 {
 		return
 	}
+	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
+	edges, _ = FilterStructuralEdgeViolations(edges)
+	// Lazy builtin-sentinel materialization: see BuiltinStubNodes. The
+	// per-store seen-set keeps it one upsert per stub per store lifetime.
+	if stubs := BuiltinStubNodes(edges); len(stubs) > 0 {
+		var fresh []*Node
+		for _, stub := range stubs {
+			if _, dup := g.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
+				fresh = append(fresh, stub)
+			}
+		}
+		if len(fresh) > 0 {
+			nodes = append(append(make([]*Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
+		}
+	}
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
@@ -2172,10 +2611,12 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	nodesByShard := make([][]*Node, g.shardCount)
 	outEdgesByShard := make([][]*Edge, g.shardCount)
 	inEdgesByShard := make([][]*Edge, g.shardCount)
+	nodeMutation := false
 	for _, n := range nodes {
 		if n == nil || n.ID == "" {
 			continue
 		}
+		nodeMutation = true
 		i := g.shardIdx(n.ID)
 		nodesByShard[i] = append(nodesByShard[i], n)
 	}
@@ -2190,6 +2631,7 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	var addedNodes []*Node
 	var addedEdges []*Edge
 	incompleteReceipt := false
+	replacedEdge := false
 	for i := range g.shards {
 		if len(nodesByShard[i]) == 0 && len(outEdgesByShard[i]) == 0 && len(inEdgesByShard[i]) == 0 {
 			continue
@@ -2230,8 +2672,13 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 					srcRepo = src.RepoPrefix
 				}
 				s.repoEdgeAdd(srcRepo, e)
-			} else if old != nil && old.Alias != e.Alias {
-				incompleteReceipt = true
+			} else {
+				// One revision per batch is sufficient for same-key payload
+				// replacements; inserted edges already advance edgeMutGen above.
+				replacedEdge = true
+				if old != nil && old.Alias != e.Alias {
+					incompleteReceipt = true
+				}
 			}
 		}
 		for _, e := range inEdgesByShard[i] {
@@ -2240,6 +2687,12 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		s.mu.Unlock()
 	}
 
+	if nodeMutation {
+		g.nodeMutGen.Add(1)
+	}
+	if replacedEdge {
+		g.edgeMutGen.Add(1)
+	}
 	if incompleteReceipt {
 		g.markMutationReceiptsIncomplete()
 	}
@@ -2265,6 +2718,11 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 // adjacency-list length is unchanged. Drops the double-edge problem
 // that used to surface after daemon restarts (bug B1).
 func (g *Graph) AddEdge(e *Edge) {
+	// Structural-shape backstop: see StructuralEdgeTargetInvalid.
+	if e != nil && StructuralEdgeTargetInvalid(e.Kind, e.To) {
+		structuralWriteDrops.Add(1)
+		return
+	}
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
@@ -2300,6 +2758,11 @@ func (g *Graph) AddEdge(e *Edge) {
 			srcRepo = src.RepoPrefix
 		}
 		sFrom.repoEdgeAdd(srcRepo, e)
+	} else {
+		// A same-key re-add replaces the persisted payload in place. It must
+		// invalidate resolver liveness snapshots even when the endpoints and
+		// kind did not change (for example watcher metadata replacement).
+		g.edgeMutGen.Add(1)
 	}
 	unlock()
 
@@ -2355,6 +2818,7 @@ func (g *Graph) SetEdgeProvenance(e *Edge, newOrigin string) bool {
 		e.Tier = ResolvedBy(newOrigin)
 	}
 	g.edgeIdentityRevisions.Add(1)
+	g.edgeMutGen.Add(1)
 	return true
 }
 
@@ -2431,7 +2895,11 @@ func (e *edgeIdentityError) Error() string {
 // edgeKey depends on To), the inEdgeIdx entry on the old target bucket
 // (removed), and the inEdgeIdx entry on the new target bucket (added).
 func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
-	if oldTo == e.To {
+	g.reindexEdge(e, oldTo, e.Kind)
+}
+
+func (g *Graph) reindexEdge(e *Edge, oldTo string, oldKind EdgeKind) {
+	if oldTo == e.To && oldKind == e.Kind {
 		return
 	}
 	receiptActive := g.beginReceiptMutation()
@@ -2447,7 +2915,7 @@ func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 
 	// Old identity uses oldTo; the current edge struct already has the
 	// new To set, so we reconstruct the key before mutation.
-	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: e.Kind, FilePath: e.FilePath, Line: e.Line})
+	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: oldKind, FilePath: e.FilePath, Line: e.Line})
 	newKey := hashEdgeKey(keyOf(e))
 
 	sFrom := g.shardFor(e.From)
@@ -2755,11 +3223,10 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 		}
 		removeNodeFromBucket(s.byName, s.byNameIdx, n.Name, n.ID)
 		removeNodeFromBucket(s.byFile, s.byFileIdx, filePath, n.ID)
-		if n.RepoPrefix != "" {
-			removeNodeFromBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID)
-		}
+		removeNodeFromBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID)
 	}
 	nodesRemoved = len(nodes)
+	g.nodeMutGen.Add(1)
 
 	edgesRemoved = g.evictEdgesLocked(evictedIDs)
 	return nodesRemoved, edgesRemoved
@@ -3046,6 +3513,267 @@ func (g *Graph) DrainEdges() iter.Seq[*Edge] {
 	}
 }
 
+// DrainNodeBatches destructively transfers nodes out of the graph in bounded
+// batches. Each yielded batch is sorted by ID so SQLite's WITHOUT ROWID primary
+// key sees locally ordered inserts. The backing node map is detached one shard
+// at a time and entries are deleted as they enter a batch: the graph never
+// allocates a whole-corpus snapshot, and processed Node objects become
+// collectible as soon as the consumer returns. maxBytes is an estimate based
+// on nodeBytes; an individual oversized node is yielded alone. A zero byte cap
+// disables only the byte limit. Callers must consume the sequence fully.
+func (g *Graph) DrainNodeBatches(maxRows int, maxBytes uint64) iter.Seq[[]*Node] {
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	return func(yield func([]*Node) bool) {
+		batch := make([]*Node, 0, maxRows)
+		var batchBytes uint64
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			slices.SortFunc(batch, func(a, b *Node) int {
+				return strings.Compare(a.ID, b.ID)
+			})
+			if !yield(batch) {
+				return false
+			}
+			batch = make([]*Node, 0, maxRows)
+			batchBytes = 0
+			return true
+		}
+
+		for _, s := range g.shards {
+			s.mu.Lock()
+			nodes := s.nodes
+			s.nodes = make(map[string]*Node)
+			s.byFile = make(map[string][]*Node)
+			s.byName = make(map[string][]*Node)
+			s.byQual = make(map[string]*Node)
+			s.byRepo = make(map[string][]*Node)
+			s.byFileIdx = make(map[string]map[string]int)
+			s.byNameIdx = make(map[string]map[string]int)
+			s.byRepoIdx = make(map[string]map[string]int)
+			s.repoNodeBytes = make(map[string]uint64)
+			s.repoNodeCount = make(map[string]int)
+			s.mu.Unlock()
+
+			for id, n := range nodes {
+				delete(nodes, id)
+				nextBytes := nodeBytes(n)
+				if len(batch) > 0 && (len(batch) >= maxRows || maxBytes > 0 && batchBytes+nextBytes > maxBytes) {
+					if !flush() {
+						return
+					}
+				}
+				batch = append(batch, n)
+				batchBytes += nextBytes
+				if len(batch) >= maxRows || maxBytes > 0 && batchBytes >= maxBytes {
+					if !flush() {
+						return
+					}
+				}
+			}
+		}
+		flush()
+	}
+}
+
+// DrainEdgeBatches is the edge sibling of DrainNodeBatches. It drains only
+// each edge's canonical out-adjacency entry (in-adjacency holds the same
+// pointers), orders every bounded batch by the SQLite logical key, and clears
+// the duplicate adjacency/index structures before yielding. An oversized edge
+// is yielded alone; maxBytes == 0 disables the byte limit.
+func (g *Graph) DrainEdgeBatches(maxRows int, maxBytes uint64) iter.Seq[[]*Edge] {
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	g.allEdgesCacheMu.Lock()
+	g.allEdgesCache = nil
+	g.allEdgesCacheGen = 0
+	g.allEdgesCacheMu.Unlock()
+	g.edgeMutGen.Add(1)
+
+	return func(yield func([]*Edge) bool) {
+		batch := make([]*Edge, 0, maxRows)
+		var batchBytes uint64
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			slices.SortFunc(batch, compareDrainEdges)
+			if !yield(batch) {
+				return false
+			}
+			batch = make([]*Edge, 0, maxRows)
+			batchBytes = 0
+			return true
+		}
+
+		for _, s := range g.shards {
+			s.mu.Lock()
+			outEdges := s.outEdges
+			s.outEdges = make(map[string][]*Edge)
+			s.inEdges = make(map[string][]*Edge)
+			s.outEdgeIdx = make(map[string]map[edgeHash]int)
+			s.inEdgeIdx = make(map[string]map[edgeHash]int)
+			s.outEdgeKeys = make(map[string][]edgeHash)
+			s.inEdgeKeys = make(map[string][]edgeHash)
+			s.repoEdgeBytes = make(map[string]uint64)
+			s.repoEdgeCount = make(map[string]int)
+			s.mu.Unlock()
+
+			for fromID, edges := range outEdges {
+				delete(outEdges, fromID)
+				for i, e := range edges {
+					edges[i] = nil
+					nextBytes := edgeBytes(e)
+					if len(batch) > 0 && (len(batch) >= maxRows || maxBytes > 0 && batchBytes+nextBytes > maxBytes) {
+						if !flush() {
+							return
+						}
+					}
+					batch = append(batch, e)
+					batchBytes += nextBytes
+					if len(batch) >= maxRows || maxBytes > 0 && batchBytes >= maxBytes {
+						if !flush() {
+							return
+						}
+					}
+				}
+			}
+		}
+		flush()
+	}
+}
+
+func compareDrainEdges(a, b *Edge) int {
+	if c := strings.Compare(a.From, b.From); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.To, b.To); c != 0 {
+		return c
+	}
+	if c := strings.Compare(string(a.Kind), string(b.Kind)); c != 0 {
+		return c
+	}
+	if c := strings.Compare(a.FilePath, b.FilePath); c != 0 {
+		return c
+	}
+	switch {
+	case a.Line < b.Line:
+		return -1
+	case a.Line > b.Line:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// DrainFileMetaBatches removes one repository's compact file projection and
+// yields bounded, path-sorted batches without materialising FileMetasForRepo.
+func (g *Graph) DrainFileMetaBatches(repoPrefix string, maxRows int, maxBytes uint64) iter.Seq[[]FileMetaRow] {
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	return func(yield func([]FileMetaRow) bool) {
+		g.fileMetasMu.Lock()
+		rows := g.fileMetas[repoPrefix]
+		delete(g.fileMetas, repoPrefix)
+		g.fileMetasMu.Unlock()
+
+		batch := make([]FileMetaRow, 0, maxRows)
+		var batchBytes uint64
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			slices.SortFunc(batch, func(a, b FileMetaRow) int {
+				return strings.Compare(a.FilePath, b.FilePath)
+			})
+			if !yield(batch) {
+				return false
+			}
+			batch = make([]FileMetaRow, 0, maxRows)
+			batchBytes = 0
+			return true
+		}
+		for filePath, row := range rows {
+			delete(rows, filePath)
+			nextBytes := uint64(len(row.FilePath) + len(row.ContentHash) + len(row.Errors) + 64)
+			if len(batch) > 0 && (len(batch) >= maxRows || maxBytes > 0 && batchBytes+nextBytes > maxBytes) {
+				if !flush() {
+					return
+				}
+			}
+			batch = append(batch, row)
+			batchBytes += nextBytes
+			if len(batch) >= maxRows || maxBytes > 0 && batchBytes >= maxBytes {
+				if !flush() {
+					return
+				}
+			}
+		}
+		flush()
+	}
+}
+
+// DrainConstantValueBatches removes one repository's compact constant-value
+// projection and yields bounded node-ID-sorted batches.
+func (g *Graph) DrainConstantValueBatches(repoPrefix string, maxRows int, maxBytes uint64) iter.Seq[[]ConstantValueRow] {
+	if maxRows <= 0 {
+		maxRows = 1
+	}
+	return func(yield func([]ConstantValueRow) bool) {
+		g.constValuesMu.Lock()
+		owned := g.constValues
+		remaining := make(map[string]constValueEntry)
+		for nodeID, entry := range owned {
+			if entry.repoPrefix != repoPrefix {
+				remaining[nodeID] = entry
+				delete(owned, nodeID)
+			}
+		}
+		g.constValues = remaining
+		g.constValuesMu.Unlock()
+
+		batch := make([]ConstantValueRow, 0, maxRows)
+		var batchBytes uint64
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			slices.SortFunc(batch, func(a, b ConstantValueRow) int {
+				return strings.Compare(a.NodeID, b.NodeID)
+			})
+			if !yield(batch) {
+				return false
+			}
+			batch = make([]ConstantValueRow, 0, maxRows)
+			batchBytes = 0
+			return true
+		}
+		for nodeID, entry := range owned {
+			delete(owned, nodeID)
+			row := ConstantValueRow{NodeID: nodeID, FilePath: entry.filePath, Value: entry.value}
+			nextBytes := uint64(len(row.NodeID) + len(row.FilePath) + len(row.Value) + 48)
+			if len(batch) > 0 && (len(batch) >= maxRows || maxBytes > 0 && batchBytes+nextBytes > maxBytes) {
+				if !flush() {
+					return
+				}
+			}
+			batch = append(batch, row)
+			batchBytes += nextBytes
+			if len(batch) >= maxRows || maxBytes > 0 && batchBytes >= maxBytes {
+				if !flush() {
+					return
+				}
+			}
+		}
+		flush()
+	}
+}
+
 // Stats returns summary counts by kind and language.
 func (g *Graph) Stats() GraphStats {
 	g.lockAllRead()
@@ -3085,15 +3813,56 @@ func (g *Graph) Stats() GraphStats {
 	}
 }
 
-// GetRepoNodes returns all nodes belonging to the given repository
-// prefix. Each shard holds a byRepo slice for nodes it owns; we
-// aggregate across shards.
+// GetRepoNodes returns all nodes belonging to the exact repository prefix.
+// Non-empty prefixes use each shard's compact byRepo bucket. Empty prefix is
+// the single-repository/shadow-graph case and scans shard maps directly so the
+// graph does not duplicate its entire node set in byRepo.
 func (g *Graph) GetRepoNodes(repoPrefix string) []*Node {
 	var out []*Node
 	for _, s := range g.shards {
 		s.mu.RLock()
+		if repoPrefix == "" {
+			for _, n := range s.nodes {
+				if n != nil && n.RepoPrefix == "" {
+					out = append(out, n)
+				}
+			}
+			s.mu.RUnlock()
+			continue
+		}
 		if src := s.byRepo[repoPrefix]; len(src) > 0 {
 			out = append(out, src...)
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
+// GetRepoNodesByLanguage is the exact compound-predicate sibling of
+// GetRepoNodes. An empty prefix scans each shard's native node map directly,
+// avoiding both an AllNodes materialization and a duplicate byRepo index over
+// every single-repository shadow node.
+func (g *Graph) GetRepoNodesByLanguage(repoPrefix, language string) []*Node {
+	if language == "" {
+		return nil
+	}
+	var out []*Node
+	for _, s := range g.shards {
+		s.mu.RLock()
+		candidates := s.byRepo[repoPrefix]
+		if repoPrefix == "" {
+			for _, n := range s.nodes {
+				if n != nil && n.RepoPrefix == "" && n.Language == language {
+					out = append(out, n)
+				}
+			}
+			s.mu.RUnlock()
+			continue
+		}
+		for _, n := range candidates {
+			if n != nil && n.Language == language {
+				out = append(out, n)
+			}
 		}
 		s.mu.RUnlock()
 	}
@@ -3129,6 +3898,12 @@ func (g *Graph) GetRepoEdges(repoPrefix string) []*Edge {
 // EvictRepo removes all nodes with matching RepoPrefix and all edges
 // referencing those nodes. Returns counts of removed nodes and edges.
 func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	// Empty prefix has never been a public repo bucket (GetRepoNodes("") and
+	// RepoPrefixes intentionally exclude it). Preserve the historical no-op
+	// contract now that empty-prefix nodes are no longer duplicated in byRepo.
+	if repoPrefix == "" {
+		return 0, 0
+	}
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()
@@ -3163,6 +3938,7 @@ func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 		removeNodeFromBucket(s.byRepo, s.byRepoIdx, repoPrefix, n.ID)
 	}
 	nodesRemoved = len(nodes)
+	g.nodeMutGen.Add(1)
 
 	edgesRemoved = g.evictEdgesLocked(evictedIDs)
 	return nodesRemoved, edgesRemoved
@@ -3177,6 +3953,9 @@ func (g *Graph) RepoStats() map[string]GraphStats {
 	repoNodes := make(map[string][]*Node)
 	for _, s := range g.shards {
 		for prefix, nodes := range s.byRepo {
+			if prefix == "" {
+				continue
+			}
 			repoNodes[prefix] = append(repoNodes[prefix], nodes...)
 		}
 	}
@@ -3361,6 +4140,9 @@ func (g *Graph) RepoPrefixes() []string {
 	for _, s := range g.shards {
 		s.mu.RLock()
 		for prefix := range s.byRepo {
+			if prefix == "" {
+				continue
+			}
 			seen[prefix] = struct{}{}
 		}
 		s.mu.RUnlock()
@@ -3515,11 +4297,18 @@ func (g *Graph) ThrowerErrorSurface(pathPrefix string) []ThrowerErrorRow {
 func (g *Graph) MemberMethodsByType() map[string][]MemberMethodInfo {
 	out := map[string][]MemberMethodInfo{}
 	seen := map[string]map[string]struct{}{}
+	var edges []*Edge
+	var methodIDs []string
 	for e := range g.EdgesByKind(EdgeMemberOf) {
 		if e == nil {
 			continue
 		}
-		m := g.GetNode(e.From)
+		edges = append(edges, e)
+		methodIDs = append(methodIDs, e.From)
+	}
+	methods := g.GetNodesByIDs(methodIDs)
+	for _, e := range edges {
+		m := methods[e.From]
 		if m == nil || m.Kind != KindMethod {
 			continue
 		}
@@ -3548,24 +4337,26 @@ func (g *Graph) MemberMethodsByType() map[string][]MemberMethodInfo {
 }
 
 // StructuralParentEdges is the in-memory reference implementation of
-// the StructuralParentEdges capability. Single AllEdges scan with the
-// (Extends | Implements | Composes) kind gate and the
-// (Type | Interface) endpoint-kind gate applied per edge.
+// the StructuralParentEdges capability. It snapshots only
+// (Extends | Implements | Composes) edges, resolves their endpoints in one
+// batch, and then applies the (Type | Interface) endpoint-kind gate.
 //
 // Empty graph or no matching edges returns nil.
 func (g *Graph) StructuralParentEdges() []StructuralParentEdgeRow {
-	var out []StructuralParentEdgeRow
-	for _, e := range g.AllEdges() {
+	var edges []*Edge
+	var endpointIDs []string
+	for e := range g.EdgesByKinds([]EdgeKind{EdgeExtends, EdgeImplements, EdgeComposes}) {
 		if e == nil {
 			continue
 		}
-		switch e.Kind {
-		case EdgeExtends, EdgeImplements, EdgeComposes:
-		default:
-			continue
-		}
-		from := g.GetNode(e.From)
-		to := g.GetNode(e.To)
+		edges = append(edges, e)
+		endpointIDs = append(endpointIDs, e.From, e.To)
+	}
+	endpoints := g.GetNodesByIDs(endpointIDs)
+	var out []StructuralParentEdgeRow
+	for _, e := range edges {
+		from := endpoints[e.From]
+		to := endpoints[e.To]
 		if from == nil || to == nil {
 			continue
 		}
@@ -3596,43 +4387,83 @@ func (g *Graph) StructuralParentEdges() []StructuralParentEdgeRow {
 // Single-repo graphs (or graphs whose nodes carry no RepoPrefix)
 // return no rows because the prefix gate filters them out.
 func (g *Graph) CrossRepoCandidates(baseKinds []EdgeKind) []CrossRepoCandidateRow {
+	return g.crossRepoCandidatesScoped(baseKinds, nil, nil)
+}
+
+// CrossRepoCandidatesForRepos returns relationships incident to one of the
+// supplied repositories. The endpoint lookup is one batched projection; it
+// never performs a node lookup per edge.
+func (g *Graph) CrossRepoCandidatesForRepos(baseKinds []EdgeKind, repoPrefixes []string) []CrossRepoCandidateRow {
+	repos := nonEmptyStringSet(repoPrefixes)
+	if len(repos) == 0 {
+		return nil
+	}
+	return g.crossRepoCandidatesScoped(baseKinds, repos, nil)
+}
+
+// CrossRepoCandidatesForFiles is the exact changed-file frontier used by the
+// watcher path. An edge is included when its source site or either endpoint is
+// owned by a changed file.
+func (g *Graph) CrossRepoCandidatesForFiles(baseKinds []EdgeKind, filePaths []string) []CrossRepoCandidateRow {
+	files := nonEmptyStringSet(filePaths)
+	if len(files) == 0 {
+		return nil
+	}
+	return g.crossRepoCandidatesScoped(baseKinds, nil, files)
+}
+
+func nonEmptyStringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "" {
+			out[value] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (g *Graph) crossRepoCandidatesScoped(baseKinds []EdgeKind, repos, files map[string]struct{}) []CrossRepoCandidateRow {
 	if len(baseKinds) == 0 {
 		return nil
 	}
-	kset := make(map[EdgeKind]struct{}, len(baseKinds))
-	for _, k := range baseKinds {
-		if k == "" {
-			continue
+
+	var edges []*Edge
+	for edge := range g.EdgesByKinds(baseKinds) {
+		if edge != nil {
+			edges = append(edges, edge)
 		}
-		kset[k] = struct{}{}
 	}
-	if len(kset) == 0 {
+	if len(edges) == 0 {
 		return nil
 	}
-	var out []CrossRepoCandidateRow
-	for _, e := range g.AllEdges() {
-		if e == nil {
+
+	endpointIDs := make([]string, 0, len(edges)*2)
+	for _, edge := range edges {
+		endpointIDs = append(endpointIDs, edge.From, edge.To)
+	}
+	nodes := g.GetNodesByIDs(endpointIDs)
+	out := make([]CrossRepoCandidateRow, 0, len(edges))
+	for _, edge := range edges {
+		from, to := nodes[edge.From], nodes[edge.To]
+		if from == nil || to == nil || from.RepoPrefix == "" || to.RepoPrefix == "" || from.RepoPrefix == to.RepoPrefix {
 			continue
 		}
-		if _, ok := kset[e.Kind]; !ok {
-			continue
+		if repos != nil {
+			_, fromScoped := repos[from.RepoPrefix]
+			_, toScoped := repos[to.RepoPrefix]
+			if !fromScoped && !toScoped {
+				continue
+			}
 		}
-		from := g.GetNode(e.From)
-		to := g.GetNode(e.To)
-		if from == nil || to == nil {
-			continue
+		if files != nil {
+			_, edgeScoped := files[edge.FilePath]
+			_, fromScoped := files[from.FilePath]
+			_, toScoped := files[to.FilePath]
+			if !edgeScoped && !fromScoped && !toScoped {
+				continue
+			}
 		}
-		if from.RepoPrefix == "" || to.RepoPrefix == "" {
-			continue
-		}
-		if from.RepoPrefix == to.RepoPrefix {
-			continue
-		}
-		out = append(out, CrossRepoCandidateRow{
-			Edge:     e,
-			FromRepo: from.RepoPrefix,
-			ToRepo:   to.RepoPrefix,
-		})
+		out = append(out, CrossRepoCandidateRow{Edge: edge, FromRepo: from.RepoPrefix, ToRepo: to.RepoPrefix})
 	}
 	return out
 }

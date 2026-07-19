@@ -19,19 +19,20 @@ import (
 // resolver looks up by, independent of when applyRepoPrefix ran. Each
 // file's prior rows are deleted first so a reindex replaces them cleanly.
 func (idx *Indexer) persistConstValues(result *parser.ExtractionResult) {
+	rows, files := idx.prepareConstValues(result)
+	persistConstantValueRows(idx.graph, idx.repoPrefix, files, rows)
+}
+
+func (idx *Indexer) prepareConstValues(result *parser.ExtractionResult) ([]graph.ConstantValueRow, []string) {
 	if result == nil || len(result.ConstValues) == 0 {
-		return
-	}
-	cw, ok := idx.graph.(graph.ConstantValueWriter)
-	if !ok {
-		return
+		return nil, nil
 	}
 	prefix := ""
 	if idx.repoPrefix != "" {
 		prefix = idx.repoPrefix + "/"
 	}
 	rows := make([]graph.ConstantValueRow, 0, len(result.ConstValues))
-	fileSet := map[string]struct{}{}
+	fileSet := make(map[string]struct{}, len(result.ConstValues))
 	for _, cv := range result.ConstValues {
 		rows = append(rows, graph.ConstantValueRow{
 			NodeID:   prefix + cv.NodeID,
@@ -41,9 +42,17 @@ func (idx *Indexer) persistConstValues(result *parser.ExtractionResult) {
 		fileSet[prefix+cv.FilePath] = struct{}{}
 	}
 	files := make([]string, 0, len(fileSet))
-	for f := range fileSet {
-		files = append(files, f)
+	for filePath := range fileSet {
+		files = append(files, filePath)
 	}
-	_ = cw.DeleteConstantValuesByFiles(idx.repoPrefix, files)
-	_ = cw.BulkSetConstantValues(idx.repoPrefix, rows)
+	return rows, files
+}
+
+func persistConstantValueRows(target graph.Store, repoPrefix string, files []string, rows []graph.ConstantValueRow) {
+	cw, ok := target.(graph.ConstantValueWriter)
+	if !ok || len(rows) == 0 {
+		return
+	}
+	_ = cw.DeleteConstantValuesByFiles(repoPrefix, files)
+	_ = cw.BulkSetConstantValues(repoPrefix, rows)
 }

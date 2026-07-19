@@ -55,12 +55,16 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 		return 0
 	}
 
-	idx := buildGRPCHandlerIndex(g)
 	resolved := 0
 	var reindexBatch []graph.EdgeReindex
 	// First pass: collect every grpc.stub edge plus the From IDs we'll
 	// need to read RepoPrefix off, so the per-edge GetNode below
 	// collapses to a single GetNodesByIDs batch on disk backends.
+	// Collected BEFORE the handler index is built: a workspace with no
+	// grpc.stub edges (the common case) pays only this scan — the
+	// whole-graph handler index (measured 58s on a 28-repo workspace,
+	// yielding zero) is skipped, and with zero stubs the resolve loop
+	// below is vacuously identical.
 	type stubEdge struct {
 		edge            *graph.Edge
 		service, method string
@@ -84,11 +88,15 @@ func ResolveGRPCStubCalls(g graph.Store) int {
 			fromIDs[e.From] = struct{}{}
 		}
 	}
+	if len(stubs) == 0 {
+		return 0
+	}
 	fromList := make([]string, 0, len(fromIDs))
 	for id := range fromIDs {
 		fromList = append(fromList, id)
 	}
 	callerNodes := g.GetNodesByIDs(fromList)
+	idx := buildGRPCHandlerIndex(g)
 
 	for _, s := range stubs {
 		e := s.edge

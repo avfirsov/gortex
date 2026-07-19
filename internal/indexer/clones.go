@@ -61,6 +61,15 @@ const cloneShinglesMetaKey = "clone_shingles"
 const (
 	cmsBoilerplateRatio  = 0.01
 	minSurvivingShingles = 8
+	// clonePairBatchSize bounds both sides of clone-edge materialisation.
+	// Each relation contributes at most two endpoint IDs and two directed
+	// edges, so one batch stays below SQLite's 5,000-ID lookup chunk and
+	// caps the AddBatch payload at 4,096 edges. This avoids both the old
+	// per-pair query/write N+1 and an unbounded all-pairs edge allocation.
+	clonePairBatchSize = 2048
+	// cloneCorpusFinalizeBatch bounds durable signature projection writes and
+	// the transient raw-shingle payload retained outside the store pager.
+	cloneCorpusFinalizeBatch = 1024
 )
 
 // cmsMinCorpus is the body-count floor below which the CMS boilerplate
@@ -293,35 +302,133 @@ func computeCloneSigFromShingles(cms *clones.CMS, threshold uint32, useFilter bo
 // alone — clone detection is per-repository. A standalone single-repo
 // Indexer uses repoPrefix == "" and its nodes carry RepoPrefix == "",
 // so the equality matches every node and behaviour is unchanged.
-// (GetRepoNodes can't be used here: GetRepoNodes("") is empty for the
-// in-memory / single-repo store — see incrementalCloneIndex.Rebuild —
-// so the AllNodes + equality filter is the form that works for both
-// regimes, since "" == "" matches every node.)
 // cloneRepoNodes returns the nodes the per-repo clone passes must walk. In
 // daemon multi-repo mode repoPrefix is non-empty, so GetRepoNodes selects just
 // that repo's nodes (one backend query, and one meta decode per repo node)
 // instead of decoding every node in a many-repo graph only to discard the other
-// repos' — the whole-graph AllNodes scan these passes used to run per repo.
-// In single-repo / in-memory mode repoPrefix is "" and those nodes are not
-// tracked in the per-repo buckets GetRepoNodes reads, so the AllNodes fallback
-// (whose "" == n.RepoPrefix filter matches every node) is the only form that
-// works there. Callers keep their n.RepoPrefix == repoPrefix guard: a no-op on
-// the GetRepoNodes path, load-bearing on the AllNodes fallback. The clone passes
-// read blob-only Meta (clone_sig / clone_tokens / clone_shingles), so the full
-// GetRepoNodes — not the meta-less light reader — is required here.
+// repos. Empty prefix is an exact single-repository predicate: the in-memory
+// graph reads those nodes directly from its shards without creating a duplicate
+// byRepo index or a graph-wide snapshot. The clone passes read blob-only Meta
+// (clone_sig / clone_tokens / clone_shingles), so the full GetRepoNodes — not
+// the meta-less light reader — is required here.
 func cloneRepoNodes(g graph.Store, repoPrefix string) []*graph.Node {
-	if repoPrefix != "" {
-		return g.GetRepoNodes(repoPrefix)
-	}
-	return g.AllNodes()
+	return g.GetRepoNodes(repoPrefix)
 }
 
-func finaliseCloneSignatures(g graph.Store, repoPrefix string) {
+// finaliseCloneSignaturesCtx takes the SQLite-first compact projection path
+// when available. It keyset-pages the corpus twice only when at least one row
+// is pending; an unchanged warm corpus is read once and performs no writes.
+func finaliseCloneSignaturesCtx(ctx context.Context, g graph.Store, repoPrefix string) []clones.Item {
+	pager, paged := g.(graph.CloneCorpusPager)
+	writer, writable := g.(graph.CloneCorpusWriter)
+	if !paged || !writable {
+		return finaliseCloneSignaturesFromNodes(g, repoPrefix)
+	}
+
+	cms := clones.NewCMS(65536, 4)
+	items := make([]clones.Item, 0, cloneCorpusFinalizeBatch)
+	corpus, pending := 0, false
+	after := ""
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		page, err := pager.CloneCorpusPage(repoPrefix, after, cloneCorpusFinalizeBatch)
+		if err != nil {
+			return nil
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, row := range page {
+			corpus++
+			for _, shingle := range row.Shingles {
+				cms.Add(shingle)
+			}
+			if !row.Finalized {
+				pending = true
+				continue
+			}
+			if row.Signature == "" {
+				continue
+			}
+			sig, ok := clones.DecodeSignature(row.Signature)
+			if !ok {
+				pending = true
+				continue
+			}
+			items = append(items, clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+		}
+		after = page[len(page)-1].NodeID
+		if len(page) < cloneCorpusFinalizeBatch {
+			break
+		}
+	}
+	if corpus == 0 {
+		// Compatibility for a pre-projection store: one legacy scoped read
+		// populates the sidecar, after which every restart takes the paged path.
+		return finaliseCloneSignaturesFromNodes(g, repoPrefix)
+	}
+	if !pending {
+		return items
+	}
+
+	items = items[:0]
+	useFilter := corpus >= cmsMinCorpus
+	threshold := uint32(0)
+	if useFilter {
+		threshold = uint32(float64(corpus) * cmsBoilerplateRatio)
+		if threshold < 1 {
+			threshold = 1
+		}
+	}
+	after = ""
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		page, err := pager.CloneCorpusPage(repoPrefix, after, cloneCorpusFinalizeBatch)
+		if err != nil {
+			return nil
+		}
+		if len(page) == 0 {
+			break
+		}
+		for i := range page {
+			row := &page[i]
+			sig, ok := computeCloneSigFromShingles(cms, threshold, useFilter, row.Shingles)
+			row.Finalized = true
+			row.Signature = ""
+			if ok {
+				row.Signature = clones.EncodeSignature(sig)
+				items = append(items, clones.Item{ID: row.NodeID, Sig: sig, TokenCount: row.TokenCount})
+			}
+		}
+		if err := writer.BulkSetCloneCorpus(repoPrefix, page); err != nil {
+			return nil
+		}
+		after = page[len(page)-1].NodeID
+		if len(page) < cloneCorpusFinalizeBatch {
+			break
+		}
+	}
+	return items
+}
+
+func finaliseCloneSignaturesFromNodes(g graph.Store, repoPrefix string) []clones.Item {
 	// First pass: collect every body that has stashed shingles. We
 	// capture the *graph.Node pointers up front so the CMS-build pass
-	// and the signature-compute pass don't both re-walk g.AllNodes().
-	bodies := make([]*graph.Node, 0, 8192)
-	for _, n := range cloneRepoNodes(g, repoPrefix) {
+	// and the signature-compute pass don't both re-read the repo projection.
+	repoNodes := cloneRepoNodes(g, repoPrefix)
+	capHint := min(len(repoNodes), 8192)
+	bodies := make([]*graph.Node, 0, capHint)
+	// A legacy/in-memory graph may already carry a finalized clone_sig in
+	// Node.Meta without a raw-shingle row. Keep those items in the detection
+	// corpus. The SQLite-first projection normally supplies the same rows via
+	// CloneCorpusPage, but the node fallback must remain compatible with graphs
+	// built before that projection existed and with focused in-memory callers.
+	items := make([]clones.Item, 0, capHint)
+	for _, n := range repoNodes {
 		if n == nil || n.Meta == nil {
 			continue
 		}
@@ -331,13 +438,21 @@ func finaliseCloneSignatures(g graph.Store, repoPrefix string) {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
 		}
-		if _, ok := n.Meta[cloneShinglesMetaKey].([]uint64); !ok {
+		if _, ok := n.Meta[cloneShinglesMetaKey].([]uint64); ok {
+			bodies = append(bodies, n)
 			continue
 		}
-		bodies = append(bodies, n)
+		encoded, _ := n.Meta[cloneSigMetaKey].(string)
+		sig, ok := clones.DecodeSignature(encoded)
+		if !ok {
+			continue
+		}
+		items = append(items, clones.Item{
+			ID: n.ID, Sig: sig, TokenCount: tokensFromMeta(n),
+		})
 	}
 	if len(bodies) == 0 {
-		return
+		return items
 	}
 
 	useFilter := len(bodies) >= cmsMinCorpus
@@ -377,43 +492,49 @@ func finaliseCloneSignatures(g graph.Store, repoPrefix string) {
 	// Backends that don't implement CloneShingleWriter (no on-disk store)
 	// simply skip this — the in-session incremental index caches shingles
 	// in memory regardless.
-	if w, ok := g.(graph.CloneShingleWriter); ok {
-		byPrefix := make(map[string]map[string][]uint64)
-		for _, n := range bodies {
-			shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
-			if len(shingles) == 0 {
-				continue
-			}
-			rows := byPrefix[n.RepoPrefix]
-			if rows == nil {
-				rows = make(map[string][]uint64)
-				byPrefix[n.RepoPrefix] = rows
-			}
-			rows[n.ID] = shingles
-		}
-		for prefix, rows := range byPrefix {
-			_ = w.BulkSetCloneShingles(prefix, rows)
-		}
-	}
-
 	// Second pass: signature computation. Each body either lands a
 	// fresh clone_sig (signature over surviving shingles) or is
 	// dropped entirely (no clone_sig, never enters detection items
 	// list). In both cases clone_shingles is removed from Meta. The
 	// per-body kernel is computeCloneSigFromShingles — the incremental
 	// maintainer calls the same kernel so signatures match exactly.
+	projection := make([]graph.CloneCorpusRow, 0, min(len(bodies), cloneCorpusFinalizeBatch))
+	writer, hasWriter := g.(graph.CloneCorpusWriter)
+	flushProjection := func() {
+		if hasWriter && len(projection) > 0 {
+			_ = writer.BulkSetCloneCorpus(repoPrefix, projection)
+		}
+		projection = projection[:0]
+	}
 	for _, n := range bodies {
 		shingles, _ := n.Meta[cloneShinglesMetaKey].([]uint64)
 		sig, ok := computeCloneSigFromShingles(cms, threshold, useFilter, shingles)
 		delete(n.Meta, cloneShinglesMetaKey)
+		row := graph.CloneCorpusRow{
+			NodeID: n.ID, RepoPrefix: n.RepoPrefix, Shingles: shingles,
+			TokenCount: tokensFromMeta(n), Finalized: true,
+		}
 		if !ok {
 			// Boilerplate-dominated or empty after filter — drop
 			// from clone detection. detectClonesAndEmitEdges skips
 			// nodes without a clone_sig.
+			delete(n.Meta, cloneSigMetaKey)
+			projection = append(projection, row)
+			if len(projection) == cloneCorpusFinalizeBatch {
+				flushProjection()
+			}
 			continue
 		}
-		n.Meta[cloneSigMetaKey] = clones.EncodeSignature(sig)
+		row.Signature = clones.EncodeSignature(sig)
+		n.Meta[cloneSigMetaKey] = row.Signature
+		projection = append(projection, row)
+		items = append(items, clones.Item{ID: n.ID, Sig: sig, TokenCount: row.TokenCount})
+		if len(projection) == cloneCorpusFinalizeBatch {
+			flushProjection()
+		}
 	}
+	flushProjection()
+	return items
 }
 
 // CloneDetectionStats summarises one detectClonesAndEmitEdges run for
@@ -495,45 +616,7 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix 
 	// (delete clone_shingles, set clone_sig) don't race the AllNodes
 	// walk below.
 	reporter.Report("clones: CMS-finalise signatures", 0, 0)
-	finaliseCloneSignatures(g, repoPrefix)
-
-	reporter.Report("clones: gather items", 0, 0)
-	var items []clones.Item
-	for _, n := range cloneRepoNodes(g, repoPrefix) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		// Scope to this repo's nodes so no cross-repo candidate pair is
-		// ever formed. "" matches every node (single-repo / in-memory).
-		if n.RepoPrefix != repoPrefix {
-			continue
-		}
-		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
-			continue
-		}
-		enc, ok := n.Meta[cloneSigMetaKey].(string)
-		if !ok || enc == "" {
-			continue
-		}
-		sig, ok := clones.DecodeSignature(enc)
-		if !ok {
-			continue
-		}
-		// Read the stamped token count when present. Legacy nodes
-		// indexed before the stamp was added simply get TokenCount=0,
-		// which lengthClassesOf treats as "unknown" → all classes,
-		// preserving the unstratified behaviour for them.
-		tokens := 0
-		switch v := n.Meta[cloneTokensMetaKey].(type) {
-		case int:
-			tokens = v
-		case int64:
-			tokens = int(v)
-		case float64:
-			tokens = int(v)
-		}
-		items = append(items, clones.Item{ID: n.ID, Sig: sig, TokenCount: tokens})
-	}
+	items := finaliseCloneSignaturesCtx(ctx, g, repoPrefix)
 	stats.Items = len(items)
 	if len(items) < 2 {
 		return stats
@@ -546,20 +629,7 @@ func detectClonesAndEmitEdgesCtx(ctx context.Context, g graph.Store, repoPrefix 
 	stats.Pairs = len(detected)
 	reporter.Report("clones: emit similarity edges", len(detected), 0)
 	directPairs := make(map[[2]string]struct{}, len(detected))
-	for _, p := range detected {
-		from := g.GetNode(p.A)
-		to := g.GetNode(p.B)
-		if from == nil || to == nil {
-			continue
-		}
-		emitSimilarEdge(g, from, to, p.Similarity)
-		emitSimilarEdge(g, to, from, p.Similarity)
-		stats.Edges += 2
-		// Record the canonicalised (A<B) clone pair so the diffusion
-		// pass below never re-emits a direct clone as a merely
-		// semantically-related edge — the two edge kinds partition.
-		directPairs[canonicalPair(p.A, p.B)] = struct{}{}
-	}
+	_, stats.Edges = materializeClonePairs(g, detected, graph.EdgeSimilarTo, directPairs)
 
 	// Graph-diffusion smoothing. Runs here, after the direct clone
 	// edges are materialised, while detectClonesAndEmitEdges still
@@ -709,73 +779,139 @@ func diffuseSimilarityEdges(g graph.Store, pairs []clones.Pair, directPairs map[
 
 	// Rank surviving pairs by diffused score so the global cap keeps
 	// the strongest relations; ID tie-breaks keep the cut deterministic.
-	type diffusedPair struct {
-		a, c  string
-		score float64
-	}
-	ranked := make([]diffusedPair, 0, len(best))
+	ranked := make([]clones.Pair, 0, len(best))
 	for key, score := range best {
-		ranked = append(ranked, diffusedPair{a: key[0], c: key[1], score: score})
+		ranked = append(ranked, clones.Pair{A: key[0], B: key[1], Similarity: score})
 	}
 	sort.Slice(ranked, func(i, j int) bool {
-		if ranked[i].score != ranked[j].score {
-			return ranked[i].score > ranked[j].score
+		if ranked[i].Similarity != ranked[j].Similarity {
+			return ranked[i].Similarity > ranked[j].Similarity
 		}
-		if ranked[i].a != ranked[j].a {
-			return ranked[i].a < ranked[j].a
+		if ranked[i].A != ranked[j].A {
+			return ranked[i].A < ranked[j].A
 		}
-		return ranked[i].c < ranked[j].c
+		return ranked[i].B < ranked[j].B
 	})
 	if len(ranked) > diffusionMaxPairs {
 		ranked = ranked[:diffusionMaxPairs]
 	}
 
-	for _, rp := range ranked {
-		from := g.GetNode(rp.a)
-		to := g.GetNode(rp.c)
-		if from == nil || to == nil {
+	return materializeClonePairs(g, ranked, graph.EdgeSemanticallyRelated, nil)
+}
+
+// materializeClonePairs persists symmetric clone-derived relations without a
+// point-read or write per pair. Input is consumed in bounded chunks: endpoint
+// nodes are prefetched once with GetNodesByIDs, directed edges are staged and
+// deduplicated, then one AddBatch persists the chunk. seenPairs may be supplied
+// by the caller to both suppress duplicate writes and retain the valid direct
+// pair set for diffusion. Only pairs whose two endpoints exist are added to it.
+//
+// The returned counts intentionally preserve the old logical counters: every
+// valid input occurrence contributes one pair and two edges even when a
+// duplicate occurrence is suppressed from the physical write. Clone detection
+// normally returns unique pairs, while incremental queries can surface a pair
+// once from each newly-added endpoint.
+func materializeClonePairs(g graph.Store, pairs []clones.Pair, kind graph.EdgeKind, seenPairs map[[2]string]struct{}) (materializedPairs, logicalEdges int) {
+	if g == nil || len(pairs) == 0 {
+		return 0, 0
+	}
+	if seenPairs == nil {
+		seenPairs = make(map[[2]string]struct{}, min(len(pairs), clonePairBatchSize))
+	}
+
+	type pendingPair struct {
+		pair        clones.Pair
+		key         [2]string
+		occurrences int
+	}
+	type edgeIdentity struct {
+		from, to, file string
+		kind           graph.EdgeKind
+		line           int
+	}
+
+	for start := 0; start < len(pairs); start += clonePairBatchSize {
+		end := min(start+clonePairBatchSize, len(pairs))
+		pending := make([]pendingPair, 0, end-start)
+		pendingByKey := make(map[[2]string]int, end-start)
+
+		// Dedupe before the endpoint query. A duplicate already materialised
+		// by an earlier chunk is known to have valid endpoints, so it still
+		// contributes to the logical counters without another read or write.
+		for _, pair := range pairs[start:end] {
+			key := canonicalPair(pair.A, pair.B)
+			if _, seen := seenPairs[key]; seen {
+				materializedPairs++
+				logicalEdges += 2
+				continue
+			}
+			if pos, exists := pendingByKey[key]; exists {
+				pending[pos].occurrences++
+				continue
+			}
+			pendingByKey[key] = len(pending)
+			pending = append(pending, pendingPair{pair: pair, key: key, occurrences: 1})
+		}
+		if len(pending) == 0 {
 			continue
 		}
-		emitSemanticallyRelatedEdge(g, from, to, rp.score)
-		emitSemanticallyRelatedEdge(g, to, from, rp.score)
-		diffusedPairs++
-		diffusedEdges += 2
+
+		idSet := make(map[string]struct{}, 2*len(pending))
+		for _, item := range pending {
+			idSet[item.pair.A] = struct{}{}
+			idSet[item.pair.B] = struct{}{}
+		}
+		ids := make([]string, 0, len(idSet))
+		for id := range idSet {
+			if id != "" {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		nodes := g.GetNodesByIDs(ids)
+
+		edges := make([]*graph.Edge, 0, 2*len(pending))
+		edgeSeen := make(map[edgeIdentity]struct{}, 2*len(pending))
+		stage := func(from, to *graph.Node, similarity float64) {
+			edge := cloneRelationEdge(kind, from, to, similarity)
+			key := edgeIdentity{from: edge.From, to: edge.To, kind: edge.Kind, file: edge.FilePath, line: edge.Line}
+			if _, duplicate := edgeSeen[key]; duplicate {
+				return
+			}
+			edgeSeen[key] = struct{}{}
+			edges = append(edges, edge)
+		}
+		for _, item := range pending {
+			from := nodes[item.pair.A]
+			to := nodes[item.pair.B]
+			if from == nil || to == nil {
+				continue
+			}
+			seenPairs[item.key] = struct{}{}
+			materializedPairs += item.occurrences
+			logicalEdges += 2 * item.occurrences
+			stage(from, to, item.pair.Similarity)
+			stage(to, from, item.pair.Similarity)
+		}
+		if len(edges) > 0 {
+			g.AddBatch(nil, edges)
+		}
 	}
-	return diffusedPairs, diffusedEdges
+	return materializedPairs, logicalEdges
 }
 
-// emitSimilarEdge adds one directed EdgeSimilarTo edge carrying the
-// estimated Jaccard similarity. The edge is anchored at the source
-// node's file/line for locality. Origin is ast_inferred — the
-// relationship is a statistical estimate over normalised tokens, not a
-// structural fact.
-func emitSimilarEdge(g graph.Store, from, to *graph.Node, similarity float64) {
-	g.AddEdge(&graph.Edge{
+// cloneRelationEdge builds one directed clone-derived edge. Both direct
+// similarity and diffused relatedness share the same locality, provenance and
+// score metadata; only their edge kind differs.
+func cloneRelationEdge(kind graph.EdgeKind, from, to *graph.Node, similarity float64) *graph.Edge {
+	return &graph.Edge{
 		From:       from.ID,
 		To:         to.ID,
-		Kind:       graph.EdgeSimilarTo,
+		Kind:       kind,
 		FilePath:   from.FilePath,
 		Line:       from.StartLine,
 		Confidence: similarity,
 		Origin:     graph.OriginASTInferred,
 		Meta:       map[string]any{"similarity": similarity},
-	})
-}
-
-// emitSemanticallyRelatedEdge adds one directed EdgeSemanticallyRelated
-// edge carrying the diffused similarity score. Like emitSimilarEdge the
-// edge is anchored at the source node's file/line and origin is
-// ast_inferred — the score is a statistical estimate over normalised
-// tokens, here additionally smoothed across the similarity graph.
-func emitSemanticallyRelatedEdge(g graph.Store, from, to *graph.Node, similarity float64) {
-	g.AddEdge(&graph.Edge{
-		From:       from.ID,
-		To:         to.ID,
-		Kind:       graph.EdgeSemanticallyRelated,
-		FilePath:   from.FilePath,
-		Line:       from.StartLine,
-		Confidence: similarity,
-		Origin:     graph.OriginASTInferred,
-		Meta:       map[string]any{"similarity": similarity},
-	})
+	}
 }

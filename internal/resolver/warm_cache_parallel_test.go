@@ -116,11 +116,17 @@ func TestWarmCacheParallel_WarmLookupCacheContents(t *testing.T) {
 		require.NotNil(t, n)
 		assert.Equal(t, id, n.ID)
 	}
-	// Existing target names resolve; ghost names are cached as authoritative
-	// negatives (present key, nil/empty slice) so the worker never falls
-	// through to a per-edge store scan.
-	assert.NotEmpty(t, r.nodesByName["sym1"])
-	neg, ok := r.nodesByName["ghost0"]
-	require.True(t, ok, "authoritative negative must be recorded for a missing target name")
+	// Every seeded source has unknown language, so the conservative exact-repo
+	// fallback produces one authoritative grouped cache. Existing targets and
+	// negative misses both live in that group; workers never fall through to a
+	// per-edge store scan, and ordinary candidates are not duplicated globally.
+	scope, languages := resolverNameScope("", "")
+	require.Empty(t, languages, "unknown language must query all languages conservatively")
+	grouped, ok := r.nodesByRepoLanguageName[scope]
+	require.True(t, ok, "unknown-language repository group was not warmed")
+	assert.NotEmpty(t, grouped["sym1"])
+	neg, ok := grouped["ghost0"]
+	require.True(t, ok, "authoritative grouped negative must be recorded for a missing target name")
 	assert.Empty(t, neg)
+	assert.Nil(t, r.nodesByName, "ordinary grouped candidates must not be duplicated globally")
 }

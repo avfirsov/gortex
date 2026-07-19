@@ -225,6 +225,16 @@ type LangSpec struct {
 	ProviderName string
 	Languages    []string
 
+	// CandidateLanguages, when non-empty, is the full set of node Language
+	// values a type-candidate lookup may bind for this spec — the spec's own
+	// languages plus sibling grammar variants (tsx/jsx for the TypeScript
+	// spec). Candidate hydration is scoped to this set: on a mixed repo a
+	// TypeScript pass must not drown in same-named symbols from the host
+	// language (a 194k-node Go repo turned a few hundred TS files into a
+	// ten-minute pass purely through cross-language candidate pollution).
+	// Empty means Languages. Language-neutral ("") nodes are always allowed.
+	CandidateLanguages []string
+
 	// GrammarFor returns the grammar for a file path. Per-path because
 	// one provider can span sibling grammars (typescript / tsx /
 	// javascript).
@@ -625,6 +635,37 @@ func identifierLike(t string) bool {
 	switch t {
 	case "identifier", "constant", "type_identifier", "variable_name", "local_variable", "name", "simple_identifier":
 		return true
+	}
+	return false
+}
+
+// candidateLanguages returns the language filter for type-candidate lookups:
+// CandidateLanguages (or Languages when unset) plus the language-neutral "".
+func (s *LangSpec) candidateLanguages() []string {
+	base := s.CandidateLanguages
+	if len(base) == 0 {
+		base = s.Languages
+	}
+	out := make([]string, 0, len(base)+1)
+	seen := make(map[string]struct{}, len(base)+1)
+	for _, lang := range append(append([]string(nil), base...), "") {
+		if _, dup := seen[lang]; dup {
+			continue
+		}
+		seen[lang] = struct{}{}
+		out = append(out, lang)
+	}
+	return out
+}
+
+// allowsCandidateLanguage reports whether a candidate node's language is
+// inside the spec's candidate set (the compatibility-path filter mirroring
+// the scoped SQL lookup).
+func (s *LangSpec) allowsCandidateLanguage(language string) bool {
+	for _, lang := range s.candidateLanguages() {
+		if lang == language {
+			return true
+		}
 	}
 	return false
 }

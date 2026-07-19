@@ -36,6 +36,22 @@ type Provider interface {
 	Close() error
 }
 
+// FileBatchEnricher is an optional provider capability for a known, repo-scoped
+// file frontier. Implementations must process the complete deduplicated batch
+// without issuing one heavyweight workspace load per file.
+type FileBatchEnricher interface {
+	EnrichFiles(g graph.Store, repoPrefix, repoRoot string, filePaths []string) (*EnrichResult, error)
+}
+
+// ContextFileBatchEnricher is the cancellation-aware sibling of
+// FileBatchEnricher. The manager uses it for partial frontiers so heavyweight
+// compiler loads inherit the manager's deadline instead of escaping through a
+// context.Background root. Providers keep FileBatchEnricher for compatibility;
+// implementations that support cancellation should implement both.
+type ContextFileBatchEnricher interface {
+	EnrichFilesContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, filePaths []string) (*EnrichResult, error)
+}
+
 // RepoScopedProvider is an optional interface a Provider MAY implement to
 // receive the repo prefix of the enrichment root alongside the root path.
 // In a multi-repo daemon the shared graph holds file nodes from every
@@ -74,6 +90,15 @@ type EnrichDeadlinePolicy func(candidates int) time.Duration
 // in; the provider narrows it via deadline once selection is done.
 type ContextEnricher interface {
 	EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline EnrichDeadlinePolicy) (*EnrichResult, error)
+}
+
+// PreselectionDeadlineEnricher marks a ContextEnricher whose expensive work
+// begins before it can count a post-filter candidate frontier (for example a
+// SCIP provider must first run its external indexer). The Manager gives these
+// providers the same eager, repo-node-scaled deadline used by the legacy path
+// instead of the generous lazy-selection outer ceiling.
+type PreselectionDeadlineEnricher interface {
+	UsePreselectionDeadline()
 }
 
 // ReadinessProber is an optional interface a Provider MAY implement when its
@@ -124,6 +149,12 @@ type EnrichResult struct {
 	// surface reflects the actual (candidate-scaled) window, not the whole-repo
 	// estimate. 0 means the pass ran unbounded (nil policy / non-positive bound).
 	BudgetSeconds float64 `json:"budget_seconds,omitempty"`
+	// LockWaitMs is the time this pass spent queued on the graph-wide
+	// resolve mutex before its apply phase could start. It is inside
+	// DurationMs but outside the pass's budget accounting — the wait is
+	// another pass's work — so a 400s duration with 390s of lock wait reads
+	// as the queueing it was, not as this provider's cost.
+	LockWaitMs int64 `json:"lock_wait_ms,omitempty"`
 	// Partial reports that the pass was cut short (per-repo deadline /
 	// context cancellation) after landing some — but not all — of its
 	// work. The counters above reflect only what actually reached the
@@ -163,9 +194,10 @@ const (
 // an un-enriched or partially-enriched graph instead of assuming green.
 const (
 	EnrichStateRunning   = "running"
+	EnrichStateDraining  = "draining" // deadline/cancel hit; manager is waiting for the in-process writer to stop
 	EnrichStateCompleted = "completed"
 	EnrichStatePartial   = "partial"   // deadline hit; completed work landed and is counted
-	EnrichStateAbandoned = "abandoned" // legacy provider detached at deadline; result discarded
+	EnrichStateAbandoned = "abandoned" // timed-out provider stopped; terminal result discarded
 	EnrichStateFailed    = "failed"
 	EnrichStateNotReady  = "not_ready" // readiness prober timed out; sweep skipped, repo left for retry
 )
@@ -178,8 +210,8 @@ type EnrichmentStatus struct {
 	Provider string `json:"provider"`
 	Language string `json:"language,omitempty"`
 	State    string `json:"state"`
-	// StartedAt is stamped when the pass enters EnrichStateRunning — the
-	// only state where "how long has this been going" is meaningful.
+	// StartedAt is stamped when the pass enters EnrichStateRunning and carried
+	// through EnrichStateDraining while a timed-out writer is stopping.
 	// Consumed by the daemon status surface to render a live elapsed
 	// time next to the per-repo deadline instead of a mute "in progress".
 	StartedAt       time.Time `json:"started_at,omitempty"`

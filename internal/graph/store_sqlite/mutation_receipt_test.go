@@ -299,7 +299,7 @@ func TestSQLiteMutationReceiptBulkBoundariesFailClosed(t *testing.T) {
 	})
 }
 
-func TestSQLiteMutationReceiptUnsupportedTopologyMutations(t *testing.T) {
+func TestSQLiteMutationReceiptTopologyMutations(t *testing.T) {
 	t.Run("reindex edge", func(t *testing.T) {
 		store := openMutationReceiptStore(t)
 		edge := &graph.Edge{From: "repo/a.go::A", To: "repo/old.go::Old", Kind: graph.EdgeCalls, FilePath: "a.go", Line: 1}
@@ -308,8 +308,8 @@ func TestSQLiteMutationReceiptUnsupportedTopologyMutations(t *testing.T) {
 		updated.To = "repo/new.go::New"
 		token := store.BeginMutationReceipt()
 		store.ReindexEdge(&updated, edge.To)
-		if receipt := store.EndMutationReceipt(token); receipt.Complete {
-			t.Fatalf("ReindexEdge returned complete receipt: %+v", receipt)
+		if receipt := store.EndMutationReceipt(token); !receipt.Complete || receipt.ResolutionRelevant {
+			t.Fatalf("ReindexEdge receipt = %+v, want complete and resolution-irrelevant", receipt)
 		}
 
 		noop := store.BeginMutationReceipt()
@@ -327,8 +327,8 @@ func TestSQLiteMutationReceiptUnsupportedTopologyMutations(t *testing.T) {
 		updated.To = "repo/new.go::New"
 		token := store.BeginMutationReceipt()
 		store.ReindexEdges([]graph.EdgeReindex{{Edge: &updated, OldTo: edge.To}})
-		if receipt := store.EndMutationReceipt(token); receipt.Complete {
-			t.Fatalf("ReindexEdges returned complete receipt: %+v", receipt)
+		if receipt := store.EndMutationReceipt(token); !receipt.Complete || receipt.ResolutionRelevant {
+			t.Fatalf("ReindexEdges receipt = %+v, want complete and resolution-irrelevant", receipt)
 		}
 
 		noop := store.BeginMutationReceipt()

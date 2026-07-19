@@ -37,6 +37,28 @@ func TestDetectCrossRepoEdgesForFilesUsesExactIncidentFrontier(t *testing.T) {
 	}
 }
 
+func TestResolveForFilePrefixesMultiRepoGraphPath(t *testing.T) {
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "a/a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "a/a.go", RepoPrefix: "a"},
+		{ID: "a/a.go::Call", Kind: graph.KindFunction, Name: "Call", FilePath: "a/a.go", RepoPrefix: "a"},
+		{ID: "b/b.go", Kind: graph.KindFile, Name: "b.go", FilePath: "b/b.go", RepoPrefix: "b"},
+		{ID: "b/b.go::Serve", Kind: graph.KindFunction, Name: "Serve", FilePath: "b/b.go", RepoPrefix: "b"},
+	}, []*graph.Edge{
+		{From: "a/a.go::Call", To: "b/b.go::Serve", Kind: graph.EdgeCalls, FilePath: "a/a.go", Line: 3},
+	})
+
+	NewCrossRepo(g).ResolveForFile("a", "a.go")
+
+	crossKind, ok := graph.CrossRepoKindFor(graph.EdgeCalls)
+	if !ok {
+		t.Fatal("calls has no cross-repo kind")
+	}
+	if !hasEdgeKindTo(g.GetOutEdges("a/a.go::Call"), crossKind, "b/b.go::Serve") {
+		t.Fatal("repo-relative watcher path did not resolve to its prefixed graph file")
+	}
+}
+
 func hasEdgeKindTo(edges []*graph.Edge, kind graph.EdgeKind, target string) bool {
 	for _, edge := range edges {
 		if edge != nil && edge.Kind == kind && edge.To == target {

@@ -24,7 +24,7 @@ func (s *Store) BulkSetReleases(repoPrefix string, rows []graph.ReleaseEnrichmen
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func (s *Store) DeleteReleases(nodeIDs []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

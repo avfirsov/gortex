@@ -203,8 +203,16 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 			}
 		}
 	}
-	for _, e := range landed {
-		g.AddEdge(e)
+	// One bounded AddBatch per chunk instead of an AddEdge per edge: on a
+	// disk-backed store the per-edge form was one ACID round-trip each
+	// across tens of thousands of synthesized callback edges.
+	const fnValueAddBatchChunk = 4096
+	for start := 0; start < len(landed); start += fnValueAddBatchChunk {
+		end := start + fnValueAddBatchChunk
+		if end > len(landed) {
+			end = len(landed)
+		}
+		g.AddBatch(nil, landed[start:end])
 	}
 	return len(landed)
 }

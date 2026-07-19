@@ -16,11 +16,9 @@ var (
 	_ graph.CloneShingleReader = (*Store)(nil)
 )
 
-// shingleChunk bounds how many (node_id, repo_prefix, shingles) tuples
-// ride in a single multi-row INSERT. SQLite's default compiled-in host
-// parameter limit is 999; at 3 params per row that caps a statement at
-// 333 rows, so 300 leaves headroom. Mirrors mtimeChunk.
-const shingleChunk = 300
+// shingleChunk bounds clone-corpus writes. Five parameters per row stay below
+// SQLite's conservative 999 host-parameter limit with ample headroom.
+const shingleChunk = 180
 
 // encodeShingles serialises a uint64 slice to a little-endian BLOB
 // (8 bytes per element). A nil/empty slice encodes to an empty BLOB.
@@ -55,51 +53,11 @@ func (s *Store) BulkSetCloneShingles(repoPrefix string, rows map[string][]uint64
 	if len(rows) == 0 {
 		return nil
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	// Stable ordering is not required for correctness, but iterating the
-	// map directly is fine — we only chunk by count.
-	type kv struct {
-		id   string
-		blob []byte
-	}
-	pending := make([]kv, 0, len(rows))
+	pending := make([]graph.CloneCorpusRow, 0, len(rows))
 	for id, sh := range rows {
-		pending = append(pending, kv{id: id, blob: encodeShingles(sh)})
+		pending = append(pending, graph.CloneCorpusRow{NodeID: id, Shingles: sh})
 	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-
-	for start := 0; start < len(pending); start += shingleChunk {
-		end := start + shingleChunk
-		if end > len(pending) {
-			end = len(pending)
-		}
-		batch := pending[start:end]
-
-		// Build a multi-row INSERT OR REPLACE: (?, ?, ?), (?, ?, ?), ...
-		args := make([]any, 0, len(batch)*3)
-		stmt := make([]byte, 0, 64+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO clone_shingles (node_id, repo_prefix, shingles) VALUES "...)
-		for i, e := range batch {
-			if i > 0 {
-				stmt = append(stmt, ',')
-			}
-			stmt = append(stmt, "(?, ?, ?)"...)
-			args = append(args, e.id, repoPrefix, e.blob)
-		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
+	return s.BulkSetCloneCorpus(repoPrefix, pending)
 }
 
 // DeleteCloneShingles drops the rows for the supplied node ids, chunked
@@ -131,7 +89,7 @@ func (s *Store) DeleteCloneShingles(nodeIDs []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.beginWrite()
 	if err != nil {
 		return err
 	}

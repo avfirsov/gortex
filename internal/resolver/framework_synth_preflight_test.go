@@ -124,9 +124,9 @@ func TestFrameworkSynthPreflightPreservesScopedFallbackSemantics(t *testing.T) {
 		want  bool
 	}{
 		{
-			name:  "mapped whole-graph fallback sees language outside scope",
+			name:  "mapped legacy pass is bounded to scope",
 			synth: synthFunc{name: SynthStoreFactory, fn: func(graph.Store) int { return 0 }},
-			want:  true,
+			want:  false,
 		},
 		{
 			name: "mapped scoped pass ignores language outside scope",
@@ -148,9 +148,9 @@ func TestFrameworkSynthPreflightPreservesScopedFallbackSemantics(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "node candidate keeps whole-graph fallback enabled",
+			name:  "node candidate outside scope does not enable legacy pass",
 			synth: synthFunc{name: SynthReactSetState, fn: func(graph.Store) int { return 0 }},
-			want:  true,
+			want:  false,
 		},
 		{
 			name: "node candidate outside scope does not enable scoped pass",
@@ -219,7 +219,10 @@ func TestFrameworkSynthPreflightRequiresEveryNecessaryMarker(t *testing.T) {
 		synth string
 		nodes []*graph.Node
 		edges []*graph.Edge
-		want  bool
+		// callEdges are added to the backing store so the cold EdgeCalls
+		// census sees them.
+		callEdges []*graph.Edge
+		want      bool
 	}{
 		{
 			name:  "observer registrar alone is insufficient",
@@ -293,16 +296,30 @@ func TestFrameworkSynthPreflightRequiresEveryNecessaryMarker(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "laravel handle enables event dispatch",
+			name:  "laravel handle plus dispatch placeholder enable event dispatch",
 			synth: SynthLaravelEvent,
 			nodes: []*graph.Node{{Kind: graph.KindMethod, Name: "handle", Language: "php"}},
-			want:  true,
+			callEdges: []*graph.Edge{{
+				From: "app.php::fire", To: "unresolved::*.OrderShipped", Kind: graph.EdgeCalls,
+				Meta: map[string]any{"via": laravelEventVia, "laravel_event_type": "OrderShipped"},
+			}},
+			want: true,
+		},
+		{
+			name:  "laravel handle without a dispatch placeholder is insufficient",
+			synth: SynthLaravelEvent,
+			nodes: []*graph.Node{{Kind: graph.KindMethod, Name: "handle", Language: "php"}},
+			want:  false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			store := &countingFrameworkLightStore{Store: graph.New(), nodes: tt.nodes, edges: tt.edges}
+			base := graph.New()
+			for _, e := range tt.callEdges {
+				base.AddEdge(e)
+			}
+			store := &countingFrameworkLightStore{Store: base, nodes: tt.nodes, edges: tt.edges}
 			summary := summarizeFrameworkCandidates(store, nil)
 			synth := synthFunc{name: tt.synth, fn: func(graph.Store) int { return 0 }}
 			if got := shouldRunFrameworkSynthesizer(synth, nil, summary); got != tt.want {
@@ -390,5 +407,52 @@ func BenchmarkSummarizeFrameworkObserverCandidates100K(b *testing.B) {
 		if summary.allMarkers[SynthObserverChannel] != 0 {
 			b.Fatal("unrelated observer fields must not enable synthesis")
 		}
+	}
+}
+
+// One-way-gate safety for the round-12 census markers and conjunction gates:
+// a workspace CONTAINING the candidate shape must always pass the gate (a
+// wrong skip is a quality regression; a wrong run is only wasted time).
+func TestNewCensusMarkersNeverSkipPresentCandidates(t *testing.T) {
+	markers := map[string]int{}
+	nodes := []*graph.Node{
+		{ID: "a/i.cs::IHandler", Kind: graph.KindInterface, Language: "csharp", FilePath: "a/i.cs", Name: "IHandler"},
+		{ID: "a/k.kt::Expecter", Kind: graph.KindFunction, Language: "kotlin", FilePath: "a/k.kt", Name: "Expecter"},
+		{ID: "a/m.h::MAC", Kind: graph.KindMacro, Language: "c", FilePath: "a/m.h", Name: "MAC"},
+		{ID: "repo::route::goframe::GET:/x", Kind: graph.KindContract, Language: "go", FilePath: "a/r.go", Name: "GET:/x"},
+		{ID: "a/+page.svelte::cmp", Kind: graph.KindType, Language: "svelte", FilePath: "a/+page.svelte", Name: "cmp"},
+		{ID: "a/+page.server.ts::load", Kind: graph.KindFunction, Language: "typescript", FilePath: "a/+page.server.ts", Name: "load"},
+		{ID: "a/u.pas", Kind: graph.KindFile, Language: "pascal", FilePath: "a/u.pas", Name: "u.pas"},
+		{ID: "a/u.dfm", Kind: graph.KindFile, Language: "", FilePath: "a/u.dfm", Name: "u.dfm"},
+	}
+	for _, n := range nodes {
+		recordFrameworkNodeCandidates(markers, n, frameworkLanguageFamily(n.Language))
+	}
+	for _, name := range []string{
+		SynthCSharpIfaceDispatch, SynthKMPExpectActual, SynthMacroExpansion, SynthGoFrameRoute,
+	} {
+		if markers[name] == 0 {
+			t.Errorf("marker %s not recorded for a present candidate", name)
+		}
+	}
+	for _, m := range []string{
+		frameworkMarkerSvelteKitPage, frameworkMarkerSvelteKitServer,
+		frameworkMarkerPascalSource, frameworkMarkerPascalForm,
+	} {
+		if markers[m] == 0 {
+			t.Errorf("marker %s not recorded for a present candidate", m)
+		}
+	}
+
+	// Conjunction gates: both sides present must pass; either side absent
+	// must skip (that is their entire point).
+	both := frameworkCandidateSummary{all: map[string]int{"web": 1, "apple": 1}, allMarkers: markers}
+	webOnly := frameworkCandidateSummary{all: map[string]int{"web": 1}, allMarkers: markers}
+	s := synthFunc{name: SynthExpoModules}
+	if !shouldRunFrameworkSynthesizer(s, nil, both) {
+		t.Error("expo bridge must run when both sides are present")
+	}
+	if shouldRunFrameworkSynthesizer(s, nil, webOnly) {
+		t.Error("expo bridge must skip when the native side is absent")
 	}
 }

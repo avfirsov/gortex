@@ -71,8 +71,12 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 		ambiguous bool
 	}
 	byKey := map[string]*macroEntry{}
+	macroByID := map[string]*macroEntry{}
+	macroNames := map[string]struct{}{}
 	macroKey := func(repo, name string) string { return repo + "\x00" + name }
 
+	var macros []*graph.Node
+	var macroIDs []string
 	for _, n := range nodesByKindsOrAll(g, graph.KindMacro) {
 		if n == nil || n.Meta == nil || n.Name == "" {
 			continue
@@ -80,16 +84,26 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 		if k, _ := n.Meta["macro_kind"].(string); k != macroFunctionKindMeta {
 			continue
 		}
-		callees := macroBodyCallees(g, n.ID)
+		macros = append(macros, n)
+		macroIDs = append(macroIDs, n.ID)
+	}
+	macroOut := g.GetOutEdgesByNodeIDs(macroIDs)
+	for _, n := range macros {
+		callees := macroBodyCallees(macroOut[n.ID])
 		if len(callees) == 0 {
 			continue
 		}
 		key := macroKey(n.RepoPrefix, n.Name)
-		if e, ok := byKey[key]; ok {
-			e.ambiguous = true
+		if entry, ok := byKey[key]; ok {
+			entry.ambiguous = true
+			macroByID[n.ID] = entry
+			macroNames[n.Name] = struct{}{}
 			continue
 		}
-		byKey[key] = &macroEntry{node: n, callees: callees}
+		entry := &macroEntry{node: n, callees: callees}
+		byKey[key] = entry
+		macroByID[n.ID] = entry
+		macroNames[n.Name] = struct{}{}
 	}
 	if len(byKey) == 0 {
 		return 0
@@ -107,37 +121,42 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 		line   int
 		entry  *macroEntry
 	}
-	var sites []useSite
+	var callEdges []*graph.Edge
+	var candidateCallerIDs []string
+	callerSeen := make(map[string]struct{})
 	for e := range g.EdgesByKind(graph.EdgeCalls) {
 		if e == nil || e.From == "" || e.To == "" {
 			continue
 		}
-		var entry *macroEntry
-		switch {
-		case graph.IsUnresolvedTarget(e.To):
+		if graph.IsUnresolvedTarget(e.To) {
 			name := graph.UnresolvedName(e.To)
-			if name == "" {
+			if _, candidate := macroNames[name]; !candidate {
 				continue
 			}
-			caller := g.GetNode(e.From)
+			if _, seen := callerSeen[e.From]; !seen {
+				callerSeen[e.From] = struct{}{}
+				candidateCallerIDs = append(candidateCallerIDs, e.From)
+			}
+		} else if macroByID[e.To] == nil {
+			continue
+		}
+		callEdges = append(callEdges, e)
+	}
+	callers := g.GetNodesByIDs(candidateCallerIDs)
+	var sites []useSite
+	for _, e := range callEdges {
+		var entry *macroEntry
+		if graph.IsUnresolvedTarget(e.To) {
+			caller := callers[e.From]
 			if caller == nil {
 				continue
 			}
-			ent, ok := byKey[macroKey(caller.RepoPrefix, name)]
-			if !ok || ent.ambiguous {
-				continue
-			}
-			entry = ent
-		default:
-			target := g.GetNode(e.To)
-			if target == nil || target.Kind != graph.KindMacro {
-				continue
-			}
-			ent, ok := byKey[macroKey(target.RepoPrefix, target.Name)]
-			if !ok || ent.ambiguous || ent.node.ID != target.ID {
-				continue
-			}
-			entry = ent
+			entry = byKey[macroKey(caller.RepoPrefix, graph.UnresolvedName(e.To))]
+		} else {
+			entry = macroByID[e.To]
+		}
+		if entry == nil || entry.ambiguous {
+			continue
 		}
 		sites = append(sites, useSite{caller: e.From, file: e.FilePath, line: e.Line, entry: entry})
 	}
@@ -160,20 +179,26 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 		return sites[i].entry.node.ID < sites[j].entry.node.ID
 	})
 
+	callerIDs := make([]string, 0, len(sites))
+	for _, site := range sites {
+		callerIDs = append(callerIDs, site.caller)
+	}
+	existingCalls := make(map[string]*graph.Edge)
+	for _, edges := range g.GetOutEdgesByNodeIDs(dedupeFrameworkIDs(callerIDs)) {
+		for _, edge := range edges {
+			if edge != nil && edge.Kind == graph.EdgeCalls {
+				existingCalls[frameworkScopedEdgeKey(edge)] = edge
+			}
+		}
+	}
+
 	owned := 0
 	for _, s := range sites {
 		for _, callee := range s.entry.callees {
 			if callee == s.caller {
 				continue
 			}
-			if existing := existingCallEdge(g, s.caller, callee, s.file, s.line); existing != nil {
-				if v, _ := existing.Meta["via"].(string); v != macroExpansionVia {
-					// A real edge already occupies this exact identity
-					// slot — never overwrite or downgrade it.
-					continue
-				}
-			}
-			g.AddEdge(&graph.Edge{
+			edge := &graph.Edge{
 				From:            s.caller,
 				To:              callee,
 				Kind:            graph.EdgeCalls,
@@ -188,7 +213,17 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 					MetaSynthesizedBy: SynthMacroExpansion,
 					MetaProvenance:    ProvenanceHeuristic,
 				},
-			})
+			}
+			key := frameworkScopedEdgeKey(edge)
+			if existing := existingCalls[key]; existing != nil {
+				if v, _ := existing.Meta["via"].(string); v != macroExpansionVia {
+					// A real edge already occupies this exact identity
+					// slot — never overwrite or downgrade it.
+					continue
+				}
+			}
+			g.AddEdge(edge)
+			existingCalls[key] = edge
 			owned++
 		}
 	}
@@ -198,10 +233,10 @@ func ResolveMacroExpansionCalls(g graph.Store) int {
 // macroBodyCallees returns the distinct call targets a macro node's body
 // recovered — the `To` of each EdgeCalls out-edge the extractor emitted
 // from the macro node — in stable order.
-func macroBodyCallees(g graph.Store, macroID string) []string {
+func macroBodyCallees(edges []*graph.Edge) []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, e := range g.GetOutEdges(macroID) {
+	for _, e := range edges {
 		if e == nil || e.Kind != graph.EdgeCalls || e.To == "" {
 			continue
 		}
@@ -213,16 +248,4 @@ func macroBodyCallees(g graph.Store, macroID string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// existingCallEdge returns the call edge already at the exact
-// (from, to, file, line) identity slot, or nil. Used both to keep the
-// pass idempotent and to refuse to overwrite a real edge.
-func existingCallEdge(g graph.Store, from, to, file string, line int) *graph.Edge {
-	for _, e := range g.GetOutEdges(from) {
-		if e != nil && e.Kind == graph.EdgeCalls && e.To == to && e.FilePath == file && e.Line == line {
-			return e
-		}
-	}
-	return nil
 }

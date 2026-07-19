@@ -764,7 +764,7 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.db.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND state = ?`, analysisGenerationStale, generationID, analysisGenerationBuilding)
+	result, err := s.writerDB.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND state = ?`, analysisGenerationStale, generationID, analysisGenerationBuilding)
 	if err != nil {
 		return err
 	}
@@ -774,7 +774,7 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	if changed == 0 {
 		var state int
-		if err := s.db.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ?`, generationID).Scan(&state); err != nil {
+		if err := s.writerDB.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ?`, generationID).Scan(&state); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("analysis generation: generation %d does not exist", generationID)
 			}

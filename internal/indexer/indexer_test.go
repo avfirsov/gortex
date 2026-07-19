@@ -147,11 +147,10 @@ func TestIncrementalReindexPaths_LeavesFullReindexClear(t *testing.T) {
 // TestIncrementalReindexPaths_MtimeBumpFlagsReparse mirrors the durable-loss
 // scenario: after a repo is indexed and its enrichment marker recorded at a
 // clean HEAD, a git checkout-and-back / stash-pop / no-op save bumps a file's
-// mtime without changing its content or moving HEAD. The scoped warm-restart
+// mtime without changing its content or moving HEAD. The explicitly file-scoped
 // route re-parses the mtime-drifted file (dropping its hover edges), so it must
-// flag reparsedThisRun — otherwise runDeferredEnrich builds Force=false, the
-// completion marker still matches on the clean tree, and the re-parsed file's
-// LSP edges stay durably gone.
+// flag reparsedThisRun — otherwise the current completion marker would suppress
+// restoration of those file-scoped enrichment edges.
 func TestIncrementalReindexPaths_MtimeBumpFlagsReparse(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(dir, "main.go")
@@ -170,14 +169,14 @@ func TestIncrementalReindexPaths_MtimeBumpFlagsReparse(t *testing.T) {
 	result, err := idx.IncrementalReindexPaths(dir, []string{main})
 	require.NoError(t, err)
 	require.Positive(t, result.StaleFileCount,
-		"an mtime bump must classify the content-identical file as stale and re-parse it")
+		"an explicit mtime-stale file must enter the scoped reparse path")
 	assert.True(t, idx.reparsedThisRun.Load(),
-		"a scoped re-parse of an mtime-drifted file must force the deferred enrich past the completion marker")
+		"a scoped re-parse of an mtime-drifted file must force deferred enrichment")
 }
 
-// TestIncrementalReindex_MtimeBumpFlagsReparse is the whole-root sibling of
-// TestIncrementalReindexPaths_MtimeBumpFlagsReparse: the non-scoped incremental
-// path also re-parses mtime-drifted files and must flag reparsedThisRun.
+// TestIncrementalReindex_MtimeBumpFlagsReparse is the whole-root sibling of the
+// scoped fingerprint no-op above: an mtime-stale but byte-identical file is
+// examined without eviction and therefore leaves reparsedThisRun clear.
 func TestIncrementalReindex_MtimeBumpFlagsReparse(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(dir, "main.go")
@@ -194,8 +193,8 @@ func TestIncrementalReindex_MtimeBumpFlagsReparse(t *testing.T) {
 	result, err := idx.IncrementalReindex(dir)
 	require.NoError(t, err)
 	require.Positive(t, result.StaleFileCount)
-	assert.True(t, idx.reparsedThisRun.Load(),
-		"a whole-root incremental re-parse must also force the deferred enrich past the completion marker")
+	assert.False(t, idx.reparsedThisRun.Load(),
+		"a whole-root content-identical fingerprint no-op must not force deferred enrichment")
 }
 
 // TestIncrementalReindex_NoChangeLeavesReparseClear guards the other side: a

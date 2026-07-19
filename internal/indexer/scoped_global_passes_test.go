@@ -14,10 +14,13 @@ import (
 // via a whole-graph AllNodes / NodesByKind scan.
 type idxCountingStore struct {
 	graph.Store
-	allNodes      int
-	repoNodes     map[string]int
-	repoEdges     map[string]int
-	nodesReturned int
+	allNodes            int
+	repoNodes           map[string]int
+	repoEdges           map[string]int
+	repoEdgeProjections int
+	getNodeCalls        int
+	getNodesBatchCalls  int
+	nodesReturned       int
 }
 
 func newIdxCountingStore(s graph.Store) *idxCountingStore {
@@ -43,6 +46,24 @@ func (c *idxCountingStore) GetRepoEdges(prefix string) []*graph.Edge {
 	return c.Store.GetRepoEdges(prefix)
 }
 
+func (c *idxCountingStore) GetNode(id string) *graph.Node {
+	c.getNodeCalls++
+	return c.Store.GetNode(id)
+}
+
+func (c *idxCountingStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	c.getNodesBatchCalls++
+	return c.Store.GetNodesByIDs(ids)
+}
+
+func (c *idxCountingStore) RepoEdgesByKinds(prefixes []string, kinds []graph.EdgeKind) []graph.RepoEdgeRow {
+	c.repoEdgeProjections++
+	if reader, ok := c.Store.(graph.RepoEdgeKindReader); ok {
+		return reader.RepoEdgesByKinds(prefixes, kinds)
+	}
+	return graph.ReadRepoEdgesByKinds(c.Store, prefixes, kinds)
+}
+
 func (c *idxCountingStore) GetFileNodes(path string) []*graph.Node {
 	ns := c.Store.GetFileNodes(path)
 	c.nodesReturned += len(ns)
@@ -59,6 +80,16 @@ func (c *idxCountingStore) NodesByKind(k graph.NodeKind) iter.Seq[*graph.Node] {
 			}
 		}
 	}
+}
+
+func (c *idxCountingStore) RepoNodeIDsByKinds(prefixes []string, kinds []graph.NodeKind) []string {
+	reader, ok := c.Store.(graph.RepoNodeKindIDReader)
+	if !ok {
+		return graph.ReadRepoNodeIDsByKinds(c.Store, prefixes, kinds)
+	}
+	ids := reader.RepoNodeIDsByKinds(prefixes, kinds)
+	c.nodesReturned += len(ids)
+	return ids
 }
 
 // twoRepoFuncGraph builds a graph with a handful of function/method nodes in
@@ -96,14 +127,16 @@ func TestCloneRepoNodes_ScopedNeverMaterialisesOtherRepo(t *testing.T) {
 	}
 }
 
-// TestCloneRepoNodes_EmptyPrefixFallsBackToAllNodes asserts the single-repo /
-// in-memory regime (empty prefix, nodes not tracked in the byRepo buckets) still
-// uses the AllNodes fallback — GetRepoNodes("") would be empty.
-func TestCloneRepoNodes_EmptyPrefixFallsBackToAllNodes(t *testing.T) {
+// TestCloneRepoNodes_EmptyPrefixUsesExactRepoProjection asserts that the
+// single-repo/shadow regime does not regress to a graph-wide snapshot.
+func TestCloneRepoNodes_EmptyPrefixUsesExactRepoProjection(t *testing.T) {
 	cs := newIdxCountingStore(twoRepoFuncGraph())
 	detectClonesAndEmitEdgesCtx(context.Background(), cs, "", 0.8)
-	if cs.allNodes == 0 {
-		t.Errorf("empty-prefix clone detect must fall back to AllNodes()")
+	if cs.allNodes != 0 {
+		t.Errorf("empty-prefix clone detect must not call AllNodes(); got %d calls", cs.allNodes)
+	}
+	if cs.repoNodes[""] == 0 {
+		t.Errorf("empty-prefix clone detect must use GetRepoNodes(\"\")")
 	}
 }
 
@@ -146,14 +179,14 @@ func capabilityFixture() *graph.Graph {
 func TestSynthesizeCapabilityEdgesScoped_ParityAndFewerReads(t *testing.T) {
 	full := newIdxCountingStore(capabilityFixture())
 	synthesizeCapabilityEdges(full)
-	wantA := accessesFieldFrom(full, "repoA")
+	wantA := accessesFieldFrom(full.Store, "repoA")
 	if !wantA["repoA::a.go::Foo.set->repoA::a.go::Foo.count"] {
 		t.Fatalf("unscoped pass did not emit repo A's accesses_field edge: %v", wantA)
 	}
 
 	scoped := newIdxCountingStore(capabilityFixture())
 	synthesizeCapabilityEdgesScoped(scoped, map[string]bool{"repoA": true})
-	gotA := accessesFieldFrom(scoped, "repoA")
+	gotA := accessesFieldFrom(scoped.Store, "repoA")
 	if len(gotA) != len(wantA) {
 		t.Fatalf("scoped capability repo-A edges = %v, want %v", gotA, wantA)
 	}
@@ -163,11 +196,51 @@ func TestSynthesizeCapabilityEdgesScoped_ParityAndFewerReads(t *testing.T) {
 		}
 	}
 
-	if scoped.repoEdges["repoA"] == 0 {
-		t.Errorf("scoped capability must drive its sweep off GetRepoEdges(\"repoA\")")
+	if scoped.repoEdgeProjections != 1 {
+		t.Errorf("scoped capability repository/kind projections = %d, want 1", scoped.repoEdgeProjections)
+	}
+	if scoped.repoEdges["repoA"] != 0 {
+		t.Errorf("scoped capability must not issue per-repo GetRepoEdges calls; got %d", scoped.repoEdges["repoA"])
+	}
+	if scoped.getNodeCalls != 0 {
+		t.Errorf("scoped capability must not issue point GetNode calls; got %d", scoped.getNodeCalls)
+	}
+	// One capability target batch plus the indirect-mutation pass's bounded
+	// write-target and call-target batches. The count is constant regardless of
+	// edge cardinality; point GetNode calls above must remain zero.
+	if scoped.getNodesBatchCalls != 3 {
+		t.Errorf("scoped capability endpoint batches = %d, want 3 bounded batches", scoped.getNodesBatchCalls)
 	}
 	if scoped.nodesReturned >= full.nodesReturned {
 		t.Errorf("scoped capability should materialise fewer nodes than unscoped: scoped=%d full=%d",
 			scoped.nodesReturned, full.nodesReturned)
+	}
+}
+
+func TestScopedTestEdgesUseOneRepoKindProjection(t *testing.T) {
+	g := graph.New()
+	for _, repo := range []string{"repoA", "repoB"} {
+		testID := repo + "::test"
+		targetID := repo + "::target"
+		g.AddBatch([]*graph.Node{
+			{ID: testID, Kind: graph.KindFunction, RepoPrefix: repo, FilePath: repo + "/x_test.go"},
+			{ID: targetID, Kind: graph.KindFunction, RepoPrefix: repo, FilePath: repo + "/x.go"},
+		}, []*graph.Edge{{From: testID, To: targetID, Kind: graph.EdgeCalls, FilePath: repo + "/x_test.go"}})
+	}
+	store := newIdxCountingStore(g)
+	emitted := emitTestEdgesAndPersistLocked(
+		store,
+		map[string]bool{"repoA::test": true, "repoB::test": true},
+		nil,
+		map[string]bool{"repoA": true, "repoB": true},
+	)
+	if emitted != 2 {
+		t.Fatalf("test edges emitted = %d, want 2", emitted)
+	}
+	if store.repoEdgeProjections != 1 {
+		t.Fatalf("repo/kind projections = %d, want 1", store.repoEdgeProjections)
+	}
+	if len(store.repoEdges) != 0 {
+		t.Fatalf("per-repo GetRepoEdges calls = %v, want none", store.repoEdges)
 	}
 }

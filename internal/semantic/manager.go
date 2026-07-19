@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,18 +111,80 @@ type Manager struct {
 	// failed) so index_health can surface an un-enriched graph instead
 	// of reporting green. Keyed by repo + "\x00" + provider name.
 	enrichStatus map[string]*EnrichmentStatus
+
+	// lifecycleCtx is cancelled before providers are closed. activePasses
+	// covers the whole manager-owned pass (including terminal marker writes),
+	// not merely the provider call, so Close never returns while an enrichment
+	// goroutine can still mutate the graph. lifecycleMu serialises Add with
+	// Close's transition to closing; sync.WaitGroup alone cannot safely do so
+	// when Add and Wait race at a zero count.
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	lifecycleMu     sync.Mutex
+	activePasses    sync.WaitGroup
+	closing         bool
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // NewManager creates a Manager from configuration.
 // It registers providers based on config, probes availability, and logs results.
 func NewManager(cfg Config, logger *zap.Logger) *Manager {
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	m := &Manager{
-		config:       cfg,
-		logger:       logger,
-		lastResults:  make(map[string]*EnrichResult),
-		enrichStatus: make(map[string]*EnrichmentStatus),
+		config:          cfg,
+		logger:          logger,
+		lastResults:     make(map[string]*EnrichResult),
+		enrichStatus:    make(map[string]*EnrichmentStatus),
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
 	}
 	return m
+}
+
+var errManagerClosed = errors.New("semantic manager is closed")
+
+// beginPass registers a complete manager-owned enrichment pass. Close first
+// flips closing under the same mutex and can then Wait without racing a new
+// WaitGroup.Add. A pass that was admitted must call endPass on every return.
+func (m *Manager) beginPass() bool {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.closing {
+		return false
+	}
+	m.activePasses.Add(1)
+	return true
+}
+
+func (m *Manager) endPass() {
+	m.activePasses.Done()
+}
+
+// passContext joins a caller-owned context to the Manager lifecycle. The
+// returned context is cancelled when either parent is done or Close begins.
+func (m *Manager) passContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	m.lifecycleMu.Lock()
+	lifecycleCtx := m.lifecycleCtx
+	closing := m.closing
+	m.lifecycleMu.Unlock()
+	if closing {
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx, func() {}
+	}
+	if lifecycleCtx == nil { // Supports zero-value Managers used by small tests.
+		return context.WithCancel(parent)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stopLifecycle := context.AfterFunc(lifecycleCtx, cancel)
+	return ctx, func() {
+		stopLifecycle()
+		cancel()
+	}
 }
 
 // RegisterProvider adds a provider to the manager.
@@ -187,6 +250,43 @@ type EnrichOptions struct {
 	// same "no freshness evidence, don't skip" default the language-presence
 	// gate uses.
 	RepoState map[string]RepoEnrichState
+
+	// MinLanguageNodes is the admission floor: a language with fewer than
+	// this many enrichable nodes across the enriched roots is treated as NOT
+	// present, so no provider (in-process engine or LSP spawn) runs for it.
+	// 0 disables the floor — the default for every path except the
+	// index-time enrichment calls, which set EnrichmentAdmissionFloor(). The
+	// floor is what stops a Rust repo's go-binding stub or a grammar repo's
+	// seven-node bindings/go tree from admitting a whole Go compiler pass.
+	MinLanguageNodes int
+
+	// ApplyGate, when non-nil, parks every provider's graph-apply phase until
+	// the channel closes (see WithApplyGate). The warmup sets it while the
+	// enrichment pool overlaps the resolve phase so compute proceeds but no
+	// apply can starve the resolver on the shared ResolveMutex.
+	ApplyGate <-chan struct{}
+}
+
+// defaultEnrichmentAdmissionFloor balances two measured failure modes:
+// seven-node tree-sitter go bindings admitted minutes-long go/packages loads
+// (the floor must sit above ~10), while genuinely small-but-real language
+// surfaces (a ~70-node Go tree inside a TS repo) should keep compiler-grade
+// enrichment (the floor must stay well under that).
+const defaultEnrichmentAdmissionFloor = 16
+
+// EnrichmentAdmissionFloor resolves the index-time admission floor:
+// GORTEX_ENRICH_MIN_NODES overrides (0 or a negative value disables),
+// otherwise the default applies.
+func EnrichmentAdmissionFloor() int {
+	if v := strings.TrimSpace(os.Getenv("GORTEX_ENRICH_MIN_NODES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				return 0
+			}
+			return n
+		}
+	}
+	return defaultEnrichmentAdmissionFloor
 }
 
 // EnrichAll runs all available providers against the graph.
@@ -228,8 +328,25 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// nodeCounts (enrichable nodes per repo) feeds the size-scaled per-repo
 	// deadline — see enrichRepoTimeout.
 	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
-	gateOnPresence := len(present) > 0
-	if gateOnPresence {
+	if floor := opts.MinLanguageNodes; floor > 0 {
+		below := make(map[string]int)
+		for lang, count := range langCounts {
+			if count < floor {
+				below[lang] = count
+				delete(present, lang)
+			}
+		}
+		if len(below) > 0 {
+			m.logger.Info("semantic enrichment: languages below admission floor",
+				zap.Int("floor", floor),
+				zap.Any("skipped", below))
+		}
+	}
+	// Presence gating needs only EVIDENCE, not survivors: when the census saw
+	// rows but the floor rejected every language, providers must still be
+	// gated off rather than falling through to their own per-pass gates.
+	gateOnPresence := len(langCounts) > 0
+	if len(present) > 0 {
 		langs := make([]string, 0, len(present))
 		for l := range present {
 			langs = append(langs, l)
@@ -347,7 +464,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], results, partial)
+					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
 				}()
 			}
 		}
@@ -391,31 +508,34 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[str
 	// the composition signal EnrichAll ranks providers by so the dominant
 	// language enriches first.
 	langCounts := make(map[string]int)
+	repoPrefixes := make([]string, 0, len(roots))
 	for repoPrefix := range roots {
-		// Code-only enumeration: content (data_class=content) sections carry
-		// no enrichable language (pdf/text have no semantic provider), so
-		// dropping them at the store level keeps a content-heavy repo's
-		// hundreds of thousands of sections out of memory here. Content file
-		// nodes (KindFile) are kept, so a content language still registers.
-		nodes := graph.RepoCodeNodes(g, repoPrefix)
-		for _, n := range nodes {
-			// Include file/import nodes too: the per-provider EnrichRepo gate
-			// can spawn on an ambiguous edge sourced from a file/import node, so
-			// presence here must be at least as permissive — otherwise we would
-			// gate out a provider whose own pass would have run.
-			if n.RepoPrefix != repoPrefix || n.Language == "" {
-				continue
-			}
-			// Generated / vendored files don't make a language "present" — a
-			// repo whose only C is tree-sitter's generated parser.c should not
-			// spawn clangd just to index it.
-			if IsLowValueForEnrichment(n.FilePath, m.config.ExcludeGlobs) {
-				continue
-			}
-			present[n.Language] = true
-			counts[repoPrefix]++
-			langCounts[n.Language]++
+		repoPrefixes = append(repoPrefixes, repoPrefix)
+	}
+	sort.Strings(repoPrefixes)
+
+	// One compact projection covers every repository. SQLite groups promoted
+	// repo/file/language columns without decoding Meta, docs, or signatures;
+	// content sections are filtered before rows cross the database boundary.
+	for _, row := range graph.ReadRepoLanguageFileCounts(g, repoPrefixes) {
+		if _, tracked := roots[row.RepoPrefix]; !tracked || row.Language == "" || row.Count <= 0 {
+			continue
 		}
+		// Generated / vendored files don't make a language "present" — a
+		// repo whose only C is tree-sitter's generated parser.c should not
+		// spawn clangd just to index it.
+		if IsLowValueForEnrichment(row.FilePath, m.config.ExcludeGlobs) {
+			continue
+		}
+		// Fixture corpora don't either: a Go repo's TS/Java/Python parser
+		// fixtures are indexed and searchable but are not evidence that the
+		// repo needs those languages' type-inference passes.
+		if IsFixtureCensusPath(row.FilePath) {
+			continue
+		}
+		present[row.Language] = true
+		counts[row.RepoPrefix] += row.Count
+		langCounts[row.Language] += row.Count
 	}
 	return present, counts, langCounts
 }
@@ -496,7 +616,7 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // providers.
 func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], results, partial)
+		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
 	}
 	return results
 }
@@ -678,7 +798,7 @@ func (m *Manager) EnrichmentActive() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, st := range m.enrichStatus {
-		if st.State == EnrichStateRunning {
+		if st.State == EnrichStateRunning || st.State == EnrichStateDraining {
 			return true
 		}
 	}
@@ -814,15 +934,24 @@ func shortSHA(sha string) string {
 // The pass is bounded by a per-repo deadline scaled to the repo's
 // enrichable node count (env-overridable — see enrichRepoTimeout).
 // Providers that implement ContextEnricher are cancelled cooperatively:
-// they land everything finished so far, mark the result Partial, and
-// return — nothing completed is discarded and no goroutine is detached.
-// Legacy providers keep the old detach-on-deadline behaviour, recorded
-// as "abandoned" in the enrichment status.
+// they land everything finished so far, mark the result Partial, and return.
+// A provider that ignores cancellation is reported as abandoned after the
+// grace window, but the Manager still drains the in-process call before it
+// advances. Legacy providers are observed by the same deadline watchdog and
+// likewise drained synchronously. At no point is a graph writer detached.
 //
 // partial records repos left incomplete: any provider that was abandoned,
 // failed, or returned a Partial result flips partial[repoName] so the caller
 // knows the repo's enrichment must be retried.
-func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+	if !m.beginPass() {
+		partial[repoName] = true
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, 0, nil,
+			errManagerClosed.Error())
+		return results
+	}
+	defer m.endPass()
+
 	// Skip a provider whose persisted completion marker already records this
 	// repo's current HEAD on a clean tree: re-running its hover pass would
 	// confirm the edges the persisted graph already carries. Only the
@@ -851,9 +980,11 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// not implement the interface, so gopls / rust-analyzer never wait. Bounded
 	// and best-effort: a probe timeout or error just proceeds.
 	if rp, ok := provider.(ReadinessProber); ok && enrichReadinessBudget > 0 {
-		rctx, rcancel := context.WithTimeout(context.Background(), enrichReadinessBudget)
+		lifecycleCtx, stopLifecycle := m.passContext(context.Background())
+		rctx, rcancel := context.WithTimeout(lifecycleCtx, enrichReadinessBudget)
 		err := rp.WaitReady(rctx, repoRoot)
 		rcancel()
+		stopLifecycle()
 		if errors.Is(err, ErrWorkspaceNotReady) {
 			// The server never finished loading its workspace: a sweep now
 			// would spend the whole budget answering empty and report a
@@ -887,7 +1018,11 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// before the terminal status is recorded.
 	var d time.Duration
 	if isContextEnricher {
-		d = enrichOuterCeiling()
+		if _, eager := provider.(PreselectionDeadlineEnricher); eager {
+			d = enrichRepoTimeout(nodeCount)
+		} else {
+			d = enrichOuterCeiling()
+		}
 	} else {
 		d = enrichRepoTimeout(nodeCount)
 	}
@@ -906,103 +1041,113 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// it to scope file selection to the repo actually being enriched.
 	var result *EnrichResult
 	var err error
-	if ce, ok := provider.(ContextEnricher); ok {
-		// Cooperative path: ctx carries only the generous outer ceiling; the
-		// provider narrows it to a lazy, candidate-scaled deadline (via the
-		// enrichRepoTimeout policy) once selection is done, checks it between
-		// work items, lands completed work incrementally, and returns a Partial
-		// result once it expires. We still wait on a goroutine with a bounded
-		// grace window past the ceiling: a provider wedged in an uncancellable
-		// call (e.g. an unbounded LSP initialize) must not pin the enrichment
-		// WaitGroup forever — that liveness guarantee is what the old detach
-		// provided.
-		ctx := context.Background()
-		var cancel context.CancelFunc
-		if d > 0 {
-			ctx, cancel = context.WithTimeout(ctx, d)
-			defer cancel()
-		}
-		type enrichOutcome struct {
-			result *EnrichResult
-			err    error
-		}
-		done := make(chan enrichOutcome, 1)
-		go func() {
+	type enrichOutcome struct {
+		result *EnrichResult
+		err    error
+	}
+
+	// The provider call runs in a Manager-owned goroutine so the deadline can
+	// be observed without freezing daemon status/health requests. Crucially,
+	// every path below receives from done before returning: a timed-out
+	// in-process writer is never detached and the next provider/repo cannot
+	// overlap it.
+	baseCtx, stopLifecycle := m.passContext(context.Background())
+	defer stopLifecycle()
+	if ctxErr := baseCtx.Err(); ctxErr != nil {
+		partial[repoName] = true
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
+			"semantic manager closed before provider dispatch")
+		return results
+	}
+	ctx := baseCtx
+	cancel := func() {}
+	if d > 0 {
+		ctx, cancel = context.WithTimeout(baseCtx, d)
+	}
+	if applyGate != nil {
+		ctx = WithApplyGate(ctx, applyGate)
+	}
+	defer cancel()
+
+	ce, isContextEnricher := provider.(ContextEnricher)
+	done := make(chan enrichOutcome, 1)
+	go func() {
+		var r *EnrichResult
+		var e error
+		if isContextEnricher {
 			// enrichRepoTimeout is the lazy deadline policy: the provider calls
 			// it with its post-filter candidate count to size its own context
-			// bound (and honour the GORTEX_LSP_ENRICH_TIMEOUT override) inside
-			// the generous outer ceiling already on ctx.
-			r, e := ce.EnrichRepoContext(ctx, g, repoName, repoRoot, enrichRepoTimeout)
-			done <- enrichOutcome{r, e}
-		}()
-		if d > 0 {
-			timer := time.NewTimer(d + enrichCancelGrace)
+			// bound inside the generous outer ceiling already on ctx.
+			r, e = ce.EnrichRepoContext(ctx, g, repoName, repoRoot, enrichRepoTimeout)
+		} else if rsp, ok := provider.(RepoScopedProvider); ok {
+			r, e = rsp.EnrichRepo(g, repoName, repoRoot)
+		} else {
+			r, e = provider.Enrich(g, repoRoot)
+		}
+		done <- enrichOutcome{result: r, err: e}
+	}()
+
+	abandoned := false
+	abandonDetail := ""
+	if isContextEnricher {
+		select {
+		case oc := <-done:
+			result, err = oc.result, oc.err
+		case <-ctx.Done():
+			// A cooperative provider gets a grace window to flush completed
+			// work and report a counted Partial result. Past that window the
+			// health state changes to draining, but we still wait for the call
+			// to end before returning or releasing the active-pass gate.
+			grace := time.NewTimer(enrichCancelGrace)
 			select {
 			case oc := <-done:
-				timer.Stop()
+				if !grace.Stop() {
+					select {
+					case <-grace.C:
+					default:
+					}
+				}
 				result, err = oc.result, oc.err
-			case <-timer.C:
-				m.logger.Warn("semantic enrichment ignored cancellation past its deadline; abandoning",
+			case <-grace.C:
+				abandoned = true
+				abandonDetail = "provider ignored cancellation past the grace window; waiting for its in-process graph writer to stop before advancing"
+				m.logger.Warn("semantic enrichment ignored cancellation; draining provider before advancing",
 					zap.String("provider", provider.Name()),
 					zap.String("language", lang),
 					zap.String("repo", repoName),
 					zap.Duration("deadline", d),
 					zap.Duration("grace", enrichCancelGrace),
 				)
-				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
-					"provider did not return within the post-deadline grace window; incrementally landed work is kept, the final result was discarded")
+				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
 				partial[repoName] = true
-				return results
+				<-done // mandatory drain: never abandon an in-process writer
 			}
-		} else {
-			oc := <-done
-			result, err = oc.result, oc.err
 		}
 	} else {
-		// Legacy path: run the (possibly long) provider pass on its own
-		// goroutine and bound it with the deadline. On deadline we log
-		// and move on; the detached goroutine still drains (its calls
-		// are individually bounded and its graph mutations are
-		// internally synchronized) and exits on its own — but its
-		// result is discarded, so the status records "abandoned".
-		type enrichOutcome struct {
-			result *EnrichResult
-			err    error
-		}
-		done := make(chan enrichOutcome, 1)
-		go func() {
-			var result *EnrichResult
-			var err error
-			if rsp, ok := provider.(RepoScopedProvider); ok {
-				result, err = rsp.EnrichRepo(g, repoName, repoRoot)
-			} else {
-				result, err = provider.Enrich(g, repoRoot)
-			}
-			done <- enrichOutcome{result, err}
-		}()
-
-		if d > 0 {
-			timer := time.NewTimer(d)
-			select {
-			case oc := <-done:
-				timer.Stop()
-				result, err = oc.result, oc.err
-			case <-timer.C:
-				m.logger.Warn("semantic enrichment exceeded per-repo deadline; abandoning",
-					zap.String("provider", provider.Name()),
-					zap.String("language", lang),
-					zap.String("repo", repoName),
-					zap.Duration("deadline", d),
-				)
-				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
-					"per-repo deadline exceeded; provider detached and its result discarded")
-				partial[repoName] = true
-				return results
-			}
-		} else {
-			oc := <-done
+		select {
+		case oc := <-done:
 			result, err = oc.result, oc.err
+		case <-ctx.Done():
+			abandoned = true
+			abandonDetail = "legacy provider exceeded its deadline; waiting for its in-process graph writer to stop before advancing"
+			if errors.Is(ctx.Err(), context.Canceled) {
+				abandonDetail = "semantic manager is closing; waiting for the legacy in-process graph writer to stop"
+			}
+			m.logger.Warn("semantic enrichment deadline reached; draining legacy provider before advancing",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+				zap.String("repo", repoName),
+				zap.Duration("deadline", d),
+			)
+			m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
+			partial[repoName] = true
+			<-done // mandatory drain: the legacy interface cannot be cancelled
 		}
+	}
+	if abandoned {
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
+			abandonDetail+"; provider stopped and its terminal result was discarded")
+		return results
 	}
 	// Surface the deadline the ContextEnricher actually derived from its
 	// candidate count (lazy budgeting) rather than the outer ceiling. 0 means
@@ -1061,6 +1206,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Int("nodes_enriched", result.NodesEnriched),
 			zap.Float64("coverage", result.CoveragePercent),
 			zap.Int64("duration_ms", result.DurationMs),
+			zap.Int64("lock_wait_ms", result.LockWaitMs),
 		)
 	} else {
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateCompleted, d, nil, "")
@@ -1068,50 +1214,128 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	return results
 }
 
-// EnrichFile runs incremental enrichment for a single file change.
+// EnrichFile runs one explicitly-requested, file-bounded enrichment pass.
+// Watcher callers enforce EnrichOnWatch before dispatch; deferred incremental
+// work calls the batched sibling so a scoped reindex never falls back to N
+// heavyweight provider loads.
 func (m *Manager) EnrichFile(g graph.Store, repoRoot, filePath string) (*EnrichResult, error) {
-	if !m.config.Enabled || !m.config.EnrichOnWatch {
+	if !m.config.Enabled {
 		return nil, nil
+	}
+
+	// One exact file lookup determines both language and repository scope. The
+	// batched entry point receives these explicitly and performs no per-file
+	// graph discovery.
+	nodes := g.GetFileNodes(filePath)
+	if len(nodes) == 0 || nodes[0] == nil {
+		return nil, nil
+	}
+	return m.EnrichFiles(g, nodes[0].RepoPrefix, repoRoot, nodes[0].Language, []string{filePath})
+}
+
+// EnrichFiles runs one provider call for a deduplicated, single-language file
+// frontier. Batch-capable providers receive every path together. A provider
+// without that capability gets one repository call for multi-file work, never
+// an N+1 loop of EnrichFile calls.
+func (m *Manager) EnrichFiles(g graph.Store, repoPrefix, repoRoot, language string, filePaths []string) (*EnrichResult, error) {
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if m.config.TimeoutSeconds > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(m.config.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+	return m.EnrichFilesContext(ctx, g, repoPrefix, repoRoot, language, filePaths)
+}
+
+// EnrichFilesContext is EnrichFiles with an explicit parent context. The
+// manager-level semantic timeout remains the default through EnrichFiles;
+// callers that already own a tighter deadline can pass it here without it
+// being replaced by a Background root.
+func (m *Manager) EnrichFilesContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot, language string, filePaths []string) (*EnrichResult, error) {
+	if !m.config.Enabled || language == "" || len(filePaths) == 0 {
+		return nil, nil
+	}
+	if !m.beginPass() {
+		return nil, errManagerClosed
+	}
+	defer m.endPass()
+	ctx, stopLifecycle := m.passContext(ctx)
+	defer stopLifecycle()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(filePaths))
+	files := make([]string, 0, len(filePaths))
+	for _, filePath := range filePaths {
+		if filePath == "" {
+			continue
+		}
+		if _, ok := seen[filePath]; ok {
+			continue
+		}
+		seen[filePath] = struct{}{}
+		files = append(files, filePath)
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+	sort.Strings(files)
+
+	run := func(provider Provider) (*EnrichResult, error) {
+		if batch, ok := provider.(ContextFileBatchEnricher); ok {
+			return batch.EnrichFilesContext(ctx, g, repoPrefix, repoRoot, files)
+		}
+		if batch, ok := provider.(FileBatchEnricher); ok {
+			return batch.EnrichFiles(g, repoPrefix, repoRoot, files)
+		}
+		if len(files) == 1 {
+			return provider.EnrichFile(g, repoRoot, files[0])
+		}
+		if contextual, ok := provider.(ContextEnricher); ok {
+			return contextual.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
+		}
+		if scoped, ok := provider.(RepoScopedProvider); ok {
+			return scoped.EnrichRepo(g, repoPrefix, repoRoot)
+		}
+		return provider.Enrich(g, repoRoot)
 	}
 
 	langProviders := m.selectProviders()
-
-	// Determine language from file nodes.
-	nodes := g.GetFileNodes(filePath)
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-	lang := nodes[0].Language
-
 	var primary *EnrichResult
 	var primaryErr error
-	if provider, ok := langProviders[lang]; ok && provider.Available() {
-		primary, primaryErr = provider.EnrichFile(g, repoRoot, filePath)
+	if provider, ok := langProviders[language]; ok && provider.Available() {
+		primary, primaryErr = run(provider)
 	}
 
-	// Supplemental providers for this language run regardless of the
-	// arbitration outcome — same contract as EnrichAll.
-	for _, p := range m.providers {
-		if !isSupplemental(p) || !p.Available() || m.providerDisabled(p.Name()) {
+	// Supplemental providers preserve EnrichAll parity. Each receives one
+	// batched call when supported, otherwise one repo call for a multi-file
+	// frontier; no provider is invoked once per file.
+	for _, provider := range m.providers {
+		if !isSupplemental(provider) || !provider.Available() || m.providerDisabled(provider.Name()) {
 			continue
 		}
-		for _, l := range p.Languages() {
-			if l != lang {
-				continue
-			}
-			res, err := p.EnrichFile(g, repoRoot, filePath)
-			if err != nil {
-				m.logger.Debug("supplemental incremental enrichment failed",
-					zap.String("provider", p.Name()),
-					zap.String("file", filePath),
-					zap.Error(err),
-				)
+		handlesLanguage := false
+		for _, candidate := range provider.Languages() {
+			if candidate == language {
+				handlesLanguage = true
 				break
 			}
-			if primary == nil {
-				primary = res
-			}
-			break
+		}
+		if !handlesLanguage {
+			continue
+		}
+		result, err := run(provider)
+		if err != nil {
+			m.logger.Debug("supplemental incremental enrichment failed",
+				zap.String("provider", provider.Name()),
+				zap.Int("files", len(files)),
+				zap.Error(err),
+			)
+			continue
+		}
+		if primary == nil {
+			primary = result
 		}
 	}
 
@@ -1241,23 +1465,40 @@ func (m *Manager) Stats() []ProviderStatus {
 }
 
 // Close shuts down all providers, including any LSP subprocesses
-// owned by the installed LSPRouter.
+// owned by the installed LSPRouter. It first cancels every context-aware pass,
+// then closes provider resources to interrupt subprocess-backed legacy calls,
+// and finally waits for every admitted pass to stop mutating before returning.
 func (m *Manager) Close() error {
-	var errs []error
-	for _, p := range m.providers {
-		if err := p.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing %s: %w", p.Name(), err))
+	m.closeOnce.Do(func() {
+		m.lifecycleMu.Lock()
+		m.closing = true
+		if m.lifecycleCancel != nil {
+			m.lifecycleCancel()
 		}
-	}
-	if m.lspRouter != nil {
-		if err := m.lspRouter.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing lsp router: %w", err))
+		providers := append([]Provider(nil), m.providers...)
+		router := m.lspRouter
+		m.lifecycleMu.Unlock()
+
+		var errs []error
+		for _, p := range providers {
+			if err := p.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing %s: %w", p.Name(), err))
+			}
 		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("semantic manager close errors: %v", errs)
-	}
-	return nil
+		if router != nil {
+			if err := router.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing lsp router: %w", err))
+			}
+		}
+
+		// No pass can be admitted after closing was set under lifecycleMu.
+		// Every admitted run drains its provider goroutine before endPass.
+		m.activePasses.Wait()
+		if len(errs) > 0 {
+			m.closeErr = fmt.Errorf("semantic manager close errors: %v", errs)
+		}
+	})
+	return m.closeErr
 }
 
 // Enabled returns whether semantic enrichment is enabled.

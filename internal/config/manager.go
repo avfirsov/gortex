@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
@@ -26,7 +28,11 @@ type ConfigManager struct {
 	// still gets gitignore-respecting behaviour.
 	workspacePaths map[string]string
 	mu             sync.RWMutex
-	logger         *zap.Logger
+	// revision is a monotonically increasing epoch for immutable views built
+	// from global and per-repo config. Readers can cache those views and pay
+	// only an atomic load until configuration state actually changes.
+	revision atomic.Uint64
+	logger   *zap.Logger
 	// excludeCache memoizes the per-repo `.gitignore` parse and the layered
 	// exclude list so EffectiveExclude — called on every indexer walk and
 	// per-file reconcile — does not re-read and re-merge on every call.
@@ -66,7 +72,20 @@ func (cm *ConfigManager) SetLogger(logger *zap.Logger) {
 
 // Global returns the underlying GlobalConfig.
 func (cm *ConfigManager) Global() *GlobalConfig {
-	return cm.global
+	cm.mu.RLock()
+	global := cm.global
+	cm.mu.RUnlock()
+	return global
+}
+
+// Revision returns the current configuration epoch. It changes after every
+// successful global reload and whenever LoadWorkspaceConfig changes cached
+// per-repo state.
+func (cm *ConfigManager) Revision() uint64 {
+	if cm == nil {
+		return 0
+	}
+	return cm.revision.Load()
 }
 
 // Reload re-reads the GlobalConfig from disk, keeping the same config
@@ -96,6 +115,7 @@ func (cm *ConfigManager) Reload() error {
 	// they'll be reloaded on the next LoadWorkspaceConfig call.
 	cm.workspace = make(map[string]*Config)
 	cm.workspacePaths = make(map[string]string)
+	cm.revision.Add(1)
 	cm.mu.Unlock()
 	return nil
 }
@@ -105,18 +125,11 @@ func (cm *ConfigManager) Reload() error {
 // no entry is cached (global defaults will apply). If the file is
 // malformed, a warning is logged and no entry is cached.
 func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
-	// Remember the path even when `.gortex.yaml` is absent so the
-	// effective-exclude layer can still find the repo's `.gitignore`.
-	if repoPath != "" {
-		cm.mu.Lock()
-		cm.workspacePaths[repoPrefix] = repoPath
-		cm.mu.Unlock()
-	}
-
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
+		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
 		if os.IsNotExist(err) {
 			// No workspace config — global defaults will apply.
 			return
@@ -130,6 +143,7 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		cm.updateWorkspaceConfig(repoPrefix, repoPath, nil)
 		// Malformed workspace config — log warning, return global defaults.
 		cm.logger.Warn("malformed workspace config, using global defaults",
 			zap.String("repo", repoPrefix),
@@ -138,9 +152,28 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 		return
 	}
 
+	cm.updateWorkspaceConfig(repoPrefix, repoPath, &cfg)
+}
+
+// updateWorkspaceConfig publishes a per-repo state transition and advances
+// revision only when the cached state actually changes. A nil cfg updates the
+// remembered path without replacing an existing parsed config, preserving the
+// prior missing/malformed-file behavior.
+func (cm *ConfigManager) updateWorkspaceConfig(repoPrefix, repoPath string, cfg *Config) {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.workspace[repoPrefix] = &cfg
+	changed := false
+	if repoPath != "" && cm.workspacePaths[repoPrefix] != repoPath {
+		cm.workspacePaths[repoPrefix] = repoPath
+		changed = true
+	}
+	if cfg != nil && !reflect.DeepEqual(cm.workspace[repoPrefix], cfg) {
+		cm.workspace[repoPrefix] = cfg
+		changed = true
+	}
+	if changed {
+		cm.revision.Add(1)
+	}
+	cm.mu.Unlock()
 }
 
 // getWorkspaceConfig returns the cached workspace config for a repo, or nil.

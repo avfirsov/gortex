@@ -61,6 +61,28 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 		}
 	}
 	byNode := graph.OutEdgesForNodes(g, ids)
+	// Resolve every reusable target in one bounded lookup. The old point lookup
+	// below made this path one SQLite query per resolved reference in the edited
+	// file, which dominates warm/partial saves for generated or call-heavy code.
+	targetIDSet := make(map[string]struct{})
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		for _, e := range byNode[n.ID] {
+			if reusableResolvedEdge(e) {
+				targetIDSet[e.To] = struct{}{}
+			}
+		}
+	}
+	targetIDs := make([]string, 0, len(targetIDSet))
+	for id := range targetIDSet {
+		targetIDs = append(targetIDs, id)
+	}
+	var targets map[string]*graph.Node
+	if len(targetIDs) > 0 {
+		targets = g.GetNodesByIDs(targetIDs)
+	}
 	for _, n := range nodes {
 		if n == nil {
 			continue
@@ -78,7 +100,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 			if !reusableResolvedEdge(e) {
 				continue
 			}
-			tgt := g.GetNode(e.To)
+			tgt := targets[e.To]
 			if tgt == nil || tgt.Name == "" {
 				continue
 			}
@@ -108,7 +130,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 // newIDs holds the IDs of the nodes about to be re-added by the caller's
 // AddBatch. It exists for the same-file case: when a call's target lives in the
 // re-parsed file, eviction removed the target node before this runs, so a bare
-// GetNode(v.to) lookup would miss and the edge would fall through to a full
+// point lookup for v.to would miss and the edge would fall through to a full
 // re-resolve — which rebinds the target correctly but drops its origin/tier to
 // the resolver's heuristic default. Because node IDs are file::Name (line- and
 // content-independent), a same-file target re-appears under an identical ID, so
@@ -118,6 +140,34 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]*reuseVal, newIDs map[string]struct{}) int {
 	if len(idx) == 0 {
 		return 0
+	}
+	// Determine the small set of captured targets actually referenced by this
+	// extraction, then check their existence once. Same-file targets are about
+	// to be re-added and deliberately do not need a store lookup.
+	targetIDSet := make(map[string]struct{})
+	for _, e := range edges {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) {
+			continue
+		}
+		name := reuseIdentifier(graph.UnresolvedName(e.To))
+		if name == "" {
+			continue
+		}
+		v := idx[reuseKey{from: e.From, kind: e.Kind, recv: edgeReceiverType(e), name: name}]
+		if v == nil {
+			continue
+		}
+		if _, reAdded := newIDs[v.to]; !reAdded {
+			targetIDSet[v.to] = struct{}{}
+		}
+	}
+	targetIDs := make([]string, 0, len(targetIDSet))
+	for id := range targetIDSet {
+		targetIDs = append(targetIDs, id)
+	}
+	var existingTargets map[string]struct{}
+	if len(targetIDs) > 0 {
+		existingTargets = graph.LookupExistingNodeIDs(g, targetIDs)
 	}
 	reused := 0
 	for _, e := range edges {
@@ -133,7 +183,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 		if v == nil {
 			continue // miss, or poisoned ambiguous key
 		}
-		if g.GetNode(v.to) == nil {
+		if _, exists := existingTargets[v.to]; !exists {
 			if _, reAdded := newIDs[v.to]; !reAdded {
 				continue // captured target genuinely deleted since the snapshot
 			}
