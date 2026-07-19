@@ -1479,8 +1479,10 @@ func reserveExploreConceptImplementation(
 		queryTerms = append(queryTerms, term)
 	}
 	var frequencyStorage [64]int
-	frequency := frequencyStorage[:len(queryTerms)]
-	if len(queryTerms) > len(frequencyStorage) {
+	var frequency []int
+	if len(queryTerms) <= len(frequencyStorage) {
+		frequency = frequencyStorage[:len(queryTerms)]
+	} else {
 		frequency = make([]int, len(queryTerms))
 	}
 	var metricStorage [80]exploreConceptImplementationMetric

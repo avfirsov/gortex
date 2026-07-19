@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -183,6 +184,39 @@ func TestMergeExploreCandidatesPreservesSourceLiteralSignalThroughDedupe(t *test
 	require.Equal(t, float64(2), merged[0].Signals[exploreSourceLiteralCoverageSignal])
 	require.Zero(t, primarySignals[exploreSourceLiteralSignal], "request-local evidence must not mutate an input candidate")
 	require.Zero(t, primarySignals[exploreSourceLiteralCoverageSignal], "coverage evidence must remain request-local")
+}
+
+func TestReserveExploreConceptImplementationHandlesMoreThanInlineTermCapacity(t *testing.T) {
+	terms := make([]string, 65)
+	for i := range terms {
+		terms[i] = fmt.Sprintf("term%c%c", 'a'+rune(i/26), 'a'+rune(i%26))
+	}
+	primary := sourcePreservationCandidate("primary", 0, 0)
+	targetName := terms[0] + "_" + terms[1]
+	target := &rerank.Candidate{Node: &graph.Node{
+		ID:       "demo/worker.go::" + targetName,
+		Name:     targetName,
+		QualName: "demo." + targetName,
+		Kind:     graph.KindFunction,
+		FilePath: "demo/worker.go",
+	}}
+	candidates := []*rerank.Candidate{
+		primary,
+		sourcePreservationCandidate("secondary", 1, 0),
+		target,
+	}
+
+	got, protected := reserveExploreConceptImplementation(
+		strings.Join(terms, " "),
+		rerank.QueryClassConcept,
+		candidates,
+		2,
+	)
+
+	require.Len(t, got, len(candidates))
+	require.Same(t, primary, got[0], "reservation must preserve the semantic head")
+	require.Same(t, target, got[1], "the callable matching long-query terms must be reserved")
+	require.Equal(t, target.Node.ID, protected)
 }
 
 func TestExploreAnswerReadyKeepsQuotedNonExactConceptNonTerminal(t *testing.T) {
