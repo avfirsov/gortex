@@ -49,16 +49,7 @@ func (s *Store) ReplaceDerivedContracts(replacement graph.DerivedContractReplace
 			values.WriteString("(?,?,?,?,?)")
 			args = append(args, edge.From, edge.To, string(edge.Kind), edge.FilePath, edge.Line)
 		}
-		removed, execErr := tx.Exec(`WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES `+values.String()+`)
-DELETE FROM edges
-WHERE EXISTS (
-    SELECT 1 FROM wanted AS w
-    WHERE w.from_id = edges.from_id
-      AND w.to_id = edges.to_id
-      AND w.kind = edges.kind
-      AND w.file_path = edges.file_path
-      AND w.line = edges.line
-)`, args...)
+		removed, execErr := tx.Exec(edgeExactDeleteByIdentitySQL(values.String()), args...)
 		if execErr != nil {
 			return graph.DerivedContractReplaceResult{}, execErr
 		}

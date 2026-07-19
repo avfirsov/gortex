@@ -6,6 +6,26 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// edgeExactDeleteByIdentitySQL deletes edges matching a VALUES list of
+// full identities. The IN-over-JOIN shape is load-bearing: a correlated
+// WHERE EXISTS against a constant VALUES table cannot be inverted by the
+// planner and scans the whole edges table per chunk; driving the join
+// from the VALUES side probes the edges primary key per identity.
+func edgeExactDeleteByIdentitySQL(values string) string {
+	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + values + `)
+DELETE FROM edges
+WHERE id IN (
+    SELECT e.id
+    FROM edges AS e
+    JOIN wanted AS w
+      ON e.from_id = w.from_id
+     AND e.to_id = w.to_id
+     AND e.kind = w.kind
+     AND e.file_path = w.file_path
+     AND e.line = w.line
+)`
+}
+
 const exactEdgeRemoveChunkSize = 160 // 160 * 5 = 800 bound parameters.
 
 // RemoveEdgesExact deletes complete logical edge identities through bounded
@@ -66,16 +86,7 @@ func (s *Store) RemoveEdgesExact(edges []*graph.Edge) int {
 			values.WriteString("(?,?,?,?,?)")
 			args = append(args, k.from, k.to, k.kind, k.file, k.line)
 		}
-		result, execErr := tx.Exec(`WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES `+values.String()+`)
-DELETE FROM edges
-WHERE EXISTS (
-    SELECT 1 FROM wanted AS w
-    WHERE w.from_id = edges.from_id
-      AND w.to_id = edges.to_id
-      AND w.kind = edges.kind
-      AND w.file_path = edges.file_path
-      AND w.line = edges.line
-)`, args...)
+		result, execErr := tx.Exec(edgeExactDeleteByIdentitySQL(values.String()), args...)
 		if execErr != nil {
 			panicOnFatal(execErr)
 			return 0
