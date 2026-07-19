@@ -141,6 +141,31 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 	}
 }
 
+// explainPlanTolerant mirrors explainQueryPlan but accepts empty plans:
+// prepared DML like a bare INSERT legitimately has no plan rows.
+func explainPlanTolerant(t *testing.T, s *Store, query string) []string {
+	t.Helper()
+	args := make([]any, strings.Count(query, "?"))
+	for i := range args {
+		args[i] = ""
+	}
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain %.60s: %v", query, err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	return plan
+}
+
 // The receiver-rebind batch drives from the TEMP file table (CROSS JOIN pin);
 // the temp table is connection-local, so this lock provisions it through the
 // same writer path production uses.
@@ -174,5 +199,72 @@ func TestSweepPlanLockReceiverRebindBatch(t *testing.T) {
 	}
 	if !strings.Contains(joined, "nodes_by_file (file_path=?)") {
 		t.Fatalf("plan must probe nodes_by_file per requested file:\n%s", joined)
+	}
+}
+
+// TestPreparedStatementPlansNeverScanBigTables is the mechanical form of the
+// partial-index convention: every statement prepared at Open is EXPLAINed
+// and any full scan of the nodes or edges tables fails the build, unless the
+// statement is on the explicit allowlist of intentional whole-table reads.
+// A future prepared statement that trips the partial-index-vs-bound-parameter
+// trap (or any other misplan) fails here without anyone remembering a rule.
+func TestPreparedStatementPlansNeverScanBigTables(t *testing.T) {
+	s := newPlanLockFixture(t)
+	// Intentional whole-table reads, and statements the tiny fixture plans
+	// as a scan but a production-scale store verifiably serves from an
+	// index (regime flips — each entry names its verification). Adding an
+	// entry here is a reviewed decision, not a remembered convention.
+	allowlist := []string{
+		"COUNT(*)", // whole-table counts are whole-table by intent
+		// WHERE repo_prefix = ?: SEARCH nodes_by_repo_kind (repo_prefix=?)
+		// on the production snapshot; the 1.2k-row fixture prefers a scan.
+		`FROM nodes WHERE repo_prefix = ?`,
+		// Repo edges via LIST SUBQUERY + edges_by_from_line probe on the
+		// production snapshot; fixture-size regime flip.
+		`FROM edges e`,
+	}
+	if len(s.preparedSQL) == 0 {
+		t.Fatal("prepared-statement registry is empty; the fence covers nothing")
+	}
+	bareScan := func(plan []string) string {
+		for _, detail := range plan {
+			trimmed := strings.TrimSpace(detail)
+			if !strings.HasPrefix(trimmed, "SCAN nodes") && !strings.HasPrefix(trimmed, "SCAN edges") {
+				continue
+			}
+			// A covering-index scan is an index-only read (DISTINCT over a
+			// partial index, for example) — only bare table scans fail.
+			if strings.Contains(trimmed, "USING") {
+				continue
+			}
+			return trimmed
+		}
+		return ""
+	}
+	for _, query := range s.preparedSQL {
+		name := query
+		if len(name) > 70 {
+			name = name[:70]
+		}
+		allowed := false
+		for _, allow := range allowlist {
+			if strings.Contains(query, allow) {
+				allowed = true
+				break
+			}
+		}
+		// The bare AllNodes/AllEdges exports are whole-table by intent —
+		// matched by exact suffix so nothing with a WHERE clause rides along.
+		if strings.HasSuffix(query, "FROM nodes") || strings.HasSuffix(query, "FROM edges") {
+			allowed = true
+		}
+		if allowed {
+			continue
+		}
+		plan := explainPlanTolerant(t, s, query)
+		if offender := bareScan(plan); offender != "" {
+			t.Errorf("prepared statement scans a big table (%s):\n  %s\nplan:\n%s",
+				offender, name, strings.Join(plan, "\n"))
+		}
 	}
 }

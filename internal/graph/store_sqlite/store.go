@@ -65,6 +65,11 @@ type Store struct {
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
 
+	// preparedSQL registers every statement prepared at Open so the plan
+	// fence can EXPLAIN the entire prepared surface against a fixture and
+	// reject big-table scans mechanically.
+	preparedSQL []string
+
 	// writeMu serialises every mutation. SQLite serialises writers
 	// internally; doing the same on the Go side turns SQLITE_BUSY
 	// contention into clean lock-wait and keeps the conformance
@@ -719,8 +724,20 @@ func (s *Store) prepare() error {
 		}
 		*out = st
 	}
-	prep := func(out **sql.Stmt, q string) { prepOn(s.db, out, q) }
-	prepWrite := func(out **sql.Stmt, q string) { prepOn(s.writerDB, out, q) }
+	// Every prepared statement is also recorded so the plan fence
+	// (TestPreparedStatementPlansNeverScanBigTables) can EXPLAIN the whole
+	// prepared surface mechanically. Partial-index misuse against bound
+	// parameters slipped through review three independent times as a
+	// "convention"; the registry turns the convention into a gate that
+	// covers every future statement automatically.
+	prep := func(out **sql.Stmt, q string) {
+		s.preparedSQL = append(s.preparedSQL, q)
+		prepOn(s.db, out, q)
+	}
+	prepWrite := func(out **sql.Stmt, q string) {
+		s.preparedSQL = append(s.preparedSQL, q)
+		prepOn(s.writerDB, out, q)
+	}
 
 	const nodeCols = nodeInsertColumns
 
