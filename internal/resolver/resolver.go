@@ -709,6 +709,13 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	guardRepos := make(map[string]struct{})
 	total := &ResolveStats{}
 	reindexTotal := 0
+	// Conversion-vs-churn split of the reindex volume. A pass once applied a
+	// 666k-entry reindex batch while net pending moved only 30k — without
+	// this split there is no way to tell corpus conversion (an unresolved
+	// target became a real node) from identity churn (kind promotions,
+	// origin upgrades, re-corrections of already-resolved edges).
+	reindexConversions := 0
+	reindexChurn := 0
 	warmElapsed := time.Duration(0)
 	for {
 		// The pending page is a stable edge snapshot taken while mu is held.
@@ -868,6 +875,11 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 					j.edge.Origin = j.origin
 					j.edge.Meta = j.meta
 					reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo, OldKind: j.oldKind})
+					if graph.IsUnresolvedTarget(j.oldTo) && !graph.IsUnresolvedTarget(j.newTo) {
+						reindexConversions++
+					} else {
+						reindexChurn++
+					}
 					kept = append(kept, j)
 				}
 				perWorkerJobs[i] = kept
@@ -1267,6 +1279,8 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 	r.logger.Info("resolver: compute done",
 		zap.Int("pending", pendingAfter),
 		zap.Int("reindex_batch", reindexTotal),
+		zap.Int("reindex_conversions", reindexConversions),
+		zap.Int("reindex_churn", reindexChurn),
 		zap.Int("super_chunk", superChunk),
 		zap.Int("lsp_deferred", lspDeferred),
 		zap.Int("lsp_attempted", lspResult.attempted),
