@@ -759,8 +759,12 @@ func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP
 		zap.Bool("scoped", scoped),
 		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
 		zap.Int("scope_repos", len(scope)),
-		zap.Int("pending_before", stats.PendingBefore),
-		zap.Int("pending_after", stats.PendingAfter))
+		// Scanned vs admitted, NOT residual-after-resolution: PendingAfter
+		// counts the rows that survived scope/terminal filtering into the
+		// pass (see ResolveStats). A 666k-conversion pass with these two
+		// nearly equal is a pass that admitted nearly everything it scanned.
+		zap.Int("pending_scanned", stats.PendingBefore),
+		zap.Int("pending_admitted", stats.PendingAfter))
 }
 
 func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
@@ -774,8 +778,8 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
 		zap.Int("files", len(files)),
-		zap.Int("pending_before", stats.PendingBefore),
-		zap.Int("pending_after", stats.PendingAfter))
+		zap.Int("pending_scanned", stats.PendingBefore),
+		zap.Int("pending_admitted", stats.PendingAfter))
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
