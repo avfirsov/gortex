@@ -77,9 +77,10 @@ WITH requested_languages(language) AS (
 )
 SELECT `+qualifiedNodeColumns("n", lookupNodeColsLight)+`
 FROM requested_files AS f
-JOIN nodes AS n ON n.file_path = f.file_path
+CROSS JOIN nodes AS n
 JOIN requested_languages AS l ON l.language = n.language
-WHERE n.repo_prefix = ?
+WHERE n.file_path = f.file_path
+  AND +n.repo_prefix = ?
   AND n.kind NOT IN (?, ?)`+predicate+`
 ORDER BY n.file_path, n.id`, languagesJSON, filesJSON, repoPrefix, string(graph.KindFile), string(graph.KindImport))
 	if err != nil {
@@ -128,10 +129,12 @@ WITH requested_languages(language) AS (
 )
 SELECT `+lookupQualifiedEdgeCols+`
 FROM requested_files AS f
-JOIN nodes AS n ON n.file_path = f.file_path
+CROSS JOIN nodes AS n
 JOIN requested_languages AS l ON l.language = n.language
-JOIN edges AS e ON e.from_id = n.id
-WHERE n.repo_prefix = ?
+CROSS JOIN edges AS e
+WHERE n.file_path = f.file_path
+  AND e.from_id = n.id
+  AND +n.repo_prefix = ?
   AND e.kind NOT IN (?, ?, ?, ?, ?, ?)`+confidencePredicate+`
 ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJSON, repoPrefix,
 		string(graph.EdgeMemberOf), string(graph.EdgeDefines), string(graph.EdgeContains),
@@ -189,11 +192,13 @@ WITH requested_languages(language) AS (
 )
 SELECT `+lookupQualifiedEdgeCols+`
 FROM requested_files AS f
-JOIN nodes AS n ON n.file_path = f.file_path
+CROSS JOIN nodes AS n
 JOIN requested_languages AS l ON l.language = n.language
-JOIN edges AS e ON e.from_id = n.id
+CROSS JOIN edges AS e
 JOIN requested_kinds AS k ON k.kind = e.kind
-WHERE n.repo_prefix = ?
+WHERE n.file_path = f.file_path
+  AND e.from_id = n.id
+  AND +n.repo_prefix = ?
 ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJSON, kindsJSON, repoPrefix)
 	if err != nil {
 		panicOnFatal(err)

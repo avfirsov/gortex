@@ -12,17 +12,18 @@ const goMethodReceiverFileTableSQL = `CREATE TEMP TABLE IF NOT EXISTS go_receive
 
 const goMethodReceiverCandidatesForFilesSQL = `
 SELECT e.id, MIN(c.id)
-FROM nodes AS m INDEXED BY nodes_by_file
-JOIN temp.go_receiver_rebind_files AS f ON f.file_path = m.file_path
-JOIN edges AS e INDEXED BY edges_by_from
-  ON e.from_id = m.id
- AND e.kind = 'member_of'
+FROM temp.go_receiver_rebind_files AS f
+CROSS JOIN nodes AS m INDEXED BY nodes_by_file
+CROSS JOIN edges AS e INDEXED BY edges_by_from
 LEFT JOIN nodes AS t ON t.id = e.to_id
 JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
-WHERE m.language = 'go'
+WHERE m.file_path = f.file_path
+  AND e.from_id = m.id
+  AND e.kind = 'member_of'
+  AND m.language = 'go'
   AND m.kind = 'method'
   AND e.member_receiver IS NOT NULL
   AND e.member_receiver_dir IS NOT NULL
