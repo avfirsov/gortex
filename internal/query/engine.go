@@ -1688,11 +1688,24 @@ func hasPrefixFold(s, prefix string) bool {
 
 // containsFold reports whether sub occurs in s under simple case folding,
 // without allocating. sub is already lowercased by the caller.
+//
+// The window loop only pays an EqualFold where the first byte can actually
+// fold-match: an ASCII byte is prechecked with |0x20 case-folding, and any
+// non-ASCII byte always takes the EqualFold path. Known limitation shared by
+// every byte-windowed fold: length-changing Unicode foldings (the three-byte
+// Kelvin sign folding to a one-byte k) cannot match, because the window is
+// sized in bytes. Identifiers do not contain those; the degraded-mode
+// fallback accepts the trade, and production search uses the indexed
+// backend.
 func containsFold(s, sub string) bool {
 	if len(sub) == 0 {
 		return true
 	}
+	c := sub[0] | 0x20
 	for i := 0; i+len(sub) <= len(s); i++ {
+		if b := s[i]; b < 0x80 && b|0x20 != c {
+			continue
+		}
 		if strings.EqualFold(s[i:i+len(sub)], sub) {
 			return true
 		}
