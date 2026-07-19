@@ -11,107 +11,198 @@ import (
 // Terminal evidence retention.
 //
 // The localize handler builds a byte-budgeted evidence envelope once and
-// used to throw it away after serialization: the per-session terminal state
-// kept only the completion contract. A host that navigated past answer_ready
-// then received bare refusals — each one a burned model turn with no way
-// forward — and a session could exhaust its turn budget holding the correct
-// answer it was never shown again. The digest is the retained, replayable
-// core of that envelope plus a deterministic final response the host can
-// emit verbatim.
+// retains a compact projection for post-terminal calls. Replaying that evidence
+// as a successful result keeps non-adapted hosts out of error-recovery loops,
+// but the model-visible response must remain evidence rather than masquerade as
+// a prewritten answer.
 
-// localizationDigestMaxBytes bounds the retained digest independently of the
-// original envelope budget so session state stays small no matter how large
-// the localize response was.
-const localizationDigestMaxBytes = 4096
+const (
+	// localizationDigestMaxBytes bounds retained session state independently of
+	// the original envelope budget.
+	localizationDigestMaxBytes = 4096
+	// localizationReplayEvidenceLimit prevents a broad localization envelope
+	// from becoming an exhaustive, implicitly endorsed answer during replay.
+	// Five keeps the promoted structural/literal candidates reserved by the
+	// envelope builder while bounding repeat-turn cost.
+	localizationReplayEvidenceLimit = 5
+	// localizationHostFallbackMetaKey is deliberately carried in MCP _meta,
+	// which is available to an adapting host without duplicating a prewritten
+	// answer in model-visible TextContent or structuredContent.
+	localizationHostFallbackMetaKey = "gortex/localization-fallback"
+)
 
 // localizationEvidenceDigest is the compact, session-retained projection of
-// an answer envelope: enough to answer from, never the full source bodies.
+// an answer envelope: ranked candidate evidence without source bodies.
 type localizationEvidenceDigest struct {
-	Files         []string                `json:"files,omitempty"`
-	Symbols       []string                `json:"symbols,omitempty"`
-	Evidence      []localizationDigestRow `json:"evidence,omitempty"`
-	FinalResponse string                  `json:"final_response,omitempty"`
+	Files    []string                `json:"files,omitempty"`
+	Symbols  []string                `json:"symbols,omitempty"`
+	Evidence []localizationDigestRow `json:"evidence,omitempty"`
 }
 
 type localizationDigestRow struct {
-	Rank      int    `json:"rank,omitempty"`
-	ID        string `json:"id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	File      string `json:"file,omitempty"`
-	Line      int    `json:"line,omitempty"`
-	Signature string `json:"signature,omitempty"`
+	Rank      int      `json:"rank,omitempty"`
+	ID        string   `json:"id,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	QualName  string   `json:"qual_name,omitempty"`
+	Kind      string   `json:"kind,omitempty"`
+	File      string   `json:"file,omitempty"`
+	Line      int      `json:"line,omitempty"`
+	Signature string   `json:"signature,omitempty"`
+	Callers   []string `json:"callers,omitempty"`
+	Callees   []string `json:"callees,omitempty"`
 }
 
-// newLocalizationEvidenceDigest projects the serialized envelope into the
-// retained digest. Evidence rows drop their Source bodies and are shed from
-// the tail until the digest fits localizationDigestMaxBytes, mirroring the
-// envelope's own shed-expansion-first budgeting; Files and Symbols are always
-// retained (they are the answer's skeleton and already bounded upstream).
+// newLocalizationEvidenceDigest retains only concrete ranked evidence rows.
+// Files and Symbols are rebuilt from those rows, so an item that was shed by
+// the replay limit or byte budget cannot survive as an unsupported answer
+// candidate. The upstream ordering already reserves the strongest direct,
+// exact, literal, and promoted structural targets before lower-ranked fan-out.
 func newLocalizationEvidenceDigest(envelope localizationExploreEnvelope) *localizationEvidenceDigest {
-	digest := &localizationEvidenceDigest{
-		Files:   append([]string(nil), envelope.Files...),
-		Symbols: append([]string(nil), envelope.Symbols...),
-	}
+	digest := &localizationEvidenceDigest{}
+	seen := make(map[string]struct{}, localizationReplayEvidenceLimit)
 	for _, row := range envelope.Evidence {
+		if len(digest.Evidence) >= localizationReplayEvidenceLimit {
+			break
+		}
+		if row.ID == "" || row.File == "" {
+			continue
+		}
+		if _, exists := seen[row.ID]; exists {
+			continue
+		}
+		seen[row.ID] = struct{}{}
 		digest.Evidence = append(digest.Evidence, localizationDigestRow{
 			Rank:      row.Rank,
 			ID:        row.ID,
 			Name:      row.Name,
+			QualName:  row.QualName,
+			Kind:      row.Kind,
 			File:      row.File,
 			Line:      row.Line,
 			Signature: row.Signature,
+			Callers:   append([]string(nil), row.Callers...),
+			Callees:   append([]string(nil), row.Callees...),
 		})
 	}
-	digest.FinalResponse = buildLocalizationFinalResponse(digest)
-	for len(digest.Evidence) > 0 {
+	for {
+		rebuildLocalizationDigestSkeleton(digest)
 		encoded, err := json.Marshal(digest)
 		if err == nil && len(encoded) <= localizationDigestMaxBytes {
 			return digest
 		}
-		digest.Evidence = digest.Evidence[:len(digest.Evidence)-1]
-		digest.FinalResponse = buildLocalizationFinalResponse(digest)
+		if len(digest.Evidence) == 0 {
+			return digest
+		}
+		last := len(digest.Evidence) - 1
+		if shedLocalizationDigestRowOptionalFields(&digest.Evidence[last]) {
+			continue
+		}
+		if last == 0 {
+			// ID and file are the irreducible replay contract. They are bounded by
+			// filesystem and symbol extraction limits in production, so retain the
+			// mandatory row rather than returning an empty terminal replay.
+			return digest
+		}
+		digest.Evidence = digest.Evidence[:last]
 	}
-	return digest
 }
 
-// buildLocalizationFinalResponse renders the deterministic, ready-to-emit
-// answer text: the FILES / SYMBOLS / EVIDENCE sections a localization-only
-// caller is expected to produce. A host may return it verbatim when it does
-// not want to spend an inference turn on synthesis.
-func buildLocalizationFinalResponse(digest *localizationEvidenceDigest) string {
-	var b strings.Builder
-	b.WriteString("FILES:\n")
-	for _, file := range digest.Files {
-		fmt.Fprintf(&b, "- %s\n", file)
+func shedLocalizationDigestRowOptionalFields(row *localizationDigestRow) bool {
+	if row == nil {
+		return false
 	}
-	b.WriteString("SYMBOLS:\n")
-	for _, symbol := range digest.Symbols {
-		fmt.Fprintf(&b, "- %s\n", symbol)
+	if len(row.Callers) > 0 || len(row.Callees) > 0 {
+		row.Callers = nil
+		row.Callees = nil
+		return true
 	}
-	if len(digest.Evidence) > 0 {
-		b.WriteString("EVIDENCE:\n")
-		for _, row := range digest.Evidence {
-			fmt.Fprintf(&b, "- %s:%d — %s", row.File, row.Line, row.Name)
-			if row.Signature != "" {
-				fmt.Fprintf(&b, " (%s)", row.Signature)
-			}
-			b.WriteString("\n")
+	if row.Signature != "" {
+		row.Signature = ""
+		return true
+	}
+	if row.QualName != "" {
+		row.QualName = ""
+		return true
+	}
+	if row.Name != "" || row.Kind != "" {
+		row.Name = ""
+		row.Kind = ""
+		return true
+	}
+	return false
+}
+
+func rebuildLocalizationDigestSkeleton(digest *localizationEvidenceDigest) {
+	digest.Files = digest.Files[:0]
+	digest.Symbols = digest.Symbols[:0]
+	seenFiles := make(map[string]struct{}, len(digest.Evidence))
+	seenSymbols := make(map[string]struct{}, len(digest.Evidence))
+	for _, row := range digest.Evidence {
+		if _, exists := seenFiles[row.File]; !exists {
+			seenFiles[row.File] = struct{}{}
+			digest.Files = append(digest.Files, row.File)
 		}
+		if _, exists := seenSymbols[row.ID]; !exists {
+			seenSymbols[row.ID] = struct{}{}
+			digest.Symbols = append(digest.Symbols, row.ID)
+		}
+	}
+}
+
+const localizationReplayNotice = "The completed localization retained the ranked candidates below. " +
+	"Additional navigation repeats this evidence. Use the strongest supported rows when composing the final " +
+	"file-and-symbol answer; candidate presence alone does not prove a change target."
+
+// renderLocalizationReplayEvidence is model-visible. It presents provenance
+// and ranking without claiming every candidate is a target or asking the model
+// to repeat a prewritten answer.
+func renderLocalizationReplayEvidence(digest *localizationEvidenceDigest) string {
+	var b strings.Builder
+	b.WriteString(localizationReplayNotice)
+	if digest == nil || len(digest.Evidence) == 0 {
+		b.WriteString("\nNo retained candidate rows are available; use the original localization result.")
+		return b.String()
+	}
+	for index, row := range digest.Evidence {
+		rank := row.Rank
+		if rank <= 0 {
+			rank = index + 1
+		}
+		fmt.Fprintf(&b, "\n%d. %s:%d — %s", rank, row.File, row.Line, row.ID)
+		if row.Signature != "" {
+			fmt.Fprintf(&b, " (%s)", row.Signature)
+		}
+		if len(row.Callers) > 0 || len(row.Callees) > 0 {
+			fmt.Fprintf(&b, " [graph: %d caller(s), %d callee(s)]", len(row.Callers), len(row.Callees))
+		}
+	}
+	return b.String()
+}
+
+// buildLocalizationHostFallback provides a deterministic compact summary for
+// hosts that explicitly implement a no-inference fallback. It stays in MCP
+// _meta and is never concatenated into model-visible tool content.
+func buildLocalizationHostFallback(digest *localizationEvidenceDigest) string {
+	var b strings.Builder
+	b.WriteString("Localization candidates:\n")
+	if digest == nil || len(digest.Evidence) == 0 {
+		b.WriteString("- no retained candidate evidence")
+		return b.String()
+	}
+	for _, row := range digest.Evidence {
+		fmt.Fprintf(&b, "- %s:%d — %s", row.File, row.Line, row.ID)
+		if row.Signature != "" {
+			fmt.Fprintf(&b, " (%s)", row.Signature)
+		}
+		b.WriteByte('\n')
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// localizationReplayDirective is the actionable half of a post-terminal
-// replay: the same "answer NOW" instruction the momentum escalation uses,
-// phrased for the terminal case.
-const localizationReplayDirective = "You already hold the localization answer — respond NOW using the evidence " +
-	"below: name the files and symbols, citing the locations already returned. Further Gortex navigation " +
-	"returns this same evidence; a confident answer beats an exhausted turn budget with no answer."
-
-// answerReadyDirective returns the answer-now note a post-terminal READ
-// result carries: reads execute after answer_ready (starving them produced
-// empty finals), but every such result reminds the host it already holds
-// the answer and repeats the deterministic final response.
+// answerReadyDirective returns a neutral evidence reminder for a post-terminal
+// READ. Reads remain executable because starving them produced empty finals;
+// the appended note makes the completion boundary explicit without presenting
+// an injected-looking answer script.
 func (s *localizationTerminalState) answerReadyDirective() (string, bool) {
 	if s == nil {
 		return "", false
@@ -121,29 +212,22 @@ func (s *localizationTerminalState) answerReadyDirective() (string, bool) {
 	if s.state != localizationStateAnswerReady || s.digest == nil {
 		return "", false
 	}
-	return localizationReplayDirective + "\n\n" + s.digest.FinalResponse, true
+	return renderLocalizationReplayEvidence(s.digest), true
 }
 
 // localizationEvidenceReplayResult is the successful, idempotent response to
-// any post-terminal navigation call. It is deliberately NOT an error: error
-// results push non-adapted hosts into error-recovery loops and count as
-// failed calls, while a success result is actionable on the very next model
-// turn. Every subsequent call returns the byte-identical payload — the
-// refused call's facade/operation is deliberately absent, because the answer
-// does not depend on which navigation was attempted.
+// post-terminal navigation. Model-visible text contains neutral ranked evidence;
+// structuredContent carries the machine-readable completion and digest; an
+// adapting host can use the deterministic fallback from _meta.
 func localizationEvidenceReplayResult(completion localizationCompletion, digest *localizationEvidenceDigest) *mcpgo.CallToolResult {
-	payload := map[string]any{
+	result := mcpgo.NewToolResultText(renderLocalizationReplayEvidence(digest))
+	result.StructuredContent = map[string]any{
 		"completion":      completion,
 		"replay":          true,
-		"directive":       localizationReplayDirective,
 		"evidence_digest": digest,
-		"final_response":  digest.FinalResponse,
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return mcpgo.NewToolResultText(localizationReplayDirective + "\n\n" + digest.FinalResponse)
-	}
-	result := mcpgo.NewToolResultText(localizationReplayDirective + "\n\n" + digest.FinalResponse + "\n\n" + string(body))
-	result.StructuredContent = json.RawMessage(body)
+	result.Meta = mcpgo.NewMetaFromMap(map[string]any{
+		localizationHostFallbackMetaKey: buildLocalizationHostFallback(digest),
+	})
 	return result
 }
