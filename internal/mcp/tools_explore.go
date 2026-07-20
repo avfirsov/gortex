@@ -2114,7 +2114,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			preferredSymbol, task, targets, budget, routes,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
-			s.localizationFor(ctx).keepOpenForTask(task)
+			refinement.digest = digest
+			s.localizationFor(ctx).armForTask(refinement, task)
 			return result, nil
 		}
 		// Wire and server authorization are derived from the same finalized
@@ -2146,7 +2147,8 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			preferredSymbol, task, targets, budget, routes,
 		)
 		if refinement.State != localizationStateNeedsRefinement {
-			s.localizationFor(ctx).keepOpenForTask(task)
+			refinement.digest = refinedDigest
+			s.localizationFor(ctx).armForTask(refinement, task)
 			return refined, nil
 		}
 		s.localizationFor(ctx).armRefinementRoutesForTask(
@@ -2187,12 +2189,16 @@ type localizationEvidence struct {
 }
 
 func (s *Server) completeEmptyLocalization(ctx context.Context, task string, budget int) *mcp.CallToolResult {
-	completion := newLocalizationOpenCompletion()
-	// An empty result supersedes any previous task contract but must not arm
-	// answer-ready or an exact-read allowance. Stage the open state so facade
-	// dispatch commits it only after the successful response.
-	s.localizationFor(ctx).keepOpenForTask(task)
-	return newLocalizationExploreResult(completion, []exploreTarget{}, budget)
+	// No bounded source read can improve an empty projection. Return a compact,
+	// advisory terminal contract so the host gets a final response instead of
+	// an unbounded navigation loop with an eventually empty final.
+	completion := newLocalizationCompletion(true, "")
+	result, _, digest, completion := buildLocalizationExploreResultForTaskFinalized(
+		completion, task, nil, budget,
+	)
+	completion.digest = digest
+	s.localizationFor(ctx).armForTask(completion, task)
+	return result
 }
 
 // exploreAllowsStructuralBody keeps graph-expanded source reads exclusive to
@@ -2668,16 +2674,30 @@ func buildLocalizationRefinementResultForTask(
 	budget int,
 	routes map[string]localizationRefinementRoute,
 ) (*mcp.CallToolResult, localizationCompletion, map[string]localizationRefinementRoute, *localizationEvidenceDigest) {
-	open := newLocalizationOpenCompletion()
-	candidateSymbols := exploreLocalizationTargetSymbols(targets)
-	preauthorized, prebounded := boundedLocalizationRefinementRoutes(candidateSymbols, routes, preferredSymbol)
-	if preferredSymbol == "" {
-		result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(open, task, targets, budget)
-		return result, open, nil, digest
+	choosePreferred := func(symbols []string, requested string) (string, []string, map[string]localizationRefinementRoute) {
+		authorized, bounded := boundedLocalizationRefinementRoutes(symbols, routes, requested)
+		if requested != "" {
+			if _, ok := bounded[requested]; ok {
+				return requested, authorized, bounded
+			}
+		}
+		authorized, bounded = boundedLocalizationRefinementRoutes(symbols, routes, "")
+		for _, symbol := range symbols {
+			if _, ok := bounded[symbol]; !ok {
+				continue
+			}
+			authorized, bounded = boundedLocalizationRefinementRoutes(symbols, routes, symbol)
+			return symbol, authorized, bounded
+		}
+		return "", nil, nil
 	}
-	if _, preferredAuthorized := prebounded[preferredSymbol]; !preferredAuthorized {
-		result, _, digest, _ := buildLocalizationExploreResultForTaskFinalized(open, task, targets, budget)
-		return result, open, nil, digest
+
+	candidateSymbols := exploreLocalizationTargetSymbols(targets)
+	preferredSymbol, preauthorized, prebounded := choosePreferred(candidateSymbols, preferredSymbol)
+	if preferredSymbol == "" {
+		advisory := newLocalizationCompletion(true, "")
+		result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(advisory, task, targets, budget)
+		return result, packedCompletion, nil, digest
 	}
 
 	// Budget against the largest completion this envelope can expose. The final
@@ -2685,24 +2705,22 @@ func buildLocalizationRefinementResultForTask(
 	// so replacing this provisional contract cannot invalidate the byte cap.
 	budgetCompletion := newLocalizationRefinementCompletionForSymbols(preferredSymbol, preauthorized)
 	budgetCompletion.refinementRoutes = prebounded
-	finalCompletion := open
 	var finalRoutes map[string]localizationRefinementRoute
 	result, _, digest, packedCompletion := buildLocalizationExploreResultForTaskFinalized(
 		budgetCompletion, task, targets, budget,
 		func(packed localizationExploreEnvelope) localizationCompletion {
-			allowedSymbols, bounded := boundedLocalizationRefinementRoutes(packed.Symbols, routes, preferredSymbol)
-			if _, preferredAuthorized := bounded[preferredSymbol]; !preferredAuthorized {
+			packedPreferred, allowedSymbols, bounded := choosePreferred(packed.Symbols, preferredSymbol)
+			if packedPreferred == "" {
 				finalRoutes = nil
-				return open
+				return newLocalizationCompletion(true, "")
 			}
 			finalRoutes = localizationBoundRouteEvidence(bounded, packed)
-			finalCompletion = newLocalizationRefinementCompletionForSymbols(preferredSymbol, allowedSymbols)
-			finalCompletion.refinementRoutes = finalRoutes
-			return finalCompletion
+			completion := newLocalizationRefinementCompletionForSymbols(packedPreferred, allowedSymbols)
+			completion.refinementRoutes = finalRoutes
+			return completion
 		},
 	)
-	finalCompletion = packedCompletion
-	return result, finalCompletion, finalRoutes, digest
+	return result, packedCompletion, finalRoutes, digest
 }
 
 // The finalized variant additionally returns the exact completion used by both

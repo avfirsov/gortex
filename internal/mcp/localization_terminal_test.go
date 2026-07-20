@@ -151,20 +151,20 @@ func TestCompleteEmptyLocalizationReplacesPriorContract(t *testing.T) {
 	if !ok {
 		t.Fatalf("completion = %#v, want object", envelope["completion"])
 	}
-	if state, _ := completion["state"].(string); state != localizationStateInactive {
-		t.Fatalf("empty completion state = %q, want inactive", state)
+	if state, _ := completion["state"].(string); state != localizationStateAnswerReady {
+		t.Fatalf("empty completion state = %q, want advisory answer_ready", state)
 	}
-	if action, _ := completion["required_action"].(string); action != "continue" {
-		t.Fatalf("empty completion action = %q, want continue", action)
+	if action, _ := completion["required_action"].(string); action != "respond" {
+		t.Fatalf("empty completion action = %q, want respond", action)
 	}
 	terminal.mu.Lock()
 	state, exact := terminal.state, terminal.exactSymbol
 	terminal.mu.Unlock()
-	if state != localizationStateInactive || exact != "" {
+	if state != localizationStateAnswerReady || exact != "" {
 		t.Fatalf("empty localization armed terminal state=%q exact=%q", state, exact)
 	}
-	if blocked := terminal.block("search", "symbols", map[string]any{"query": "better anchor"}); blocked != nil {
-		t.Fatalf("empty localization blocked continued investigation: %v", blocked)
+	if blocked := terminal.block("search", "symbols", map[string]any{"query": "better anchor"}); blocked == nil {
+		t.Fatal("zero-candidate advisory completion did not stop repeated localization")
 	}
 }
 
@@ -205,7 +205,7 @@ func TestLocalizationCompletionEnvelope(t *testing.T) {
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		t.Fatalf("decode completion envelope: %v\n%s", err, text)
 	}
-	if envelope.Completion.State != localizationStateAnswerReady || envelope.Completion.RequiredAction != "respond" || envelope.Completion.AllowedToolCalls != 0 {
+	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || envelope.Completion.AllowedToolCalls != 1 {
 		t.Fatalf("unexpected completion: %#v", envelope.Completion)
 	}
 	if len(envelope.Files) != 1 || len(envelope.Symbols) != 1 || envelope.Symbols[0] != "repo/pkg/file.go::Run" || len(envelope.Evidence) != 1 {
@@ -253,7 +253,16 @@ func TestLocalizationRefinementAllowsExactlyOneCandidateRead(t *testing.T) {
 	state := newLocalizationTerminalState()
 	candidate := "repo/pkg/file.go::Resolver.Run"
 	other := "repo/pkg/other.go::Other"
-	state.armRefinementForTask("locate resolver behavior", candidate, []string{candidate, other}, nil)
+	state.armRefinementRoutesForTask(
+		"locate resolver behavior",
+		candidate,
+		[]string{candidate, other},
+		map[string]localizationRefinementRoute{
+			candidate: {enforceable: true},
+			other:     {enforceable: true},
+		},
+		nil,
+	)
 
 	wrong := map[string]any{"target": map[string]any{"symbol": "repo/pkg/wrong.go::Wrong"}}
 	if blocked, reserved := state.authorize("read", "source", wrong); blocked == nil || reserved {
@@ -299,7 +308,13 @@ func TestHandleFacadeRefinementReadReturnsAnswerReadyCompletion(t *testing.T) {
 	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "refinement-read-completion")
-	server.localizationFor(ctx).armRefinementForTask("locate resolver behavior", candidate, []string{candidate}, testEvidenceDigest())
+	server.localizationFor(ctx).armRefinementRoutesForTask(
+		"locate resolver behavior",
+		candidate,
+		[]string{candidate},
+		map[string]localizationRefinementRoute{candidate: {enforceable: true}},
+		testEvidenceDigest(),
+	)
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "read"
@@ -488,7 +503,9 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 	})
 	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
 	ctx := WithSessionID(context.Background(), "exact-read")
-	server.localizationFor(ctx).armForTask(newLocalizationCompletion(false, "repo/pkg/file.go::Run"), "locate Run")
+	exactCompletion := newLocalizationCompletion(false, "repo/pkg/file.go::Run")
+	exactCompletion.enforceableOnAnswerReady = true
+	server.localizationFor(ctx).armForTask(exactCompletion, "locate Run")
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = "read"
 	req.Params.Arguments = map[string]any{
@@ -504,15 +521,19 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		t.Fatalf("retry should retain and consume the allowance on success: result=%#v err=%v", second, err)
 	}
 	body, ok := singleTextContent(second)
-	if !ok || !strings.Contains(body, `"state":"answer_ready"`) ||
-		!strings.Contains(body, `"contract_version":2`) || !strings.Contains(body, `"terminal":true`) {
-		t.Fatalf("successful exact read omitted terminal completion: %q", body)
+	if !ok || !strings.Contains(body, `"state":"needs_recovery"`) ||
+		!strings.Contains(body, `"required_action":"recover_once"`) || !strings.Contains(body, `"terminal":false`) {
+		t.Fatalf("successful unproven exact-read retry omitted recovery completion: %q", body)
 	}
 	third, err := server.handleFacade(ctx, "read", req)
-	if err != nil || calls != 2 {
-		t.Fatalf("successful exact read must make later navigation terminal: result=%#v err=%v calls=%d", third, err, calls)
+	if err != nil || third == nil || third.IsError || calls != 3 {
+		t.Fatalf("bounded exact-read recovery = result=%#v err=%v calls=%d", third, err, calls)
 	}
-	requireLocalizationTerminalError(t, third, "read", "source")
+	fourth, err := server.handleFacade(ctx, "read", req)
+	if err != nil || calls != 3 {
+		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d", fourth, err, calls)
+	}
+	requireLocalizationTerminalError(t, fourth, "read", "source")
 }
 
 func TestHandleFacadeExhaustedCorrectionFailureCarriesTerminalCompletion(t *testing.T) {
@@ -835,7 +856,9 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 	ctx := WithSessionID(context.Background(), "exact-read-panic")
 	terminal := server.localizationFor(ctx)
 	const symbol = "repo/internal/file.go::Target"
-	terminal.armForTask(newLocalizationCompletion(false, symbol), "Locate Target")
+	exactCompletion := newLocalizationCompletion(false, symbol)
+	exactCompletion.enforceableOnAnswerReady = true
+	terminal.armForTask(exactCompletion, "Locate Target")
 
 	args := map[string]any{
 		"operation": "source",
@@ -857,12 +880,16 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 		t.Fatalf("exact read retry = (%v, %v), want success", result, err)
 	}
 	third, err := server.handleFacade(ctx, "read", req)
-	if err != nil {
-		t.Fatalf("third exact read = (%v, %v), want terminal block", third, err)
+	if err != nil || third == nil || third.IsError {
+		t.Fatalf("third exact read recovery = (%v, %v), want success", third, err)
 	}
-	requireLocalizationTerminalError(t, third, "read", "source")
-	if calls != 2 {
-		t.Fatalf("legacy source calls = %d, want 2", calls)
+	fourth, err := server.handleFacade(ctx, "read", req)
+	if err != nil {
+		t.Fatalf("fourth exact read = (%v, %v), want terminal block", fourth, err)
+	}
+	requireLocalizationTerminalError(t, fourth, "read", "source")
+	if calls != 3 {
+		t.Fatalf("legacy source calls = %d, want 3", calls)
 	}
 }
 

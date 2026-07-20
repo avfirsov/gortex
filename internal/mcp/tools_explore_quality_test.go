@@ -224,14 +224,15 @@ func TestHandleExploreRecallsExactQuotedLiteralFromSQLiteContentFTS(t *testing.T
 	require.True(t, api < 0 || registry < api, "exact body-literal candidate must lead ordinary metadata: %s", text)
 }
 
-func TestHandleExploreLocalizeKeepsEmptyResultNonTerminal(t *testing.T) {
+func TestHandleExploreLocalizeTerminatesEmptyResultAdvisory(t *testing.T) {
 	server := newExploreQualityServer(t)
 	result, text := callExploreQuality(t, server, "find request validation and message routing behavior", true)
 	require.False(t, result.IsError, text)
-	require.Contains(t, text, `"state":""`)
-	require.Contains(t, text, `"required_action":"continue"`)
+	require.Contains(t, text, `"state":"answer_ready"`)
+	require.Contains(t, text, `"required_action":"respond"`)
+	require.Contains(t, text, `"terminal":true`)
 	require.Contains(t, text, `"evidence":[]`)
-	require.Nil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
+	require.NotNil(t, server.localization.block("search", "symbols", map[string]any{"query": "better anchor"}))
 }
 
 func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testing.T) {
@@ -249,11 +250,13 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	require.False(t, result.IsError, text)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(text), &envelope))
-	require.Equal(t, localizationStateInactive, envelope.Completion.State)
+	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.Empty(t, envelope.Completion.ExactSymbol)
-	require.Equal(t, "continue", envelope.Completion.RequiredAction)
-	require.Zero(t, envelope.Completion.AllowedToolCalls)
+	require.Equal(t, "recover_once", envelope.Completion.RequiredAction)
+	require.Equal(t, 1, envelope.Completion.AllowedToolCalls)
+	require.Equal(t, localizationRecoveryOperations, envelope.Completion.AllowedOperations)
 	require.Empty(t, envelope.Completion.AllowedSymbols)
+	require.False(t, envelope.Terminal)
 	require.NotEmpty(t, envelope.Evidence)
 	require.NotEmpty(t, envelope.Symbols)
 
@@ -263,13 +266,16 @@ func TestHandleExploreLocalizeReturnsBoundedEvidenceWhenConfidenceIsLow(t *testi
 	preferred := terminal.refinementSymbol
 	authorized := append([]string(nil), terminal.refinementSymbols...)
 	terminal.mu.Unlock()
-	require.Equal(t, localizationStateInactive, state)
+	require.Equal(t, localizationStateNeedsRecovery, state)
 	require.Empty(t, preferred)
 	require.Empty(t, authorized)
-	require.Nil(t, terminal.block("search", "symbols", map[string]any{"query": "locale formatter"}))
-	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
-	blocked, reserved := terminal.authorize("read", "source", candidateRead)
+	blocked, reserved := terminal.authorize("search", "symbols", map[string]any{"query": "locale formatter"})
 	require.Nil(t, blocked)
+	require.True(t, reserved)
+	require.Equal(t, localizationStateAnswerReady, terminal.finishReservedRead(true).State)
+	candidateRead := map[string]any{"target": map[string]any{"symbol": envelope.Symbols[0]}}
+	blocked, reserved = terminal.authorize("read", "source", candidateRead)
+	require.NotNil(t, blocked)
 	require.False(t, reserved)
 }
 

@@ -95,14 +95,17 @@ func TestLocalizationEvidencePolicyRejectsWeakFindLocaliserOwnerFromSQLiteCSharp
 		newLocalizationCompletion(true, ""), `FindLocaliser handles the literal "ku"`,
 		[]exploreTarget{target}, exploreDefaultBudgetTokens,
 	)
-	require.Equal(t, localizationStateAnswerReady, completion.State)
+	require.Equal(t, localizationStateNeedsRecovery, completion.State)
 	require.False(t, completion.Enforceable)
+	require.Equal(t, "recover_once", completion.RequiredAction)
+	require.Equal(t, localizationRecoveryOperations, completion.AllowedOperations)
 
 	body, ok := singleTextContent(result)
 	require.True(t, ok)
 	var envelope localizationExploreEnvelope
 	require.NoError(t, json.Unmarshal([]byte(body), &envelope))
-	require.True(t, envelope.Terminal)
+	require.False(t, envelope.Terminal)
+	require.Equal(t, localizationStateNeedsRecovery, envelope.Completion.State)
 	require.False(t, envelope.Completion.Enforceable)
 	require.Len(t, envelope.Evidence, 1)
 	require.Empty(t, envelope.Evidence[0].Provenance)

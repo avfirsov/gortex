@@ -445,8 +445,11 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	// the cheap terminal gate before operation lookup, shorthand resolution,
 	// overlay construction, and legacy dispatch. Non-navigation facades never
 	// enter this gate.
+	recoveryGeneration := uint64(0)
 	if !newUserExploreFlow {
-		if blocked := terminal.interceptAnswerReady(facade, operation); blocked != nil {
+		var blocked *mcpgo.CallToolResult
+		blocked, recoveryGeneration = terminal.interceptAnswerReady(facade, operation, req.GetArguments())
+		if blocked != nil {
 			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
 			return blocked, nil
 		}
@@ -495,6 +498,9 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	}
 	input, _ := req.Params.Arguments.(map[string]any)
 	if invalid := validateFacadeInput(spec, input); invalid != nil {
+		if completion, consumed := terminal.consumeInvalidRecovery(facade, operation, recoveryGeneration); consumed {
+			invalid, _ = decorateExhaustedLocalizationReadFailure(invalid, nil, completion, spec)
+		}
 		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
 		return invalid, nil
 	}
@@ -539,15 +545,15 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReservation != 0 {
 		localizationReadSucceeded = succeeded
-		// Finalize before decorating so a preclassified route can expose its
-		// next exact hop in this same response. An exhausted failed allowance is
-		// also converted to a tool error result carrying answer_ready; otherwise
-		// a Go handler error would hide the terminal contract from the host.
+		// Finalize before decorating so a preclassified route or bounded recovery
+		// can expose its next state in this same response. Every failed allowance
+		// is converted to a tool error carrying either its one restored retry or
+		// terminal answer_ready; a Go handler error must not hide the contract.
 		completion := terminal.finishReservedReadToken(localizationReadReservation, succeeded)
 		localizationReadReservation = 0
 		if succeeded {
 			result = decorateLocalizationReadResult(result, completion)
-		} else if completion.State == localizationStateAnswerReady {
+		} else {
 			result, err = decorateExhaustedLocalizationReadFailure(result, err, completion, spec)
 		}
 	}

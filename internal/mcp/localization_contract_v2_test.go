@@ -159,7 +159,7 @@ func TestLocalizationEnforceabilityPersistsOnlyFromProvenRoute(t *testing.T) {
 		t.Fatalf("advisory read = (%#v, %v)", blocked, reserved)
 	}
 	weak := advisory.finishReservedRead(true)
-	if weak.State != localizationStateAnswerReady || weak.Enforceable {
+	if weak.State != localizationStateNeedsRecovery || weak.Enforceable || weak.RequiredAction != "recover_once" {
 		t.Fatalf("unproven read upgraded enforceability: %#v", weak)
 	}
 }

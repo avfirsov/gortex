@@ -13,26 +13,31 @@ const (
 	localizationStateInactive          = ""
 	localizationStateNeedsExactRead    = "needs_exact_read"
 	localizationStateNeedsRefinement   = "needs_refinement"
+	localizationStateNeedsRecovery     = "needs_recovery"
 	localizationStateRefineInFlight    = "refinement_in_flight"
 	localizationStateExactReadInFlight = "exact_read_in_flight"
+	localizationStateRecoveryInFlight  = "recovery_in_flight"
 	localizationStateAnswerReady       = "answer_ready"
 	localizationTerminalContractV2     = 2
 )
+
+var localizationRecoveryOperations = []string{"search.text", "search.symbols", "read.source"}
 
 // localizationCompletion is the host-neutral terminality contract returned by
 // explore(operation:"localize"). Hosts may stop the turn from this payload;
 // the server also enforces it for later Gortex navigation calls in the same
 // MCP session.
 type localizationCompletion struct {
-	State            string   `json:"state"`
-	Scope            string   `json:"scope"`
-	RequiredAction   string   `json:"required_action"`
-	Instruction      string   `json:"instruction,omitempty"`
-	AllowedToolCalls int      `json:"allowed_tool_calls"`
-	ContractVersion  int      `json:"contract_version"`
-	Enforceable      bool     `json:"enforceable"`
-	ExactSymbol      string   `json:"exact_symbol,omitempty"`
-	AllowedSymbols   []string `json:"allowed_symbols,omitempty"`
+	State             string   `json:"state"`
+	Scope             string   `json:"scope"`
+	RequiredAction    string   `json:"required_action"`
+	Instruction       string   `json:"instruction,omitempty"`
+	AllowedToolCalls  int      `json:"allowed_tool_calls"`
+	ContractVersion   int      `json:"contract_version"`
+	Enforceable       bool     `json:"enforceable"`
+	ExactSymbol       string   `json:"exact_symbol,omitempty"`
+	AllowedSymbols    []string `json:"allowed_symbols,omitempty"`
+	AllowedOperations []string `json:"allowed_operations,omitempty"`
 
 	// Route hops stay session-only, while AllowedSymbols exposes the exact
 	// bounded authorization set carried by the wire contract.
@@ -90,6 +95,18 @@ func localizationContractFor(completion localizationCompletion) localizationTerm
 	return localizationTerminalContract{
 		Completion: completion,
 		Terminal:   completion.State == localizationStateAnswerReady,
+	}
+}
+
+func newLocalizationRecoveryCompletion() localizationCompletion {
+	return localizationCompletion{
+		State:             localizationStateNeedsRecovery,
+		Scope:             "localization",
+		RequiredAction:    "recover_once",
+		Instruction:       `Make exactly one bounded Gortex recovery call: search(operation:"text" or "symbols", query:<specific anchor>) or read(operation:"source", target:{symbol:<exact id>}); then respond from the returned evidence.`,
+		AllowedToolCalls:  1,
+		ContractVersion:   localizationTerminalContractV2,
+		AllowedOperations: append([]string(nil), localizationRecoveryOperations...),
 	}
 }
 
@@ -195,6 +212,7 @@ type localizationTerminalState struct {
 	exactReadRoute               localizationRefinementRoute
 	correctionRetriesRemaining   uint8
 	refinementRetriesRemaining   uint8
+	recoveryRetriesRemaining     uint8
 	// Read reservations are tokenized independently of localization calls. A
 	// reset or newly armed task invalidates an old token, so a late read cannot
 	// finish (or decorate itself with) a newer task's contract.
@@ -247,6 +265,7 @@ func (s *localizationTerminalState) reset() {
 	s.exactReadRoute = localizationRefinementRoute{}
 	s.correctionRetriesRemaining = 0
 	s.refinementRetriesRemaining = 0
+	s.recoveryRetriesRemaining = 0
 	s.readReservationToken = 0
 	s.readReservationGen = 0
 	s.enforceableOnAnswerReady = false
@@ -366,6 +385,7 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	s.exactReadRoute = localizationRefinementRoute{}
 	s.correctionRetriesRemaining = 0
 	s.refinementRetriesRemaining = 0
+	s.recoveryRetriesRemaining = 0
 	s.readReservationToken = 0
 	s.readReservationGen = 0
 	s.enforceableOnAnswerReady = completion.enforceableOnAnswerReady
@@ -382,6 +402,9 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	} else {
 		s.correctionSymbol = ""
 		s.correctionRoute = localizationRefinementRoute{}
+	}
+	if completion.State == localizationStateNeedsRecovery {
+		s.recoveryRetriesRemaining = 1
 	}
 	s.taskFingerprint = fingerprint
 	// The digest follows the contract: an inactive commit (keepOpenForTask)
@@ -401,6 +424,14 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 		}
 	case localizationStateNeedsExactRead, localizationStateExactReadInFlight:
 		completion = newLocalizationExactReadCompletion(s.exactSymbol, s.exactReadIsCorrection)
+	case localizationStateNeedsRecovery, localizationStateRecoveryInFlight:
+		completion = newLocalizationRecoveryCompletion()
+		if s.state == localizationStateRecoveryInFlight {
+			completion.State = localizationStateRecoveryInFlight
+			completion.RequiredAction = "wait"
+			completion.Instruction = "The bounded Gortex recovery call is already in progress."
+			completion.AllowedToolCalls = 0
+		}
 	case localizationStateInactive:
 		completion = newLocalizationOpenCompletion()
 	default:
@@ -416,17 +447,30 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 
 // interceptAnswerReady is the cheap pre-validation gate used by facade
 // dispatch. It makes localization terminality independent of operation
-// validity while deliberately leaving non-navigation facades untouched.
-func (s *localizationTerminalState) interceptAnswerReady(facade, operation string) *mcpgo.CallToolResult {
+// validity, and consumes an unsupported advisory recovery attempt before a
+// schema error can create an unbounded retry loop. Non-navigation facades stay
+// untouched.
+func (s *localizationTerminalState) interceptAnswerReady(facade, operation string, arguments map[string]any) (*mcpgo.CallToolResult, uint64) {
 	if s == nil || !localizationNavigationFacade(facade) {
-		return nil
+		return nil, 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != localizationStateAnswerReady {
-		return nil
+	switch s.state {
+	case localizationStateAnswerReady:
+		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
+	case localizationStateNeedsRecovery:
+		if localizationRecoveryAllows(facade, operation, arguments) {
+			// Carry the task generation through later schema validation. A stale
+			// invalid request must never consume a newly committed task's recovery.
+			return nil, s.generation
+		}
+		s.state = localizationStateAnswerReady
+		s.recoveryRetriesRemaining = 0
+		return localizationRecoveryRejectedResult(s.completionLocked(), facade, operation), 0
+	default:
+		return nil, 0
 	}
-	return localizationTerminalResult(s.completionLocked(), facade, operation)
 }
 
 func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
@@ -435,6 +479,55 @@ func (s *localizationTerminalState) refinementAllowsLocked(symbol string) bool {
 	}
 	_, authorized := s.refinementRoutes[symbol]
 	return authorized
+}
+
+func localizationRecoveryAllows(facade, operation string, arguments map[string]any) bool {
+	switch facade + "." + operation {
+	case "search.text", "search.symbols":
+		query, _ := arguments["query"].(string)
+		return strings.TrimSpace(query) != ""
+	case "read.source":
+		return exactLocalizationSymbol(arguments) != ""
+	default:
+		return false
+	}
+}
+
+func localizationRecoveryOperationAllowed(facade, operation string) bool {
+	switch facade + "." + operation {
+	case "search.text", "search.symbols", "read.source":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *localizationTerminalState) consumeInvalidRecovery(facade, operation string, generation uint64) (localizationCompletion, bool) {
+	if s == nil || generation == 0 || !localizationRecoveryOperationAllowed(facade, operation) {
+		return newLocalizationOpenCompletion(), false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != localizationStateNeedsRecovery || s.generation != generation {
+		return newLocalizationOpenCompletion(), false
+	}
+	s.state = localizationStateAnswerReady
+	s.recoveryRetriesRemaining = 0
+	return s.completionLocked(), true
+}
+
+func localizationRecoveryRejectedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
+	return newStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeLocalizationTerminal,
+		Message:   "the one bounded localization recovery call must be search.text, search.symbols, or read.source with a concrete query or symbol; localization is now terminal",
+		Retriable: false,
+		Data: map[string]any{
+			"contract":           localizationContractFor(completion),
+			"facade":             facade,
+			"operation":          operation,
+			"allowed_operations": append([]string(nil), localizationRecoveryOperations...),
+		},
+	}, true)
 }
 
 // beginLocalize reserves the only localization handler slot for this session.
@@ -458,6 +551,11 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 	}
 	if s.state != localizationStateInactive && !newUserTask {
 		completion := s.completionLocked()
+		if s.state == localizationStateNeedsRecovery {
+			s.state = localizationStateAnswerReady
+			s.recoveryRetriesRemaining = 0
+			return 0, localizationRecoveryRejectedResult(s.completionLocked(), "explore", "localize")
+		}
 		// A repeat localize against a terminal contract gets the same compact,
 		// typed non-retriable signal as every other post-terminal navigation
 		// call. The original successful result already holds the evidence.
@@ -553,6 +651,15 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 	if s.state == localizationStateAnswerReady {
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	}
+	if s.state == localizationStateNeedsRecovery {
+		if localizationRecoveryAllows(facade, operation, arguments) {
+			s.state = localizationStateRecoveryInFlight
+			return nil, s.beginReadReservationLocked()
+		}
+		s.state = localizationStateAnswerReady
+		s.recoveryRetriesRemaining = 0
+		return localizationRecoveryRejectedResult(s.completionLocked(), facade, operation), 0
+	}
 	if s.state == localizationStateNeedsExactRead && facade == "read" && operation == "source" && exactLocalizationSymbol(arguments) == s.exactSymbol {
 		s.inFlightImplementationSymbol = s.exactReadRoute.implementationSymbol
 		s.inFlightEnforceable = s.exactReadRoute.enforceable
@@ -583,6 +690,8 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 		message = fmt.Sprintf("localization permits exactly one read(operation:\"source\") for %q; other navigation calls are blocked", s.refinementSymbol)
 	case localizationStateRefineInFlight:
 		message = "the permitted localization refinement read is already in progress"
+	case localizationStateRecoveryInFlight:
+		message = "the bounded localization recovery call is already in progress"
 	}
 	return newStructuredErrorResult(StructuredError{
 		ErrorCode: ErrCodeLocalizationComplete,
@@ -631,9 +740,23 @@ func (s *localizationTerminalState) finishReservedReadToken(token uint64, succes
 	s.readReservationToken = 0
 	s.readReservationGen = 0
 	switch s.state {
+	case localizationStateRecoveryInFlight:
+		if success {
+			s.state = localizationStateAnswerReady
+			s.recoveryRetriesRemaining = 0
+			return s.completionLocked()
+		}
+		if s.recoveryRetriesRemaining > 0 {
+			s.recoveryRetriesRemaining--
+			s.state = localizationStateNeedsRecovery
+			return s.completionLocked()
+		}
+		s.state = localizationStateAnswerReady
+		return s.completionLocked()
 	case localizationStateExactReadInFlight:
 		implementationSymbol := s.inFlightImplementationSymbol
 		routeEnforceable := s.inFlightEnforceable
+		wasCorrection := s.exactReadIsCorrection
 		s.inFlightImplementationSymbol = ""
 		s.inFlightEnforceable = false
 		s.inFlightCorrectionSymbol = ""
@@ -641,19 +764,24 @@ func (s *localizationTerminalState) finishReservedReadToken(token uint64, succes
 			if routeEnforceable {
 				s.enforceableOnAnswerReady = true
 			}
-			if s.exactReadIsCorrection && implementationSymbol != "" {
+			if wasCorrection && implementationSymbol != "" {
 				s.state = localizationStateNeedsExactRead
 				s.exactSymbol = implementationSymbol
 				s.exactReadRoute = localizationRefinementRoute{enforceable: routeEnforceable}
 				return s.completionLocked()
 			}
-			s.state = localizationStateAnswerReady
 			s.exactSymbol = ""
 			s.correctionSymbol = ""
 			s.correctionRoute = localizationRefinementRoute{}
 			s.exactReadIsCorrection = false
 			s.exactReadRoute = localizationRefinementRoute{}
 			s.correctionRetriesRemaining = 0
+			if !wasCorrection && !s.enforceableOnAnswerReady {
+				s.state = localizationStateNeedsRecovery
+				s.recoveryRetriesRemaining = 1
+				return s.completionLocked()
+			}
+			s.state = localizationStateAnswerReady
 			return s.completionLocked()
 		}
 		s.enforceableOnAnswerReady = false
@@ -701,6 +829,11 @@ func (s *localizationTerminalState) finishReservedReadToken(token uint64, succes
 				s.exactReadIsCorrection = true
 				s.exactReadRoute = correctionRoute
 				s.correctionRetriesRemaining = 1
+				return s.completionLocked()
+			}
+			if !enforceable {
+				s.state = localizationStateNeedsRecovery
+				s.recoveryRetriesRemaining = 1
 				return s.completionLocked()
 			}
 			s.state = localizationStateAnswerReady

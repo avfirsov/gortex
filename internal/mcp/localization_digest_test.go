@@ -140,7 +140,16 @@ func TestRefinementAllowsOneAlternateRankedCandidateRead(t *testing.T) {
 	state := &localizationTerminalState{}
 	preferred := "repo/storage/disk.go::DiskStorage.Load"
 	alternate := "repo/storage/cloud.go::CloudStorage.Load"
-	state.armRefinementForTask("find the storage load implementations", preferred, []string{preferred, alternate}, testEvidenceDigest())
+	state.armRefinementRoutesForTask(
+		"find the storage load implementations",
+		preferred,
+		[]string{preferred, alternate},
+		map[string]localizationRefinementRoute{
+			preferred: {enforceable: true},
+			alternate: {enforceable: true},
+		},
+		testEvidenceDigest(),
+	)
 
 	if completion := state.completionLocked(); !strings.Contains(completion.RequiredAction, "recommended") ||
 		!strings.Contains(completion.RequiredAction, "any returned candidate") {
@@ -479,10 +488,11 @@ func TestPermittedRefinementReadInvokesHandlerAndPreservesPayload(t *testing.T) 
 		searchCalls++
 		return mcpgo.NewToolResultText("unexpected search result"), nil
 	})
-	srv.localizationFor(ctx).armRefinementForTask(
+	srv.localizationFor(ctx).armRefinementRoutesForTask(
 		"find the storage load implementation",
 		symbol,
 		[]string{symbol},
+		map[string]localizationRefinementRoute{symbol: {enforceable: true}},
 		testEvidenceDigest(),
 	)
 

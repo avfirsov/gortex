@@ -14,7 +14,7 @@ func TestRefinementRouteConcreteReadCompletesInOneCall(t *testing.T) {
 		"find the replace implementation",
 		concrete,
 		[]string{concrete},
-		map[string]localizationRefinementRoute{concrete: {}},
+		map[string]localizationRefinementRoute{concrete: {enforceable: true}},
 		nil,
 	)
 
@@ -346,7 +346,7 @@ func TestGenericCorrectionSharesOneRetryAcrossRouteHops(t *testing.T) {
 	}
 }
 
-func TestWeakPreferredReadWithoutPrevalidatedAlternateTerminates(t *testing.T) {
+func TestWeakPreferredReadWithoutPrevalidatedAlternateOffersRecovery(t *testing.T) {
 	state := &localizationTerminalState{}
 	preferred := "repo/search.go::findCandidate"
 	unproven := "repo/search.go::validateCandidate"
@@ -354,7 +354,10 @@ func TestWeakPreferredReadWithoutPrevalidatedAlternateTerminates(t *testing.T) {
 
 	requireRefinementSourceReservation(t, state, preferred)
 	completion := state.finishReservedRead(true)
-	requireRefinementCompletion(t, completion, localizationStateAnswerReady, "", 0)
+	requireRefinementCompletion(t, completion, localizationStateNeedsRecovery, "", 1)
+	if completion.RequiredAction != "recover_once" {
+		t.Fatalf("weak preferred completion action = %q, want recover_once", completion.RequiredAction)
+	}
 }
 
 func TestInitialRefinementFailureRestoresOnlyOnce(t *testing.T) {

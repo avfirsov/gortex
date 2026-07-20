@@ -105,6 +105,12 @@ func localizationFinalizeCompletionEvidence(
 	completion.enforceableOnAnswerReady = false
 	proof := localizationStrongEvidenceForCompletion(completion, targets)
 	if !localizationEvidenceProofVisible(proof, envelope) {
+		if completion.State == localizationStateAnswerReady &&
+			(len(envelope.Evidence) > 0 || len(envelope.Symbols) > 0) {
+			recovery := newLocalizationRecoveryCompletion()
+			recovery.digest = completion.digest
+			return recovery
+		}
 		return completion
 	}
 	switch completion.State {

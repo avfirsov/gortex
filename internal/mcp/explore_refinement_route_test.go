@@ -210,29 +210,29 @@ func TestBuildLocalizationRefinementResultKeepsWireAndStateAuthorizationEqual(t 
 	}
 }
 
-func TestBuildLocalizationRefinementResultStaysOpenWithoutValidPreferredRoute(t *testing.T) {
+func TestBuildLocalizationRefinementResultOffersRecoveryWithoutValidPreferredRoute(t *testing.T) {
 	unhydrated := &graph.Node{ID: "repo/unhydrated", Name: "replace", Kind: graph.KindMethod, FilePath: "src/replace.rs"}
 	targets := []exploreTarget{{node: unhydrated}}
 	result, completion, bounded, _ := buildLocalizationRefinementResultForTask(
 		unhydrated.ID, "find the replace implementation", targets, exploreDefaultBudgetTokens,
 		exploreLocalizationRefinementRoutes(targets),
 	)
-	if completion.State != localizationStateInactive || completion.RequiredAction != "continue" || completion.AllowedToolCalls != 0 {
-		t.Fatalf("invalid preferred route completion = %#v, want explicit open contract", completion)
+	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != "recover_once" || completion.AllowedToolCalls != 1 {
+		t.Fatalf("invalid preferred route completion = %#v, want bounded recovery contract", completion)
 	}
 	if len(bounded) != 0 {
 		t.Fatalf("invalid preferred route retained authorization: %v", bounded)
 	}
 	text, ok := singleTextContent(result)
 	if !ok {
-		t.Fatal("open localization result has no single text payload")
+		t.Fatal("recovery localization result has no single text payload")
 	}
 	var envelope localizationExploreEnvelope
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
-		t.Fatalf("decode open localization envelope: %v", err)
+		t.Fatalf("decode recovery localization envelope: %v", err)
 	}
-	if envelope.Completion.State != localizationStateInactive || envelope.Completion.RequiredAction != "continue" || len(envelope.Completion.AllowedSymbols) != 0 {
-		t.Fatalf("wire completion = %#v, want open without authorization", envelope.Completion)
+	if envelope.Completion.State != localizationStateNeedsRecovery || envelope.Completion.RequiredAction != "recover_once" || len(envelope.Completion.AllowedSymbols) != 0 {
+		t.Fatalf("wire completion = %#v, want bounded recovery without a prevalidated route", envelope.Completion)
 	}
 }
 
