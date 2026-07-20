@@ -101,7 +101,7 @@ type exploreCausalNeighbor struct {
 
 const (
 	exploreCausalSeedLimit       = 3
-	exploreCausalDepth           = 4
+	exploreCausalDepth           = 2
 	exploreCausalAdmissionBudget = 10 * time.Millisecond
 	exploreDraftPrimaryLimit     = 3
 	exploreDraftTotalLimit       = 5
@@ -196,6 +196,18 @@ func exploreQueryIsConceptTask(query string) bool {
 	return plain >= 6 && plain*2 >= len(fields) && codeShaped*2 < len(fields)
 }
 
+// exploreQueryClass applies the prose-aware concept decision consistently.
+// The generic classifier intentionally treats compact parentheses and paths as
+// signatures/lookups; long issue paraphrases may contain those shapes as small
+// embedded examples and must remain concept localization everywhere.
+func exploreQueryClass(query string) rerank.QueryClass {
+	class := rerank.ClassifyQuery(query)
+	if class != rerank.QueryClassConcept && exploreQueryIsConceptTask(query) {
+		return rerank.QueryClassConcept
+	}
+	return class
+}
+
 func exploreQueryHasCallAnchor(query, name string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -252,10 +264,6 @@ func exploreQueryHasPathSymbolAnchor(query string, n *graph.Node) bool {
 	return false
 }
 
-func exploreAdmitCausalSeed(conceptTask, explicit, strong bool, admitted int, elapsed time.Duration) bool {
-	return conceptTask && !explicit && strong && admitted < exploreCausalSeedLimit && elapsed < exploreCausalAdmissionBudget
-}
-
 func exploreStrongCausalSeed(query string, target exploreTarget) bool {
 	n := target.node
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) || exploreDraftIsTestNode(n) || exploreIdentifierSegmentCount(n.Name) < 2 {
@@ -265,6 +273,98 @@ func exploreStrongCausalSeed(query string, target exploreTarget) bool {
 	overlap, longest := exploreDraftTermOverlap(queryTerms, n)
 	bodyOverlap := exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(target.source))
 	return overlap >= 2 || bodyOverlap >= 2 || (overlap == 1 && longest >= 5)
+}
+
+type exploreCausalSeedMetric struct {
+	index             int
+	crossFileCallees  int
+	callableCallees   int
+	identifierOverlap int
+	bodyOverlap       int
+	longest           int
+	generic           bool
+}
+
+// selectExploreCausalSeeds spends the fixed depth-2 budget only after every
+// final candidate has received the same source and depth-1 hydration. Selection
+// is therefore evidence-based rather than arrival-order based: task-aligned
+// production callables that cross a file boundary lead, while leaf accessors
+// and configuration gates remain eligible only when stronger routes are absent.
+func selectExploreCausalSeeds(query string, targets []exploreTarget, conceptTask, explicit bool) []int {
+	if !conceptTask || explicit || len(targets) == 0 {
+		return nil
+	}
+	queryTerms := exploreTerminalTerms(query)
+	metrics := make([]exploreCausalSeedMetric, 0, len(targets))
+	for index, target := range targets {
+		if !exploreHydratedProductionCallable(target) || !exploreStrongCausalSeed(query, target) {
+			continue
+		}
+		identifierOverlap, longest := exploreDraftTermOverlap(queryTerms, target.node)
+		metric := exploreCausalSeedMetric{
+			index:             index,
+			identifierOverlap: identifierOverlap,
+			bodyOverlap:       exploreDraftTermSetOverlap(queryTerms, exploreTerminalTerms(target.source)),
+			longest:           longest,
+			generic:           exploreDraftGenericCandidate(target.node, target.source),
+		}
+		seedPath := exploreNormalizedPath(nodeDisplayPath(target.node))
+		for _, callee := range target.callees {
+			if callee == nil || callee.ID == "" || exploreDraftIsTestNode(callee) ||
+				(callee.Kind != graph.KindFunction && callee.Kind != graph.KindMethod) {
+				continue
+			}
+			metric.callableCallees++
+			calleePath := exploreNormalizedPath(nodeDisplayPath(callee))
+			if seedPath != "" && calleePath != "" && calleePath != seedPath {
+				metric.crossFileCallees++
+			}
+		}
+		metrics = append(metrics, metric)
+	}
+	if len(metrics) == 0 {
+		return nil
+	}
+	alignment := func(metric exploreCausalSeedMetric) int {
+		body := metric.bodyOverlap
+		if body > 2 {
+			body = 2
+		}
+		return metric.identifierOverlap + body
+	}
+	sort.SliceStable(metrics, func(i, j int) bool {
+		a, b := metrics[i], metrics[j]
+		if (a.crossFileCallees > 0) != (b.crossFileCallees > 0) {
+			return a.crossFileCallees > 0
+		}
+		if a.crossFileCallees != b.crossFileCallees {
+			return a.crossFileCallees > b.crossFileCallees
+		}
+		if (a.callableCallees > 0) != (b.callableCallees > 0) {
+			return a.callableCallees > 0
+		}
+		if a.generic != b.generic {
+			return !a.generic
+		}
+		if alignment(a) != alignment(b) {
+			return alignment(a) > alignment(b)
+		}
+		if a.identifierOverlap != b.identifierOverlap {
+			return a.identifierOverlap > b.identifierOverlap
+		}
+		if a.longest != b.longest {
+			return a.longest > b.longest
+		}
+		return a.index < b.index
+	})
+	if len(metrics) > exploreCausalSeedLimit {
+		metrics = metrics[:exploreCausalSeedLimit]
+	}
+	selected := make([]int, len(metrics))
+	for index, metric := range metrics {
+		selected[index] = metric.index
+	}
+	return selected
 }
 
 // minimumExploreCausalHops derives a deterministic, bounded reachable set from
@@ -781,7 +881,7 @@ func exploreDraftGenericCandidate(n *graph.Node, source string) bool {
 	nameTerms := rerank.Tokenize(n.Name)
 	if len(nameTerms) > 0 && len(nameTerms) <= 3 {
 		switch strings.ToLower(nameTerms[0]) {
-		case "get", "set", "is", "has":
+		case "get", "set", "is", "has", "no":
 			return true
 		}
 	}
@@ -1087,7 +1187,7 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 		return false
 	}
 	query := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -1112,8 +1212,9 @@ func exploreAnswerReady(task string, targets []exploreTarget) bool {
 	matchedNode := func(node *graph.Node) int { return matchedNodeFor(node, queryTerms) }
 	head := targets[0]
 	headMatches := matchedNode(head.node)
+	strongSourceLiteral := head.sourceLiteral && head.sourceLiteralCallee && !head.exactContentAmbiguous
 	if class == rerank.QueryClassConcept && !exploreLocalizationExplicitAnchor(query, head.node) &&
-		!exploreSyntacticAnchorEvidenceReady(task, targets) {
+		!exploreSyntacticAnchorEvidenceReady(task, targets) && !strongSourceLiteral {
 		return false
 	}
 
@@ -1333,7 +1434,7 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 		return true
 	}
 
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassSignature {
 		signature := exploreNormalizedAnchor(retrieval.Signature)
 		return signature != "" && strings.Contains(normalizedQuery, " "+signature+" ")
@@ -1349,7 +1450,7 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 // allowed post-localization source read.
 func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) string {
 	query := shapeExploreQuery(task)
-	if rerank.ClassifyQuery(query) == rerank.QueryClassConcept {
+	if exploreQueryClass(query) == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
 	for _, target := range targets {
@@ -1370,7 +1471,7 @@ func exploreLocalizationExplicitTarget(task string, targets []exploreTarget) str
 // stable final tie-breaker.
 func exploreLocalizationExactTarget(task string, targets []exploreTarget) string {
 	query := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(query)
+	class := exploreQueryClass(query)
 	if class == rerank.QueryClassConcept {
 		query = stripLeadingExploreDirective(query)
 	}
@@ -1805,7 +1906,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// untouched. The original task is still shown in the header so the agent
 	// sees what it asked.
 	searchQuery := shapeExploreQuery(task)
-	queryClass := rerank.ClassifyQuery(searchQuery)
+	queryClass := exploreQueryClass(searchQuery)
 	if queryClass == rerank.QueryClassConcept {
 		searchQuery = stripLeadingExploreDirective(searchQuery)
 	}
@@ -1979,8 +2080,6 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			}
 		}
 	}
-	causalAdmitted := 0
-	var causalElapsed time.Duration
 	artifactTargets := artifactLane.targets
 	targets := make([]exploreTarget, 0, len(artifactTargets)+len(cands))
 	// Artifact evidence leads only when the strong classifier activated its
@@ -2006,51 +2105,52 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.callers = ringNeighbors(callers.Nodes, n.ID, exploreRingCap)
 		}
 
-		calleeOpts := ringOpts
-		expanded := exploreAdmitCausalSeed(
-			queryClass == rerank.QueryClassConcept,
-			explicitTarget,
-			exploreStrongCausalSeed(searchQuery, t),
-			causalAdmitted,
-			causalElapsed,
-		)
-		if expanded {
-			calleeOpts.Depth = exploreCausalDepth
-			causalAdmitted++
-		}
-		started := time.Now()
-		callees := eng.GetCallChain(n.ID, calleeOpts)
-		if expanded {
-			causalElapsed += time.Since(started)
-		}
+		callees := eng.GetCallChain(n.ID, ringOpts)
 		if callees != nil {
 			t.directCalleesComplete = !callees.Truncated && !callees.BudgetHit && !callees.LowerBound
-			if expanded {
-				neighbors := minimumExploreCausalHops(n.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
-				direct := make([]*graph.Node, 0, exploreRingCap)
-				for _, neighbor := range neighbors {
-					if neighbor.hop == 1 {
-						direct = append(direct, neighbor.node)
-					} else {
-						t.causalCallees = append(t.causalCallees, neighbor)
-					}
-				}
-				if len(neighbors) > 0 {
-					var projectionComplete bool
-					t.callees, projectionComplete = ringNeighborsProjection(direct, n.ID, exploreRingCap)
-					t.directCalleesComplete = t.directCalleesComplete && projectionComplete
-				} else {
-					var projectionComplete bool
-					t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
-					t.directCalleesComplete = t.directCalleesComplete && projectionComplete
-				}
-			} else {
-				var projectionComplete bool
-				t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
-				t.directCalleesComplete = t.directCalleesComplete && projectionComplete
-			}
+			var projectionComplete bool
+			t.callees, projectionComplete = ringNeighborsProjection(callees.Nodes, n.ID, exploreRingCap)
+			t.directCalleesComplete = t.directCalleesComplete && projectionComplete
 		}
 		targets = append(targets, t)
+	}
+
+	// Every final symbol now has equally-bounded depth-1 evidence. Spend the
+	// deeper budget in a second pass so a strong route ranked fourth cannot be
+	// starved by three earlier leaf/accessor collisions.
+	symbolTargets := targets[len(artifactTargets):]
+	var causalElapsed time.Duration
+	for _, index := range selectExploreCausalSeeds(
+		searchQuery, symbolTargets, queryClass == rerank.QueryClassConcept, explicitTarget,
+	) {
+		if causalElapsed >= exploreCausalAdmissionBudget {
+			break
+		}
+		target := &symbolTargets[index]
+		calleeOpts := ringOpts
+		calleeOpts.Depth = exploreCausalDepth
+		started := time.Now()
+		callees := eng.GetCallChain(target.node.ID, calleeOpts)
+		causalElapsed += time.Since(started)
+		if callees == nil {
+			continue
+		}
+		target.directCalleesComplete = !callees.Truncated && !callees.BudgetHit && !callees.LowerBound
+		neighbors := minimumExploreCausalHops(target.node.ID, callees, opts, exploreCausalDepth, ringOpts.Limit)
+		direct := make([]*graph.Node, 0, exploreRingCap)
+		target.causalCallees = target.causalCallees[:0]
+		for _, neighbor := range neighbors {
+			if neighbor.hop == 1 {
+				direct = append(direct, neighbor.node)
+			} else {
+				target.causalCallees = append(target.causalCallees, neighbor)
+			}
+		}
+		if len(neighbors) > 0 {
+			var projectionComplete bool
+			target.callees, projectionComplete = ringNeighborsProjection(direct, target.node.ID, exploreRingCap)
+			target.directCalleesComplete = target.directCalleesComplete && projectionComplete
+		}
 	}
 	if exploreQueryIsConceptTask(task) && len(targets) > len(artifactTargets) {
 		symbolTargets := promoteExploreDivergentDefaultOwner(task, targets[len(artifactTargets):], s.graph, maxSymbols, func(node *graph.Node) string {
@@ -2066,7 +2166,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !req.GetBool("localize", false) {
 		return mcp.NewToolResultText(s.renderExplore(task, targets, budget)), nil
 	}
-	symbolTargets := targets[len(artifactTargets):]
+	symbolTargets = targets[len(artifactTargets):]
 	// An implementation-intent query expands abstract seeds into their
 	// concrete implementors before terminality is judged, so the envelope
 	// carries the code that changes and answer_ready can see it.
@@ -2078,6 +2178,11 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// rank together; implementation-intent queries are exempt because
 		// they ask for exactly those members.
 		symbolTargets = preserveExploreDivergentDefaultOrder(s.foldMemberOwners(ctx, symbolTargets))
+		// Owner folding is weaker than a unique source-literal callsite whose
+		// callee was resolved and hydrated. Re-promote that proof after folding
+		// so terminality is judged against the same strongest evidence that the
+		// final envelope exposes, rather than against a synthetic owner row.
+		symbolTargets = promoteExploreStrongSourceLiteralTarget(symbolTargets)
 		targets = append(targets[:len(artifactTargets):len(artifactTargets)], symbolTargets...)
 	}
 	answerReady := exploreAnswerReady(task, symbolTargets) || artifactLane.ready
@@ -2207,7 +2312,7 @@ func (s *Server) completeEmptyLocalization(ctx context.Context, task string, bud
 // literal symbol and signature queries retain their direct-only behavior.
 func exploreAllowsStructuralBody(task string) bool {
 	shaped := shapeExploreQuery(task)
-	class := rerank.ClassifyQuery(shaped)
+	class := exploreQueryClass(shaped)
 	_, directoryQualified := exploreQueryPathAnchors(shaped)
 	return !directoryQualified && class != rerank.QueryClassSymbol && class != rerank.QueryClassSignature
 }
@@ -3390,6 +3495,10 @@ const (
 	// be worth repeating — below it the "clause" is a sentence fragment
 	// whose repetition would over-weight one or two words.
 	shapeInlineMinLeadChars = 20
+	// A long single-line paraphrase with sentence structure is report-like even
+	// when it contains no flags or hashes. Short focused queries stay byte-for-
+	// byte unchanged.
+	shapeInlineLongQueryChars = 180
 	// shaMinHexLen / shaMaxHexLen bound a commit-SHA-shaped token: git
 	// abbreviates to >=7 hex chars; a full SHA-1 is 40.
 	shaMinHexLen = 7
@@ -3417,11 +3526,17 @@ var (
 // shapeExploreQuery: drop provably-inert tokens and weight the lead
 // clause, gated on structural noise so a clean query is untouched.
 func shapeInlineQuery(task string) string {
-	if !hasInlineNoise(task) {
+	noisy := hasInlineNoise(task)
+	lead := inlineLeadClause(task)
+	if !noisy && (len(task) < shapeInlineLongQueryChars || lead == "") {
 		return task
 	}
-	cleaned := dropInertTokens(task)
-	if lead := inlineLeadClause(cleaned); lead != "" {
+	cleaned := task
+	if noisy {
+		cleaned = dropInertTokens(task)
+		lead = inlineLeadClause(cleaned)
+	}
+	if lead != "" {
 		cleaned += " " + lead
 	}
 	return cleaned
@@ -3568,6 +3683,13 @@ func inlineLeadClause(task string) string {
 			// "ignore::WalkBuilder" does not.
 			if i > 0 && t[i-1] != ':' && t[i-1] != ' ' && i+1 < len(t) && t[i+1] == ' ' {
 				end = i
+			}
+		case '.', '?', '!':
+			// A sentence boundary in a long single-line report is the inline
+			// equivalent of a title newline. Requiring following whitespace
+			// avoids splitting .ignore, dotted identifiers, and quoted ".".
+			if i+1 < len(t) && (t[i+1] == ' ' || t[i+1] == '\t') {
+				end = i + 1
 			}
 		}
 		if end >= 0 {
@@ -4040,13 +4162,63 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	return candidates
 }
 
+// exploreConceptTermPresent recognizes a bounded family of inflectional forms
+// when concept prose and source identifiers use different grammatical forms
+// (for example matching versus matched_ignore). It never uses a raw stem
+// substring: that would incorrectly equate building with Builder.
+func exploreConceptTermPresent(text, term string) bool {
+	if strings.Contains(text, term) {
+		return true
+	}
+	for _, suffix := range [...]string{"ing", "ed"} {
+		if !strings.HasSuffix(term, suffix) {
+			continue
+		}
+		stem := strings.TrimSuffix(term, suffix)
+		if len(stem) < 5 {
+			continue
+		}
+		alternate := stem + "ing"
+		if suffix == "ing" {
+			alternate = stem + "ed"
+		}
+		if exploreConceptFormAtBoundary(text, alternate, false) ||
+			exploreConceptFormAtBoundary(text, stem, true) {
+			return true
+		}
+	}
+	return false
+}
+
+func exploreConceptFormAtBoundary(text, form string, requireEnd bool) bool {
+	for offset := 0; offset < len(text); {
+		index := strings.Index(text[offset:], form)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		startOK := index == 0 || !exploreASCIIAlphaNumeric(text[index-1])
+		end := index + len(form)
+		endOK := !requireEnd || end == len(text) || !exploreASCIIAlphaNumeric(text[end])
+		if startOK && endOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func exploreASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
+}
+
 // rerankExploreConceptCoverage corrects the principal weakness of prefix-OR
 // symbol retrieval: one rare identifier can otherwise outrank an implementation
 // whose metadata covers several independent task concepts. Explicit anchors and
 // bounded exact body-literal hits remain strongest. Vector-backed candidates
 // retain their semantic ordering; coverage only reorders lexical-only rows.
 func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) []*rerank.Candidate {
-	if rerank.ClassifyQuery(query) != rerank.QueryClassConcept || len(candidates) < 2 {
+	if exploreQueryClass(query) != rerank.QueryClassConcept || len(candidates) < 2 {
 		return candidates
 	}
 	queryTerms := exploreTerminalTerms(query)
@@ -4054,14 +4226,19 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		return candidates
 	}
 	type evidence struct {
+		text           string
 		explicit       bool
 		exactContent   bool
 		ambiguousExact bool
+		callable       bool
+		generic        bool
 		overlap        int
 		contentTerms   float64
 		contentRank    float64
 	}
 	metrics := make(map[*rerank.Candidate]evidence, len(candidates))
+	termFrequency := make(map[string]int, len(queryTerms))
+	candidateCount := 0
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.Node == nil {
 			continue
@@ -4071,22 +4248,41 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		if len(doc) > 768 {
 			doc = doc[:768]
 		}
-		// Candidate-side token maps are disproportionately expensive on the
-		// 80-row over-fetch window. Query terms are already normalized and at
-		// least three bytes long; a lowercase retrieval projection plus bounded
-		// substring checks preserves camelCase/path matching with no per-term
-		// allocations.
 		text := strings.ToLower(strings.Join([]string{
 			candidate.Node.Name, retrieval.QualName, nodeDisplayPath(candidate.Node),
 			retrieval.Signature, doc,
 		}, " "))
+		metrics[candidate] = evidence{text: text}
+		candidateCount++
+		for term := range queryTerms {
+			if exploreConceptTermPresent(text, term) {
+				termFrequency[term]++
+			}
+		}
+	}
+	// A task noun shared by more than a third of the retrieval window (path is
+	// the common case) carries no discriminating evidence. Counting it as a
+	// second concept turns every path wrapper into a strong semantic peer and
+	// freezes the upstream rank order. Frequency is computed only inside the
+	// already-bounded window, so this adds no graph or index work.
+	maxFrequency := max(1, candidateCount/3)
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Node == nil {
+			continue
+		}
+		metric := metrics[candidate]
+		text := metric.text
 		overlap := 0
 		for term := range queryTerms {
-			if strings.Contains(text, term) {
+			if frequency := termFrequency[term]; frequency > 0 && frequency <= maxFrequency &&
+				exploreConceptTermPresent(text, term) {
 				overlap++
 			}
 		}
-		metric := evidence{explicit: exploreLocalizationExplicitAnchor(query, candidate.Node), overlap: overlap}
+		metric.explicit = exploreLocalizationExplicitAnchor(query, candidate.Node)
+		metric.callable = candidate.Node.Kind == graph.KindFunction || candidate.Node.Kind == graph.KindMethod
+		metric.generic = exploreDraftGenericCandidate(candidate.Node, "")
+		metric.overlap = overlap
 		if candidate.Signals != nil {
 			metric.contentTerms = candidate.Signals[exploreContentRecallTermSignal]
 			metric.contentRank = candidate.Signals[exploreContentRecallRankSignal]
@@ -4120,20 +4316,33 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 			return 0
 		}
 	}
+	strongConjunctive := func(candidate *rerank.Candidate) bool {
+		metric := metrics[candidate]
+		return metric.callable && !metric.generic && metric.overlap >= 2
+	}
+	weakCollision := func(candidate *rerank.Candidate) bool {
+		metric := metrics[candidate]
+		return metric.generic || metric.overlap <= 1
+	}
 	// Explicit anchors and verified full quoted literals may cross semantic
 	// candidates. Unique exact evidence leads ambiguous pages; ambiguous exact
-	// peers use task coverage before content-channel rank. All other evidence
-	// only reorders lexical-only slots, preserving vector ordering.
+	// peers use task coverage before content-channel rank. Outside those proof
+	// tiers, one concrete callable covering two independent concepts may cross a
+	// generic one-token exact/vector collision, but never another multi-concept
+	// semantic candidate.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		at, bt := priorityTier(a), priorityTier(b)
 		if at != bt {
 			return at > bt
 		}
+		am, bm := metrics[a], metrics[b]
+		if at == 0 {
+			return false
+		}
 		if at != 1 {
 			return false
 		}
-		am, bm := metrics[a], metrics[b]
 		ac, bc := coverageTier(am.overlap), coverageTier(bm.overlap)
 		if ac != bc {
 			return ac > bc
@@ -4146,6 +4355,24 @@ func rerankExploreConceptCoverage(query string, candidates []*rerank.Candidate) 
 		}
 		return am.contentRank > bm.contentRank
 	})
+	// Within the ordinary evidence tier, promote a strong conjunctive callable
+	// only across adjacent weak collisions. A multi-concept non-callable is a
+	// barrier: crossing it would violate the promise that semantic peers retain
+	// their upstream order. Expressing that barrier relation inside sort.Less is
+	// non-transitive (strong~medium, medium~weak, strong<weak), so use this
+	// explicit stable insertion pass instead.
+	for index := 1; index < len(candidates); index++ {
+		candidate := candidates[index]
+		if priorityTier(candidate) != 0 || !strongConjunctive(candidate) {
+			continue
+		}
+		insert := index
+		for insert > 0 && priorityTier(candidates[insert-1]) == 0 && weakCollision(candidates[insert-1]) {
+			candidates[insert] = candidates[insert-1]
+			insert--
+		}
+		candidates[insert] = candidate
+	}
 	priorityEnd := 0
 	for priorityEnd < len(candidates) && priorityTier(candidates[priorityEnd]) > 0 {
 		priorityEnd++
@@ -4475,6 +4702,40 @@ func promoteExploreSourceLiteralCandidate(candidates []*rerank.Candidate) []*rer
 	return promoted
 }
 
+// promoteExploreStrongSourceLiteralTarget keeps terminality aligned with the
+// final evidence projection after concept owner folding. A unique, hydrated
+// source-literal callee is direct implementation proof; an owner inserted from
+// member_of metadata must not displace it. Ambiguous or incomplete literal
+// hits deliberately retain their established order.
+func promoteExploreStrongSourceLiteralTarget(targets []exploreTarget) []exploreTarget {
+	hasDivergentOwner, hasDivergentType := false, false
+	for _, target := range targets {
+		hasDivergentOwner = hasDivergentOwner || target.divergentDefaultOwner
+		hasDivergentType = hasDivergentType || target.divergentDefaultType
+	}
+	if hasDivergentOwner && hasDivergentType {
+		// The paired constructor/default-flow proof identifies why behavior
+		// diverges, while a literal callee identifies only where the literal is
+		// consumed. Preserve the stronger causal ordering.
+		return targets
+	}
+	best := -1
+	for index, target := range targets {
+		if localizationStrongSourceLiteralCallee(target) {
+			best = index
+			break
+		}
+	}
+	if best <= 0 {
+		return targets
+	}
+	promoted := append([]exploreTarget(nil), targets...)
+	target := promoted[best]
+	copy(promoted[1:best+1], promoted[:best])
+	promoted[0] = target
+	return promoted
+}
+
 // selectFinalExploreCandidates applies the source-literal reservation at the
 // last production boundary, after every reranker and concept reservation has
 // settled candidate order. The source hit replaces the weakest bounded
@@ -4505,24 +4766,108 @@ func selectFinalExploreCandidates(prod, test []*rerank.Candidate, maxSymbols int
 // first-seen order for the ordinary concept recall channel. The same generic
 // and stopword filter used by answer-readiness keeps agent verbs and task
 // boilerplate from consuming the bounded expansion bag.
+func exploreConceptRecallTokenStream(text string) []string {
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	})
+	tokens := make([]string, 0, len(fields))
+	for _, field := range fields {
+		tokens = append(tokens, rerank.Tokenize(field)...)
+	}
+	return tokens
+}
+
 func exploreConceptRecallTerms(text string) []string {
-	const maxTerms = 12
+	const (
+		maxTerms     = 12
+		frequentCap  = 8
+		lateMinChars = 6
+	)
 	allowed := exploreTerminalTerms(text)
-	seen := make(map[string]struct{}, len(allowed))
-	out := make([]string, 0, min(len(allowed), maxTerms))
-	for _, raw := range rerank.Tokenize(text) {
+	type termStat struct {
+		term        string
+		first, last int
+		count       int
+	}
+	stats := make([]termStat, 0, len(allowed))
+	byTerm := make(map[string]int, len(allowed))
+	weightedTokens := exploreConceptRecallTokenStream(text)
+	for position, raw := range weightedTokens {
 		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(raw)))
 		if _, ok := allowed[term]; !ok {
 			continue
 		}
-		if _, ok := seen[term]; ok {
+		if index, ok := byTerm[term]; ok {
+			stats[index].count++
+			stats[index].last = position
 			continue
 		}
-		seen[term] = struct{}{}
-		out = append(out, term)
-		if len(out) >= maxTerms {
+		byTerm[term] = len(stats)
+		stats = append(stats, termStat{term: term, first: position, last: position, count: 1})
+	}
+	if len(stats) <= maxTerms {
+		out := make([]string, len(stats))
+		for index := range stats {
+			out[index] = stats[index].term
+		}
+		return out
+	}
+
+	// Repetition captures the weighted lead; length breaks ties toward more
+	// informative concepts. Reserve the remaining slots by scanning the
+	// original tail so late technical constraints survive the fixed bag even
+	// when the lead was deliberately repeated for primary retrieval.
+	ranked := append([]termStat(nil), stats...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].count != ranked[j].count {
+			return ranked[i].count > ranked[j].count
+		}
+		if len(ranked[i].term) != len(ranked[j].term) {
+			return len(ranked[i].term) > len(ranked[j].term)
+		}
+		return ranked[i].first < ranked[j].first
+	})
+	selected := make(map[string]struct{}, maxTerms)
+	for _, stat := range ranked {
+		if len(selected) >= frequentCap {
 			break
 		}
+		selected[stat.term] = struct{}{}
+	}
+	baseText := strings.TrimSpace(text)
+	if lead := inlineLeadClause(baseText); lead != "" {
+		suffix := " " + lead
+		if strings.HasSuffix(baseText, suffix) {
+			baseText = strings.TrimSpace(strings.TrimSuffix(baseText, suffix))
+		}
+	}
+	baseTokens := exploreConceptRecallTokenStream(baseText)
+	for index := len(baseTokens) - 1; index >= 0 && len(selected) < maxTerms; index-- {
+		term := exploreTerminalTermRoot(strings.ToLower(strings.TrimSpace(baseTokens[index])))
+		if len(term) < lateMinChars {
+			continue
+		}
+		if _, ok := allowed[term]; !ok {
+			continue
+		}
+		selected[term] = struct{}{}
+	}
+	for _, stat := range ranked {
+		if len(selected) >= maxTerms {
+			break
+		}
+		selected[stat.term] = struct{}{}
+	}
+	chosen := make([]termStat, 0, len(selected))
+	for _, stat := range stats {
+		if _, ok := selected[stat.term]; ok {
+			chosen = append(chosen, stat)
+		}
+	}
+	sort.SliceStable(chosen, func(i, j int) bool { return chosen[i].first < chosen[j].first })
+	out := make([]string, len(chosen))
+	for index := range chosen {
+		out[index] = chosen[index].term
 	}
 	return out
 }

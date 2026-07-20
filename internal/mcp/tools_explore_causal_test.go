@@ -3,7 +3,6 @@ package mcp
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -150,27 +149,51 @@ func TestExploreStrongCausalSeedRejectsWeakAndTestParents(t *testing.T) {
 	}
 }
 
-func TestExploreAdmitCausalSeedEnforcesExplicitLimitAndBudget(t *testing.T) {
-	cases := []struct {
-		name                      string
-		concept, explicit, strong bool
-		admitted                  int
-		elapsed                   time.Duration
-		want                      bool
-	}{
-		{name: "admit", concept: true, strong: true, want: true},
-		{name: "explicit", concept: true, explicit: true, strong: true},
-		{name: "non-concept", strong: true},
-		{name: "weak", concept: true},
-		{name: "seed limit", concept: true, strong: true, admitted: exploreCausalSeedLimit},
-		{name: "budget", concept: true, strong: true, elapsed: exploreCausalAdmissionBudget},
+func TestSelectExploreCausalSeedsUsesEvidenceInsteadOfArrivalOrder(t *testing.T) {
+	query := "replacement match sink line terminator"
+	leaves := []exploreTarget{
+		{node: exploreCausalTestNode("path", "configure_replacement_path", "config.rs"), source: "fn configure_replacement_path() { replacement match line terminator }"},
+		{node: exploreCausalTestNode("flag", "select_replacement_match", "flags.rs"), source: "fn select_replacement_match() { replacement match line terminator }"},
+		{node: exploreCausalTestNode("setting", "prepare_replacement_sink", "settings.rs"), source: "fn prepare_replacement_sink() { replacement sink line terminator }"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := exploreAdmitCausalSeed(tc.concept, tc.explicit, tc.strong, tc.admitted, tc.elapsed); got != tc.want {
-				t.Fatalf("got %v, want %v", got, tc.want)
-			}
-		})
+	fromMatch := exploreCausalTestNode("from-match", "from_match", "matcher.rs")
+	sunk := exploreCausalTestNode("sunk", "from_sink_match", "sink.rs")
+	targets := append(leaves, exploreTarget{
+		node:    fromMatch,
+		source:  "fn from_match() { if replacement_matches() { Sunk::from_sink_match() } }",
+		callees: []*graph.Node{sunk},
+	})
+
+	selected := selectExploreCausalSeeds(query, targets, true, false)
+	if len(selected) == 0 || selected[0] != len(leaves) {
+		t.Fatalf("cross-file callable route was starved by earlier leaves: selected=%v", selected)
+	}
+	if len(selected) > exploreCausalSeedLimit {
+		t.Fatalf("selected %d seeds, want cap %d", len(selected), exploreCausalSeedLimit)
+	}
+	if got := selectExploreCausalSeeds(query, targets, false, false); len(got) != 0 {
+		t.Fatalf("non-concept task selected causal seeds: %v", got)
+	}
+	if got := selectExploreCausalSeeds(query, targets, true, true); len(got) != 0 {
+		t.Fatalf("explicit target selected causal seeds: %v", got)
+	}
+}
+
+func TestExploreCausalTwoPassReachesSecondHopReplacementImplementation(t *testing.T) {
+	fromMatch := exploreCausalTestNode("from-match", "from_match", "matcher.rs")
+	sunk := exploreCausalTestNode("sunk", "from_sink_match", "sink.rs")
+	replaceAll := exploreCausalTestNode("replace-all", "replace_all", "replacer.rs")
+	sg := &query.SubGraph{
+		Nodes: []*graph.Node{fromMatch, sunk, replaceAll},
+		Edges: []*graph.Edge{
+			{From: fromMatch.ID, To: sunk.ID, Kind: graph.EdgeCalls},
+			{From: sunk.ID, To: replaceAll.ID, Kind: graph.EdgeCalls},
+		},
+	}
+
+	got := causalHopMap(minimumExploreCausalHops(fromMatch.ID, sg, exploreCausalTestScope(), exploreCausalDepth, 15))
+	if got[sunk.ID] != 1 || got[replaceAll.ID] != 2 {
+		t.Fatalf("two-pass causal projection lost replacement route: %v", got)
 	}
 }
 

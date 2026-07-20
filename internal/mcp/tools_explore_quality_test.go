@@ -60,6 +60,129 @@ func TestRerankExploreConceptCoveragePromotesConjunctiveImplementation(t *testin
 	}
 }
 
+func TestRerankExploreConceptCoverageCrossesGenericVectorPathCollision(t *testing.T) {
+	pathSetter := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "builder-path", Name: "path", QualName: "StandardBuilder.path",
+			Kind: graph.KindMethod, FilePath: "src/builder.rs",
+			Meta: map[string]any{"signature": "fn path(&mut self, path: &Path)"},
+		},
+		TextRank: 0, VectorRank: 0, Score: 9,
+	}
+	matchedIgnore := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "matched-ignore", Name: "matched_ignore", QualName: "Ignore.matched_ignore",
+			Kind: graph.KindMethod, FilePath: "src/dir.rs",
+			Meta: map[string]any{"signature": "fn matched_ignore(&self, path: &Path)"},
+		},
+		TextRank: 9, VectorRank: 7, Score: 1,
+	}
+	got := rerankExploreConceptCoverage(shapeExploreQuery(exploreLongIgnoreTask), []*rerank.Candidate{pathSetter, matchedIgnore})
+	require.Same(t, matchedIgnore, got[0], "two-concept callable must cross a generic one-token vector collision")
+}
+
+func TestExploreConceptTermPresentUsesBoundedInflections(t *testing.T) {
+	require.True(t, exploreConceptTermPresent("ignore.matched_ignore", "matching"),
+		"query prose and declaration tense should align")
+	require.True(t, exploreConceptTermPresent("matcher matching rules", "matched"),
+		"the inverse tense should align as well")
+	require.False(t, exploreConceptTermPresent("tree.Builder", "building"),
+		"a raw grammatical stem must not match a longer unrelated identifier")
+}
+
+func TestDiversifyRepeatedExploreNamesPreservesLegitimateShortCallables(t *testing.T) {
+	readA := &rerank.Candidate{Node: &graph.Node{ID: "reader-a", Name: "read", Kind: graph.KindMethod}}
+	readB := &rerank.Candidate{Node: &graph.Node{ID: "reader-b", Name: "read", Kind: graph.KindMethod}}
+	emitA := &rerank.Candidate{Node: &graph.Node{ID: "emitter-a", Name: "emit", Kind: graph.KindMethod}}
+	emitB := &rerank.Candidate{Node: &graph.Node{ID: "emitter-b", Name: "emit", Kind: graph.KindMethod}}
+	other := &rerank.Candidate{Node: &graph.Node{ID: "other", Name: "dispatch", Kind: graph.KindMethod}}
+	input := []*rerank.Candidate{readA, readB, emitA, emitB, other}
+
+	got := diversifyRepeatedExploreNames(append([]*rerank.Candidate(nil), input...), rerank.QueryClassConcept)
+	require.Equal(t, input, got, "identifier length alone must not demote valid overload or receiver families")
+}
+
+func TestStrongSourceLiteralPromotionPreservesDivergentDefaultProof(t *testing.T) {
+	owner := exploreTarget{
+		node:                  &graph.Node{ID: "child.cs::.ctor", Name: ".ctor", Kind: graph.KindMethod, FilePath: "child.cs"},
+		source:                "Child() { mode = Disabled; }",
+		divergentDefaultOwner: true,
+	}
+	typeEvidence := exploreTarget{
+		node:                 &graph.Node{ID: "child.cs::Child", Name: "Child", Kind: graph.KindType, FilePath: "child.cs"},
+		divergentDefaultType: true,
+	}
+	literal := exploreTarget{
+		node:                &graph.Node{ID: "registry.cs::Register", Name: "Register", Kind: graph.KindMethod, FilePath: "registry.cs"},
+		source:              "void Register() { Add(\"value\"); }",
+		exactContent:        true,
+		sourceLiteral:       true,
+		sourceLiteralCallee: true,
+	}
+	input := []exploreTarget{owner, typeEvidence, literal}
+
+	got := promoteExploreStrongSourceLiteralTarget(input)
+	require.Equal(t, input, got, "a literal consumer must not displace a proven divergent-default cause")
+}
+
+func TestRerankExploreConceptCoverageDropsTermsPresentInMoreThanOneThird(t *testing.T) {
+	decoy := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "path-dispatch", Name: "path_dispatch", Kind: graph.KindMethod,
+			Meta: map[string]any{"doc": "Dispatch ownership for a path."},
+		},
+		TextRank: 0, VectorRank: 0, Score: 9,
+	}
+	implementation := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "matched-rule", Name: "matched_rule", Kind: graph.KindMethod,
+			Meta: map[string]any{
+				"signature": "fn matched_rule(path: &Path)",
+				"doc":       "Match ancestor ownership rules.",
+			},
+		},
+		TextRank: 7, VectorRank: 7, Score: 1,
+	}
+	fillerA := &rerank.Candidate{Node: &graph.Node{ID: "cache", Name: "cache", Kind: graph.KindType}, TextRank: 8, VectorRank: 8}
+	fillerB := &rerank.Candidate{Node: &graph.Node{ID: "clock", Name: "clock", Kind: graph.KindType}, TextRank: 9, VectorRank: 9}
+
+	got := rerankExploreConceptCoverage(
+		"where does the path matching ancestor rule ownership behavior live",
+		[]*rerank.Candidate{decoy, implementation, fillerA, fillerB},
+	)
+	require.Same(t, implementation, got[0], "a term present in two of four candidates must not manufacture a second decoy concept")
+}
+
+func TestRerankExploreConceptCoverageRespectsSemanticBarriers(t *testing.T) {
+	weak := &rerank.Candidate{
+		Node:     &graph.Node{ID: "weak", Name: "request", Kind: graph.KindVariable},
+		TextRank: 0, VectorRank: 0,
+	}
+	medium := &rerank.Candidate{
+		Node:     &graph.Node{ID: "medium", Name: "DispatchRouting", Kind: graph.KindType},
+		TextRank: 1, VectorRank: 1,
+	}
+	strong := &rerank.Candidate{
+		Node: &graph.Node{
+			ID: "strong", Name: "routeRequest", Kind: graph.KindMethod,
+			Meta: map[string]any{"doc": "Dispatch and route each request."},
+		},
+		TextRank: 2, VectorRank: 2,
+	}
+	fillerA := &rerank.Candidate{Node: &graph.Node{ID: "clock", Name: "clock", Kind: graph.KindType}, TextRank: 3, VectorRank: 3}
+	fillerB := &rerank.Candidate{Node: &graph.Node{ID: "cache", Name: "cache", Kind: graph.KindType}, TextRank: 4, VectorRank: 4}
+	fillerC := &rerank.Candidate{Node: &graph.Node{ID: "queue", Name: "queue", Kind: graph.KindType}, TextRank: 5, VectorRank: 5}
+	query := "where does the request dispatch routing behavior happen in code"
+
+	barrier := rerankExploreConceptCoverage(query, []*rerank.Candidate{weak, medium, strong, fillerA, fillerB, fillerC})
+	require.Equal(t, []*rerank.Candidate{weak, medium, strong}, barrier[:3],
+		"a conjunctive callable must not cross a multi-concept semantic peer")
+
+	adjacent := rerankExploreConceptCoverage(query, []*rerank.Candidate{medium, weak, strong, fillerA, fillerB, fillerC})
+	require.Equal(t, []*rerank.Candidate{medium, strong, weak}, adjacent[:3],
+		"a conjunctive callable may cross an adjacent one-concept collision")
+}
+
 func TestRerankExploreConceptCoveragePromotesBoundedBodyLiteral(t *testing.T) {
 	metadataHit := &rerank.Candidate{
 		Node:     &graph.Node{ID: "api", Name: "convert", Kind: graph.KindMethod, FilePath: "api.go"},

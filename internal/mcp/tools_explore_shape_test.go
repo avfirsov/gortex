@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+const exploreLongIgnoreTask = `Hidden files whitelisted by an ancestor .ignore file are not searched when "." is passed as the directory argument to ripgrep (but are found when no argument is given, or "./." is given). This relates to how paths are canonicalized/parsed and how the ignore/ancestor-parent logic determines the "root" for computing ancestor .ignore whitelist rules, likely in the ignore crate's directory traversal or the path argument handling in core (hiargs/paths). Need the exact file/function responsible for treating "." specially versus other paths when building parents/ancestors for gitignore matching.`
+
 // TestShapeExploreQuery_DistilsReport locks the report-distillation behavior:
 // a pasted issue (a title, then a body of repro commands, template prompts and
 // an environment table) is reduced to its retrieval signal — the lead weighted,
@@ -52,6 +54,24 @@ func TestShapeExploreQuery_PassThrough(t *testing.T) {
 	} {
 		if got := shapeExploreQuery(q); got != q {
 			t.Errorf("focused query altered:\n in:  %q\n out: %q", q, got)
+		}
+	}
+}
+
+func TestShapeExploreQueryWeightsLongSingleLineAndRetainsLateConcepts(t *testing.T) {
+	got := shapeExploreQuery(exploreLongIgnoreTask)
+	lead := inlineLeadClause(exploreLongIgnoreTask)
+	if lead == "" || strings.Count(got, lead) != 2 {
+		t.Fatalf("long inline lead not weighted exactly once: lead=%q query=%q", lead, got)
+	}
+	terms := exploreConceptRecallTerms(got)
+	seen := make(map[string]bool, len(terms))
+	for _, term := range terms {
+		seen[term] = true
+	}
+	for _, term := range []string{"ignore", "path", "parent", "gitignore", "matching"} {
+		if !seen[term] {
+			t.Fatalf("late/repeated concept %q was lost from bounded terms %v", term, terms)
 		}
 	}
 }

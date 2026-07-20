@@ -788,7 +788,8 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.True(t, found, "literal callsite must promote the uniquely resolved invoked method")
 
 	task := `CultureNotFoundException for "ku" culture - code adds/uses "ku" (Kurdish) CultureInfo which is not supported on Xamarin.Android, causing crash. Find where "ku" culture is registered/used in fallback resolution logic.`
-	require.NotEqual(t, rerank.QueryClassConcept, rerank.ClassifyQuery(shapeExploreQuery(task)), "regression requires the non-concept retrieval branch")
+	require.Equal(t, rerank.QueryClassConcept, exploreQueryClass(shapeExploreQuery(task)),
+		"long parenthesized issue prose must use concept retrieval without losing its unique literal proof")
 	engine := query.NewEngine(counting)
 	engine.SetSearchProvider(idx.Search)
 	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
