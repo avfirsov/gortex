@@ -92,6 +92,7 @@ type exploreTarget struct {
 	exactContentAmbiguous bool   // exact evidence has visible or possibly truncated peers
 	sourceLiteral         bool   // exact source-body hit that must survive final envelope packing
 	sourceLiteralCallee   bool   // exact source callsite uniquely resolved to this invoked callable
+	sourceLiteralAligned  bool   // source-literal callee that instantiates the task's value; strongest literal owner
 	typedAnchorProjection bool   // bounded field-owner-call proof promoted from a task-aligned typed field
 	foldedOwner           bool   // synthetic owner inserted by concept member folding
 }
@@ -828,6 +829,18 @@ func exploreDraftIsTestNode(n *graph.Node) bool {
 	for _, dir := range []string{"/__tests__/", "/spec/", "/specs/", "/test/", "/tests/"} {
 		if strings.Contains(segmented, dir) {
 			return true
+		}
+	}
+	// .NET/JVM test assemblies name their directory with a dotted token, e.g.
+	// `Humanizer.Tests.Shared` — a real path segment that the slash-delimited
+	// check above cannot see. Treat a dot-delimited test/spec token inside any
+	// segment as test code so test metadata never suppresses production recall.
+	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+		for _, token := range strings.Split(segment, ".") {
+			switch token {
+			case "test", "tests", "spec", "specs":
+				return true
+			}
 		}
 	}
 	base := path
@@ -2115,6 +2128,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			t.exactContentAmbiguous = c.Signals[exploreContentRecallAmbiguousSignal] > 0
 			t.sourceLiteral = c.Signals[exploreSourceLiteralSignal] > 0
 			t.sourceLiteralCallee = c.Signals[exploreSourceLiteralCalleeSignal] > 0
+			t.sourceLiteralAligned = c.Signals[exploreSourceLiteralTaskAlignSignal] > 0
 			t.typedAnchorProjection = c.Signals[exploreTypedAnchorProjectionSignal] > 0
 		}
 		t.source = s.manifestSymbolSource(ctx, n)
@@ -2713,6 +2727,16 @@ func localizationEvidenceTargetsFromDraft(task, exactID string, targets []explor
 	// A source-body literal is the only direct evidence that can identify an
 	// implementation absent from symbol metadata. Reserve the strongest one
 	// before draft promotion and byte-budget packing can consume every slot.
+	// A construction-aligned callee — one that instantiates the task's value —
+	// is the strongest literal owner; reserve it ahead of a generic literal
+	// callee that merely leads primary retrieval, so it is never the sacrificial
+	// tail when the projection is at the max_symbols boundary.
+	for _, target := range targets {
+		if target.sourceLiteral && target.sourceLiteralAligned {
+			appendTarget(target)
+			break
+		}
+	}
 	for _, target := range targets {
 		if target.sourceLiteral {
 			appendTarget(target)
@@ -2938,6 +2962,15 @@ func buildLocalizationExploreResultForTaskFinalized(
 	}
 	for index, target := range targets {
 		if target.sourceLiteral && index+1 > mandatoryCount {
+			mandatoryCount = index + 1
+			break
+		}
+	}
+	// The construction-aligned literal owner is reserved evidence: guarantee its
+	// identifier survives byte-budget packing even when a generic literal callee
+	// leads the projection and holds the first source-literal slot.
+	for index, target := range targets {
+		if target.sourceLiteral && target.sourceLiteralAligned && index+1 > mandatoryCount {
 			mandatoryCount = index + 1
 			break
 		}
@@ -4486,6 +4519,7 @@ func mergeExploreCandidates(primary, expanded []*rerank.Candidate, expansionRank
 				exploreSourceLiteralSignal,
 				exploreSourceLiteralCalleeSignal,
 				exploreSourceLiteralCoverageSignal,
+				exploreSourceLiteralTaskAlignSignal,
 			} {
 				if clone.Signals == nil || clone.Signals[key] <= current.Signals[key] {
 					continue
