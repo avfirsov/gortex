@@ -336,12 +336,12 @@ jobs:
       # artifacts. Append .sig + .pem files to the same release so
       # verification instructions in README point at a single URL set.
       - name: Upload signatures to release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: |
             dist/*.sig
             dist/*.pem
-          # softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3 appends to an existing release
+          # softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3 appends to an existing release
           # when the tag already exists (it does — goreleaser made it a
           # moment ago). Never fail_on_unmatched_files here — a failed
           # signing step should surface as a signing error, not as a
