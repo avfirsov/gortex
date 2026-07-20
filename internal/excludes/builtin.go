@@ -12,9 +12,16 @@ package excludes
 // Users can re-include an entry by listing "!pattern" in global,
 // RepoEntry, or workspace config.
 var Builtin = []string{
+	// Version-control metadata can contain huge object stores and working-copy
+	// state. Prune all common VCS directories before the walker descends.
 	".git/",
+	".jj/",
 	".hg/",
 	".svn/",
+	".bzr/",
+	"_darcs/",
+	".pijul/",
+	".fossil-settings/",
 	".terraform/",
 	".gortex-cache/",
 	".gortex/", // Gortex's per-repo state dir (quarantine, merkle tree)
