@@ -465,6 +465,12 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 			// invalid request must never consume a newly committed task's recovery.
 			return nil, s.generation
 		}
+		if localizationRecoveryAllows(facade, operation, arguments) {
+			// A concrete search with a weak task correlation has not spent the
+			// bounded recovery call. Let the caller correct the anchor once it has
+			// better evidence instead of terminalizing the localization session.
+			return localizationRecoveryMisalignedResult(s.completionLocked(), facade, operation), 0
+		}
 		s.state = localizationStateAnswerReady
 		s.recoveryRetriesRemaining = 0
 		return localizationRecoveryRejectedResult(s.completionLocked(), facade, operation), 0
@@ -536,7 +542,20 @@ func localizationRecoveryQueryAligned(task, query string) bool {
 			return true
 		}
 	}
-	return false
+	return localizationRecoverySpecificAnchor(query)
+}
+
+// localizationRecoverySpecificAnchor admits compact path-like literals that
+// are sufficiently concrete to bound a recovery search on their own. This
+// covers metadata paths such as `".jj/"` whose semantic class (VCS state) may
+// appear in the task without the literal directory name. Generic declaration
+// fragments remain subject to task-term alignment.
+func localizationRecoverySpecificAnchor(query string) bool {
+	anchor := strings.Trim(strings.TrimSpace(query), "`'\"")
+	if len(anchor) < 2 || strings.ContainsAny(anchor, " \t\r\n") {
+		return false
+	}
+	return strings.ContainsAny(anchor, "/\\") || strings.HasPrefix(anchor, ".")
 }
 
 func localizationRecoveryOperationAllowed(facade, operation string) bool {
@@ -560,6 +579,20 @@ func (s *localizationTerminalState) consumeInvalidRecovery(facade, operation str
 	s.state = localizationStateAnswerReady
 	s.recoveryRetriesRemaining = 0
 	return s.completionLocked(), true
+}
+
+func localizationRecoveryMisalignedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
+	return newStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeLocalizationComplete,
+		Message:   "the recovery search query is not specific to the localization task; use a task term or a concrete path/literal anchor; the recovery allowance is still available",
+		Retriable: true,
+		Data: map[string]any{
+			"contract":           localizationContractFor(completion),
+			"facade":             facade,
+			"operation":          operation,
+			"allowed_operations": append([]string(nil), localizationRecoveryOperations...),
+		},
+	}, true)
 }
 
 func localizationRecoveryRejectedResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
@@ -701,6 +734,9 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 		if s.localizationRecoveryAllowsLocked(facade, operation, arguments) {
 			s.state = localizationStateRecoveryInFlight
 			return nil, s.beginReadReservationLocked()
+		}
+		if localizationRecoveryAllows(facade, operation, arguments) {
+			return localizationRecoveryMisalignedResult(s.completionLocked(), facade, operation), 0
 		}
 		s.state = localizationStateAnswerReady
 		s.recoveryRetriesRemaining = 0

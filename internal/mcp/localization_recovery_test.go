@@ -63,7 +63,7 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	}
 }
 
-func TestRecoveryRejectsSearchAnchorUnrelatedToTaskBeforeHandler(t *testing.T) {
+func TestRecoveryRejectsUnrelatedAnchorWithoutConsumingAllowance(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "unrelated_recovery_anchor")
 	terminal := server.localizationFor(ctx)
@@ -76,19 +76,54 @@ func TestRecoveryRejectsSearchAnchorUnrelatedToTaskBeforeHandler(t *testing.T) {
 	calls := 0
 	server.facades.capture(mcpgo.NewTool(searchSpec.Legacy), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		calls++
-		return mcpgo.NewToolResultText(`{"matches":[{"text":"fn sink_matched"}]}`), nil
+		return mcpgo.NewToolResultText(`{"matches":[{"text":"replace output"}]}`), nil
 	})
 
 	result, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "fn sink_matched",
 	}))
-	if err != nil {
-		t.Fatalf("unrelated recovery returned transport error: %v", err)
+	if err != nil || result == nil || !result.IsError {
+		t.Fatalf("unrelated recovery = (%#v, %v), want corrective tool error", result, err)
 	}
-	requireLocalizationTerminalError(t, result, "search", "text")
+	text, ok := singleTextContent(result)
+	if !ok {
+		t.Fatalf("corrective result content = %#v, want one text block", result.Content)
+	}
+	var corrective struct {
+		ErrorCode ErrorCode `json:"error_code"`
+		Retriable bool      `json:"retriable"`
+		Data      struct {
+			Contract localizationTerminalContract `json:"contract"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(text), &corrective); err != nil {
+		t.Fatalf("decode corrective error %q: %v", text, err)
+	}
+	if corrective.ErrorCode != ErrCodeLocalizationComplete || !corrective.Retriable {
+		t.Fatalf("corrective error = %#v", corrective)
+	}
+	if corrective.Data.Contract.Terminal ||
+		corrective.Data.Contract.Completion.State != localizationStateNeedsRecovery ||
+		corrective.Data.Contract.Completion.AllowedToolCalls != 1 {
+		t.Fatalf("corrective contract = %#v", corrective.Data.Contract)
+	}
+	terminal.mu.Lock()
+	stored := terminal.completionLocked()
+	terminal.mu.Unlock()
+	if stored.State != localizationStateNeedsRecovery || stored.AllowedToolCalls != 1 {
+		t.Fatalf("stored recovery after rejected anchor = %#v", stored)
+	}
 	if calls != 0 {
 		t.Fatalf("unrelated recovery reached handler: calls=%d", calls)
 	}
+
+	retry, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+		"query": "--replace",
+	}))
+	if err != nil || retry == nil || retry.IsError || calls != 1 {
+		t.Fatalf("corrected recovery = (%#v, %v), calls=%d", retry, err, calls)
+	}
+	requireLocalizationResultStateEqual(t, terminal, retry, localizationStateAnswerReady, true, 0)
 }
 
 func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing.T) {
@@ -100,6 +135,7 @@ func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing
 		{name: "identifier segment", task: "find candidate resolution", query: "resolveCandidate"},
 		{name: "flag", task: "--multiline with --replace duplicates output", query: "--replace"},
 		{name: "compact literal", task: `register the locale code "ku"`, query: "ku"},
+		{name: "specific VCS path", task: "confirm the completed VCS default exclusion change", query: `".jj/"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
