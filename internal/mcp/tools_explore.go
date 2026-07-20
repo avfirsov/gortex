@@ -2786,7 +2786,7 @@ func buildLocalizationRefinementResultForTask(
 				return requested, authorized, bounded
 			}
 		}
-		authorized, bounded = boundedLocalizationRefinementRoutes(symbols, routes, "")
+		_, bounded = boundedLocalizationRefinementRoutes(symbols, routes, "")
 		for _, symbol := range symbols {
 			if _, ok := bounded[symbol]; !ok {
 				continue
