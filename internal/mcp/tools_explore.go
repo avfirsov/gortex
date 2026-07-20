@@ -3574,6 +3574,7 @@ const (
 	exploreSourceLiteralSignal          = "explore_source_literal"
 	exploreSourceLiteralCalleeSignal    = "explore_source_literal_callee"
 	exploreSourceLiteralCoverageSignal  = "explore_source_literal_coverage"
+	exploreSourceLiteralTaskAlignSignal = "explore_source_literal_task_alignment"
 	exploreSourceLiteralReservationMax  = 2
 	exploreQuotedRecallMaxTerms         = 3
 	exploreQuotedRecallMaxPerTerm       = 12
@@ -3697,16 +3698,50 @@ func exploreQuotedRecallHasExactSourceNode(
 		!exploreLocalizableKind(node.Kind) || !exploreCodeDefinitionKind(node.Kind) {
 		return false
 	}
+	if exploreDraftIsTestNode(node) && !exploreQueryHasTestIntent(task) {
+		return false
+	}
 	if exploreLocalizationExplicitAnchor(task, node) {
 		return true
 	}
 	retrieval := node.RetrievalMetadata()
-	fields := [...]string{node.Name, retrieval.QualName, retrieval.Signature}
 	for _, term := range terms {
-		for _, field := range fields {
+		// Compact values such as locale and protocol codes are usually source
+		// literals, not declaration identities. Trust an exact declaration name
+		// or signature, but never a path-derived qualified name such as a test
+		// namespace ending in `.ku`.
+		fields := [...]string{node.Name, retrieval.Signature, retrieval.QualName}
+		fieldCount := len(fields)
+		if exploreCompactSourceLiteral(term, utf8.RuneCountInString(term)) {
+			fieldCount--
+		}
+		for _, field := range fields[:fieldCount] {
 			if exploreTextHasExactLiteral(field, term) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func exploreQueryHasTestIntent(task string) bool {
+	for _, token := range rerank.Tokenize(task) {
+		switch strings.ToLower(token) {
+		case "test", "tests", "testing", "spec", "specs", "fixture", "fixtures":
+			return true
+		}
+	}
+	return false
+}
+
+func exploreSourceLiteralConstructionIntent(task string) bool {
+	for _, token := range rerank.Tokenize(task) {
+		switch strings.ToLower(token) {
+		case "construct", "constructed", "constructing", "construction", "constructor", "constructors",
+			"initialise", "initialised", "initialises", "initialising", "initialisation",
+			"initialize", "initialized", "initializes", "initializing", "initialization",
+			"instantiate", "instantiated", "instantiates", "instantiating", "instantiation":
+			return true
 		}
 	}
 	return false
@@ -3812,6 +3847,7 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 	sourceLiteralAmbiguous := make(map[string]bool)
 	sourceLiteralSettled := make(map[string]bool)
 	sourceLiteralCallee := make(map[string]bool)
+	sourceLiteralTaskAligned := make(map[string]bool)
 	for _, page := range pages {
 		seenForTerm := make(map[string]struct{}, len(page.hits))
 		exactIDs := make(map[string]struct{})
@@ -3922,6 +3958,29 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 				nodes[id] = node
 			}
 		}
+		// A collision-heavy literal alone cannot justify replacing two semantic
+		// candidates. When the task explicitly asks about construction, however,
+		// an exact callsite whose resolved callable instantiates a value is a
+		// language-neutral causal discriminator. One batched edge lookup covers
+		// the already-bounded owner set; no source body or recursive walk is added.
+		if exploreSourceLiteralConstructionIntent(task) {
+			calleeIDs := make([]string, 0, len(sourceLiteralCallee))
+			for id, callee := range sourceLiteralCallee {
+				if callee {
+					calleeIDs = append(calleeIDs, id)
+				}
+			}
+			if len(calleeIDs) > 0 {
+				for id, edges := range s.graph.GetOutEdgesByNodeIDs(calleeIDs) {
+					for _, edge := range edges {
+						if edge != nil && edge.Kind == graph.EdgeInstantiates {
+							sourceLiteralTaskAligned[id] = true
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 	if len(order) == 0 {
 		return nil
@@ -3948,6 +4007,9 @@ func (s *Server) gatherExploreQuotedContentCandidates(
 			signals[exploreSourceLiteralCoverageSignal] = float64(len(sourceLiteralAnchors[id]))
 			if sourceLiteralCallee[id] {
 				signals[exploreSourceLiteralCalleeSignal] = 1
+			}
+			if sourceLiteralTaskAligned[id] {
+				signals[exploreSourceLiteralTaskAlignSignal] = 1
 			}
 		}
 		candidates = append(candidates, &rerank.Candidate{
@@ -4253,12 +4315,28 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 	}
 
 	sources := make([]*rerank.Candidate, 0, exploreSourceLiteralReservationMax)
+	seenSourceIDs := make(map[string]struct{}, exploreSourceLiteralReservationMax)
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.Node == nil || candidate.Signals == nil ||
+		if candidate == nil || candidate.Node == nil || candidate.Node.ID == "" || candidate.Signals == nil ||
 			candidate.Signals[exploreSourceLiteralSignal] <= 0 {
 			continue
 		}
+		if _, duplicate := seenSourceIDs[candidate.Node.ID]; duplicate {
+			continue
+		}
+		seenSourceIDs[candidate.Node.ID] = struct{}{}
 		sources = append(sources, candidate)
+	}
+	directProductionCallee := func(candidate *rerank.Candidate) bool {
+		return candidate != nil && candidate.Node != nil && candidate.Signals != nil &&
+			candidate.Signals[exploreSourceLiteralCalleeSignal] > 0 &&
+			!exploreDraftIsTestNode(candidate.Node)
+	}
+	callableSpecificity := func(candidate *rerank.Candidate) int {
+		if !directProductionCallee(candidate) {
+			return 0
+		}
+		return exploreIdentifierSegmentCountBounded(candidate.Node.Name)
 	}
 	sort.SliceStable(sources, func(i, j int) bool {
 		leftCoverage := sources[i].Signals[exploreSourceLiteralCoverageSignal]
@@ -4266,7 +4344,27 @@ func reserveExploreSourceLiteralCandidate(candidates, bounded []*rerank.Candidat
 		if leftCoverage != rightCoverage {
 			return leftCoverage > rightCoverage
 		}
-		return sources[i].Signals[exploreSourceLiteralSignal] > sources[j].Signals[exploreSourceLiteralSignal]
+		leftSettled := sources[i].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		rightSettled := sources[j].Signals[exploreContentRecallAmbiguousSignal] <= 0
+		if leftSettled != rightSettled {
+			return leftSettled
+		}
+		leftDirect := directProductionCallee(sources[i])
+		rightDirect := directProductionCallee(sources[j])
+		if leftDirect != rightDirect {
+			return leftDirect
+		}
+		leftAligned := sources[i].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		rightAligned := sources[j].Signals[exploreSourceLiteralTaskAlignSignal] > 0
+		if leftAligned != rightAligned {
+			return leftAligned
+		}
+		leftRank := sources[i].Signals[exploreSourceLiteralSignal]
+		rightRank := sources[j].Signals[exploreSourceLiteralSignal]
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		return callableSpecificity(sources[i]) > callableSpecificity(sources[j])
 	})
 	selectedSources := sources[:0]
 	for _, source := range sources {

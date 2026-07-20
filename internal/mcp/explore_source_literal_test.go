@@ -819,6 +819,119 @@ func TestGatherExploreSourceLiteralRecallMapsParsedCSharpConstructor(t *testing.
 	require.Zero(t, counting.allNodesCalls, "literal mapping must stay bounded to matched files")
 }
 
+func TestExploreQuotedRecallCompactMetadataUsesDeclarationEvidenceOnly(t *testing.T) {
+	scope := query.QueryOptions{}
+	compactName := &graph.Node{
+		ID: "src/locale.rs::KU", Name: "KU", QualName: "locale.KU",
+		Kind: graph.KindFunction, FilePath: "src/locale.rs", Language: "rust",
+	}
+	require.True(t, exploreQuotedRecallHasExactSourceNode(`find locale "ku"`, []string{"ku"}, compactName, scope))
+
+	pathOnly := &graph.Node{
+		ID: "src/locales/ku/registry.rs::register", Name: "register", QualName: "locales.ku.register",
+		Kind: graph.KindFunction, FilePath: "src/locales/ku/registry.rs", Language: "rust",
+	}
+	require.False(t, exploreQuotedRecallHasExactSourceNode(`find locale "ku"`, []string{"ku"}, pathOnly, scope),
+		"a path-derived qualified name must not suppress bounded source recall")
+}
+
+func TestExploreQuotedRecallTestMetadataRequiresTestIntent(t *testing.T) {
+	testNode := &graph.Node{
+		ID: "pkg/locale_test.go::TestKurdish", Name: "TestKurdish", QualName: "tests.ku.TestKurdish",
+		Kind: graph.KindFunction, FilePath: "pkg/locale_test.go", Language: "go",
+		Meta: map[string]any{"is_test": true, "signature": `func TestKurdish() // "ku"`},
+	}
+	require.False(t, exploreQuotedRecallHasExactSourceNode(`find where locale "ku" is registered`, []string{"ku"}, testNode, query.QueryOptions{}))
+	require.True(t, exploreQuotedRecallHasExactSourceNode(`find the test for locale "ku"`, []string{"ku"}, testNode, query.QueryOptions{}))
+}
+
+func TestExploreCompactLiteralIgnoresTestMetadataAndPrefersSpecificProductionCallee(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"src/Humanizer/Configuration/FormatterRegistry.cs": `namespace Humanizer.Configuration {
+    internal class FormatterRegistry {
+        public FormatterRegistry() { RegisterDefaultFormatter("ku"); }
+        private void RegisterDefaultFormatter(string localeCode) { var formatter = new DefaultFormatter(localeCode); }
+    }
+    internal class DefaultFormatter { public DefaultFormatter(string localeCode) { } }
+}`,
+		"src/Humanizer/Configuration/NumberToWordsConverterRegistry.cs": `namespace Humanizer.Configuration {
+    internal class NumberToWordsConverterRegistry {
+        public NumberToWordsConverterRegistry() { Register("ku"); }
+        private void Register(string localeCode) { }
+    }
+}`,
+		"src/Humanizer.Tests.Shared/Localisation/ku/NumberToWordsTests.cs": `namespace Humanizer.Tests.Localisation.ku {
+    [UseCulture("ku")]
+    public class NumberToWordsTests {
+        public void ToOrdinalWordsKurdish() { }
+    }
+}`,
+	}
+	for rel, source := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(source), 0o644))
+	}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	registry := parser.NewRegistry()
+	languages.RegisterAll(registry)
+	idx := indexer.New(store, registry, config.IndexConfig{}, zap.NewNop())
+	_, err = idx.IndexCtx(context.Background(), root)
+	require.NoError(t, err)
+	counting := &exploreSourceLiteralCountingStore{Store: store}
+	server := &Server{graph: counting, indexer: idx, logger: zap.NewNop()}
+
+	task := `CultureNotFoundException for culture "ku" (Kurdish) thrown when code enumerates or references all supported cultures, e.g. in number-to-words or collection initialization; find where "ku" locale/culture is registered or iterated causing crash on platforms lacking that culture.`
+	testNodes := store.FindNodesByName("ToOrdinalWordsKurdish")
+	require.NotEmpty(t, testNodes)
+	candidates := server.gatherExploreQuotedContentCandidates(
+		context.Background(), task,
+		[]*rerank.Candidate{{Node: testNodes[0], TextRank: 0, VectorRank: -1}},
+		20, query.QueryOptions{},
+	)
+	specificID := "src/Humanizer/Configuration/FormatterRegistry.cs::FormatterRegistry.RegisterDefaultFormatter"
+	genericID := "src/Humanizer/Configuration/NumberToWordsConverterRegistry.cs::NumberToWordsConverterRegistry.Register"
+	specificCandidate := candidateByID(candidates, specificID)
+	genericCandidate := candidateByID(candidates, genericID)
+	require.NotNil(t, specificCandidate, "test metadata must not suppress production literal recall")
+	require.NotNil(t, genericCandidate, "both production direct callees must remain available")
+	require.Equal(t, 1.0, specificCandidate.Signals[exploreSourceLiteralTaskAlignSignal],
+		"construction intent must align with the exact owner that instantiates a value")
+	require.Zero(t, genericCandidate.Signals[exploreSourceLiteralTaskAlignSignal],
+		"a generic registration helper must not gain construction alignment")
+
+	engine := query.NewEngine(counting)
+	engine.SetSearchProvider(idx.Search)
+	fullServer := NewServer(engine, counting, idx, nil, zap.NewNop(), nil)
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"task": task, "localize": true, "max_symbols": 6,
+	}
+	result, err := fullServer.handleExplore(context.Background(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+	text, ok := result.Content[0].(mcpgo.TextContent)
+	require.True(t, ok)
+	var envelope localizationExploreEnvelope
+	require.NoError(t, json.Unmarshal([]byte(text.Text), &envelope))
+
+	specificRank := -1
+	for rank, evidence := range envelope.Evidence {
+		if evidence.ID == specificID {
+			specificRank = rank
+		}
+	}
+	require.NotEqual(t, -1, specificRank, "construction-aligned source evidence must survive final packing")
+	require.Equal(t, localizationStateNeedsRefinement, envelope.Completion.State)
+	require.False(t, envelope.Terminal)
+	require.False(t, envelope.Completion.Enforceable, "ambiguous production literal sites remain advisory")
+	require.Contains(t, envelope.Completion.AllowedSymbols, specificID)
+}
+
 func TestGatherExploreSourceLiteralRecallBoundsMappingByRequestDeadline(t *testing.T) {
 	root := t.TempDir()
 	rel := "src/Registry.cs"

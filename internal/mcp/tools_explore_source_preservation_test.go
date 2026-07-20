@@ -81,6 +81,69 @@ func TestSelectFinalExploreCandidatesReservesOnlyOneAmbiguousSingleAnchorOwner(t
 	require.NotNil(t, candidateByID(selected, "primary-1"), "ambiguous collision evidence must not consume both reserve slots")
 }
 
+func TestSelectFinalExploreCandidatesPrefersTaskAlignedAmbiguousCallee(t *testing.T) {
+	generic := sourcePreservationCandidate("generic-register", 10, 1)
+	generic.Node.Name = "Register"
+	generic.Signals[exploreSourceLiteralCoverageSignal] = 1
+	generic.Signals[exploreContentRecallAmbiguousSignal] = 1
+	generic.Signals[exploreSourceLiteralCalleeSignal] = 1
+	specific := sourcePreservationCandidate("specific-register", 20, 0.5)
+	specific.Node.Name = "RegisterDefaultFormatter"
+	specific.Node.Language = "rust"
+	specific.Node.FilePath = "src/registry.rs"
+	specific.Signals[exploreSourceLiteralCoverageSignal] = 1
+	specific.Signals[exploreContentRecallAmbiguousSignal] = 1
+	specific.Signals[exploreSourceLiteralCalleeSignal] = 1
+	specific.Signals[exploreSourceLiteralTaskAlignSignal] = 1
+	third := sourcePreservationCandidate("third-register", 30, 0.25)
+	third.Signals[exploreSourceLiteralCoverageSignal] = 1
+	third.Signals[exploreContentRecallAmbiguousSignal] = 1
+	third.Signals[exploreSourceLiteralCalleeSignal] = 1
+	prod := []*rerank.Candidate{
+		sourcePreservationCandidate("primary-0", 0, 0),
+		sourcePreservationCandidate("primary-1", 1, 0),
+		sourcePreservationCandidate("primary-2", 2, 0),
+		generic,
+		specific,
+		third,
+	}
+
+	selected := selectFinalExploreCandidates(prod, nil, 3)
+
+	require.Len(t, selected, 3)
+	require.Equal(t, "primary-0", selected[0].Node.ID, "source reservation must preserve the semantic head")
+	require.NotNil(t, candidateByID(selected, specific.Node.ID))
+	require.Nil(t, candidateByID(selected, generic.Node.ID), "one compact collision may reserve only one owner")
+	require.Nil(t, candidateByID(selected, third.Node.ID), "three-way collision noise must stay outside the bounded answer")
+}
+
+func TestSelectFinalExploreCandidatesDeduplicatesSourceOwnersAndHonorsSmallLimits(t *testing.T) {
+	head := sourcePreservationCandidate("head", 0, 0)
+	source := sourcePreservationCandidate("aligned-source", 8, 0.5)
+	source.Signals[exploreSourceLiteralCoverageSignal] = 1
+	source.Signals[exploreContentRecallAmbiguousSignal] = 1
+	source.Signals[exploreSourceLiteralCalleeSignal] = 1
+	source.Signals[exploreSourceLiteralTaskAlignSignal] = 1
+	duplicate := *source
+	duplicate.Signals = map[string]float64{
+		exploreSourceLiteralSignal:          0.5,
+		exploreSourceLiteralCoverageSignal:  1,
+		exploreContentRecallAmbiguousSignal: 1,
+		exploreSourceLiteralCalleeSignal:    1,
+		exploreSourceLiteralTaskAlignSignal: 1,
+	}
+	prod := []*rerank.Candidate{head, sourcePreservationCandidate("tail", 1, 0), source, &duplicate}
+
+	require.Nil(t, selectFinalExploreCandidates(prod, nil, 0))
+	one := selectFinalExploreCandidates(prod, nil, 1)
+	require.Len(t, one, 1)
+	require.Equal(t, "head", one[0].Node.ID)
+	two := selectFinalExploreCandidates(prod, nil, 2)
+	require.Len(t, two, 2)
+	require.Equal(t, "head", two[0].Node.ID)
+	require.Equal(t, "aligned-source", two[1].Node.ID)
+}
+
 func TestSelectFinalExploreCandidatesReservesTwoSourceOwnersWhenCapacityAllows(t *testing.T) {
 	multi := sourcePreservationCandidate("multi-anchor", 90, 0.25)
 	multi.Signals[exploreSourceLiteralCoverageSignal] = 2
