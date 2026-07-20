@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // TestUpgradeInstallMethodDetection proves the path-math that maps a binary's
 // location to its install method — so `gortex upgrade` updates the way the user
@@ -43,6 +46,31 @@ func TestUpgradeInstallMethodDetection(t *testing.T) {
 	// A version pin flows into the go-install target.
 	if cmd, _ := upgradeInstructions(InstallGoInstall, "v0.49.0"); cmd != "go install github.com/zzet/gortex/cmd/gortex@v0.49.0" {
 		t.Errorf("pinned go install cmd = %q", cmd)
+	}
+}
+
+// TestUpgradeRunCommandUsesShellOnlyForPipelines proves --run routes the
+// installer-script pipeline through `sh -c` (so the pipe is interpreted rather
+// than split into raw curl args — issue #281) while plain-argv methods still
+// exec directly with no shell in the way.
+func TestUpgradeRunCommandUsesShellOnlyForPipelines(t *testing.T) {
+	ctx := context.Background()
+	cmd := upgradeExecCommand(ctx, "curl -fsSL https://get.gortex.dev | sh")
+	// Assert on Args[0], not Path: exec.Command resolves a bare name through
+	// LookPath, so Path becomes /bin/sh once sh is on $PATH — Args[0] stays "sh".
+	if got := cmd.Args[0]; got != "sh" {
+		t.Fatalf("script installer should run through sh, got %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "-c" || cmd.Args[2] != "curl -fsSL https://get.gortex.dev | sh" {
+		t.Fatalf("script installer command args = %#v", cmd.Args)
+	}
+
+	cmd = upgradeExecCommand(ctx, "go install github.com/zzet/gortex/cmd/gortex@latest")
+	if got := cmd.Args[0]; got != "go" {
+		t.Fatalf("plain argv command should exec directly, got %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "install" || cmd.Args[2] != "github.com/zzet/gortex/cmd/gortex@latest" {
+		t.Fatalf("go install command args = %#v", cmd.Args)
 	}
 }
 
