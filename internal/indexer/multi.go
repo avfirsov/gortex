@@ -2298,6 +2298,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		}
 	}
 	hook := mi.onRepoTracked
+	trackedRepoCount := len(mi.repos)
 	mi.mu.RUnlock()
 
 	if hook != nil {
@@ -2315,7 +2316,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	if mi.configMgr != nil {
 		totalConfigured = foldDistinctRepoCount(mi.configMgr.Global().Repos)
 	}
-	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
+	willBeMultiRepo := trackedRepoCount+1 >= 2 || totalConfigured >= 2
 
 	// A second repo joining a live single-repo daemon flips the graph
 	// into prefixed-ID mode, but the first repo's nodes were minted
@@ -2423,6 +2424,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	// Already tracked — nothing to do.
 	mi.mu.RLock()
 	_, exists := mi.repos[prefix]
+	trackedRepoCount := len(mi.repos)
 	mi.mu.RUnlock()
 	if exists {
 		return nil, nil
@@ -2442,7 +2444,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	if mi.configMgr != nil {
 		totalConfigured = foldDistinctRepoCount(mi.configMgr.Global().Repos)
 	}
-	willBeMultiRepo := len(mi.repos)+1 >= 2 || totalConfigured >= 2
+	willBeMultiRepo := trackedRepoCount+1 >= 2 || totalConfigured >= 2
 
 	// Same transition guard as TrackRepoCtx: an already-reconciled
 	// lone repo with unprefixed nodes must be re-minted before this
