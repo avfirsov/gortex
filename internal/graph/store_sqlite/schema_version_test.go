@@ -247,6 +247,77 @@ func TestOpenV2RequiresTopologyIntegrityRebuild(t *testing.T) {
 	}
 }
 
+// TestOpenV6RepairsDuplicateQualNamesWithoutRebuild covers the release upgrade
+// failure from issue #278. Open repairs ambiguous qualified names before
+// schemaSQL creates nodes_by_qual, preserving every node and edge without
+// requiring destructive-rebuild authority.
+func TestOpenV6RepairsDuplicateQualNamesWithoutRebuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("create current store: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`DROP INDEX nodes_by_qual`); err != nil {
+			t.Fatalf("drop qualified-name index: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO nodes (id, kind, name, qual_name, file_path) VALUES
+			('a', 'function', 'Run', 'pkg.Run', 'a.go'),
+			('b', 'function', 'Run', 'pkg.Run', 'b.go')`); err != nil {
+			t.Fatalf("seed duplicate qualified names: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO edges (from_id, to_id, kind, file_path, line) VALUES
+			('a', 'b', 'calls', 'a.go', 1)`); err != nil {
+			t.Fatalf("seed edge between duplicate nodes: %v", err)
+		}
+	})
+
+	repaired, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy store for in-place repair: %v", err)
+	}
+	if repaired.NeedsRebuild() {
+		t.Fatal("qualified-name repair unexpectedly requested a rebuild")
+	}
+	if n := nodeCount(t, repaired.db); n != 2 {
+		t.Fatalf("node count after repair = %d, want 2", n)
+	}
+	var edges int
+	if err := repaired.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE from_id = 'a' AND to_id = 'b'`).Scan(&edges); err != nil || edges != 1 {
+		t.Fatalf("preserved edge count = %d (err %v), want 1", edges, err)
+	}
+	var aQual, bQual string
+	if err := repaired.db.QueryRow(`SELECT qual_name FROM nodes WHERE id = 'a'`).Scan(&aQual); err != nil {
+		t.Fatalf("read deterministic keeper: %v", err)
+	}
+	if err := repaired.db.QueryRow(`SELECT qual_name FROM nodes WHERE id = 'b'`).Scan(&bQual); err != nil {
+		t.Fatalf("read repaired duplicate: %v", err)
+	}
+	if aQual != "pkg.Run" || bQual != "" {
+		t.Fatalf("repaired qualified names = a:%q b:%q, want a:%q b:%q", aQual, bQual, "pkg.Run", "")
+	}
+	var uniqueIndex int
+	if err := repaired.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'nodes_by_qual'`).Scan(&uniqueIndex); err != nil || uniqueIndex != 1 {
+		t.Fatalf("qualified-name index count = %d (err %v), want 1", uniqueIndex, err)
+	}
+	if err := repaired.Close(); err != nil {
+		t.Fatalf("close repaired store: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("warm reopen after repair: %v", err)
+	}
+	defer reopened.Close()
+	if n := nodeCount(t, reopened.db); n != 2 {
+		t.Fatalf("node count after warm reopen = %d, want 2", n)
+	}
+}
+
 // TestApplyInPlaceMigrations: steps run in order and commit; a failing step
 // rolls the whole transaction back.
 func TestApplyInPlaceMigrations(t *testing.T) {
