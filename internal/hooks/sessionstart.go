@@ -293,7 +293,10 @@ func hasPathPrefix(path, prefix string) bool {
 // — this is just enough that an agent in the very first turn knows
 // to reach for graph tools first.
 func rulePreamble() string {
-	return "**Rule:** Call `explore` first for every code task (you're not oblicated to call `explore` if the given task is not related to the code). " +
+	return "**Rule:** Call `explore` first for code discovery, diagnosis, relationship analysis, or implementation. " +
+		"For an explicitly named file that the user asks you to read, review, or summarize, call `read(operation:\"file\", target:{file:\"<path>\"})` directly; do not start localization. " +
+		"Use `explore(operation:\"localize\")` when the file, symbol, or supporting evidence must be discovered. " +
+		"After starting localization, obey `completion.required_action` and make no further tool calls after `answer_ready`. " +
 		"Inspect indexed code with `search`, `read`, `relations`, or `trace`. " +
 		"Use native read, search, or edit tools only when Gortex performance or integration is bad. " +
 		"Before mutation call `change(operation:\"impact\")`; " +

@@ -529,7 +529,7 @@ func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
 		require.NotContains(t, strings.ToLower(got), implementationTerm)
 	}
-	for _, directive := range []string{"MUST use Gortex MCP", "files/symbols/evidence/where", `explore(operation:"localize")`, "completion.required_action", "make no calls after answer_ready", `explore(operation:"task")`, "For diagnosis/change", `change(operation:"impact")`, "Mutate only with edit or refactor", `change(operation:"detect")`, "Call capabilities only for unknown fields"} {
+	for _, directive := range []string{"MUST use Gortex MCP", "Explicit file read/review", `read(operation:"file", target:{file:"<path>"})`, "do not localize", "Unknown file/symbol/evidence", `explore(operation:"localize")`, "completion.required_action", "stop at answer_ready", "Diagnosis/change", `explore(operation:"task")`, `change(operation:"impact")`, "Mutate only via edit/refactor", `change(operation:"detect")`, "capabilities only if fields unknown"} {
 		require.Contains(t, got, directive)
 	}
 }
