@@ -4,9 +4,10 @@
 // Pi is unlike every other adapter in this tree for two reasons:
 //
 //  1. Pi has no MCP support — by design. Instead we ship a TypeScript
-//     extension that registers Gortex's graph tools natively (each
-//     shelling `gortex call <tool>`) and re-creates the Claude-Code
-//     read-discipline enforcement by bridging Pi lifecycle events to
+//     extension that registers Gortex's graph tools natively, forwarding
+//     each call over a persistent MCP stdio bridge (one `gortex mcp`
+//     child per session), and re-creates the Claude-Code read-discipline
+//     enforcement by bridging Pi lifecycle events to
 //     `gortex hook --agent=pi`.
 //
 //  2. It is therefore has to ship executable code (the embedded
@@ -53,7 +54,15 @@ const (
 	sentinelArgv         = "{{GORTEX_HOOK_ARGV}}"
 	sentinelEnforce      = "{{GORTEX_ENFORCE}}"
 	sentinelInstructions = "{{GORTEX_INSTRUCTIONS}}"
+	sentinelToolsPreset  = "{{GORTEX_TOOLS_PRESET}}"
 )
+
+// defaultToolsPreset is the eager tool preset baked into the extension. It
+// mirrors the daemon's own default surface (corePresetTools, in defer
+// mode); GORTEX_TOOLS in the environment overrides it at runtime, the same
+// override the daemon honours. Kept a constant (not read from the
+// environment at render time) so the rendered extension is deterministic.
+const defaultToolsPreset = "core"
 
 type Adapter struct{}
 
@@ -158,6 +167,7 @@ func renderExtension(env agents.Env) string {
 	src = substituteSentinel(src, sentinelArgv, jsonValue(argv))
 	src = substituteSentinel(src, sentinelEnforce, jsonValue(env.InstallHooks))
 	src = substituteSentinel(src, sentinelInstructions, jsonString(agents.BashInstructionsBody))
+	src = substituteSentinel(src, sentinelToolsPreset, jsonString(defaultToolsPreset))
 	return src
 }
 

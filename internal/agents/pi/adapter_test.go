@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"regexp"
-	"slices"
 	"strings"
 	"testing"
 
@@ -240,52 +238,57 @@ func TestPiRendersCompactPublicTools(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
 	src := renderExtension(env)
 
-	// Every Gortex tool is namespaced under gortex_ so it cannot clobber a
-	// Pi built-in such as read or edit. The CLI still receives the bare public
-	// name and the model's exact request object.
-	if !strings.Contains(src, `const TOOL_PREFIX = "gortex_"`) {
-		t.Error("expected a gortex_ tool-name prefix")
+	// B: on-demand discovery reuses the server's own tools_search tool —
+	// no client-side meta-tool re-implementation. Promotions arrive via
+	// notifications/tools/list_changed and a tools/list re-sync.
+	if strings.Contains(src, "registerSearchTool") {
+		t.Error("expected no client-side tools_search meta-tool; the server's own tool is registered like any other")
 	}
-	if !strings.Contains(src, `"call",
-          bare,
-          "--json",
-          JSON.stringify(params ?? {}),`) {
-		t.Error("expected each Pi tool to forward the exact request object through gortex call")
+	if !strings.Contains(src, `"notifications/tools/list_changed"`) {
+		t.Error("expected the bridge to handle tools/list_changed for server-side promotion")
 	}
-
-	for _, legacy := range []string{"tools_search", "TOOLS_PRESET", `"tools", "list"`, `"tools", "search"`} {
-		if strings.Contains(src, legacy) {
-			t.Errorf("Pi compact surface must not contain legacy discovery vocabulary %q", legacy)
-		}
-	}
-	if strings.Contains(src, `"--format"`) {
-		t.Error("Pi must not rewrite the request by forcing an output format")
+	if !strings.Contains(src, "syncTools(pi)") {
+		t.Error("expected promoted tools to be registered via a tools/list re-sync")
 	}
 
-	blockStart := strings.Index(src, "const PUBLIC_TOOLS: ToolDescriptor[] = [")
-	if blockStart < 0 {
-		t.Fatal("PUBLIC_TOOLS roster missing")
+	// Tools are registered under their bare daemon names — the names the
+	// server's tools_search reply cites must be exactly the names the
+	// model can call, so no client-side prefix.
+	if strings.Contains(src, "TOOL_PREFIX") {
+		t.Error("expected tools to be registered under bare daemon names, not a client-side prefix")
 	}
-	block := src[blockStart:]
-	if end := strings.Index(block, "];"); end >= 0 {
-		block = block[:end]
+
+	// Only recognised presets are forwarded to the proxy: an unknown
+	// value would parse server-side as a one-tool allow-list and strip
+	// every promoted tool from the session (fail open instead).
+	if !strings.Contains(src, `new Set(["edit", "nav", "readonly"])`) {
+		t.Error("expected only recognised presets to be forwarded into GORTEX_TOOLS")
 	}
-	matches := regexp.MustCompile(`\{ name: "([^"]+)"`).FindAllStringSubmatch(block, -1)
-	got := make([]string, 0, len(matches))
-	for _, match := range matches {
-		got = append(got, match[1])
+	// D: the MCP bridge identifies itself as "pi" and self-declares its
+	// GCX decoder via the gortex/wire capability (no server-side
+	// allowlist entry), and never lets a preset hide-block promoted
+	// tools.
+	if !strings.Contains(src, `const CLIENT_NAME = "pi"`) {
+		t.Error("expected the bridge to send clientInfo.name \"pi\"")
 	}
-	want := []string{
-		"explore", "search", "read", "relations", "trace", "analyze", "ask",
-		"change", "edit", "refactor", "review", "publish_review", "pr", "recall",
-		"remember", "workspace", "workspace_admin", "overlay", "session", "response",
-		"capabilities",
+	if !strings.Contains(src, `"gortex/wire": WIRE_FORMATS`) {
+		t.Error("expected the bridge to declare the gortex/wire capability in initialize")
 	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("public Pi tools = %v, want %v", got, want)
+	if !strings.Contains(src, `env.GORTEX_TOOLS_MODE = "defer"`) {
+		t.Error("expected the bridge to force GORTEX_TOOLS_MODE=defer when a preset is active")
 	}
-	if !strings.Contains(src, agents.BashInstructionsSentinel) {
-		t.Error("rendered Pi extension must carry the mandatory Bash-only public workflow")
+	// Tool calls carry a generous-but-finite cap: long analyzers can
+	// finish, a wedged daemon can't hang the agent turn forever.
+	if !strings.Contains(src, "const CALL_TIMEOUT_MS = 600_000") {
+		t.Error("expected tools/call to run under the 10-minute cap")
+	}
+	if strings.Contains(src, "Number.POSITIVE_INFINITY") {
+		t.Error("tools/call must not run without a timeout")
+	}
+	// A tools_search call re-syncs synchronously so every name its reply
+	// cites is already a callable Pi tool when the model reads it.
+	if !strings.Contains(src, `if (name === "tools_search")`) {
+		t.Error("expected tools_search to await a tools/list re-sync before returning its reply")
 	}
 }
 
