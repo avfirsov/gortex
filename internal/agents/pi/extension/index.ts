@@ -3,88 +3,82 @@
 // Pi has no MCP support by design — the extension API's registerTool
 // covers it. This extension does two things:
 //
-//   1. Exposes Gortex's compact public tools as native Pi tools. On every
-//      session_start the daemon is brought up (ensureDaemon) and the tools
-//      are (re)registered — Pi has no MCP, so the extension does what an MCP
-//      client's `gortex mcp` proxy does for it, and Pi resets the session's
-//      tool registry on each /new, so registration must happen per session.
-//      Each registered tool then shells `gortex call <name>`, which
-//      relays the exact request object to the daemon. The fixed public roster
-//      keeps Pi aligned with every MCP host without exposing implementation
-//      aliases or requiring runtime catalogue discovery.
+//   1. Exposes Gortex's graph tools as native Pi tools through a
+//      persistent MCP stdio bridge: one `gortex mcp` child per session,
+//      spoken to over standard JSON-RPC 2.0. The eager tools/list
+//      surface is registered up front; the deferred catalogue is
+//      reached via the server's own `tools_search` tool, whose
+//      promotions are re-synced into Pi's registry on
+//      notifications/tools/list_changed.
 //
-//   2. Re-creates the Claude-Code "prefer graph tools over raw file
-//      reads" enforcement. Rather than re-implementing the deny logic in
-//      TypeScript, every relevant lifecycle event is marshalled into a
-//      normalized envelope and handed to `gortex hook --agent=pi`, whose
-//      decision is applied here. The Go side owns the deny / enrich /
-//      consult-unlock / nudge postures, identical to every other agent.
+//   2. Re-creates the "prefer graph tools over raw file reads"
+//      enforcement by forwarding lifecycle events to
+//      `gortex hook --agent=pi` and applying its decision — the Go side
+//      owns the postures, identical to every other agent.
 //
-// This file is written verbatim by the `pi` agent adapter, except for four
-// templated sentinels the adapter replaces at install time:
+// This file is written verbatim by the `pi` agent adapter, except for
+// four templated sentinels replaced with JSON literals at install time:
 //
-//   {{GORTEX_BIN}}        -> a JSON string: the resolved `gortex` binary path
-//   {{GORTEX_HOOK_ARGV}}  -> a JSON array: the full hook argv, e.g.
-//                            ["/usr/local/bin/gortex","hook","--agent=pi"]
-//                            (with a trailing "--mode=<mode>" when non-deny)
-//   {{GORTEX_ENFORCE}}    -> a JSON boolean: whether to wire the read-discipline
-//                            enforcement (false when installed with --no-hooks;
-//                            the graph tools + orientation are still wired)
-//   {{GORTEX_INSTRUCTIONS}} -> a JSON string: the shared mandatory public-tool
-//                              workflow injected once per session.
+//   {{GORTEX_BIN}}          -> string: resolved `gortex` binary path
+//   {{GORTEX_HOOK_ARGV}}    -> array: full hook argv
+//   {{GORTEX_ENFORCE}}      -> boolean: wire read-discipline enforcement
+//                              (false when installed with --no-hooks)
+//   {{GORTEX_TOOLS_PRESET}} -> string: default eager tool preset;
+//                              GORTEX_TOOLS overrides it at runtime
 //
-// Each is emitted as a JSON literal so values containing spaces survive.
-//
-// NOTE: Pi is pre-1.0. The ExtensionAPI surface, event names, and the Pi
-// built-in tool names mapped in normalizeToolCall() below are pinned to
-// Pi's documented API (packages/coding-agent/docs/extensions.md). If a Pi
-// upgrade renames an event or a built-in tool, adjust the small maps here
-// — the Go side (the wire contract) stays unchanged.
+// NOTE: Pi is pre-1.0. The event names and built-in tool names mapped in
+// normalizeToolCall() below are pinned to Pi's documented API
+// (packages/coding-agent/docs/extensions.md); if an upgrade renames one,
+// adjust the small maps here — the Go wire contract stays unchanged.
 
-// Zero runtime dependencies: only Node built-ins. The tool `parameters`
-// below are plain JSON Schema objects rather than TypeBox schemas — Pi's
-// tool layer accepts a plain JSON-schema object. This is deliberate: 
-// a single-file auto-discovered extension has no package.json / node_modules, 
-// so importing `typebox` would throw at load and take the whole extension
-// (tools AND enforcement) down with it.
+// Zero runtime dependencies, by design: a single-file auto-discovered
+// extension has no node_modules, so any non-built-in import would throw
+// at load and take the whole extension down. Tool `parameters` are the
+// MCP server's JSON-Schema objects, passed verbatim.
 import { execFileSync, spawn } from "node:child_process";
 
 const GORTEX_BIN: string = {{ GORTEX_BIN }};
 const HOOK_ARGV: string[] = {{ GORTEX_HOOK_ARGV }};
 const ENFORCE: boolean = {{ GORTEX_ENFORCE }};
-const GORTEX_INSTRUCTIONS: string = {{ GORTEX_INSTRUCTIONS }};
 
-// Names (all gortex_-prefixed) of the Gortex tools registered into Pi.
+// Which eager preset to expose as native Pi tools. The daemon itself
+// defaults to the `core` preset in `defer` mode, so for `core` (and
+// `full`) the bridge passes nothing and the daemon's own surface applies.
+// A non-default preset (edit|nav|readonly) is forwarded to the `gortex
+// mcp` proxy via GORTEX_TOOLS, always with GORTEX_TOOLS_MODE=defer — in
+// hide mode the proxy would -32601 calls to tools promoted later by
+// tools_search. Anything unrecognised (a typo, a stale baked value) is
+// NOT forwarded: server-side it would parse as a one-tool allow-list and
+// silently filter every promoted tool out of the session — fail open to
+// the daemon's default surface instead. GORTEX_TOOLS in the environment
+// overrides the value baked at install time.
+const TOOLS_PRESET: string = ((process.env && process.env.GORTEX_TOOLS) || {{ GORTEX_TOOLS_PRESET }}).trim();
+
+// Identity reported as MCP clientInfo, plus the gortex/wire capability
+// declared in the initialize request: the daemon reads it to learn which
+// compact wire formats this client decodes, so list-shaped tools default
+// to GCX1 for this session without a server-side client-name allowlist
+// entry.
+const CLIENT_NAME = "pi";
+const CLIENT_VERSION = "1.0.0";
+const WIRE_FORMATS: string[] = ["gcx"];
+
+// Names of the Gortex tools registered into Pi — the daemon's bare tool
+// names (search_symbols, tools_search, ...). Registered unprefixed so
+// every name the server's tools_search reply cites is exactly a callable
+// Pi tool; on an (unlikely) collision with another extension's tool,
+// safeRegister leaves the existing registration standing.
 const gortexToolNames = new Set<string>();
 
-// Every Gortex tool is registered under a `gortex_` prefix so it can never
-// silently clobber a Pi built-in or another extension's tool of the same
-// name.
-// The execute() closure still calls the daemon with the bare name.
-const TOOL_PREFIX = "gortex_";
-function piToolName(bare: string): string {
-  return bare.startsWith(TOOL_PREFIX) ? bare : TOOL_PREFIX + bare;
-}
-
 // ---------------------------------------------------------------------------
-// Subprocess helpers
+// Daemon lifecycle
 // ---------------------------------------------------------------------------
 
-function runGortex(args: string[], input?: string): string {
-  return execFileSync(GORTEX_BIN, args, {
-    input,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: 30_000,
-  }).trim();
-}
-
-// ensureDaemon brings the shared Gortex daemon up, the way an MCP host's
-// `gortex mcp` does for other agents.
-// Idempotent, fire-and-forget (we don't block on the launcher's ≤60s 
-// readiness poll), and never throws — a missing binary or spawn failure
-// must not take the extension down. The first tool calls either find it
-// ready or degrade gracefully.
+// ensureDaemon brings the shared Gortex daemon up before the MCP child
+// dials it. Idempotent, fire-and-forget (we don't block on the launcher's
+// ≤60s readiness poll), and never throws — a missing binary or spawn
+// failure must not take the extension down. The bridge's initialize retry
+// absorbs the warm-up window.
 function ensureDaemon(): void {
   try {
     const child = spawn(GORTEX_BIN, ["daemon", "start", "--detach"], {
@@ -93,10 +87,266 @@ function ensureDaemon(): void {
     });
     child.on("error", () => { }); // binary missing / spawn failure — swallow
     // No teardown counterpart, by design: the daemon is shared, long-lived
-    // infrastructure that outlives the session — like `gortex mcp`.
+    // infrastructure that outlives the session.
     child.unref();
   } catch {
   }
+}
+
+// ---------------------------------------------------------------------------
+// MCP stdio client (newline-delimited JSON-RPC 2.0 over a `gortex mcp` child)
+// ---------------------------------------------------------------------------
+
+const INIT_TIMEOUT_MS = 60_000;
+const RPC_TIMEOUT_MS = 30_000;
+// tools/call cap: generous enough for long analyzers (sast sweeps,
+// reviews, enrich passes), finite so a wedged daemon behind a
+// still-alive child can't hang the agent turn forever.
+const CALL_TIMEOUT_MS = 600_000;
+// A single JSON-RPC frame past this cap kills the child: the stream
+// can't be resynced mid-frame, and the old shell-out path errored at
+// execFileSync's 64 MiB maxBuffer for the same reason.
+const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+interface PendingRequest {
+  resolve: (value: any) => void;
+  reject: (err: Error) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+class MCPStdioClient {
+  private child: any = null;
+  private buffer = "";
+  private searchStart = 0;
+  private nextId = 1;
+  private pending = new Map<number, PendingRequest>();
+  private exited = true;
+  private respawnPromise: Promise<void> | null = null;
+
+  // Fired on notifications/tools/list_changed (server-side promotion).
+  onToolsListChanged: (() => void) | null = null;
+
+  private childEnv(): Record<string, string | undefined> {
+    const env: Record<string, string | undefined> = { ...process.env };
+    const preset = TOOLS_PRESET.toLowerCase();
+    // The daemon's own default surface already IS core/defer; only a
+    // recognised non-default preset needs the proxy-side narrowing.
+    // Unknown values are dropped (fail open) — forwarded verbatim they
+    // would parse as a one-tool allow-list and leave the session with
+    // no callable graph tools at all.
+    const FORWARDED_PRESETS = new Set(["edit", "nav", "readonly"]);
+    if (!env.GORTEX_TOOLS && FORWARDED_PRESETS.has(preset)) {
+      env.GORTEX_TOOLS = TOOLS_PRESET;
+    }
+    // Never let a preset hide-block tools promoted later by tools_search.
+    if (env.GORTEX_TOOLS && !env.GORTEX_TOOLS_MODE) env.GORTEX_TOOLS_MODE = "defer";
+    return env;
+  }
+
+  private spawnChild(): void {
+    const child = spawn(GORTEX_BIN, ["mcp"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: this.childEnv(),
+    });
+    this.child = child;
+    this.buffer = "";
+    this.searchStart = 0;
+    this.exited = false;
+    child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+    // Consume stderr so the child never blocks on a full pipe; routing it
+    // to the terminal would corrupt Pi's TUI.
+    child.stderr.on("data", () => { });
+    child.stdin.on("error", () => { }); // EPIPE race: child may exit before stdin.write() finishes
+    child.on("error", () => this.markExited(new Error("gortex mcp spawn failed")));
+    child.on("exit", () => this.markExited(new Error("gortex mcp exited")));
+  }
+
+  private markExited(err: Error): void {
+    if (this.exited && this.pending.size === 0) return;
+    this.exited = true;
+    this.child = null;
+    for (const [, p] of this.pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
+  }
+
+  private onData(chunk: Buffer): void {
+    this.buffer += chunk.toString("utf8");
+    let nl: number;
+    // Resume the newline scan where the previous chunk left off — a
+    // large frame split across many chunks must not re-scan the whole
+    // growing buffer from index 0 on every data event.
+    while ((nl = this.buffer.indexOf("\n", this.searchStart)) >= 0) {
+      const line = this.buffer.slice(0, nl).trim();
+      this.buffer = this.buffer.slice(nl + 1);
+      this.searchStart = 0;
+      if (!line) continue;
+      let msg: any;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        continue; // non-JSON noise — ignore
+      }
+      this.dispatch(msg);
+    }
+    this.searchStart = this.buffer.length;
+    if (this.buffer.length > MAX_BUFFER_BYTES) {
+      // One frame past the cap is fatal for this child (no way to
+      // resync mid-frame): pending requests reject, the next call
+      // respawns a fresh child.
+      this.buffer = "";
+      this.searchStart = 0;
+      const child = this.child;
+      this.markExited(new Error(`gortex mcp frame exceeded ${MAX_BUFFER_BYTES} bytes`));
+      try {
+        child?.kill();
+      } catch {
+      }
+    }
+  }
+
+  private dispatch(msg: any): void {
+    if (msg && typeof msg.id === "number" && this.pending.has(msg.id)) {
+      const p = this.pending.get(msg.id)!;
+      this.pending.delete(msg.id);
+      if (p.timer) clearTimeout(p.timer);
+      if (msg.error) {
+        p.reject(new Error(msg.error.message || `JSON-RPC error ${msg.error.code}`));
+      } else {
+        p.resolve(msg.result);
+      }
+      return;
+    }
+    if (msg && msg.method === "notifications/tools/list_changed") {
+      try {
+        this.onToolsListChanged?.();
+      } catch {
+        // best effort — never break the read loop.
+      }
+    }
+  }
+
+  private send(obj: Record<string, unknown>): void {
+    if (!this.child || this.exited) throw new Error("gortex mcp is not running");
+    this.child.stdin.write(JSON.stringify(obj) + "\n");
+  }
+
+  // A single shared respawn: concurrent callers of request() against a
+  // dead child all await the same spawn+initialize, so a burst of tool
+  // calls can never fork multiple children.
+  private respawn(): Promise<void> {
+    if (!this.respawnPromise) {
+      this.respawnPromise = (async () => {
+        this.spawnChild();
+        await this.initialize();
+      })().finally(() => {
+        this.respawnPromise = null;
+      });
+    }
+    return this.respawnPromise;
+  }
+
+  async request(method: string, params: unknown, timeoutMs: number = RPC_TIMEOUT_MS): Promise<any> {
+    if (this.exited) await this.respawn();
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const entry: PendingRequest = { resolve, reject };
+      if (Number.isFinite(timeoutMs)) {
+        entry.timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+      this.pending.set(id, entry);
+      try {
+        this.send({ jsonrpc: "2.0", id, method, params });
+      } catch (err: any) {
+        this.pending.delete(id);
+        if (entry.timer) clearTimeout(entry.timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  private notify(method: string, params: unknown): void {
+    try {
+      this.send({ jsonrpc: "2.0", method, params });
+    } catch {
+      // notifications are best-effort.
+    }
+  }
+
+  private async initialize(): Promise<void> {
+    await this.request(
+      "initialize",
+      {
+        protocolVersion: "2025-06-18",
+        // gortex/wire self-declares this client's compact-format
+        // decoders; the daemon prefers it over its name allowlist.
+        capabilities: { experimental: { "gortex/wire": WIRE_FORMATS } },
+        clientInfo: { name: CLIENT_NAME, version: CLIENT_VERSION },
+      },
+      INIT_TIMEOUT_MS,
+    );
+    this.notify("notifications/initialized", {});
+  }
+
+  // start spawns the child and runs the MCP handshake, retrying once
+  // after a 1s backoff — the daemon may still be warming up right after
+  // ensureDaemon() kicked it off.
+  async start(): Promise<void> {
+    this.spawnChild();
+    try {
+      await this.initialize();
+    } catch {
+      await new Promise((r) => setTimeout(r, 1_000));
+      if (this.exited) this.spawnChild();
+      await this.initialize();
+    }
+  }
+
+  async listTools(): Promise<any[]> {
+    const res = await this.request("tools/list", {});
+    return Array.isArray(res?.tools) ? res.tools : [];
+  }
+
+  // Tool calls get a generous cap rather than none: long-running
+  // analyzers (sast sweeps, reviews, enrich passes) must be able to
+  // finish, but a wedged daemon behind a still-alive child must not
+  // hang the agent turn forever.
+  async callTool(name: string, args: Record<string, unknown>): Promise<any> {
+    return this.request("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
+  }
+
+  stop(): void {
+    const child = this.child;
+    this.markExited(new Error("gortex mcp bridge stopped"));
+    try {
+      child?.kill();
+    } catch {
+    }
+  }
+}
+
+// The session's live bridge; claimed synchronously at session_start (so
+// an overlapping restart can stop it) and nulled when the handshake
+// fails or the session is superseded.
+let client: MCPStdioClient | null = null;
+
+// Why the bridge is down this session (empty when it's up). Surfaced
+// once through the orientation injection so the user learns that
+// /reload retries the handshake.
+let bridgeError = "";
+
+// textFromResult joins the text parts of an MCP tools/call result.
+function textFromResult(result: any): string {
+  const parts = Array.isArray(result?.content) ? result.content : [];
+  return parts
+    .filter((c: any) => c && c.type === "text" && typeof c.text === "string")
+    .map((c: any) => c.text)
+    .join("\n");
 }
 
 interface PiDecision {
@@ -173,40 +423,14 @@ function normalizeToolCall(
 }
 
 // ---------------------------------------------------------------------------
-// Compact public-tool registration
+// Dynamic tool registration
 // ---------------------------------------------------------------------------
 
 interface ToolDescriptor {
   name: string;
-  description: string;
+  description?: string;
+  inputSchema?: unknown;
 }
-
-// Keep this roster closed and agent-neutral. The bare names are the exact
-// public CLI/MCP names; Pi adds only its collision-avoidance prefix at the
-// registration boundary.
-const PUBLIC_TOOLS: ToolDescriptor[] = [
-  { name: "explore", description: "Localize a task and return ranked source plus call paths. Call first." },
-  { name: "search", description: "Search indexed symbols, text, files, or AST shapes." },
-  { name: "read", description: "Read indexed files, symbols, summaries, or editing context." },
-  { name: "relations", description: "Find usages, callers, dependencies, dependents, or implementations." },
-  { name: "trace", description: "Trace call chains, value flow, or taint paths." },
-  { name: "analyze", description: "Run a graph analysis; use kind help to list analyses." },
-  { name: "ask", description: "Answer a codebase question from graph evidence." },
-  { name: "change", description: "Plan and check mutations: impact, verify, detect, tests, guards, or contract." },
-  { name: "edit", description: "Apply file, symbol, batch, or new-file edits." },
-  { name: "refactor", description: "Rename, move, inline, delete, or apply code actions." },
-  { name: "review", description: "Review changes with graph context." },
-  { name: "publish_review", description: "Publish prepared review feedback." },
-  { name: "pr", description: "Inspect pull-request changes, context, or risk." },
-  { name: "recall", description: "Retrieve notes or memories relevant to the work." },
-  { name: "remember", description: "Store durable decisions, invariants, or gotchas." },
-  { name: "workspace", description: "Inspect workspace and repository state." },
-  { name: "workspace_admin", description: "Perform explicit workspace administration." },
-  { name: "overlay", description: "Compare or manage session overlay state." },
-  { name: "session", description: "Manage session state or subscriptions." },
-  { name: "response", description: "Control response encoding or pagination." },
-  { name: "capabilities", description: "Get exact operations and request schemas only when needed." },
-];
 
 // safeRegister registers a Pi tool, tolerating a redundant registration —
 // a config reload can re-fire session_start without resetting the session's
@@ -219,43 +443,113 @@ function safeRegister(pi: any, def: any): void {
   }
 }
 
-// registerOneTool registers one public Gortex tool as a native Pi tool named
-// `gortex_<bare>`, whose execute() shells `gortex call <bare>`. The `--json`
-// value is the model's exact request object; the adapter does not add output
-// fields or translate operation names.
-function registerOneTool(pi: any, desc: ToolDescriptor): void {
-  const bare = desc.name;
-  if (!bare) return;
-  const name = piToolName(bare);
-  if (gortexToolNames.has(name)) return;
-  gortexToolNames.add(name);
-  safeRegister(pi, {
-    name,
-    label: name,
-    description: desc.description,
-    // Pass-through arguments: the model supplies whatever the underlying
-    // Gortex tool accepts; `gortex call` validates names + args server
-    // side and suggests near-matches on a typo.
-    parameters: { type: "object", additionalProperties: true, properties: {} },
-    async execute(_id: string, params: Record<string, unknown>) {
-      try {
-        const out = runGortex([
-          "call",
-          bare,
-          "--json",
-          JSON.stringify(params ?? {}),
-        ]);
-        return { content: [{ type: "text", text: out }], details: {} };
-      } catch (err: any) {
-        const msg = err?.stderr?.toString?.() || err?.message || String(err);
-        throw new Error(`gortex call ${bare} failed: ${msg}`);
-      }
-    },
-  });
+// Lazily resolved TUI Text component, used only to collapse a gortex
+// tool's result to nothing until the user expands it (ctrl+o). Resolved
+// via require (not a static import) so a Pi packaging that can't
+// provide @earendil-works/pi-tui to a dependency-free single-file
+// extension degrades to Pi's default renderer instead of throwing at
+// load and taking tool registration down with it — the same hazard the
+// file's zero-runtime-dependency design already avoids for typebox.
+let TuiText: (new (text: string, x: number, y: number) => any) | undefined;
+try {
+  TuiText = require("@earendil-works/pi-tui").Text;
+} catch {
+  TuiText = undefined;
 }
 
-function registerGortexTools(pi: any): void {
-  for (const desc of PUBLIC_TOOLS) registerOneTool(pi, desc);
+// registerOneTool registers a single Gortex tool as a native Pi tool
+// under its bare daemon name, whose execute() forwards to the MCP
+// bridge's tools/call. The MCP input schema is passed verbatim as Pi's
+// parameters (Pi validates plain JSON Schema), so the model sees real
+// parameter docs. Idempotent — a name already registered is skipped.
+// Adds the name to gortexToolNames so the read-discipline postures treat
+// a call to it as a graph query, not a raw file read. Used both for the
+// eager tools/list surface and for tools promoted later by a
+// tools_search call (picked up via the list_changed re-sync).
+//
+// renderResult keeps the collapsed view to just the tool name (Pi's
+// fallback renderCall already shows that) — no preview, no summary.
+// ctrl+o (expand) is the only way to see the actual output.
+function registerOneTool(pi: any, desc: ToolDescriptor): void {
+  const name = desc.name;
+  if (!name) return;
+  if (gortexToolNames.has(name)) return;
+  gortexToolNames.add(name);
+  const parameters =
+    desc.inputSchema && typeof desc.inputSchema === "object"
+      ? desc.inputSchema
+      : { type: "object", properties: {} };
+  const def: any = {
+    name,
+    label: name,
+    description: (desc.description || name).trim(),
+    parameters,
+    async execute(_id: string, params: Record<string, unknown>) {
+      if (!client) throw new Error(`gortex ${name}: MCP bridge is not connected`);
+      let result: any;
+      try {
+        result = await client.callTool(name, params ?? {});
+      } catch (err: any) {
+        throw new Error(`gortex ${name} failed: ${err?.message || String(err)}`);
+      }
+      if (name === "tools_search") {
+        // The daemon just promoted the matches and fired list_changed;
+        // register them NOW (bypassing the debounce) so every tool the
+        // reply cites is already callable when the model reads it.
+        await syncTools(pi);
+      }
+      const text = textFromResult(result) ||
+        JSON.stringify(result?.structuredContent ?? result ?? {});
+      if (result?.isError) throw new Error(text || `gortex ${name} failed`);
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  };
+  if (TuiText) {
+    def.renderResult = (result: any, opts: { expanded?: boolean }) => {
+      if (!opts?.expanded) return new TuiText!("", 0, 0);
+      const text = textFromResult(result) ||
+        JSON.stringify(result?.structuredContent ?? result ?? {});
+      return new TuiText!(text, 0, 0);
+    };
+  }
+  safeRegister(pi, def);
+}
+
+// registerGortexTools fetches the daemon's eager surface (tools/list —
+// the configured preset, full schemas included) and registers each entry,
+// including the server's `tools_search` discovery tool.
+async function registerGortexTools(pi: any): Promise<void> {
+  if (!client) return;
+  for (const desc of await client.listTools()) {
+    if (!desc) continue;
+    registerOneTool(pi, desc);
+  }
+}
+
+// syncTools re-fetches tools/list after a notifications/tools/list_changed
+// and registers anything new. This is how tools promoted by a
+// tools_search call become callable Pi tools.
+async function syncTools(pi: any): Promise<void> {
+  try {
+    await registerGortexTools(pi);
+  } catch {
+    // transient — the next promotion or session retries.
+  }
+}
+
+// The daemon fires one list_changed per promoted tool, so a tools_search
+// sweep arrives as a notification burst; debounce to a single trailing
+// re-fetch instead of one full tools/list round-trip per notification.
+// (The tools_search execute() path awaits syncTools directly, bypassing
+// the debounce, so the reply never waits on this timer.)
+const SYNC_DEBOUNCE_MS = 200;
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSyncTools(pi: any): void {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    void syncTools(pi);
+  }, SYNC_DEBOUNCE_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,22 +558,52 @@ function registerGortexTools(pi: any): void {
 
 export default function (pi: any) {
   let orientationInjected = false;
-  // Mandatory workflow and hook orientation awaiting injection into the next
-  // LLM call. The `context` hook appends them as a tail user message rather
-  // than mutating
+  // Orientation awaiting injection into the next LLM call. The `context`
+  // hook appends it as a tail user message rather than mutating
   // systemPrompt: a systemPrompt change sits at messages[0] and invalidates
   // prefix prompt caching. Computed once per session.
-  let pendingOrientation = GORTEX_INSTRUCTIONS;
+  let pendingOrientation = "";
 
   // Pi resets the session's tool registry on every session_start, so
   // (re)register here. Clear the name guard first — it persists across
-  // sessions and would otherwise suppress re-registration.
-  pi.on("session_start", () => {
+  // sessions and would otherwise suppress re-registration. The previous
+  // session's bridge child (if any) is stopped before a fresh handshake.
+  pi.on("session_start", async () => {
     orientationInjected = false;
-    pendingOrientation = GORTEX_INSTRUCTIONS;
+    pendingOrientation = "";
+    bridgeError = "";
     ensureDaemon();
     gortexToolNames.clear();
-    registerGortexTools(pi);
+    if (syncTimer) {
+      clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    if (client) {
+      client.stop();
+      client = null;
+    }
+    const c = new MCPStdioClient();
+    // Claim the slot before the first await: an overlapping
+    // session_start (rapid /new or /reload) then sees and stops THIS
+    // bridge instead of leaking its child mid-handshake.
+    client = c;
+    try {
+      await c.start();
+      if (client !== c) return; // superseded while handshaking
+      c.onToolsListChanged = () => {
+        scheduleSyncTools(pi);
+      };
+      await registerGortexTools(pi);
+    } catch (err: any) {
+      // daemon unreachable / binary missing / handshake or tools/list
+      // failure — no graph tools this session; /reload (or the next
+      // session_start) retries.
+      c.stop();
+      if (client === c) {
+        client = null;
+        bridgeError = err?.message || String(err);
+      }
+    }
   });
 
   // Fires before the agent loop's first LLM call. It can't mutate messages
@@ -287,10 +611,19 @@ export default function (pi: any) {
   pi.on("before_agent_start", () => {
     if (orientationInjected) return;
     const decision = callHook({ event: "session_start", cwd: pi?.cwd ?? process.cwd() });
-    if (decision.orientation) {
-      pendingOrientation = [GORTEX_INSTRUCTIONS, decision.orientation].filter(Boolean).join("\n\n");
+    const parts: string[] = [];
+    if (bridgeError) {
+      parts.push(
+        `[Gortex] graph tools are unavailable this session (${bridgeError}). ` +
+        `Tell the user to run /reload to retry the connection.`,
+      );
+      bridgeError = "";
     }
-    orientationInjected = true;
+    if (decision.orientation) parts.push(decision.orientation);
+    if (parts.length > 0) {
+      pendingOrientation = parts.join("\n\n");
+      orientationInjected = true;
+    }
     return;
   });
 

@@ -999,6 +999,7 @@ var knownAgentClients = map[string]bool{
 	"openclaw":         true,
 	"codex":            true,
 	"omp-coding-agent": true,
+	"pi":               true,
 }
 
 // knownAgentHosts are host-context families whose aliases name the same
