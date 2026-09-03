@@ -5028,6 +5028,20 @@ func localizationMemberTier(n *graph.Node) int {
 	}
 }
 
+// sortLocalizationMemberTier puts one file's tier rows in declaration order,
+// falling back to the node id when two rows share a start line (a fixture
+// without line numbers, or two declarations the extractor put on one line).
+// Both keys are the graph's own, so the result is identical on every platform.
+func sortLocalizationMemberTier(tier []*rerank.Candidate) {
+	sort.SliceStable(tier, func(i, j int) bool {
+		a, b := tier[i].Node, tier[j].Node
+		if a.StartLine != b.StartLine {
+			return a.StartLine < b.StartLine
+		}
+		return a.ID < b.ID
+	})
+}
+
 // demoteLocalizationFileMembers reorders localization candidates inside the
 // index positions each file already occupies. Nothing is dropped, added, or
 // moved across files: a file's tiered candidates are written back into that
@@ -5036,6 +5050,17 @@ func localizationMemberTier(n *graph.Node) int {
 // projection's field — survives. Relative order inside a tier is preserved, so
 // the reorder is stable and idempotent. Candidates without a node or a file
 // path cannot be attributed to a file and keep their position.
+//
+// Inside a tier the rows are ordered by their own declaration site — the
+// file's reading order — rather than by the order they happened to arrive
+// in. The arrival order carries no ranking signal at this point:
+// liftLocalizationSiblingCallables writes each traded-in sibling into the
+// slot of whichever demoted member it replaced, so a file's rows are already
+// permuted by something other than their rank. Leaving that permutation
+// visible made the page depend on an upstream tie whose resolution is not
+// stable across platforms — the same Swift fixture paged
+// `[type, detect, reload]` on POSIX and `[type, reload, detect]` on Windows.
+// Declaration order is a total order on a key every platform agrees on.
 func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidate {
 	if len(cands) < 2 {
 		return cands
@@ -5070,6 +5095,9 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 			cand := cands[position]
 			tier := localizationMemberTier(cand.Node)
 			tiers[tier] = append(tiers[tier], cand)
+		}
+		for i := range tiers {
+			sortLocalizationMemberTier(tiers[i])
 		}
 		written := 0
 		for _, tier := range tiers {

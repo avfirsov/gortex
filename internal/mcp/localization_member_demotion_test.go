@@ -102,6 +102,32 @@ func TestLocalizationDemotionYieldsFrontSlotToSiblingMethodForDataMembers(t *tes
 	}
 }
 
+// TestLocalizationDemotionOrdersATierByDeclarationSite pins the tier's
+// internal order to a key every platform agrees on. The candidates reaching
+// this stage are already permuted by liftLocalizationSiblingCallables — each
+// traded-in sibling lands in the slot of whichever demoted member it replaced
+// — so their arrival order carries no ranking signal, and inheriting it made
+// the localization page depend on an upstream tie that resolved differently
+// on Windows than on POSIX. Whatever order the tier arrives in, it leaves in
+// declaration order.
+func TestLocalizationDemotionOrdersATierByDeclarationSite(t *testing.T) {
+	at := func(name string, kind graph.NodeKind, line int) *rerank.Candidate {
+		cand := memberDemotionCandidate("config.swift", name, kind)
+		cand.Node.StartLine = line
+		return cand
+	}
+	for _, arrival := range [][]*rerank.Candidate{
+		{at("shaderSlots", graph.KindField, 9), at("detect", graph.KindMethod, 25), at("reload", graph.KindMethod, 29), at("DirectoryConfiguration", graph.KindType, 5)},
+		{at("shaderSlots", graph.KindField, 9), at("reload", graph.KindMethod, 29), at("detect", graph.KindMethod, 25), at("DirectoryConfiguration", graph.KindType, 5)},
+		{at("shaderSlots", graph.KindField, 9), at("DirectoryConfiguration", graph.KindType, 5), at("reload", graph.KindMethod, 29), at("detect", graph.KindMethod, 25)},
+	} {
+		require.Equal(t,
+			[]string{"DirectoryConfiguration", "detect", "reload", "shaderSlots"},
+			memberDemotionNames(demoteLocalizationFileMembers(arrival)),
+			"arrival order: %#v", memberDemotionNames(arrival))
+	}
+}
+
 func TestLocalizationDemotionKeepsTypesAndOrdinaryCallablesInOneLeadingTier(t *testing.T) {
 	in := []*rerank.Candidate{
 		memberDemotionCandidate("config.swift", "DirectoryConfiguration.<init>", graph.KindMethod),
