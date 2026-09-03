@@ -789,7 +789,12 @@ func TestMapGitDiffUntrackedStaysUnobserved(t *testing.T) {
 // well-formed graph key for a different, untouched file.
 func TestJoinHunksToSymbolsPrefixedDeleteAndRename(t *testing.T) {
 	const prefix = "repo-a"
-	key := func(rel string) string { return prefix + "/" + filepath.FromSlash(rel) }
+	// A graph key is '/'-spelled on every platform (the indexer folds through
+	// filepath.ToSlash), so the fixture keys are built with path.Join, not
+	// filepath.Join. Re-spelling them natively made the node "repo-a/repo-a\
+	// pkg\gone.go::Gone" on Windows, which GraphKey — correctly emitting the
+	// slash key — could never match.
+	key := func(rel string) string { return path.Join(prefix, rel) }
 
 	g := graph.New()
 	add := func(rel, sym string) {

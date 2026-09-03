@@ -562,9 +562,9 @@ func parseDiffFiles(output string) ([]DiffHunk, []FileChange) {
 // header and the file records — so a hunk and its file record always join.
 //
 // Git spells diff paths with forward slashes on every platform, and so does
-// every consumer of DiffHunk.FilePath: GraphKey re-spells the key natively
-// itself (filepath.FromSlash), forge review comments and report rows are a
-// '/'-separated API. filepath.Clean would therefore be wrong on Windows —
+// every consumer of DiffHunk.FilePath: a graph key is '/'-spelled (GraphKey
+// folds through filepath.ToSlash), and forge review comments and report rows
+// are a '/'-separated API. filepath.Clean would therefore be wrong on Windows —
 // it hands back "internal\forge\forge.go" and misses every join — so the
 // clean is path.Clean over the slash spelling. filepath.ToSlash is the
 // identity on POSIX, where a backslash is an ordinary filename byte.
