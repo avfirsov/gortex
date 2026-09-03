@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -28,6 +30,10 @@ const (
 	localizationTerminalSessionHardCap  = 128
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
+	// A state rename can lose a race with a concurrent reader on Windows (see
+	// renameLocalizationState); 20 attempts 3ms apart bound the wait at 60ms.
+	localizationStateRenameAttempts = 20
+	localizationStateRenameDelay    = 3 * time.Millisecond
 
 	localizationTerminalContext    = "[Gortex] Localization for this task is complete. Answer now from completion.final_response, naming the files and symbols you rely on; if its evidence does not fit the request, say so and name what does. Either way, do not call another tool."
 	localizationTerminalDenyReason = "[Gortex] Localization for this task is complete, so this tool call is blocked. Answer now from the retained evidence below, naming what you rely on; if it does not fit the request, say so in your answer."
@@ -637,7 +643,7 @@ func consumeLocalizationToolSnapshot(input localizationTerminalHookInput) (local
 		return localizationTerminalIdentity{}, "", false
 	}
 	claimPath := path + ".consume-" + claimToken
-	if err := os.Rename(path, claimPath); err != nil {
+	if err := renameLocalizationState(path, claimPath); err != nil {
 		return localizationTerminalIdentity{}, "", false
 	}
 	defer os.Remove(claimPath) //nolint:errcheck // one-shot cleanup is best effort
@@ -851,11 +857,37 @@ func writeLocalizationState(path string, value any) bool {
 	if err := tmp.Close(); err != nil {
 		return false
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := renameLocalizationState(tmpPath, path); err != nil {
 		return false
 	}
 	committed = true
 	return true
+}
+
+// renameLocalizationState renames from onto to, retrying briefly while either
+// end is still held open by somebody else.
+//
+// POSIX rename(2) replaces the destination atomically and never fails because
+// a reader has it open. Windows MoveFileEx cannot touch a file another handle
+// owns unless that handle was opened with FILE_SHARE_DELETE, and os.Open does
+// not ask for it — so a concurrent reader of the very state file being
+// replaced makes the rename fail with a sharing violation and the hook drops a
+// terminal marker it believed it had written. Readers hold the handle for
+// microseconds, so a short bounded retry turns a lost write into a slightly
+// later one.
+func renameLocalizationState(from, to string) error {
+	err := os.Rename(from, to)
+	for attempt := 1; err != nil && attempt < localizationStateRenameAttempts; attempt++ {
+		// Only Windows fails this transiently, and only while the source is
+		// still there to move: a vanished source means another caller already
+		// claimed it, which no amount of retrying changes.
+		if runtime.GOOS != "windows" || errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		time.Sleep(localizationStateRenameDelay)
+		err = os.Rename(from, to)
+	}
+	return err
 }
 
 // writeBoundedLocalizationState keeps transient marker/snapshot storage
