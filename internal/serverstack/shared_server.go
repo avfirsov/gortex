@@ -759,6 +759,12 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// prior sessions (demoting the ones that fell out of use). Runs after
 	// the NewServer register sweep, so the cold tools are already deferred.
 	srv.InitLearnedTools(sideCfg.NotesDir, sideCfg.NotesRepo)
+	// InitMemories opens a second store the SideStores dirs do not name: the
+	// user-level global memories, always mounted at platform.MemoriesDir()
+	// even when this stack configured no side-store dirs at all. Its sidecar
+	// handle is as durable as the others, so record it here or a stack whose
+	// SideStores are empty still leaves one file open at Close.
+	s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(platform.MemoriesDir()))
 	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitSuppressions(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitNotebook(sideCfg.NotebookPath)
