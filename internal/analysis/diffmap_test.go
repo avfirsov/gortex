@@ -3,6 +3,7 @@ package analysis
 import (
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -56,10 +57,10 @@ func TestParseDiffHunksEqualsInternal(t *testing.T) {
 }
 
 // diffKey spells a repo-relative path the way parseDiffLines keys its map and
-// DiffHunk.FilePath is cleaned: filepath.Clean, so the key carries the running
-// platform's separators. Writing the '/' form directly reads fine on POSIX and
-// misses on Windows, where the map key is `pkg\foo.go`.
-func diffKey(p string) string { return filepath.Clean(p) }
+// DiffHunk.FilePath is cleaned: cleanDiffPath, i.e. path.Clean over the slash
+// spelling. The key therefore carries forward slashes on every platform, so
+// the '/' literal is the key verbatim — no per-platform re-spelling.
+func diffKey(p string) string { return path.Clean(p) }
 
 func TestParseDiffLinesNewSide(t *testing.T) {
 	lines := parseDiffLines(sampleDiff)
@@ -726,14 +727,11 @@ func TestParseDiffGitPaths(t *testing.T) {
 		{`diff --git "a/od\td.go" "b/od\td.go"`, ""},
 		{"diff --git nonsense", ""},
 	} {
-		// The recovered path is cleaned, so it carries native separators;
-		// the '/' spelling above is the diff's, not the result's.
-		want := tc.want
-		if want != "" {
-			want = filepath.Clean(want)
-		}
-		if got := parseDiffGitPaths(tc.line); got != want {
-			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, want)
+		// The recovered path is cleaned by cleanDiffPath, which keeps the
+		// slash spelling on every platform: the '/' form above is both the
+		// diff's and the result's.
+		if got := parseDiffGitPaths(tc.line); got != tc.want {
+			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, tc.want)
 		}
 	}
 }
