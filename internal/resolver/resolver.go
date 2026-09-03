@@ -211,9 +211,9 @@ type Resolver struct {
 	// `RegisterAll` resolving to `OverlayManager.Register` simply
 	// because "OverlayManager" sorts before "Registry".
 	reachableDirsByFile map[string]map[string]struct{}
-	// dirByFilePath memoises filepath.Dir(path) for every indexed file,
+	// dirByFilePath memoises filePathDir(path) for every indexed file,
 	// built once alongside reachableDirsByFile. filterByReachability runs in
-	// the parallel resolver workers and otherwise recomputes filepath.Dir
+	// the parallel resolver workers and otherwise recomputes filePathDir
 	// per candidate per edge — ~20% of resolution CPU on a large TS monorepo
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
@@ -1905,7 +1905,7 @@ func (r *Resolver) scopedFiles() []string {
 // buildDirIndexes builds two lookup maps for resolveImport. Populated
 // once per ResolveAll / ResolveFile pass and torn down after.
 //
-//   - dirIndex     keys on filepath.Dir(file.FilePath) for exact
+//   - dirIndex     keys on filePathDir(file.FilePath) for exact
 //     importPath == dir matches.
 //   - lastDirIndex keys on the last path component of that directory
 //     so an import of "logger" matches any file under .../logger/.
@@ -1913,7 +1913,7 @@ func (r *Resolver) buildDirIndexes() {
 	r.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	r.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
-		dir := filepath.Dir(file.FilePath)
+		dir := filePathDir(file.FilePath)
 		r.dirIndex[dir] = append(r.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
@@ -3607,7 +3607,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		// the last path component only, so without this gate an import
 		// of `.../tree-sitter-c/bindings/go` would resolve to whichever
 		// `*/bindings/go` directory sorts first.
-		if !crossRepoFound && dirMatchesImport(filepath.Dir(file.FilePath), importPath) {
+		if !crossRepoFound && dirMatchesImport(filePathDir(file.FilePath), importPath) {
 			crossRepoFile, crossRepoFound = file, true
 		}
 	}
@@ -3634,7 +3634,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		}
 	} else {
 		for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
-			dir := filepath.Dir(file.FilePath)
+			dir := filePathDir(file.FilePath)
 			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
 				consider(file)
 				if stop() {
@@ -4663,10 +4663,10 @@ func (r *Resolver) buildReachabilityIndex() {
 	}
 
 	// Seed with each indexed file's own directory, and memoise the per-file
-	// dir so filterByReachability never recomputes filepath.Dir per edge.
+	// dir so filterByReachability never recomputes filePathDir per edge.
 	dirByPath := make(map[string]string)
 	seedFile := func(file graph.FileNodeIdentity) {
-		dir := filepath.Dir(file.FilePath)
+		dir := filePathDir(file.FilePath)
 		dirByPath[file.FilePath] = dir
 		addDir(file.ID, dir)
 	}
@@ -4717,7 +4717,7 @@ func (r *Resolver) buildReachabilityIndex() {
 			// External / unindexed package — nothing to add.
 		default:
 			if placement, ok := placements[e.To]; ok && placement.Kind == graph.KindFile {
-				importedDir = filepath.Dir(placement.FilePath)
+				importedDir = filePathDir(placement.FilePath)
 			}
 		}
 		if importedDir != "" {
@@ -4841,7 +4841,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 	dirs := make(map[string]string, len(filePaths))
 	missingFiles := make([]string, 0, len(filePaths))
 	for _, filePath := range filePaths {
-		dir := filepath.Dir(filePath)
+		dir := filePathDir(filePath)
 		dirs[filePath] = dir
 		if cached, ok := stableByFile[filePath]; ok {
 			reachable[filePath] = cached
@@ -4928,7 +4928,7 @@ func (r *Resolver) buildReachabilityIndexForPendingCached(
 			case strings.HasPrefix(targetID, "external::"):
 			default:
 				if target, ok := targets[targetID]; ok && target.FilePath != "" {
-					importedDir = filepath.Dir(target.FilePath)
+					importedDir = filePathDir(target.FilePath)
 					dirs[target.FilePath] = importedDir
 				}
 			}
@@ -5120,7 +5120,7 @@ func (r *Resolver) importedDirForSpec(callerFile, spec string) string {
 			if bare && !isJSTSDirEntryPoint(f.FilePath) {
 				continue
 			}
-			return filepath.Dir(f.FilePath)
+			return filePathDir(f.FilePath)
 		}
 		return ""
 	}
@@ -5133,16 +5133,16 @@ func (r *Resolver) importedDirForSpec(callerFile, spec string) string {
 	return ""
 }
 
-// dirFor returns filepath.Dir(path), served from the per-file memo built in
+// dirFor returns filePathDir(path), served from the per-file memo built in
 // buildReachabilityIndex (every indexed file is keyed) and falling back to a
 // live computation for paths not in the index. The memo turns the per-edge
-// filepath.Dir in filterByReachability — ~20% of resolution CPU on a large
+// filePathDir in filterByReachability — ~20% of resolution CPU on a large
 // monorepo — into a map lookup.
 func (r *Resolver) dirFor(path string) string {
 	if d, ok := r.dirByFilePath[path]; ok {
 		return d
 	}
-	return filepath.Dir(path)
+	return filePathDir(path)
 }
 
 // filterByReachability narrows candidates to those whose defining file
@@ -5354,7 +5354,7 @@ func bestTypeCandidate(candidates []*graph.Node, callerDir string) *graph.Node {
 			continue
 		}
 		rank := typeCandidateRank(c)
-		sameDir := filepath.Dir(c.FilePath) == callerDir
+		sameDir := filePathDir(c.FilePath) == callerDir
 		if best == nil || candidateBeats(rank, sameDir, c.ID, bestRank, bestSameDir, best.ID) {
 			best, bestRank, bestSameDir = c, rank, sameDir
 		}
