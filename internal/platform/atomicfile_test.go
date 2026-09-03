@@ -146,8 +146,10 @@ func TestConsumeFileHandsTheContentToASingleWinner(t *testing.T) {
 
 // TestClaimFileSurvivesConcurrentReaders reads the claimed file from other
 // goroutines while it is being claimed. Windows opens files without
-// FILE_SHARE_DELETE, so a reader holding the file blocks the winner's delete;
-// the winner must still come away with the claim.
+// FILE_SHARE_DELETE, so a reader holding the file refuses the winner's delete
+// for as long as the read takes; the winner must still come away with the
+// claim, the payload must be consumed either way — deleted, or emptied and
+// therefore unclaimable — and nobody may claim it a second time.
 func TestClaimFileSurvivesConcurrentReaders(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "read-while-claimed")
 	if err := os.WriteFile(path, []byte("payload"), 0o600); err != nil {
@@ -188,6 +190,52 @@ func TestClaimFileSurvivesConcurrentReaders(t *testing.T) {
 
 	if got := winners.Load(); got != 1 {
 		t.Fatalf("claim winners = %d, want 1", got)
+	}
+	// The payload is consumed whether or not the delete landed: it is either
+	// gone, or empty because the winner neutralised it past a reader that
+	// refused the delete. A surviving byte would mean a claim that consumed
+	// nothing.
+	if info, err := os.Stat(path); err == nil && info.Size() != 0 {
+		t.Fatalf("claimed payload survived with %d bytes", info.Size())
+	}
+	// Nothing holds the file now, so a second claim must both refuse — the
+	// payload was already consumed — and collect whatever the winner left.
+	if ClaimFile(path) {
+		t.Fatal("a consumed payload was claimed a second time")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("consumed payload was not collected: %v", err)
+	}
+	if _, err := os.Stat(path + ClaimMarkerSuffix); !os.IsNotExist(err) {
+		t.Fatalf("claim marker survived: %v", err)
+	}
+}
+
+// TestClaimRefusesAnEmptiedPayload pins the rule the Windows delete fallback
+// rests on: a payload an earlier winner emptied but could not yet delete is
+// already consumed, so neither ClaimFile nor ConsumeFile may hand it to a
+// second caller — and each collects the leftover on its way out.
+func TestClaimRefusesAnEmptiedPayload(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name  string
+		claim func(string) bool
+	}{
+		{"ClaimFile", ClaimFile},
+		{"ConsumeFile", func(path string) bool { _, ok := ConsumeFile(path); return ok }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, "emptied-"+tc.name)
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.claim(path) {
+				t.Fatal("an emptied payload was claimed")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("emptied payload was not collected: %v", err)
+			}
+		})
 	}
 }
 

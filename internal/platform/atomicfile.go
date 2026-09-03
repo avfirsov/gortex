@@ -18,6 +18,19 @@ const (
 	transientDelay    = 3 * time.Millisecond
 )
 
+const (
+	// The delete a won claim still owes runs on a much longer budget than the
+	// 60ms above, because it is no longer racing anybody: the claim is already
+	// decided and only the file name is outstanding, while the readers that
+	// refuse the delete on Windows hold the file for as long as their own read
+	// takes. Go's own testing.TempDir cleanup waits about this long for the
+	// same refusal to clear. The backoff starts short so an uncontended delete
+	// still lands on the first retry.
+	claimRemoveBudget   = 2 * time.Second
+	claimRemoveDelay    = time.Millisecond
+	claimRemoveMaxDelay = 64 * time.Millisecond
+)
+
 // ReplaceFile moves oldpath onto newpath, replacing an existing newpath.
 //
 // POSIX rename(2) is atomic: it never fails because somebody holds either end
@@ -33,7 +46,7 @@ func ReplaceFile(oldpath, newpath string) error {
 	return retryTransient(func() error { return os.Rename(oldpath, newpath) })
 }
 
-// ClaimFile grants exactly one caller the right to consume path and deletes it
+// ClaimFile grants exactly one caller the right to consume path and retires it
 // as the claim. It reports true for that single winner, and false for every
 // loser of a concurrent race, for a repeat claim, and for a path that is not
 // there.
@@ -44,18 +57,46 @@ func ReplaceFile(oldpath, newpath string) error {
 // reports success to several callers, so it is claimed by everybody. Exclusive
 // creation is atomic everywhere, so the marker — not the delete — decides the
 // winner, and the delete it guards then runs against no other claimer.
+//
+// Retiring the payload is where the two platforms part company. POSIX
+// unlink(2) always succeeds for the winner: an open reader keeps its handle,
+// the name goes immediately. Windows refuses the delete outright while a
+// reader holds the payload open, because Go opens files with FILE_SHARE_READ
+// and FILE_SHARE_WRITE but never FILE_SHARE_DELETE, and the delete has to open
+// the file for DELETE access first. A winner that reported failure just
+// because a reader was mid-read would leave a contended payload claimed by
+// nobody, so instead it empties the payload — a write the reader's own share
+// mode does permit — and then retries the delete on the longer budget above.
+// A delete that still does not land leaves an empty file behind and the claim
+// stands. An emptied payload is a consumed payload: a later ClaimFile or
+// ConsumeFile refuses it and collects the leftover once the readers are gone,
+// so the emptying can never hand a second caller the claim.
+//
+// The cost of that is visible only to a racing reader on Windows, which can
+// now read an empty or truncated payload where it used to read either the
+// whole one or nothing. Every consumer of a claimed payload already has to
+// validate what it read — on POSIX the delete can land mid-read too — so a
+// short read is rejected rather than misread.
 func ClaimFile(path string) bool {
 	release, ok := claimMarker(path)
 	if !ok {
 		return false
 	}
 	defer release()
-	return removeFile(path) == nil
+	if payloadConsumed(path) {
+		collectConsumedPayload(path)
+		return false
+	}
+	return retirePayload(path)
 }
 
 // ConsumeFile reads path and claims it, handing the content to exactly one
 // caller. ok is false for every loser of a concurrent race, for an
 // already-consumed path, and for a file that cannot be read.
+//
+// An empty payload is an already-consumed one, as it is for ClaimFile: the
+// content is read before the claim retires the file, so a caller that finds
+// nothing to hand over is looking at a payload some earlier winner emptied.
 func ConsumeFile(path string) ([]byte, bool) {
 	release, ok := claimMarker(path)
 	if !ok {
@@ -68,10 +109,87 @@ func ConsumeFile(path string) ([]byte, bool) {
 		data, readErr = os.ReadFile(path) //nolint:gosec // the caller owns the path
 		return readErr
 	})
-	if removeFile(path) != nil || err != nil {
+	if err != nil {
+		return nil, false
+	}
+	if len(data) == 0 {
+		collectConsumedPayload(path)
+		return nil, false
+	}
+	if !retirePayload(path) {
 		return nil, false
 	}
 	return data, true
+}
+
+// retirePayload deletes the payload on behalf of the caller that holds its
+// claim marker, and reports whether that caller comes away owning it. A plain
+// delete settles it everywhere but Windows, where a reader can refuse it; the
+// winner then empties the payload, which no reader can refuse, and keeps
+// retrying the delete on the claim budget. Only a payload that was not there
+// to take, or that could not even be emptied, leaves the caller empty-handed.
+func retirePayload(path string) bool {
+	err := removeFile(path)
+	if err == nil {
+		return true
+	}
+	if !transientSharingError(err) {
+		return false
+	}
+	if emptyPayload(path) != nil {
+		return false
+	}
+	_ = removeWithin(path, claimRemoveBudget)
+	return true
+}
+
+// payloadConsumed reports whether path is the empty file an earlier claim left
+// behind when a reader outlasted its delete. A path that is not there is not a
+// consumed payload — it is nothing at all, which retirePayload reports on its
+// own.
+func payloadConsumed(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Size() == 0
+}
+
+// collectConsumedPayload clears an emptied payload once nothing holds it open,
+// so the leftover of a delete that lost its race does not outlive the readers
+// that caused it. Best effort: a still-held payload stays for the next caller.
+func collectConsumedPayload(path string) {
+	_ = removeFile(path)
+}
+
+// emptyPayload truncates the payload the caller has claimed but cannot yet
+// delete. Opening for writing is allowed while a reader holds the file open —
+// Go opens files with FILE_SHARE_WRITE — so the content goes away even when
+// the name cannot yet.
+func emptyPayload(path string) error {
+	return retryTransient(func() error {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // the caller owns the path
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	})
+}
+
+// removeWithin deletes path, retrying a transient sharing refusal with an
+// exponential backoff until the budget is spent. On POSIX no error is
+// transient, so the delete runs exactly once.
+func removeWithin(path string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	err := os.Remove(path)
+	for delay := claimRemoveDelay; err != nil && transientSharingError(err); {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(delay)
+		if delay < claimRemoveMaxDelay {
+			delay *= 2
+		}
+		err = os.Remove(path)
+	}
+	return err
 }
 
 // claimMarker exclusively creates path's claim marker, returning the release
