@@ -877,8 +877,12 @@ func exploreStructuralSignals(parent, child *graph.Node) (shared int, local bool
 			shared++
 		}
 	}
-	parentPath := nodeDisplayPath(parent)
-	childPath := nodeDisplayPath(child)
+	// An indexed path carries the indexing machine's separators, so the
+	// "same directory" test folds to '/' first — on Windows every
+	// LastIndex below would otherwise be -1 and no two files would ever
+	// read as local siblings.
+	parentPath := strings.ReplaceAll(nodeDisplayPath(parent), "\\", "/")
+	childPath := strings.ReplaceAll(nodeDisplayPath(child), "\\", "/")
 	parentSlash := strings.LastIndex(parentPath, "/")
 	childSlash := strings.LastIndex(childPath, "/")
 	if parentSlash >= 0 && childSlash >= 0 && parentPath != childPath {
@@ -1238,7 +1242,11 @@ func exploreDraftExactAnchor(query string, n *graph.Node) bool {
 			return true
 		}
 	}
-	path := nodeDisplayPath(n)
+	// Fold the indexed path's separators before taking the basename: on
+	// Windows a raw graph path has none of the '/' this LastIndex looks
+	// for, so the whole path would be matched against the query instead
+	// of the file's name and the anchor could never fire.
+	path := strings.ReplaceAll(nodeDisplayPath(n), "\\", "/")
 	if slash := strings.LastIndex(path, "/"); slash >= 0 {
 		path = path[slash+1:]
 	}
@@ -1585,6 +1593,9 @@ func exploreLocalizationExplicitAnchor(query string, n *graph.Node) bool {
 		// that would make same-name files in different packages terminal.
 		return false
 	}
+	// Same separator fold as above — the basename fallback must see a
+	// file name, not a whole backslash-joined Windows path.
+	path = strings.ReplaceAll(path, "\\", "/")
 	if slash := strings.LastIndex(path, "/"); slash >= 0 {
 		path = path[slash+1:]
 	}
