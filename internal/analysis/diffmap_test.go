@@ -300,11 +300,10 @@ func TestMapGitDiffMnemonicPrefixConfig(t *testing.T) {
 }
 
 func TestJoinFileNodes(t *testing.T) {
-	// Graph keys are "<prefix>/" + the remainder in native separators, so the
-	// fixture is built the same way the indexer would build it. Writing the
-	// '/'-joined form here would pass on POSIX and describe a key that does not
-	// exist on Windows.
-	key := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
+	// Graph keys are "<prefix>/" + the remainder, forward-slashed throughout
+	// on every platform: the indexer folds every key it mints through
+	// filepath.ToSlash. The fixture is built the same way.
+	key := func(rel string) string { return "myrepo/" + rel }
 
 	g := graph.New()
 	g.AddNode(&graph.Node{ID: key("a.go") + "::A", Kind: graph.KindFunction, Name: "A", FilePath: key("a.go")})
@@ -336,33 +335,39 @@ func TestJoinFileNodes(t *testing.T) {
 		t.Fatalf("a miss must stay a miss: %#v", nodes)
 	}
 
-	// Standalone indexer: no repo prefix, but the keys are still native. A
-	// forge or git path arrives '/'-spelled and must still resolve.
+	// Standalone indexer: no repo prefix, and the keys are the '/'-spelled
+	// relative paths. A natively-spelled path from filepath.Rel / filepath.Join
+	// must still land on them.
 	standalone := graph.New()
-	nested := filepath.FromSlash("pkg/auth/x.go")
+	const nested = "pkg/auth/x.go"
 	standalone.AddNode(&graph.Node{ID: nested + "::Login", Kind: graph.KindFunction, Name: "Login", FilePath: nested})
 	if nodes := JoinFileNodes(standalone, "", "pkg/auth/x.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != nested+"::Login" {
-		t.Fatalf("empty prefix must still convert separators: %#v", nodes)
+		t.Fatalf("empty prefix must resolve the '/'-spelled path: %#v", nodes)
+	}
+	if nodes := JoinFileNodes(standalone, "", filepath.FromSlash("pkg/auth/x.go"), RepoRelativePath); len(nodes) != 1 || nodes[0].ID != nested+"::Login" {
+		t.Fatalf("a natively-spelled path must be folded onto the graph key: %#v", nodes)
 	}
 }
 
 func TestGraphKey(t *testing.T) {
-	native := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
 	for _, tc := range []struct {
 		name         string
 		prefix, path string
 		domain       PathDomain
 		want         string
 	}{
-		{"repo-relative gains the prefix", "myrepo", "a.go", RepoRelativePath, native("a.go")},
-		{"prefix-shadowed path still gains it", "myrepo", "myrepo/a.go", RepoRelativePath, native("myrepo/a.go")},
+		{"repo-relative gains the prefix", "myrepo", "a.go", RepoRelativePath, "myrepo/a.go"},
+		{"prefix-shadowed path still gains it", "myrepo", "myrepo/a.go", RepoRelativePath, "myrepo/myrepo/a.go"},
 		{"graph-keyed path is untouched", "myrepo", "myrepo/a.go", GraphKeyedPath, "myrepo/a.go"},
 		{"no prefix is a no-op", "", "a.go", RepoRelativePath, "a.go"},
-		// Multi-segment with no prefix: the standalone indexer's keys still
-		// carry native separators, so a '/'-spelled forge path must be
-		// converted even though there is nothing to prefix. A single-segment
-		// fixture cannot show this — there is no separator to get wrong.
-		{"no prefix still converts separators", "", "pkg/auth/x.go", RepoRelativePath, filepath.FromSlash("pkg/auth/x.go")},
+		// A nested path is where the spelling can go wrong: the graph keys it
+		// with forward slashes on every platform, so the key must stay
+		// '/'-spelled whether the caller handed over git's spelling or the
+		// running platform's. A single-segment fixture cannot show this —
+		// there is no separator to get wrong.
+		{"nested path keeps the graph spelling", "myrepo", "pkg/auth/x.go", RepoRelativePath, "myrepo/pkg/auth/x.go"},
+		{"a native spelling is folded onto it", "myrepo", filepath.FromSlash("pkg/auth/x.go"), RepoRelativePath, "myrepo/pkg/auth/x.go"},
+		{"no prefix still folds the separators", "", filepath.FromSlash("pkg/auth/x.go"), RepoRelativePath, "pkg/auth/x.go"},
 		{"no prefix, graph-keyed stays verbatim", "", "pkg/auth/x.go", GraphKeyedPath, "pkg/auth/x.go"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

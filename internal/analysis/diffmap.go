@@ -127,11 +127,14 @@ func GraphKey(repoPrefix, path string, domain PathDomain) string {
 		return path
 	}
 	// A repo-relative path is always converted, prefix or not. The key's shape
-	// is "<prefix>/" + the remainder in the indexing machine's native
-	// separators (see internal/graphpath); with no prefix the remainder IS the
-	// key, and a '/'-spelled git or forge path still misses a key stored with
-	// native separators on Windows. FromSlash is the identity on POSIX.
-	key := filepath.FromSlash(path)
+	// is "<prefix>/" + the remainder, and the indexer keys every graph path
+	// with forward slashes on every platform (Indexer.relKey folds through
+	// filepath.ToSlash), so the remainder stays '/'-spelled. Re-spelling it
+	// natively here produced "repo-a/pkg\widget.go" on Windows and missed
+	// every file node below the repo root — the diff joined no symbols at
+	// all. ToSlash is the identity on POSIX, where a backslash is an
+	// ordinary filename byte and must survive.
+	key := filepath.ToSlash(path)
 	if repoPrefix == "" {
 		return key
 	}
