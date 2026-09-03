@@ -5061,13 +5061,20 @@ func sortLocalizationMemberTier(tier []*rerank.Candidate) {
 // stable across platforms — the same Swift fixture paged
 // `[type, detect, reload]` on POSIX and `[type, reload, detect]` on Windows.
 // Declaration order is a total order on a key every platform agrees on.
+//
+// The declaration order applies to every file that holds more than one slot,
+// not only to one that happens to carry a demotable member. A tight window
+// can select a file's type and two of its ordinary methods and nothing else:
+// every row is then in the leading tier, there is no demotion to perform, and
+// gating the ordering on one made exactly that page — the one with the fewest
+// slots to disagree about — inherit the arrival permutation again.
 func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidate {
 	if len(cands) < 2 {
 		return cands
 	}
 	slots := make(map[string][]int, len(cands))
 	files := make([]string, 0, len(cands))
-	demotable := false
+	reorderable := false
 	for i, cand := range cands {
 		if cand == nil || cand.Node == nil || cand.Node.FilePath == "" {
 			continue
@@ -5077,11 +5084,11 @@ func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidat
 			files = append(files, key)
 		}
 		slots[key] = append(slots[key], i)
-		if localizationMemberTier(cand.Node) != localizationMemberTierBehavioral {
-			demotable = true
+		if len(slots[key]) > 1 {
+			reorderable = true
 		}
 	}
-	if !demotable {
+	if !reorderable {
 		return cands
 	}
 	out := append([]*rerank.Candidate(nil), cands...)
