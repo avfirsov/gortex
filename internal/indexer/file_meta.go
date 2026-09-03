@@ -87,7 +87,7 @@ func (idx *Indexer) indexedFileReceiptMatches(filePath string) bool {
 	if !ok {
 		return false
 	}
-	relPath := idx.graphRelKey(absPath)
+	relPath := idx.relKey(absPath)
 	graphPath := idx.prefixPath(relPath)
 	rows, err := reader.FileMetasByPaths(idx.repoPrefix, []string{graphPath})
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1414,6 +1415,15 @@ func (idx *Indexer) ResolveFilePath(graphPath string) string {
 // repo-relative key the graph and the mtime map are indexed by: forward
 // slashes, and Unicode NFC.
 //
+// One key, every platform. A graph key — a file node's FilePath, the
+// prefix of every symbol ID under it, a contract bridge endpoint — is
+// slash-separated by contract, so the bulk walk, the single-file delta
+// and the watcher all stamp the same spelling. Keying the cold walk in
+// OS-native separators instead would mint "pkg\sub\thing.go" on Windows
+// and split every downstream lookup (GetFileNodes / EvictFile match the
+// exact string, with no separator folding) from the ID a caller builds
+// with '/'.
+//
 // The NFC fold is load-bearing. A file with a non-ASCII name is handed
 // to the indexer in different byte forms depending on the source — the
 // filesystem walk (filepath.WalkDir) yields decomposed NFD on macOS,
@@ -1434,27 +1444,6 @@ func (idx *Indexer) relKey(absPath string) string {
 		return pathkey.Normalize(filepath.ToSlash(absPath))
 	}
 	return pathkey.Normalize(filepath.ToSlash(rel))
-}
-
-// graphRelKey reduces an absolute path to the key the GRAPH stores a
-// file's nodes under: repo-relative, OS-native separators (the exact
-// form the bulk-walk extractor stamps on node IDs / FilePaths),
-// NFC-folded. It is the graph-node analogue of relKey — relKey
-// slash-normalises for the mtime map, graphRelKey keeps the OS-native
-// separators so an incremental re-index's evict lookup actually matches
-// the nodes the cold walk created (graph.GetFileNodes / EvictFile key on
-// the exact string, with no separator folding). On POSIX the two are
-// identical (filepath.Rel already yields '/'); they diverge only on
-// Windows, where relKey's ToSlash would key the lookup as
-// "repo/a/b.go" while the cold walk stored "repo/a\b.go" — the miss
-// leaves the stale nodes un-evicted and the re-parse leaks a duplicate
-// set on every save (issue: slash-path duplicate indexing).
-func (idx *Indexer) graphRelKey(absPath string) string {
-	rel, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		return pathkey.Normalize(absPath)
-	}
-	return pathkey.Normalize(rel)
 }
 
 // RelKey exposes relKey to in-package collaborators (the watcher) that
@@ -1565,7 +1554,7 @@ func (idx *Indexer) graphFilePaths(files []string) []string {
 		if !filepath.IsAbs(abs) && idx.rootPath != "" {
 			abs = filepath.Join(idx.rootPath, f)
 		}
-		out = append(out, idx.prefixPath(idx.graphRelKey(abs)))
+		out = append(out, idx.prefixPath(idx.relKey(abs)))
 	}
 	return out
 }
@@ -2439,17 +2428,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	admitWalkedFile := func(wf walkedFile) {
 		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
 			skippedContentBytes += wf.size
-			rel, _ := filepath.Rel(absRoot, wf.path)
+			relPath := idx.relKey(wf.path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
 			return
 		}
 		if reason, skip := contentGate.skip(wf.lang, wf.size); skip {
 			skippedContentBytes += wf.size
-			rel, _ := filepath.Rel(absRoot, wf.path)
+			relPath := idx.relKey(wf.path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
 			return
 		}
@@ -2467,9 +2456,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += wf.size
-				rel, _ := filepath.Rel(absRoot, wf.path)
 				skippedBySize = append(skippedBySize, skippedFile{
-					relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size,
+					relPath: idx.relKey(wf.path), lang: wf.lang, size: wf.size,
 				})
 				return nil
 			}
@@ -2502,9 +2490,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += info.Size()
-				rel, _ := filepath.Rel(absRoot, path)
 				skippedBySize = append(skippedBySize, skippedFile{
-					relPath: pathkey.Normalize(rel), lang: adm.lang, size: info.Size(),
+					relPath: idx.relKey(path), lang: adm.lang, size: info.Size(),
 				})
 				return nil
 			}
@@ -3305,7 +3292,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
-					relPath, _ := filepath.Rel(absRoot, path)
+					// relKey, not a raw filepath.Rel: this path is stamped onto
+					// every node ID and FilePath the extractor emits, and a graph
+					// key is slash-separated and NFC-folded on every platform.
+					// A native filepath.Rel would mint "pkg\sub\thing.go" on
+					// Windows, which no slash-keyed lookup — the watcher's evict,
+					// a symbol ID, a contract bridge — can ever match.
+					relPath := idx.relKey(path)
 					// Streaming content extractors (PDF / office docs) read the
 					// file themselves — one page/slide/sheet at a time — instead
 					// of materialising the whole file. Only the in-process route
@@ -4301,19 +4294,14 @@ func (idx *Indexer) indexFile(
 		return err
 	}
 
-	// Two keys for the same file, deliberately distinct on Windows.
-	// mtimeKey (relKey: slash form + NFC) is the fileMtimes map key.
-	// relPath (graphRelKey: OS-native separators + NFC) is what the
-	// graph stores a file's nodes under — the exact form the cold bulk
-	// walk stamped on their IDs / FilePaths. The evict below MUST use
-	// the graph form: a slash-keyed lookup misses the backslash-keyed
-	// cold nodes on Windows, so the re-parse would leak a duplicate node
-	// set on every save. On POSIX the two keys are identical
-	// (filepath.Rel already yields '/'), so this split is a Windows-only
-	// correction. Both drive an FSEvents-NFD / git-watcher-NFC path onto
-	// the same NFC key so a re-index still lands on the bulk-walk key.
-	mtimeKey := idx.relKey(absPath)
-	relPath := idx.graphRelKey(absPath)
+	// One key for the file: the slash-separated, NFC-folded spelling the
+	// cold bulk walk stamped on its nodes' IDs / FilePaths and recorded in
+	// fileMtimes. The evict below matches the graph string byte-for-byte,
+	// so a divergent spelling would leave the cold nodes un-evicted and
+	// leak a duplicate node set on every save. The NFC fold drives an
+	// FSEvents-NFD / git-watcher-NFC path onto the bulk-walk key.
+	relPath := idx.relKey(absPath)
+	mtimeKey := relPath
 
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
@@ -4826,10 +4814,9 @@ func (idx *Indexer) StructuralSymbols(filePath string) ([]*graph.Node, bool) {
 	if err != nil {
 		return nil, false
 	}
-	relPath, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		relPath = filePath
-	}
+	// relKey: the probe compares its symbols against the graph's, so it
+	// must parse under the same slash-separated key the index pass stamps.
+	relPath := idx.relKey(absPath)
 
 	src, err := os.ReadFile(absPath)
 	if err != nil {
@@ -5016,10 +5003,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(idx.rootPath, filePath)
 	}
-	// graphRelKey (OS-native + NFC): the graph keys nodes under OS-native
-	// separators, so a relKey slash-form graphPath would miss them on
-	// Windows and wrongly report the file as evicted.
-	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
+	// relKey (slash + NFC) is the spelling the graph keys nodes under, so
+	// an empty node set here really means the file is gone rather than
+	// keyed under a form this lookup cannot see.
+	graphPath := idx.prefixPath(idx.relKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
 		return nil // file gone / evicted; nothing to re-resolve
 	}
@@ -5909,7 +5896,7 @@ func (idx *Indexer) indexedFilesAbsentFromDisk(diskFiles map[string]bool) []stri
 	return out
 }
 
-// graphPathRelKey inverts prefixPath∘graphRelKey: it maps a graph file path
+// graphPathRelKey inverts prefixPath∘relKey: it maps a graph file path
 // back to the canonical repo-relative key fileMtimes and the disk walk share.
 // owned is false when the path does not belong to this repo, which is the only
 // safe answer — a path under another prefix must never be resolved against
@@ -5926,14 +5913,14 @@ func (idx *Indexer) graphPathRelKey(graphPath string) (relPath string, owned boo
 	if rel == "" {
 		return "", false
 	}
-	// relKey slash-normalises; graphRelKey keeps OS-native separators. Fold
-	// back to the slash form so the key matches diskFiles and fileMtimes on
-	// Windows too.
+	// Fold the same way relKey does, so a stored path that predates the
+	// slash contract (or arrives through another spelling) still matches
+	// diskFiles and fileMtimes.
 	return pathkey.Normalize(filepath.ToSlash(rel)), true
 }
 
 func (idx *Indexer) incrementalPathOwned(absPath string) bool {
-	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
+	graphPath := idx.prefixPath(idx.relKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) > 0 {
 		return true
 	}
@@ -6186,7 +6173,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(deletedFiles) > 0 {
 		graphPaths := make([]string, len(deletedFiles))
 		for i, relPath := range deletedFiles {
-			graphPaths[i] = idx.prefixPath(filepath.FromSlash(relPath))
+			graphPaths[i] = idx.prefixPath(relPath)
 		}
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		for _, graphPath := range graphPaths {
@@ -6825,12 +6812,16 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		if src, _ := c.Meta["schema_source"].(string); src == "extracted" || src == "partial" {
 			continue
 		}
+		// srcDir goes through path.Dir, not filepath.Dir: c.FilePath is a
+		// graph path, slash-separated on every platform, and filepath.Dir
+		// would hand back "pkg\sub" on Windows for a directory the
+		// candidate filter then compares against slash spellings.
 		todo = append(todo, pending{
 			contractID: c.ID,
 			trail:      trail,
 			fallback:   fallback,
 			repoHint:   c.RepoPrefix,
-			srcDir:     filepath.Dir(c.FilePath),
+			srcDir:     path.Dir(c.FilePath),
 		})
 	}
 	// Always strip the internal handler hints from Meta at the end of
@@ -7100,7 +7091,7 @@ func pickHandlerCandidate(candidates []*graph.Node, repoHint, srcDir string) *gr
 		}
 		var samePkg []*graph.Node
 		for _, n := range pool {
-			if filepath.Dir(n.FilePath) == srcDir {
+			if path.Dir(n.FilePath) == srcDir {
 				samePkg = append(samePkg, n)
 			}
 		}

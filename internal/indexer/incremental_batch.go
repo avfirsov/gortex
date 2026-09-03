@@ -170,7 +170,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 
 	graphPaths := make([]string, len(files))
 	for i, filePath := range files {
-		graphPaths[i] = idx.prefixPath(idx.graphRelKey(filePath))
+		graphPaths[i] = idx.prefixPath(idx.relKey(filePath))
 	}
 	priorByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 
@@ -1471,7 +1471,7 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	dependencyFiles := idx.semanticDependencyFrontierForDeletedFiles([]string{relPath})
 	var invalidation DerivedInvalidationPlan
 	nodesRemoved, edgesRemoved := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
-	graphPath := idx.prefixPath(filepath.FromSlash(relPath))
+	graphPath := idx.prefixPath(relPath)
 	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, dependencyFiles...)
 
@@ -1529,7 +1529,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		relPaths := deleted[start:end]
 		graphPaths := make([]string, len(relPaths))
 		for i, relPath := range relPaths {
-			graphPaths[i] = idx.prefixPath(filepath.FromSlash(relPath))
+			graphPaths[i] = idx.prefixPath(relPath)
 		}
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		stages := make([]*incrementalBatchStage, 0, len(graphPaths))
