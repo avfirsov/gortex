@@ -9,6 +9,43 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+func TestFileIndexFailuresSurviveFileEviction(t *testing.T) {
+	s, err := Open(t.TempDir() + "/graph.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const repo = "example/repo"
+	failures := []graph.FileIndexFailure{
+		{Path: "unreadable.go", Error: "permission denied", PermissionDenied: true},
+		{Path: "other.go", Error: "read failed"},
+	}
+	if err := s.ReplaceFileIndexFailures(repo, failures); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, paths := range [][]string{{"unreadable.go"}, {"unreadable.go", "other.go"}} {
+		s.EvictFiles(paths)
+		got, err := s.FileIndexFailuresForRepo(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(failures) {
+			t.Fatalf("EvictFiles(%v) cleared unresolved failures: got %+v", paths, got)
+		}
+	}
+
+	s.EvictRepo(repo)
+	got, err := s.FileIndexFailuresForRepo(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("repository eviction retained failures: %+v", got)
+	}
+}
+
 func TestFileIndexFailuresPersistAndScope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "graph.db")
 	s, err := Open(path)
