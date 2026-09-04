@@ -797,7 +797,7 @@ func (p *Poller) contentReceiptMatches(
 	if err != nil || !sameFileVersion(before, after) {
 		return false, false, bytesRead
 	}
-	relPath := idx.graphRelKey(absPath)
+	relPath := idx.relKey(absPath)
 	src = idx.transforms.run(relPath, src)
 	return int64(len(src)) == receipt.Size && contentHashForSource(src) == receipt.ContentHash,
 		true, bytesRead
