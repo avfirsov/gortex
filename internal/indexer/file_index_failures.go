@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"go.uber.org/zap"
 )
 
@@ -20,24 +21,29 @@ type FileIndexFailure = graph.FileIndexFailure
 // LoadFileIndexFailures reads failures from the selected graph view. An absent
 // capability has no failure ledger; it must never fall back to another view.
 func LoadFileIndexFailures(g graph.Reader, repoPrefix string) []FileIndexFailure {
+	rows, _ := LoadFileIndexFailuresWithError(g, repoPrefix)
+	return rows
+}
+
+// LoadFileIndexFailuresWithError lets health consumers distinguish unavailable
+// failure state from a healthy, empty ledger.
+func LoadFileIndexFailuresWithError(g graph.Reader, repoPrefix string) ([]FileIndexFailure, error) {
 	reader, ok := g.(graph.FileIndexFailureReader)
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	rows, err := reader.FileIndexFailuresForRepo(repoPrefix)
-	if err != nil {
-		return nil
-	}
-	return rows
+	return reader.FileIndexFailuresForRepo(repoPrefix)
 }
 
 type fileIndexFailureState struct {
 	mu               sync.Mutex
 	loaded           bool
+	loadErr          error
 	dirty            bool
 	permissionWarned bool
 	rows             map[string]FileIndexFailure
 	errors           map[string]error
+	cleared          map[string]struct{}
 }
 
 // The repository mutation lane serializes passes. The state mutex also covers
@@ -49,9 +55,12 @@ func (idx *Indexer) loadFileIndexFailuresLocked() {
 	}
 	state.rows = make(map[string]FileIndexFailure)
 	state.errors = make(map[string]error)
+	state.cleared = make(map[string]struct{})
+	state.loaded = true
 	if reader, ok := idx.graph.(graph.FileIndexFailureReader); ok {
 		rows, err := reader.FileIndexFailuresForRepo(idx.repoPrefix)
 		if err != nil {
+			state.loadErr = err
 			idx.logger.Warn("indexer: loading file failures failed", zap.String("repo", idx.repoPrefix), zap.Error(err))
 			return
 		}
@@ -59,12 +68,29 @@ func (idx *Indexer) loadFileIndexFailuresLocked() {
 			state.rows[row.Path] = row
 		}
 	}
-	state.loaded = true
 }
 
 func (idx *Indexer) loadFileIndexFailures() {
 	idx.fileIndexFailures.mu.Lock()
 	defer idx.fileIndexFailures.mu.Unlock()
+	state := &idx.fileIndexFailures
+	if state.loaded && state.loadErr != nil {
+		// Retry only at a pass boundary. A failed initial load must not turn
+		// every file into a store read or discard newly observed failures.
+		if reader, ok := idx.graph.(graph.FileIndexFailureReader); ok {
+			rows, err := reader.FileIndexFailuresForRepo(idx.repoPrefix)
+			if err == nil {
+				for _, row := range rows {
+					_, cleared := state.cleared[row.Path]
+					if _, observed := state.rows[row.Path]; !observed && !cleared {
+						state.rows[row.Path] = row
+					}
+				}
+				state.loadErr = nil
+				clear(state.cleared)
+			}
+		}
+	}
 	idx.loadFileIndexFailuresLocked()
 }
 
@@ -75,6 +101,10 @@ func (idx *Indexer) noteFileIndexFailure(path string, err error) {
 	defer state.mu.Unlock()
 	idx.loadFileIndexFailuresLocked()
 	if err == nil {
+		if state.loadErr != nil {
+			state.cleared[graphPath] = struct{}{}
+			state.dirty = true
+		}
 		if _, exists := state.rows[graphPath]; exists {
 			delete(state.rows, graphPath)
 			delete(state.errors, graphPath)
@@ -82,6 +112,7 @@ func (idx *Indexer) noteFileIndexFailure(path string, err error) {
 		}
 		return
 	}
+	delete(state.cleared, graphPath)
 	row := FileIndexFailure{
 		Path: graphPath, Error: err.Error(), PermissionDenied: errors.Is(err, os.ErrPermission),
 		RepoPrefix: idx.repoPrefix, WorkspaceID: idx.workspaceID, ProjectID: idx.projectID,
@@ -125,15 +156,18 @@ func (idx *Indexer) fileIndexFailurePaths() []string {
 }
 
 func (idx *Indexer) pruneMissingFileIndexFailures() {
-	if idx.contentSource() != nil {
-		return
-	}
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		relPath, ok := idx.graphPathRelKey(graphPath)
 		if !ok {
 			continue
 		}
 		path := filepath.Join(idx.rootPath, filepath.FromSlash(relPath))
+		if src := idx.contentSource(); src != nil {
+			if _, err := src.Stat(relPath); errors.Is(err, source.ErrNotInSource) {
+				idx.noteFileIndexFailure(path, nil)
+			}
+			continue
+		}
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			idx.noteFileIndexFailure(path, nil)
 		}
@@ -159,7 +193,10 @@ func (idx *Indexer) flushFileIndexFailures() {
 			}
 		}
 	}
-	if state.dirty {
+	if state.dirty && state.loadErr != nil {
+		idx.logger.Warn("indexer: file failure state unavailable; retaining pending updates",
+			zap.String("repo", idx.repoPrefix), zap.Error(state.loadErr))
+	} else if state.dirty {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].Path < rows[j].Path })
 		if writer, ok := idx.graph.(graph.FileIndexFailureWriter); ok {
 			if err := writer.ReplaceFileIndexFailures(idx.repoPrefix, rows); err != nil {
