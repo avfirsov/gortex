@@ -326,9 +326,9 @@ func TestFileReadReceiptKeepsStatErrorDistinctFromVersionRace(t *testing.T) {
 	badPath := filepath.Join(path, "child.go")
 	_, _, readErr := readOSFileWithVersion(badPath)
 	require.ErrorIs(t, readErr, syscall.ENOTDIR)
-	var pathErr *os.PathError
-	require.ErrorAs(t, readErr, &pathErr)
-	require.Equal(t, "stat", pathErr.Op, "the original stat error is preserved before attempting a read")
+	_, statErr := os.Stat(badPath)
+	require.Error(t, statErr)
+	require.Equal(t, statErr, readErr, "the original platform-specific stat error is preserved before attempting a read")
 	fresh, stale := idx.recordFileReadVersionsBatched([]fileReadReceipt{{absPath: badPath, mtimeKey: "source.go/child.go", readVersion: version}})
 	require.Empty(t, fresh)
 	require.Equal(t, []string{badPath}, stale)
