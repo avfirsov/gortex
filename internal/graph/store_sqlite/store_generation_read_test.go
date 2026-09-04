@@ -1742,6 +1742,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.FileEditingContext)(nil), probe: "FileEditingContext"},
 		{iface: (*graph.FileImportAggregator)(nil), probe: "FileImportCounts"},
 		{iface: (*graph.FileImporters)(nil), probe: "FileImporters"},
+		{iface: (*graph.FileIndexFailureReader)(nil), skip: "v21 generation-keyed sidecar; read/write isolation and recovery covered by TestFileIndexFailuresPersistAndScope"},
+		{iface: (*graph.FileIndexFailureWriter)(nil), skip: "v21 generation-keyed sidecar; read/write isolation and recovery covered by TestFileIndexFailuresPersistAndScope"},
 		{iface: (*graph.FileLanguageNodeSequencer)(nil), probe: "NodesLightSeq"},
 		{iface: (*graph.FileMetaPathReader)(nil), skip: skipSidecar},
 		{iface: (*graph.FileMetaReader)(nil), skip: skipSidecar},
