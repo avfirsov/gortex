@@ -154,6 +154,9 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+scoped, scopeArgs...); err != nil {
 		return 0, 0, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_index_failures WHERE `+scoped, scopeArgs...); err != nil {
+		return 0, 0, err
+	}
 	scopedNodes := `SELECT id FROM nodes WHERE ` + scoped
 	for _, column := range []string{"from_id", "to_id"} {
 		result, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`+edgeScope, edgeArgs...)
