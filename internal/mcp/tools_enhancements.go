@@ -3235,7 +3235,7 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 
 	var recommendation string
 	if healthScore < 80 {
-		recommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
+		recommendation = indexHealthLowScoreRecommendation
 	}
 	if !orphans.Clean() {
 		msg := "Graph holds nodes for files that no longer exist on disk (" + orphans.Summary() + "). " +
@@ -3365,16 +3365,17 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 	}
 
 	result := map[string]any{
-		"health_score":         healthScore,
-		"total_detected":       totalDetected,
-		"successfully_indexed": successfullyIndexed,
-		"language_coverage":    langCoverage,
-		"last_index_time":      lastIndexStr,
-		"node_count":           stats.TotalNodes,
-		"edge_count":           stats.TotalEdges,
-		"edges_ok":             edgesOK,
-		"nodes_per_file":       nodesPerFile,
-		"file_node_count":      fileNodes,
+		"health_score":                healthScore,
+		"total_detected":              totalDetected,
+		"successfully_indexed":        successfullyIndexed,
+		"language_coverage":           langCoverage,
+		"last_index_time":             lastIndexStr,
+		"node_count":                  stats.TotalNodes,
+		"edge_count":                  stats.TotalEdges,
+		"edges_ok":                    edgesOK,
+		"nodes_per_file":              nodesPerFile,
+		"file_node_count":             fileNodes,
+		indexHealthLivenessCeilingKey: orphans.LiveScore(),
 		// Shape-degradation guard firings since process start. Nonzero means
 		// the daemon caught (and self-healed) a live-patch or boot-reload
 		// resolution regression rather than silently serving a shrunken graph.

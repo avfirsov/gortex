@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"math"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
@@ -17,6 +20,11 @@ import (
 )
 
 const indexFailureSampleLimit = 20
+
+// Internal baseline bookkeeping, removed before any response is encoded.
+const indexHealthLivenessCeilingKey = "_index_health_liveness_ceiling"
+
+const indexHealthLowScoreRecommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
 
 // Registrations include repositories with no successful file nodes. Read their
 // failures through the request reader so another checkout cannot supply them.
@@ -205,18 +213,42 @@ func indexHealthFailureCounts(reader graph.Reader, totalDetected, fileNodes int,
 		if reader.GetNode(failure.Path) == nil {
 			missing++
 		}
-		prefixedParseError := parsePaths[failure.Path]
-		relative := failure.Path
-		if failure.RepoPrefix != "" {
-			relative = strings.TrimPrefix(relative, failure.RepoPrefix+"/")
-		}
-		relativeParseError := parsePaths[relative]
-		if !prefixedParseError && !relativeParseError {
+		if !parsePaths[failure.Path] {
 			additionalFailures++
 		}
 	}
 	totalDetected = max(totalDetected, fileNodes+missing)
 	return totalDetected, max(totalDetected-len(parseErrors)-additionalFailures, 0)
+}
+
+// Full indexing reports absolute paths, while the durable ledger uses graph
+// paths. Normalize only against the originating indexer's exact root/prefix;
+// a basename or suffix match could conflate failures in different repositories.
+func indexHealthParseErrorsForCounts(parseErrors []indexer.IndexError, idx *indexer.Indexer) []indexer.IndexError {
+	if idx == nil {
+		return parseErrors
+	}
+	normalized := append([]indexer.IndexError(nil), parseErrors...)
+	for i, failure := range normalized {
+		file := failure.FilePath
+		absolute := filepath.IsAbs(file)
+		if absolute {
+			if idx.RootPath() == "" {
+				continue
+			}
+			relative, err := filepath.Rel(idx.RootPath(), file)
+			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+				continue
+			}
+			file = filepath.ToSlash(relative)
+		}
+		file = norm.NFC.String(filepath.ToSlash(file))
+		if prefix := idx.RepoPrefix(); file != "" && prefix != "" && (absolute || !strings.HasPrefix(file, prefix+"/")) {
+			file = prefix + "/" + file
+		}
+		normalized[i].FilePath = file
+	}
+	return normalized
 }
 
 func indexHealthParseFailureCount(value any) int {
@@ -230,25 +262,40 @@ func indexHealthParseFailureCount(value any) int {
 	}
 }
 
-// The cached payload contains only baseline parse/liveness health. Failures
-// are read live, and every field changed here belongs to a new top-level map;
-// recovery therefore restores the baseline score without racing cache readers.
+// Parse and file failures are read live, and every field changed here belongs
+// to a new top-level map. Only the expensive liveness audit stays cached, so
+// recovery restores the score without racing readers or discarding orphan caps.
 func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline map[string]any) map[string]any {
 	result := make(map[string]any, len(baseline)+8)
 	for key, value := range baseline {
-		result[key] = value
+		if key != indexHealthLivenessCeilingKey {
+			result[key] = value
+		}
 	}
 	failures, readErr := s.readIndexFileFailures(ctx, ResolvedScope{})
 	totalDetected, _ := baseline["total_detected"].(int)
 	fileNodes, _ := baseline["file_node_count"].(int)
 	parseErrors, _ := baseline["parse_failures"].([]indexer.IndexError)
-	totalDetected, successfullyIndexed := indexHealthFailureCounts(s.readerFor(ctx), totalDetected, fileNodes, parseErrors, failures)
+	if s.indexer != nil {
+		parseErrors = s.indexer.ParseErrors()
+	}
+	if len(parseErrors) > 0 {
+		result["parse_failures"] = parseErrors
+	} else {
+		delete(result, "parse_failures")
+	}
+	totalDetected, successfullyIndexed := indexHealthFailureCounts(s.readerFor(ctx), totalDetected, fileNodes, indexHealthParseErrorsForCounts(parseErrors, s.indexer), failures)
 	result["total_detected"] = totalDetected
 	result["successfully_indexed"] = successfullyIndexed
-	if len(failures) > 0 && totalDetected > 0 {
-		healthScore, _ := baseline["health_score"].(float64)
-		failureScore := math.Round(float64(successfullyIndexed)/float64(totalDetected)*1000) / 10
-		result["health_score"] = min(healthScore, failureScore, 99.9)
+	if totalDetected > 0 {
+		healthScore := math.Round(float64(successfullyIndexed)/float64(totalDetected)*1000) / 10
+		if ceiling, ok := baseline[indexHealthLivenessCeilingKey].(float64); ok {
+			healthScore = min(healthScore, ceiling)
+		}
+		if len(failures) > 0 {
+			healthScore = min(healthScore, 99.9)
+		}
+		result["health_score"] = healthScore
 	}
 	for key, value := range indexFileFailureSummary(failures) {
 		result[key] = value
@@ -256,6 +303,18 @@ func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline ma
 	result["index_complete"] = len(failures) == 0 && readErr == nil
 	result["status"] = "ready"
 	recommendation, _ := baseline["recommendation"].(string)
+	if score, ok := result["health_score"].(float64); ok {
+		if score >= 80 {
+			recommendation = strings.TrimSpace(strings.ReplaceAll(recommendation, indexHealthLowScoreRecommendation, ""))
+		} else if !strings.Contains(recommendation, indexHealthLowScoreRecommendation) {
+			recommendation = strings.TrimSpace(indexHealthLowScoreRecommendation + " " + recommendation)
+		}
+	}
+	if recommendation == "" {
+		delete(result, "recommendation")
+	} else {
+		result["recommendation"] = recommendation
+	}
 	if len(failures) > 0 {
 		result["status"] = "degraded"
 		result["recommendation"] = strings.TrimSpace("Some files could not be indexed (see failed_files). Results can omit current code or retain stale symbols. Fix the reported file access or indexing errors and reindex the affected paths. " + recommendation)

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -142,11 +145,29 @@ func TestIndexFileFailureSummaryBoundsSamples(t *testing.T) {
 
 func TestIndexHealthFailureCountsAvoidDoubleCountingParseErrors(t *testing.T) {
 	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	idx.SetRepoPrefix("alpha")
+	idx.SetRootPath(t.TempDir())
 	failures := []indexer.FileIndexFailure{{Path: "alpha/bad.go", RepoPrefix: "alpha"}}
-	for _, key := range []string{"alpha/bad.go", "bad.go"} {
-		total, successful := indexHealthFailureCounts(g, 2, 1, []indexer.IndexError{{FilePath: key, Error: "parse failure"}}, failures)
+	for _, key := range []string{"alpha/bad.go", "bad.go", filepath.Join(idx.RootPath(), "bad.go")} {
+		errors := []indexer.IndexError{{FilePath: key, Error: "parse failure"}}
+		total, successful := indexHealthFailureCounts(g, 2, 1, indexHealthParseErrorsForCounts(errors, idx), failures)
 		require.Equal(t, 2, total)
 		require.Equal(t, 1, successful)
+		require.Equal(t, key, errors[0].FilePath, "normalization must preserve reported parse-error paths")
+	}
+	other := []indexer.IndexError{{FilePath: filepath.Join(t.TempDir(), "bad.go"), Error: "other repository"}}
+	_, successful := indexHealthFailureCounts(g, 3, 2, indexHealthParseErrorsForCounts(other, idx), failures)
+	require.Equal(t, 1, successful, "matching basenames from another root must not collapse distinct failures")
+	for _, tc := range []struct{ relative, graphPath string }{
+		{"alpha/bad.go", "alpha/alpha/bad.go"},
+		{"cafe\u0301.go", "alpha/caf\u00e9.go"},
+	} {
+		errors := []indexer.IndexError{{FilePath: filepath.Join(idx.RootPath(), tc.relative), Error: "parse failure"}}
+		normalized := indexHealthParseErrorsForCounts(errors, idx)
+		require.Equal(t, tc.graphPath, normalized[0].FilePath)
+		_, successful := indexHealthFailureCounts(g, 2, 1, normalized, []indexer.FileIndexFailure{{Path: tc.graphPath, RepoPrefix: "alpha"}})
+		require.Equal(t, 1, successful, "absolute paths must use the same prefixed NFC keys as the ledger")
 	}
 }
 
@@ -280,4 +301,75 @@ func TestIndexFileFailures_HealthCacheRefreshesLiveLedger(t *testing.T) {
 	require.NotContains(t, recovered, "failed_files")
 	require.NotContains(t, recovered, "index_state_read_error")
 	require.Equal(t, healthy["recommendation"], recovered["recommendation"])
+}
+
+type healthFailureContentSource struct {
+	source.ContentSource
+	denied bool
+}
+
+func (s *healthFailureContentSource) Open(path string) (io.ReadCloser, source.FileMeta, error) {
+	if s.denied && filepath.Base(path) == "blocked.go" {
+		return nil, source.FileMeta{}, &os.PathError{Op: "open", Path: path, Err: syscall.EPERM}
+	}
+	return s.ContentSource.Open(path)
+}
+
+func TestIndexFileFailures_HealthCacheClearsRecoveredParsePenalty(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "blocked.go"), []byte("package app\n\nfunc Blocked() {}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "readable.go"), []byte("package app\n\nfunc Readable() {}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "another.go"), []byte("package app\n\nfunc Another() {}\n"), 0o644))
+	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	filesystem, err := source.NewFilesystemSource(dir)
+	require.NoError(t, err)
+	content := &healthFailureContentSource{ContentSource: filesystem, denied: true}
+	idx.SetContentSource(content)
+	_, err = idx.Index(dir)
+	require.NoError(t, err)
+	require.NotEmpty(t, idx.ParseErrors(), "full indexing must report the injected read failure")
+	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+	baseline, err := srv.buildIndexHealthBasePayloadCtx(context.Background())
+	require.NoError(t, err)
+	require.Less(t, baseline["health_score"].(float64), float64(100))
+	failedHealth, err := srv.buildIndexHealthPayloadCtx(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 3, failedHealth["total_detected"])
+	require.Equal(t, 2, failedHealth["successfully_indexed"], "one absolute parse error and its ledger entry identify the same failed file")
+	require.Equal(t, float64(66.7), failedHealth["health_score"])
+	content.denied = false
+	_, err = idx.IncrementalReindexPaths(dir, []string{filepath.Join(dir, "blocked.go")})
+	require.NoError(t, err)
+	require.Empty(t, idx.ParseErrors(), "successful incremental recovery must clear the historical read failure")
+	for _, ceiling := range []float64{100, 40} {
+		cached := make(map[string]any, len(baseline))
+		for key, value := range baseline {
+			cached[key] = value
+		}
+		cached[indexHealthLivenessCeilingKey] = ceiling
+		srv.indexHealth.mu.Lock()
+		srv.indexHealth.payload, srv.indexHealth.updatedAt = cached, time.Now()
+		srv.indexHealth.mu.Unlock()
+		result, err := srv.handleIndexHealth(context.Background(), makeReq("index_health", map[string]any{"format": "json"}))
+		require.NoError(t, err)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result.Content[0].(mcplib.TextContent).Text), &payload))
+		require.Equal(t, ceiling, payload["health_score"], "recovery must clear the cached parse penalty while retaining the liveness ceiling")
+		require.NotContains(t, payload, "parse_failures")
+		require.NotContains(t, payload, indexHealthLivenessCeilingKey, "internal cache bookkeeping must not reach callers")
+		require.Contains(t, cached, "parse_failures", "refresh must not mutate the shared cached parse error slice")
+		if ceiling == 100 {
+			require.NotContains(t, fmt.Sprint(payload["recommendation"]), "Health score below 80%")
+		}
+	}
+}
+
+func TestIndexFileFailures_EmptyHealthBaselineWithoutIndexer(t *testing.T) {
+	srv := &Server{graph: graph.New()}
+	baseline := map[string]any{"health_score": float64(0), "total_detected": 0, "file_node_count": 0, indexHealthLivenessCeilingKey: float64(100)}
+	result := srv.refreshIndexHealthFileFailures(context.Background(), baseline)
+	require.Equal(t, float64(0), result["health_score"])
+	require.NotContains(t, result, indexHealthLivenessCeilingKey)
+	require.Contains(t, baseline, indexHealthLivenessCeilingKey)
 }
