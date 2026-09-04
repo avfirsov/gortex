@@ -1551,6 +1551,15 @@ func TestPlannerStatsIndexTimeoutFitsInsideTheBusyRetryWindow(t *testing.T) {
 		t.Fatalf("plannerStatsPassBudget = %s; a non-positive budget stops every pass after one index",
 			plannerStatsPassBudget)
 	}
+	// The other end of the same range, and not idle: the timeout test drives
+	// this var negative on purpose so the per-index context is dead the moment
+	// it is created. A leaked override — or a negative default — would make
+	// every ANALYZE time out before it started and no index would ever be
+	// rebuilt.
+	if plannerStatsIndexTimeout <= 0 {
+		t.Fatalf("plannerStatsIndexTimeout = %s; a non-positive timeout expires every per-index "+
+			"context at creation, so no ANALYZE ever runs", plannerStatsIndexTimeout)
+	}
 
 	// The constant is not what reindex_set.go and
 	// unresolved_edge_identity_batches.go actually give the gate: both call
@@ -1571,8 +1580,8 @@ func TestPlannerStatsIndexTimeoutFitsInsideTheBusyRetryWindow(t *testing.T) {
 // the failure arm so a pathological index cannot cost a full timeout at every
 // boundary for the life of the daemon.
 //
-// A nanosecond timeout reaches the same branch a real one does: the per-index
-// context is already expired when the hold acquires its write connection, so
+// An ALREADY-EXPIRED timeout reaches the same branch a real one does: the
+// per-index context is dead before the hold acquires its write connection, so
 // the hold fails while the CALLER's context is still live — which is exactly
 // what separates "this index ran out of time" from "the caller walked away".
 func TestEnsurePlannerStatsFresh_PerIndexTimeoutDefersThenSettles(t *testing.T) {
@@ -1583,8 +1592,19 @@ func TestEnsurePlannerStatsFresh_PerIndexTimeoutDefersThenSettles(t *testing.T) 
 	growStoreToDouble(t, s)
 	work := growthWorkList(t, s, "growth:"+plannerStatsNodesIndex)
 
+	// NEGATIVE, not a tiny positive duration. Production feeds this straight
+	// into context.WithTimeout, and context.WithDeadlineCause cancels
+	// synchronously with DeadlineExceeded only when time.Until(deadline) <= 0
+	// at CREATION; otherwise it arms a timer. A positive nanosecond relies on
+	// the wall clock having advanced past now+1ns by the time WithDeadline
+	// re-reads it — true on a nanosecond-resolution clock (macOS, Linux),
+	// false on Windows, where the clock ticks in ~0.5-15 ms steps: the timer
+	// gets armed instead and fires only after this fixture's tiny ANALYZE has
+	// already succeeded, so no index ever times out and the pass reports
+	// "growth:" rather than "timeout:". A deadline already in the past takes
+	// the dur <= 0 branch on every clock, on every OS.
 	restore := plannerStatsIndexTimeout
-	plannerStatsIndexTimeout = time.Nanosecond
+	plannerStatsIndexTimeout = -time.Second
 	t.Cleanup(func() { plannerStatsIndexTimeout = restore })
 
 	// The allowance: every timeout but the last is a plain deferral that leaves

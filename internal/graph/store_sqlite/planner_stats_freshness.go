@@ -251,7 +251,13 @@ func SetPlannerStatsPassBudgetForTest(budget time.Duration) (restore func()) {
 // keeps the rows it had. The index is then deferred, the cursor keeps it, and
 // the next boundary retries it.
 //
-// A var for the same reason as the budget above: a test shortens it.
+// A var for the same reason as the budget above: a test shortens it. It is
+// handed to context.WithTimeout UNGUARDED, and deliberately so — a test sets it
+// to a negative duration to make the per-index context dead at creation on any
+// OS, which a "clamp non-positive to the default" guard would silently undo
+// (see TestEnsurePlannerStatsFresh_PerIndexTimeoutDefersThenSettles). Nothing
+// in production writes it, so no production caller can reach a non-positive
+// value.
 var plannerStatsIndexTimeout = 10 * time.Second
 
 // plannerStatsIndexTimeoutRetries is how many CONSECUTIVE timeouts on the same
