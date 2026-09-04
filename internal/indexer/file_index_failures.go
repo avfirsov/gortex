@@ -46,6 +46,44 @@ type fileIndexFailureState struct {
 	cleared          map[string]struct{}
 }
 
+// clearRecoveredParseErrors runs once after a completed incremental mutation,
+// not once per file. The final failed set wins over preliminary read or walk
+// successes, and only explicitly recovered/deleted paths lose old diagnostics.
+func (idx *Indexer) clearRecoveredParseErrors(successful, failed, deleted []string) {
+	if len(successful)+len(deleted) == 0 {
+		return
+	}
+	key := func(path string) string {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(idx.rootPath, filepath.FromSlash(path))
+		}
+		return idx.relKey(path)
+	}
+	recovered := make(map[string]struct{}, len(successful)+len(deleted))
+	for _, path := range successful {
+		recovered[key(path)] = struct{}{}
+	}
+	for _, path := range deleted {
+		recovered[key(path)] = struct{}{}
+	}
+	for _, path := range failed {
+		delete(recovered, key(path))
+	}
+	if len(recovered) == 0 {
+		return
+	}
+	idx.parseErrorsMu.Lock()
+	defer idx.parseErrorsMu.Unlock()
+	retained := idx.parseErrors[:0]
+	for _, failure := range idx.parseErrors {
+		if _, ok := recovered[key(failure.FilePath)]; !ok {
+			retained = append(retained, failure)
+		}
+	}
+	clear(idx.parseErrors[len(retained):])
+	idx.parseErrors = retained
+}
+
 // The repository mutation lane serializes passes. The state mutex also covers
 // full-index parse workers; persistence happens once after those workers join.
 func (idx *Indexer) loadFileIndexFailuresLocked() {

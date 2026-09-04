@@ -1614,6 +1614,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		delete(idx.fileMtimes, relPath)
 	}
 	idx.mtimeMu.Unlock()
+	idx.clearRecoveredParseErrors(nil, nil, deleted)
 	return nodesRemoved, edgesRemoved
 }
 

@@ -152,6 +152,7 @@ type IndexError struct {
 type Indexer struct {
 	graph             graph.Store
 	fileIndexFailures fileIndexFailureState
+	parseErrorsMu     sync.RWMutex
 
 	// shadowAdmission is shared by every Indexer in the process. Cold repos
 	// acquire a weighted lease before constructing an in-memory shadow; when the
@@ -3948,7 +3949,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 
 	// Retain parse errors and record index metadata.
-	idx.parseErrors = errors
+	idx.parseErrorsMu.Lock()
+	idx.parseErrors = append([]IndexError(nil), errors...)
+	idx.parseErrorsMu.Unlock()
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
@@ -5802,9 +5805,12 @@ func effectiveExcludePatterns(patterns []string) []string {
 	return patterns
 }
 
-// ParseErrors returns the parse errors from the last full index.
+// ParseErrors returns a snapshot of errors from the last full index, excluding
+// files that a later incremental pass successfully recovered or deleted.
 func (idx *Indexer) ParseErrors() []IndexError {
-	return idx.parseErrors
+	idx.parseErrorsMu.RLock()
+	defer idx.parseErrorsMu.RUnlock()
+	return append([]IndexError(nil), idx.parseErrors...)
 }
 
 // FileMtimes returns a copy of the file modification time map.
@@ -6110,6 +6116,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	var staleFiles []string
 	var forcedDeletedFiles []string
 	var discoveryFailed []string
+	var walkedDirs []string
 
 	merkleMode := idx.merkleEnabled()
 
@@ -6171,6 +6178,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 						return filepath.SkipDir
 					}
 					idx.noteFileIndexFailure(path, nil)
+					walkedDirs = append(walkedDirs, path)
 					return nil
 				}
 				if !idx.admitScopedWalkFile(absRoot, path) {
@@ -6454,6 +6462,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(failedFiles) == 0 && !idx.hasStaleGeneratedParserProjections() {
 		idx.persistExtractorVersion("c")
 	}
+	// Accepted receipts include inert and metadata-only reparses. Directory
+	// callbacks can subsequently fail while reading entries, so exclude the
+	// final failed set before clearing their own historical walk diagnostics.
+	recoveredFiles := make([]string, 0, len(staleFiles)+len(walkedDirs))
+	recoveredFiles = append(recoveredFiles, staleFiles...)
+	recoveredFiles = append(recoveredFiles, walkedDirs...)
+	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
 	return result, nil
 }
 
