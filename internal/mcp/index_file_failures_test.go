@@ -324,6 +324,9 @@ func TestIndexFileFailures_HealthCacheClearsRecoveredParsePenalty(t *testing.T) 
 	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
 	filesystem, err := source.NewFilesystemSource(dir)
 	require.NoError(t, err)
+	// Release the os.Root handle before TempDir cleanup removes the directory;
+	// Windows does not allow removal while the source keeps that handle open.
+	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
 	content := &healthFailureContentSource{ContentSource: filesystem, denied: true}
 	idx.SetContentSource(content)
 	_, err = idx.Index(dir)
