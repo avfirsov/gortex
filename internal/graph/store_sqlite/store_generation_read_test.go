@@ -1667,6 +1667,7 @@ const (
 	skipSidecar  = "reads a v15 generation-keyed payload sidecar rather than nodes/edges; the leading view_gen primary key is its isolation and the sidecar schema fences assert it"
 	skipAdmin    = "repository administration or store lifecycle, generation-unscoped by design (see EvictRepo / PurgeRepo)"
 	skipInMemory = "answers from in-process state, not from a SQL read"
+	skipPhysical = "describes the physical B-tree indexes, which hold every generation's rows at once; the verdict is generation-unscoped by construction (see plannerStatsCounterQuery)"
 )
 
 // writerFamilyFence names one row of the write fence's writer-family table.
@@ -1784,6 +1785,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.NodesByKindsSequencer)(nil), probe: "NodesByKindsSeq"},
 		{iface: (*graph.NodesInFilesByKindFinder)(nil), probe: "NodesInFilesByKind"},
 		{iface: (*graph.OverrideDispatchCallBatchScanner)(nil), probe: "ScanOverrideDispatchCalls"},
+		{iface: (*graph.PlannerStatsFreshener)(nil), skip: skipPhysical},
 		{iface: (*graph.QualifiedNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.ReachableForwardByKinds)(nil), probe: "ReachableForwardByKinds"},
 		{iface: (*graph.ReceiverMutationScanner)(nil), probe: "ScanReceiverMutation"},
