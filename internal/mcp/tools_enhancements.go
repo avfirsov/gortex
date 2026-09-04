@@ -3368,6 +3368,63 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		// resolution regression rather than silently serving a shrunken graph.
 		"resolution_regressions": indexer.ResolutionRegressions(),
 	}
+	// Query-planner statistics. Read-only on purpose: this payload is served
+	// from a cached snapshot rebuilt in the background, and a health report
+	// that issued an ANALYZE as a side effect would make observing the store
+	// change it. The refresh belongs to the index / resolve / publish paths.
+	if planner, ok := graph.MaybePlannerStatsHealth(ctx, s.graph); ok {
+		plannerStats := map[string]any{
+			"nodes": map[string]any{
+				"believed":             planner.Nodes.Believed,
+				"actual_from_counters": planner.Nodes.Actual,
+				"counters_known":       planner.Nodes.Known,
+			},
+			"edges": map[string]any{
+				"believed":             planner.Edges.Believed,
+				"actual_from_counters": planner.Edges.Actual,
+				"counters_known":       planner.Edges.Known,
+			},
+			"stale": planner.Stale,
+		}
+		// Omitted rather than zeroed when the receiver index is not in the
+		// schema — a bulk load has dropped it, or this store never had it.
+		// believed=0 / actual=0 there would read as "the Go receiver index is
+		// empty", which is the exact misreading the poisoned zero stat row of
+		// issue #651 causes in the planner itself.
+		if planner.Receivers.Present {
+			plannerStats["receivers"] = map[string]any{
+				"believed": planner.Receivers.Believed,
+				"actual":   planner.Receivers.Actual,
+				"bounded":  planner.Receivers.Bounded,
+				// The probe is capped, so `actual` can be a truncated lower
+				// bound. complete=false says the question could not be asked
+				// in full and the two figures must not be compared.
+				"complete": planner.Receivers.Known,
+			}
+		}
+		// Every verdict, not just a stale one. The non-stale reasons are the
+		// ones a reader most needs: "bulk_window_active" is why the numbers
+		// below it are all zero, and without it the payload looks like a
+		// store whose planner believes nothing.
+		if planner.Reason != "" {
+			plannerStats["reason"] = planner.Reason
+		}
+		if !planner.LastRefreshAt.IsZero() {
+			plannerStats["last_refresh_at"] = planner.LastRefreshAt.UTC().Format(time.RFC3339)
+			plannerStats["last_refresh_reason"] = planner.LastRefreshReason
+		}
+		result["planner_stats"] = plannerStats
+		if planner.Stale {
+			msg := "SQLite planner statistics are stale (" + planner.Reason + "): the graph has grown past what the query " +
+				"planner believes, which can invert join order on receiver/edge queries. They refresh automatically at the " +
+				"next repository index, commit/HEAD move, whole-graph resolve or generation build."
+			if recommendation == "" {
+				recommendation = msg
+			} else {
+				recommendation = msg + " " + recommendation
+			}
+		}
+	}
 	if prefixAuditOK {
 		ownership := map[string]any{
 			"owned_code_nodes":   prefixAudit.OwnedCodeNodes,
