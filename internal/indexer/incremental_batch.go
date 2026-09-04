@@ -88,6 +88,8 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	markerBatch *reparsePendingEnrichmentBatch,
 	surfaceFirstVersionChange bool,
 ) (DerivedInvalidationPlan, []string, []string, []string) {
+	idx.loadFileIndexFailures()
+	defer idx.flushFileIndexFailures()
 	var invalidation DerivedInvalidationPlan
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
 
@@ -97,7 +99,7 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	invalidation.Merge(passPlan)
 	for _, filePath := range failed {
 		idx.logger.Debug("incremental reindex: failed to index file",
-			zap.String("file", filePath))
+			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
 	if len(failed) == 0 {
 		if len(reparsed) > 0 {
@@ -115,20 +117,32 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		return invalidation, reparsed, failed, versionChanged
 	}
 
+	var retryPaths, permissionFailed []string
+	for _, path := range failed {
+		if errors.Is(idx.fileIndexFailureError(path), os.ErrPermission) {
+			permissionFailed = append(permissionFailed, path)
+		} else {
+			retryPaths = append(retryPaths, path)
+		}
+	}
 	retryPlan, retryReparsed, retryFailed, retryVersionChanged := idx.reindexIncrementalStalePass(
-		failed, markerBatch, false,
+		retryPaths, markerBatch, false,
 	)
 	invalidation.Merge(retryPlan)
 	reparsed = appendUniqueSorted(reparsed, retryReparsed...)
 	versionChanged = appendUniqueSorted(versionChanged, retryVersionChanged...)
 	for _, filePath := range retryFailed {
+		err := idx.fileIndexFailureError(filePath)
+		if errors.Is(err, os.ErrPermission) {
+			continue // One aggregate permission warning is emitted for the repo.
+		}
 		idx.logger.Warn("incremental reindex: file failed after retry",
-			zap.String("file", filePath))
+			zap.String("file", filePath), zap.Error(err))
 	}
 	if len(reparsed) > 0 {
 		idx.reparsedThisRun.Store(true)
 	}
-	return invalidation, reparsed, retryFailed, versionChanged
+	return invalidation, reparsed, appendUniqueSorted(permissionFailed, retryFailed...), versionChanged
 }
 
 func (idx *Indexer) reindexIncrementalStalePass(
@@ -188,6 +202,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 	receipts := make([]fileReadReceipt, 0, len(files))
 	nodeCount, edgeCount := 0, 0
 	var retainedBytes int64
+	var readFailed []string
 	consumed := 0
 	for i, filePath := range files {
 		graphPath := graphPaths[i]
@@ -217,6 +232,11 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 
 		if !probeOK {
+			if probe.readErr != nil {
+				idx.noteFileIndexFailure(filePath, probe.readErr)
+				readFailed = append(readFailed, filePath)
+				continue
+			}
 			fallbacks = append(fallbacks, incrementalFallback{
 				filePath: filePath, graphPath: graphPath, priorNodes: priorNodes,
 				storedGraph: storedGraph, storedDerived: storedDerived,
@@ -282,10 +302,16 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 
 	var reparsed []string
-	failed := append([]string(nil), stalePaths...)
-	versionChanged := append([]string(nil), stalePaths...)
+	failed := append(readFailed, stalePaths...)
+	var versionChanged []string
+	for _, path := range failed {
+		if errors.Is(idx.fileIndexFailureError(path), errFileVersionChanged) {
+			versionChanged = append(versionChanged, path)
+		}
+	}
 	for _, fallback := range fallbacks {
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
+			idx.noteFileIndexFailure(fallback.filePath, err)
 			idx.discardPreparedExtraction(fallback.filePath)
 			failed = append(failed, fallback.filePath)
 			if errors.Is(err, errFileVersionChanged) {
@@ -293,6 +319,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			}
 			continue
 		}
+		idx.noteFileIndexFailure(fallback.filePath, nil)
 		reparsed = append(reparsed, fallback.filePath)
 	}
 	for _, stage := range stages {
@@ -1033,6 +1060,7 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 	mtimes := make(map[string]int64, len(receipts))
 	for _, receipt := range receipts {
 		if !receipt.readVersion.valid {
+			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
 			stale = append(stale, receipt.absPath)
 			continue
 		}
@@ -1040,15 +1068,23 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 			// Read from an immutable content source: nothing on disk to
 			// restat, and no working-tree mtime to advance the ledger to.
 			fresh = append(fresh, receipt.absPath)
+			idx.noteFileIndexFailure(receipt.absPath, nil)
 			continue
 		}
 		current, err := os.Stat(receipt.absPath)
-		if err != nil || !sameFileVersion(receipt.readVersion.info, current) {
+		if err != nil {
+			idx.noteFileIndexFailure(receipt.absPath, err)
+			stale = append(stale, receipt.absPath)
+			continue
+		}
+		if !sameFileVersion(receipt.readVersion.info, current) {
+			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
 			stale = append(stale, receipt.absPath)
 			continue
 		}
 		mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
 		fresh = append(fresh, receipt.absPath)
+		idx.noteFileIndexFailure(receipt.absPath, nil)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale
@@ -1523,6 +1559,10 @@ func (idx *Indexer) removeIncrementalContractsForFile(graphPath string, plan *De
 func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan) (nodesRemoved, edgesRemoved int) {
 	if len(deleted) == 0 {
 		return 0, 0
+	}
+	defer idx.flushFileIndexFailures()
+	for _, path := range deleted {
+		idx.noteFileIndexFailure(filepath.Join(idx.rootPath, filepath.FromSlash(path)), nil)
 	}
 	for start := 0; start < len(deleted); start += deletedBatchFiles {
 		end := min(start+deletedBatchFiles, len(deleted))

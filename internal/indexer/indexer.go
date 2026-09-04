@@ -150,7 +150,8 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph graph.Store
+	graph             graph.Store
+	fileIndexFailures fileIndexFailureState
 
 	// shadowAdmission is shared by every Indexer in the process. Cold repos
 	// acquire a weighted lease before constructing an in-memory shadow; when the
@@ -4459,7 +4460,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4475,7 +4476,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4521,7 +4522,7 @@ func (idx *Indexer) indexFile(
 		// expensive shadow re-track path on every restart.
 		fresh := idx.recordFileReadVersion(mtimeKey, absPath, readVersion)
 		if err == nil && !fresh {
-			return errFileVersionChanged
+			return idx.fileIndexFailureError(absPath)
 		}
 		return err
 	}
@@ -4795,7 +4796,7 @@ func (idx *Indexer) indexFile(
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
 	if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-		return errFileVersionChanged
+		return idx.fileIndexFailureError(absPath)
 	}
 	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
 		idx.logger.Warn("indexer: slow incremental stages",
@@ -4833,19 +4834,27 @@ func (idx *Indexer) recordFileMtime(relPath, absPath string) {
 // queued event or the poller retries instead of treating newer bytes as done.
 func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileReadVersion) bool {
 	if !version.valid {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	if version.snapshot {
 		// An immutable snapshot has nothing to restat and no disk mtime
 		// worth stamping: the staleness ledger tracks the working tree,
 		// which this read never touched.
+		idx.noteFileIndexFailure(absPath, nil)
 		return true
 	}
 	current, err := os.Stat(absPath)
-	if err != nil || !sameFileVersion(version.info, current) {
+	if err != nil {
+		idx.noteFileIndexFailure(absPath, err)
+		return false
+	}
+	if !sameFileVersion(version.info, current) {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	idx.recordFileMtimeValue(relPath, version.mtime)
+	idx.noteFileIndexFailure(absPath, nil)
 	return true
 }
 

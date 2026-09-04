@@ -1,0 +1,184 @@
+package indexer
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
+
+	"github.com/zzet/gortex/internal/graph"
+	"go.uber.org/zap"
+)
+
+// FileIndexFailure records an unsuccessful indexing attempt separately from
+// the last successful file snapshot.
+type FileIndexFailure = graph.FileIndexFailure
+
+// LoadFileIndexFailures reads failures from the selected graph view. An absent
+// capability has no failure ledger; it must never fall back to another view.
+func LoadFileIndexFailures(g graph.Reader, repoPrefix string) []FileIndexFailure {
+	reader, ok := g.(graph.FileIndexFailureReader)
+	if !ok {
+		return nil
+	}
+	rows, err := reader.FileIndexFailuresForRepo(repoPrefix)
+	if err != nil {
+		return nil
+	}
+	return rows
+}
+
+type fileIndexFailureState struct {
+	mu               sync.Mutex
+	loaded           bool
+	dirty            bool
+	permissionWarned bool
+	rows             map[string]FileIndexFailure
+	errors           map[string]error
+}
+
+// The repository mutation lane serializes passes. The state mutex also covers
+// full-index parse workers; persistence happens once after those workers join.
+func (idx *Indexer) loadFileIndexFailuresLocked() {
+	state := &idx.fileIndexFailures
+	if state.loaded {
+		return
+	}
+	state.rows = make(map[string]FileIndexFailure)
+	state.errors = make(map[string]error)
+	if reader, ok := idx.graph.(graph.FileIndexFailureReader); ok {
+		rows, err := reader.FileIndexFailuresForRepo(idx.repoPrefix)
+		if err != nil {
+			idx.logger.Warn("indexer: loading file failures failed", zap.String("repo", idx.repoPrefix), zap.Error(err))
+			return
+		}
+		for _, row := range rows {
+			state.rows[row.Path] = row
+		}
+	}
+	state.loaded = true
+}
+
+func (idx *Indexer) loadFileIndexFailures() {
+	idx.fileIndexFailures.mu.Lock()
+	defer idx.fileIndexFailures.mu.Unlock()
+	idx.loadFileIndexFailuresLocked()
+}
+
+func (idx *Indexer) noteFileIndexFailure(path string, err error) {
+	graphPath := idx.prefixPath(idx.relKey(path))
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	idx.loadFileIndexFailuresLocked()
+	if err == nil {
+		if _, exists := state.rows[graphPath]; exists {
+			delete(state.rows, graphPath)
+			delete(state.errors, graphPath)
+			state.dirty = true
+		}
+		return
+	}
+	row := FileIndexFailure{
+		Path: graphPath, Error: err.Error(), PermissionDenied: errors.Is(err, os.ErrPermission),
+		RepoPrefix: idx.repoPrefix, WorkspaceID: idx.workspaceID, ProjectID: idx.projectID,
+	}
+	if old, exists := state.rows[graphPath]; !exists || old != row {
+		state.rows[graphPath] = row
+		state.dirty = true
+	}
+	state.errors[graphPath] = err
+}
+
+func (idx *Indexer) fileIndexFailureError(path string) error {
+	graphPath := idx.prefixPath(idx.relKey(path))
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	idx.loadFileIndexFailuresLocked()
+	if err := state.errors[graphPath]; err != nil {
+		return err
+	}
+	if row, exists := state.rows[graphPath]; exists {
+		if row.PermissionDenied {
+			return fmt.Errorf("%s: %w", row.Error, os.ErrPermission)
+		}
+		return errors.New(row.Error)
+	}
+	return errFileVersionChanged
+}
+
+func (idx *Indexer) fileIndexFailurePaths() []string {
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	idx.loadFileIndexFailuresLocked()
+	paths := make([]string, 0, len(state.rows))
+	for path := range state.rows {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func (idx *Indexer) pruneMissingFileIndexFailures() {
+	if idx.contentSource() != nil {
+		return
+	}
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		relPath, ok := idx.graphPathRelKey(graphPath)
+		if !ok {
+			continue
+		}
+		path := filepath.Join(idx.rootPath, filepath.FromSlash(relPath))
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			idx.noteFileIndexFailure(path, nil)
+		}
+	}
+}
+
+func (idx *Indexer) flushFileIndexFailures() {
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.loaded {
+		return
+	}
+	rows := make([]FileIndexFailure, 0, len(state.rows))
+	permissionCount := 0
+	var example FileIndexFailure
+	for _, row := range state.rows {
+		rows = append(rows, row)
+		if row.PermissionDenied {
+			permissionCount++
+			if example.Path == "" || row.Path < example.Path {
+				example = row
+			}
+		}
+	}
+	if state.dirty {
+		sort.Slice(rows, func(i, j int) bool { return rows[i].Path < rows[j].Path })
+		if writer, ok := idx.graph.(graph.FileIndexFailureWriter); ok {
+			if err := writer.ReplaceFileIndexFailures(idx.repoPrefix, rows); err != nil {
+				idx.logger.Warn("indexer: persisting file failures failed", zap.String("repo", idx.repoPrefix), zap.Error(err))
+				return
+			}
+			state.dirty = false
+		}
+	}
+	if permissionCount == 0 {
+		state.permissionWarned = false
+	} else if !state.permissionWarned {
+		hint := "Check file and directory permissions for the account running Gortex, then reindex."
+		if runtime.GOOS == "darwin" {
+			hint = "Check System Settings > Privacy & Security > Full Disk Access for the app or service running Gortex, then restart it and reindex."
+		}
+		idx.logger.Warn("indexer: repository indexing incomplete due to filesystem permissions",
+			zap.String("repo", idx.repoPrefix), zap.Int("unreadable_files", permissionCount),
+			zap.String("file", example.Path), zap.String("error", example.Error), zap.String("hint", hint))
+		state.permissionWarned = true
+	}
+}
