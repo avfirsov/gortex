@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -16,11 +17,11 @@ func TestIndexFailureStatusRecoveryKeepsQueryReadiness(t *testing.T) {
 			{Prefix: "healthy", Files: 8},
 		},
 	}
-	applyIndexFailureStatus(&st, func(prefix string) (int, int) {
+	applyIndexFailureStatus(&st, func(prefix string) (int, int, error) {
 		if prefix == "denied" {
-			return 3, 2
+			return 3, 2, nil
 		}
-		return 0, 0
+		return 0, 0, nil
 	})
 	if !st.Ready || !st.IndexDegraded || st.FailedFiles != 3 || st.UnreadableFiles != 2 {
 		t.Fatalf("unexpected status: %+v", st)
@@ -30,9 +31,27 @@ func TestIndexFailureStatusRecoveryKeepsQueryReadiness(t *testing.T) {
 	}
 	// A cached table may still carry the previous failure counts. A fresh
 	// ledger read after recovery must clear both its rows and its totals.
-	applyIndexFailureStatus(&st, func(string) (int, int) { return 0, 0 })
+	applyIndexFailureStatus(&st, func(string) (int, int, error) { return 0, 0, nil })
 	if !st.Ready || st.IndexDegraded || st.FailedFiles != 0 || st.UnreadableFiles != 0 || st.TrackedRepos[0].IndexDegraded || st.TrackedRepos[0].FailedFiles != 0 {
 		t.Fatalf("recovered status retained failure state: %+v", st)
+	}
+}
+
+func TestIndexFailureStatusDisclosesUnavailableLedger(t *testing.T) {
+	st := daemon.StatusResponse{Ready: true, TrackedRepos: []daemon.TrackedRepoStatus{{Prefix: "repo", Files: 8}}}
+	applyIndexFailureStatus(&st, func(string) (int, int, error) { return 0, 0, errors.New("ledger read failed") })
+	if !st.Ready || !st.IndexDegraded || !st.TrackedRepos[0].IndexDegraded || !strings.Contains(st.IndexHealthError, "ledger read failed") {
+		t.Fatalf("unavailable ledger reported as healthy: %+v", st)
+	}
+	var out bytes.Buffer
+	renderDaemonHeader(&out, st)
+	renderIndexFailureWarning(&out, st.TrackedRepos)
+	if !strings.Contains(out.String(), "index health unavailable") || !strings.Contains(out.String(), "ledger read failed") {
+		t.Fatalf("missing health read error: %s", out.String())
+	}
+	applyIndexFailureStatus(&st, func(string) (int, int, error) { return 0, 0, nil })
+	if st.IndexDegraded || st.IndexHealthError != "" || st.TrackedRepos[0].IndexHealthError != "" {
+		t.Fatalf("recovered ledger retained unknown state: %+v", st)
 	}
 }
 
@@ -49,6 +68,16 @@ func TestIndexFailureStatusRendering(t *testing.T) {
 	}
 	if got := repoItemState(row); !strings.Contains(got, "3 failed, 2 unreadable") {
 		t.Errorf("TUI omitted failure counts: %s", got)
+	}
+	tui := statusTUI{hasStatus: true, status: st}
+	if got := tui.headerRightCol(); !strings.Contains(got, "degraded") || !strings.Contains(got, "3 failed (2 unreadable)") {
+		t.Errorf("TUI header hid degraded indexing: %s", got)
+	}
+	out.Reset()
+	st.Ready = false
+	renderDaemonHeader(&out, st)
+	if !strings.Contains(out.String(), "warming up") || !strings.Contains(out.String(), "3 failed files (2 unreadable)") {
+		t.Errorf("warming header lost readiness or indexing state: %s", out.String())
 	}
 	if got := repoStateLabel(daemon.TrackedRepoStatus{Missing: true, FailedFiles: 3}); got != "MISSING" {
 		t.Errorf("failure state hid missing path: %s", got)
