@@ -488,6 +488,8 @@ func (m *Materializer) assemble(
 	open := func(generationID int64) (*store_sqlite.Store, *GenerationLayer, store_sqlite.ViewGeneration, error) {
 		handle, layer, row, openErr := m.openGeneration(ctx, generationID)
 		if openErr == nil {
+			layer.failureRepoPrefix = repoPrefix
+			layer.failureRepoScoped = true
 			handles = append(handles, handle)
 			sources = append(sources, GenerationSource{
 				Generation: generationID, Handle: handle, Layer: layer,

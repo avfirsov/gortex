@@ -3027,6 +3027,9 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		s.refreshIndexHealthInBackground()
 		result, updatedAt, refreshing = s.indexHealthSnapshot()
 	}
+	if result != nil {
+		result = s.refreshIndexHealthFileFailures(ctx, result)
+	}
 
 	if isCompact(req) {
 		if result == nil {
@@ -3086,6 +3089,14 @@ const healthOrphanSampleLimit = 3
 // the daemon finishing a scan for nobody, holding a transport slot the whole
 // time.
 func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any, error) {
+	baseline, err := s.buildIndexHealthBasePayloadCtx(ctx)
+	if err != nil || baseline == nil {
+		return baseline, err
+	}
+	return s.refreshIndexHealthFileFailures(ctx, baseline), nil
+}
+
+func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string]any, error) {
 	if s.indexer == nil {
 		return nil, nil
 	}
@@ -3224,7 +3235,7 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 
 	var recommendation string
 	if healthScore < 80 {
-		recommendation = "Health score below 80%. Run index_repository with path \".\" to re-index the codebase."
+		recommendation = indexHealthLowScoreRecommendation
 	}
 	if !orphans.Clean() {
 		msg := "Graph holds nodes for files that no longer exist on disk (" + orphans.Summary() + "). " +
@@ -3354,15 +3365,17 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	}
 
 	result := map[string]any{
-		"health_score":         healthScore,
-		"total_detected":       totalDetected,
-		"successfully_indexed": successfullyIndexed,
-		"language_coverage":    langCoverage,
-		"last_index_time":      lastIndexStr,
-		"node_count":           stats.TotalNodes,
-		"edge_count":           stats.TotalEdges,
-		"edges_ok":             edgesOK,
-		"nodes_per_file":       nodesPerFile,
+		"health_score":                healthScore,
+		"total_detected":              totalDetected,
+		"successfully_indexed":        successfullyIndexed,
+		"language_coverage":           langCoverage,
+		"last_index_time":             lastIndexStr,
+		"node_count":                  stats.TotalNodes,
+		"edge_count":                  stats.TotalEdges,
+		"edges_ok":                    edgesOK,
+		"nodes_per_file":              nodesPerFile,
+		"file_node_count":             fileNodes,
+		indexHealthLivenessCeilingKey: orphans.LiveScore(),
 		// Shape-degradation guard firings since process start. Nonzero means
 		// the daemon caught (and self-healed) a live-patch or boot-reload
 		// resolution regression rather than silently serving a shrunken graph.

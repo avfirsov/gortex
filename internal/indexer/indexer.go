@@ -150,7 +150,9 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph graph.Store
+	graph             graph.Store
+	fileIndexFailures fileIndexFailureState
+	parseErrorsMu     sync.RWMutex
 
 	// shadowAdmission is shared by every Indexer in the process. Cold repos
 	// acquire a weighted lease before constructing an in-memory shadow; when the
@@ -2367,6 +2369,39 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	idx.loadFileIndexFailures()
+	var successfulFiles sync.Map
+	recordFileOutcome := func(path string, err error) {
+		if err != nil {
+			successfulFiles.Delete(path)
+			idx.noteFileIndexFailure(path, err)
+		} else {
+			successfulFiles.Store(path, struct{}{})
+		}
+	}
+	// Register before panic recovery and shadow restoration: failures remain
+	// durable even when a full pass fails, while recovery is acknowledged only
+	// after its replacement graph has committed to the original store.
+	defer func() {
+		if retErr == nil && result != nil {
+			successfulFiles.Range(func(path, _ any) bool {
+				idx.noteFileIndexFailure(path.(string), nil)
+				return true
+			})
+			idx.pruneMissingFileIndexFailures()
+			// A shadow drain evicts the generation's old sidecars. Rewrite even
+			// unchanged failures after restoring the destination graph.
+			idx.fileIndexFailures.mu.Lock()
+			idx.fileIndexFailures.dirty = idx.fileIndexFailures.dirty || len(idx.fileIndexFailures.rows) > 0
+			idx.fileIndexFailures.mu.Unlock()
+			for _, path := range idx.fileIndexFailurePaths() {
+				if rel, ok := idx.graphPathRelKey(path); ok {
+					result.FailedFiles = append(result.FailedFiles, filepath.Join(idx.rootPath, filepath.FromSlash(rel)))
+				}
+			}
+		}
+		idx.flushFileIndexFailures()
+	}()
 	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
 
 	start := time.Now()
@@ -2418,6 +2453,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var skippedByContent []skippedFile
 	var skippedContentBytes int64
 	var parseFailedFiles []skippedFile
+	var walkFailures []IndexError
 	// admitWalkedFile applies the two gates that sit above the shared walk
 	// admission: the git-aware untracked-asset gate and the content-admission
 	// gate. Both walks below feed it, and both account for an over-cap file the
@@ -2467,12 +2503,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	} else {
 		err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+					recordFileOutcome(path, err)
+					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: err.Error()})
+				}
 				return nil
 			}
 			if d.IsDir() {
 				if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 					return filepath.SkipDir
 				}
+				recordFileOutcome(path, nil)
 				return nil
 			}
 			// The FileInfo is taken before the admission gate rather than
@@ -2484,6 +2525,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if statErr != nil {
 				// Couldn't read FileInfo (race with deletion, broken
 				// symlink, …). Skip — the worker would fail too.
+				if !os.IsNotExist(statErr) && idx.admitWalkEntry(absRoot, path, -1, false).admit {
+					recordFileOutcome(path, statErr)
+					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: statErr.Error()})
+				}
 				return nil
 			}
 			adm := idx.admitWalkEntry(absRoot, path, info.Size(), false)
@@ -2508,6 +2553,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		})
 	}
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			recordFileOutcome(absRoot, err)
+		}
 		return nil, err
 	}
 	if skippedLarge > 0 {
@@ -3178,7 +3226,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var contractMu sync.Mutex
 
 	var errMu sync.Mutex
-	var errors []IndexError
+	errors := walkFailures
 	var processed int64
 	var fileCount int64
 	var skippedByTimeout int64
@@ -3356,6 +3404,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
 							if serr != nil {
+								recordFileOutcome(path, serr)
 								errMu.Lock()
 								errors = append(errors, IndexError{FilePath: path, Error: serr.Error()})
 								if result == nil {
@@ -3392,6 +3441,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								}
 							}
 							sidecars.addConstValues(result)
+							if serr == nil {
+								recordFileOutcome(path, nil)
+							}
 							parseLease.Release()
 							continue
 						}
@@ -3401,6 +3453,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					src, err := readFile(wf)
 					atomic.AddInt64(&parseReadNS, int64(time.Since(readStart)))
 					if err != nil {
+						recordFileOutcome(path, err)
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
@@ -3453,6 +3506,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						nativePressure.afterParse(lang, int64(len(src)))
 					}
 					if err != nil {
+						recordFileOutcome(path, err)
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
@@ -3582,6 +3636,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// every tree in the chunk until the worker exits.
 					result.ReleaseTree()
 					parseLease.Release()
+					if err == nil {
+						recordFileOutcome(path, nil)
+					}
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -3892,7 +3949,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 
 	// Retain parse errors and record index metadata.
-	idx.parseErrors = errors
+	idx.parseErrorsMu.Lock()
+	idx.parseErrors = append([]IndexError(nil), errors...)
+	idx.parseErrorsMu.Unlock()
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
@@ -4459,7 +4518,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4475,7 +4534,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4521,7 +4580,7 @@ func (idx *Indexer) indexFile(
 		// expensive shadow re-track path on every restart.
 		fresh := idx.recordFileReadVersion(mtimeKey, absPath, readVersion)
 		if err == nil && !fresh {
-			return errFileVersionChanged
+			return idx.fileIndexFailureError(absPath)
 		}
 		return err
 	}
@@ -4795,7 +4854,7 @@ func (idx *Indexer) indexFile(
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
 	if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-		return errFileVersionChanged
+		return idx.fileIndexFailureError(absPath)
 	}
 	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
 		idx.logger.Warn("indexer: slow incremental stages",
@@ -4833,19 +4892,27 @@ func (idx *Indexer) recordFileMtime(relPath, absPath string) {
 // queued event or the poller retries instead of treating newer bytes as done.
 func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileReadVersion) bool {
 	if !version.valid {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	if version.snapshot {
 		// An immutable snapshot has nothing to restat and no disk mtime
 		// worth stamping: the staleness ledger tracks the working tree,
 		// which this read never touched.
+		idx.noteFileIndexFailure(absPath, nil)
 		return true
 	}
 	current, err := os.Stat(absPath)
-	if err != nil || !sameFileVersion(version.info, current) {
+	if err != nil {
+		idx.noteFileIndexFailure(absPath, err)
+		return false
+	}
+	if !sameFileVersion(version.info, current) {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	idx.recordFileMtimeValue(relPath, version.mtime)
+	idx.noteFileIndexFailure(absPath, nil)
 	return true
 }
 
@@ -5738,9 +5805,12 @@ func effectiveExcludePatterns(patterns []string) []string {
 	return patterns
 }
 
-// ParseErrors returns the parse errors from the last full index.
+// ParseErrors returns a snapshot of errors from the last full index, excluding
+// files that a later incremental pass successfully recovered or deleted.
 func (idx *Indexer) ParseErrors() []IndexError {
-	return idx.parseErrors
+	idx.parseErrorsMu.RLock()
+	defer idx.parseErrorsMu.RUnlock()
+	return append([]IndexError(nil), idx.parseErrors...)
 }
 
 // FileMtimes returns a copy of the file modification time map.
@@ -6009,6 +6079,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	mode incrementalPathMode,
 	markerBatches ...*reparsePendingEnrichmentBatch,
 ) (*IndexResult, error) {
+	idx.loadFileIndexFailures()
+	defer idx.flushFileIndexFailures()
 	fullRoot := len(paths) == 0
 	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
@@ -6043,6 +6115,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	diskFiles := make(map[string]bool)
 	var staleFiles []string
 	var forcedDeletedFiles []string
+	var discoveryFailed []string
+	var walkedDirs []string
 
 	merkleMode := idx.merkleEnabled()
 
@@ -6086,18 +6160,25 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				}
 				continue
 			}
+			idx.noteFileIndexFailure(absPath, statErr)
 			return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
 		}
 
 		if info.IsDir() {
 			walkErr := filepath.WalkDir(absPath, func(path string, d os.DirEntry, err error) error {
 				if err != nil {
+					if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+						idx.noteFileIndexFailure(path, err)
+						discoveryFailed = append(discoveryFailed, path)
+					}
 					return nil
 				}
 				if d.IsDir() {
 					if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 						return filepath.SkipDir
 					}
+					idx.noteFileIndexFailure(path, nil)
+					walkedDirs = append(walkedDirs, path)
 					return nil
 				}
 				if !idx.admitScopedWalkFile(absRoot, path) {
@@ -6158,6 +6239,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			}
 		}
 	}
+	// Failure rows also inventory files that have never produced graph nodes
+	// or mtimes. A recovered read must be retried even when those ledgers say
+	// nothing changed (including Merkle mode and prior parse failures).
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		if relPath, ok := idx.graphPathRelKey(graphPath); ok && diskFiles[relPath] {
+			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		}
+	}
 	staleFiles = appendUniqueSorted(nil, staleFiles...)
 
 	// Restored snapshots populate fileMtimes without running IndexCtx. Preserve
@@ -6177,6 +6266,11 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		candidateSet := make(map[string]struct{}, len(forcedDeletedFiles)+4)
 		for _, relPath := range forcedDeletedFiles {
 			candidateSet[relPath] = struct{}{}
+		}
+		for _, graphPath := range idx.fileIndexFailurePaths() {
+			if relPath, ok := idx.graphPathRelKey(graphPath); ok && !diskFiles[relPath] && relPathInScope(relPath, scopeRels) {
+				candidateSet[relPath] = struct{}{}
+			}
 		}
 		idx.mtimeMu.RLock()
 		for relPath := range idx.fileMtimes {
@@ -6222,8 +6316,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				deletedFiles = append(deletedFiles, relPath)
 				continue
 			}
-			idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
-				zap.String("rel", relPath), zap.Error(statErr))
+			idx.noteFileIndexFailure(absPath, statErr)
+			discoveryFailed = append(discoveryFailed, absPath)
+			if !errors.Is(statErr, os.ErrPermission) {
+				idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
+					zap.String("rel", relPath), zap.Error(statErr))
+			}
 		}
 	}
 	deletedFiles = appendUniqueSorted(nil, deletedFiles...)
@@ -6261,6 +6359,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
 	invalidation.Merge(manifestPlan)
 	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
+	failedFiles = appendUniqueSorted(failedFiles, discoveryFailed...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
 	idx.pruneDeletedFileMtimes(deletedFiles)
@@ -6336,10 +6435,15 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		DurationMs:          time.Since(start).Milliseconds(),
 		DerivedInvalidation: invalidation,
 	}
+	for _, path := range failedFiles {
+		result.Errors = append(result.Errors, IndexError{FilePath: path, Error: idx.fileIndexFailureError(path).Error()})
+	}
 	if mode.surfaceFirstVersionChange && len(versionChangedFiles) > 0 {
 		result.mutationErr = fmt.Errorf(
 			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
 		)
+	} else if mode.surfaceFirstVersionChange && len(failedFiles) > 0 {
+		result.mutationErr = idx.fileIndexFailureError(failedFiles[0])
 	}
 	// A clean version-driven restage re-stamps the stored extractor
 	// versions; a failed file keeps the old row so the next full pass
@@ -6358,6 +6462,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(failedFiles) == 0 && !idx.hasStaleGeneratedParserProjections() {
 		idx.persistExtractorVersion("c")
 	}
+	// Accepted receipts include inert and metadata-only reparses. Directory
+	// callbacks can subsequently fail while reading entries, so exclude the
+	// final failed set before clearing their own historical walk diagnostics.
+	recoveredFiles := make([]string, 0, len(staleFiles)+len(walkedDirs))
+	recoveredFiles = append(recoveredFiles, staleFiles...)
+	recoveredFiles = append(recoveredFiles, walkedDirs...)
+	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
 	return result, nil
 }
 
