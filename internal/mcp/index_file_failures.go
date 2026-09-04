@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"path"
 	"sort"
 	"strings"
 
@@ -86,12 +88,30 @@ func scopedIndexFileFailures(failures []indexer.FileIndexFailure, resolved Resol
 		if !opts.ScopeAllows(node) {
 			continue
 		}
-		if len(paths) > 0 && !pathMatchesAnyPrefix(failure.Path, expandPathPrefixesWithRepos(paths, []string{failure.RepoPrefix})) {
+		if len(paths) > 0 && !indexFailureOverlapsPaths(failure.Path, expandPathPrefixesWithRepos(paths, []string{failure.RepoPrefix})) {
 			continue
 		}
 		scoped = append(scoped, failure)
 	}
 	return scoped
+}
+
+func indexFailureOverlapsPaths(failurePath string, paths []string) bool {
+	failurePath = path.Clean(failurePath)
+	if failurePath == "." {
+		return true // A failed standalone repository-root walk hides every subpath.
+	}
+	if pathMatchesAnyPrefix(failurePath, paths) {
+		return true
+	}
+	// A failed directory walk can hide any descendant. Its warning applies
+	// when a request narrows further into that directory, too.
+	for _, path := range paths {
+		if pathMatchesAnyPrefix(path, []string{failurePath}) {
+			return true
+		}
+	}
+	return false
 }
 
 func indexFileFailureSummary(failures []indexer.FileIndexFailure) map[string]any {
@@ -208,4 +228,42 @@ func indexHealthParseFailureCount(value any) int {
 	default:
 		return 0
 	}
+}
+
+// The cached payload contains only baseline parse/liveness health. Failures
+// are read live, and every field changed here belongs to a new top-level map;
+// recovery therefore restores the baseline score without racing cache readers.
+func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline map[string]any) map[string]any {
+	result := make(map[string]any, len(baseline)+8)
+	for key, value := range baseline {
+		result[key] = value
+	}
+	failures, readErr := s.readIndexFileFailures(ctx, ResolvedScope{})
+	totalDetected, _ := baseline["total_detected"].(int)
+	fileNodes, _ := baseline["file_node_count"].(int)
+	parseErrors, _ := baseline["parse_failures"].([]indexer.IndexError)
+	totalDetected, successfullyIndexed := indexHealthFailureCounts(s.readerFor(ctx), totalDetected, fileNodes, parseErrors, failures)
+	result["total_detected"] = totalDetected
+	result["successfully_indexed"] = successfullyIndexed
+	if len(failures) > 0 && totalDetected > 0 {
+		healthScore, _ := baseline["health_score"].(float64)
+		failureScore := math.Round(float64(successfullyIndexed)/float64(totalDetected)*1000) / 10
+		result["health_score"] = min(healthScore, failureScore, 99.9)
+	}
+	for key, value := range indexFileFailureSummary(failures) {
+		result[key] = value
+	}
+	result["index_complete"] = len(failures) == 0 && readErr == nil
+	result["status"] = "ready"
+	recommendation, _ := baseline["recommendation"].(string)
+	if len(failures) > 0 {
+		result["status"] = "degraded"
+		result["recommendation"] = strings.TrimSpace("Some files could not be indexed (see failed_files). Results can omit current code or retain stale symbols. Fix the reported file access or indexing errors and reindex the affected paths. " + recommendation)
+	}
+	if readErr != nil {
+		result["status"] = "degraded"
+		result["index_state_read_error"] = readErr.Error()
+		result["recommendation"] = strings.TrimSpace("Index failure state could not be read; index completeness is unknown. " + readErr.Error() + ". " + recommendation)
+	}
+	return result
 }

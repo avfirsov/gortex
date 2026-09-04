@@ -35,7 +35,7 @@ func (s *Server) refreshIndexHealthInBackground() {
 	s.indexHealth.mu.Unlock()
 
 	go func() {
-		payload, err := s.buildIndexHealthPayloadCtx(context.Background())
+		payload, err := s.buildIndexHealthBasePayloadCtx(context.Background())
 		s.indexHealth.mu.Lock()
 		defer s.indexHealth.mu.Unlock()
 		s.indexHealth.refreshing = false

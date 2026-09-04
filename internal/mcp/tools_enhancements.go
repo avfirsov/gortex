@@ -3027,6 +3027,9 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		s.refreshIndexHealthInBackground()
 		result, updatedAt, refreshing = s.indexHealthSnapshot()
 	}
+	if result != nil {
+		result = s.refreshIndexHealthFileFailures(ctx, result)
+	}
 
 	if isCompact(req) {
 		if result == nil {
@@ -3086,6 +3089,14 @@ const healthOrphanSampleLimit = 3
 // the daemon finishing a scan for nobody, holding a transport slot the whole
 // time.
 func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any, error) {
+	baseline, err := s.buildIndexHealthBasePayloadCtx(ctx)
+	if err != nil || baseline == nil {
+		return baseline, err
+	}
+	return s.refreshIndexHealthFileFailures(ctx, baseline), nil
+}
+
+func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string]any, error) {
 	if s.indexer == nil {
 		return nil, nil
 	}
@@ -3110,15 +3121,11 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		}
 	}
 
-	fileFailures, fileFailuresReadErr := s.readIndexFileFailures(ctx, ResolvedScope{})
-	totalDetected, successfullyIndexed := indexHealthFailureCounts(s.readerFor(ctx), totalDetected, stats.ByKind[string(graph.KindFile)], parseErrors, fileFailures)
+	successfullyIndexed := max(totalDetected-len(parseErrors), 0)
 
 	var healthScore float64
 	if totalDetected > 0 {
 		healthScore = math.Round(float64(successfullyIndexed)/float64(totalDetected)*1000) / 10
-	}
-	if len(fileFailures) > 0 && healthScore == 100 {
-		healthScore = 99.9 // Do not round a known incomplete index up to 100%.
 	}
 
 	var staleFiles []string
@@ -3367,28 +3374,11 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 		"edge_count":           stats.TotalEdges,
 		"edges_ok":             edgesOK,
 		"nodes_per_file":       nodesPerFile,
+		"file_node_count":      fileNodes,
 		// Shape-degradation guard firings since process start. Nonzero means
 		// the daemon caught (and self-healed) a live-patch or boot-reload
 		// resolution regression rather than silently serving a shrunken graph.
 		"resolution_regressions": indexer.ResolutionRegressions(),
-	}
-	for key, value := range indexFileFailureSummary(fileFailures) {
-		result[key] = value
-	}
-	result["index_complete"] = len(fileFailures) == 0 && fileFailuresReadErr == nil
-	result["status"] = "ready"
-	if len(fileFailures) > 0 {
-		result["status"] = "degraded"
-		msg := "Some files could not be indexed (see failed_files). Results can omit current code or retain stale symbols. Fix the reported file access or indexing errors and reindex the affected paths."
-		if recommendation != "" {
-			msg += " " + recommendation
-		}
-		recommendation = msg
-	}
-	if fileFailuresReadErr != nil {
-		result["status"] = "degraded"
-		result["index_state_read_error"] = fileFailuresReadErr.Error()
-		recommendation = "Index failure state could not be read; index completeness is unknown. " + fileFailuresReadErr.Error() + ". " + recommendation
 	}
 	// Query-planner statistics. Read-only on purpose: this payload is served
 	// from a cached snapshot rebuilt in the background, and a health report

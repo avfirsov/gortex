@@ -202,3 +202,82 @@ func TestIndexFileFailures_ReadErrorDoesNotClaimCompleteness(t *testing.T) {
 	require.Nil(t, srv.indexFileFailureWarning(ctx, ResolvedScope{ProjectID: "selected-project"}, nil), "project narrowing must apply before reading failure state")
 	require.NotNil(t, srv.indexFileFailureWarning(ctx, ResolvedScope{WorkspaceID: "unrelated"}, nil), "an in-scope ledger error must remain visible")
 }
+
+func TestIndexFileFailures_DirectoryFailureQualifiesNestedSearch(t *testing.T) {
+	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+	require.NoError(t, g.ReplaceFileIndexFailures("", []graph.FileIndexFailure{{Path: "restricted", Error: "permission denied", PermissionDenied: true}}))
+	for _, tc := range []struct {
+		path    string
+		warning bool
+	}{
+		{"restricted/nested/file.go", true},
+		{"restricted", true},
+		{"restricted-other/file.go", false},
+	} {
+		result, err := srv.handleSearchText(context.Background(), makeReq("search_text", map[string]any{"query": "MissingNeedle", "path": tc.path, "format": "json"}))
+		require.NoError(t, err)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result.Content[0].(mcplib.TextContent).Text), &payload))
+		require.Equal(t, float64(0), payload["count"])
+		_, warned := payload["index_warning"]
+		require.Equal(t, tc.warning, warned, tc.path)
+	}
+	failures := []indexer.FileIndexFailure{{Path: "repo/restricted", RepoPrefix: "repo"}}
+	require.Len(t, scopedIndexFileFailures(failures, ResolvedScope{}, []string{"restricted/nested/file.go"}), 1)
+	require.Empty(t, scopedIndexFileFailures(failures, ResolvedScope{}, []string{"restricted-other/file.go"}))
+	rootFailure := []indexer.FileIndexFailure{{Path: "repo/.", RepoPrefix: "repo"}}
+	require.Len(t, scopedIndexFileFailures(rootFailure, ResolvedScope{RepoAllow: map[string]bool{"repo": true}}, []string{"pkg/file.go"}), 1)
+	require.Empty(t, scopedIndexFileFailures(rootFailure, ResolvedScope{RepoAllow: map[string]bool{"other": true}}, []string{"pkg/file.go"}))
+	require.Len(t, scopedIndexFileFailures([]indexer.FileIndexFailure{{Path: "."}}, ResolvedScope{}, []string{"pkg/file.go"}), 1)
+}
+
+func TestIndexFileFailures_HealthCacheRefreshesLiveLedger(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package app\n\nfunc Alpha() {}\n"), 0o644))
+	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+	baseline, err := srv.buildIndexHealthBasePayloadCtx(context.Background())
+	require.NoError(t, err)
+	srv.indexHealth.mu.Lock()
+	srv.indexHealth.payload = baseline
+	srv.indexHealth.updatedAt = time.Now()
+	srv.indexHealth.mu.Unlock()
+	read := func(ctx context.Context) map[string]any {
+		t.Helper()
+		result, err := srv.handleIndexHealth(ctx, makeReq("index_health", map[string]any{"format": "json"}))
+		require.NoError(t, err)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result.Content[0].(mcplib.TextContent).Text), &payload))
+		return payload
+	}
+	healthy := read(context.Background())
+	require.Equal(t, true, healthy["index_complete"])
+	require.NoError(t, g.ReplaceFileIndexFailures("", []graph.FileIndexFailure{{Path: "blocked.go", Error: "permission denied", PermissionDenied: true}}))
+	failed := read(context.Background())
+	require.Equal(t, "degraded", failed["status"])
+	require.Less(t, failed["health_score"].(float64), healthy["health_score"].(float64))
+	compact, err := srv.handleIndexHealth(context.Background(), makeReq("index_health", map[string]any{"compact": true}))
+	require.NoError(t, err)
+	require.Contains(t, compact.Content[0].(mcplib.TextContent).Text, "status=degraded")
+	require.Contains(t, compact.Content[0].(mcplib.TextContent).Text, "unreadable_files=1")
+	require.NotContains(t, baseline, "failed_file_count", "response-time overlay must not mutate the shared cache")
+	selected := graph.New()
+	selectedCtx := withRequestView(context.Background(), &requestView{reader: selected})
+	require.Equal(t, true, read(selectedCtx)["index_complete"], "a healthy selected ledger must override primary failures")
+	brokenCtx := withRequestView(context.Background(), &requestView{reader: unavailableIndexFailureReader{Reader: selected, err: fmt.Errorf("selected ledger unavailable")}})
+	unknown := read(brokenCtx)
+	require.Equal(t, false, unknown["index_complete"])
+	require.Contains(t, unknown["index_state_read_error"], "selected ledger unavailable")
+	require.NoError(t, g.ReplaceFileIndexFailures("", nil))
+	recovered := read(context.Background())
+	require.Equal(t, "ready", recovered["status"])
+	require.Equal(t, healthy["health_score"], recovered["health_score"], "recovery must restore the baseline score before cache expiry")
+	require.NotContains(t, recovered, "failed_files")
+	require.NotContains(t, recovered, "index_state_read_error")
+	require.Equal(t, healthy["recommendation"], recovered["recommendation"])
+}
