@@ -1600,6 +1600,35 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	passIndexes.prepareTail()
 	tailPhase("go_attribution")
 	if len(r.scope) == 0 || r.scopedTailExceedsFileBudget() {
+		// The whole-graph arm is the one whose plans depend on the store
+		// believing its own size: the receiver rebind and the bare-name /
+		// builtin passes below join the node and edge corpora, and a planner
+		// costing them against a fraction of the real cardinality inverts the
+		// outer loop (issue #651). This is a whole-graph boundary, not a
+		// per-file resolve, so the check is paid once per full pass and is a
+		// handful of seeks unless the store has actually outgrown its
+		// statistics.
+		//
+		// The store's write gate is not held here, but the resolver's own
+		// ResolveMutex is, and on the daemon's paths so is the caller's batch
+		// gate. A refresh that queued on the store gate — or held it across a
+		// whole-store ANALYZE — would hold ResolveMutex for the same span and
+		// block every other resolve pass on this store. EnsurePlannerStatsFresh
+		// is cooperative for exactly that reason: it try-locks the store gate,
+		// analyzes ONE index per hold under a per-index timeout, and stops
+		// rather than waits, so other store writers — including the
+		// bounded-gate writers that drop their batches after 15 s — keep
+		// making progress.
+		//
+		// That bounds what this pass pays while holding ResolveMutex; it does
+		// not make it zero. A stale store costs this boundary the refresh's
+		// pass budget, plus the one index already in flight, plus one bounded
+		// sqlite_schema reload at the end of a completed pass, and the
+		// remaining indexes ride a resume cursor to the next boundary rather
+		// than being re-started from the head there. Outside that bound, and
+		// still under ResolveMutex: two health probes, the present-index list
+		// and the stat-row set — read-pool queries taking no store lock.
+		graph.MaybeEnsurePlannerStatsFresh(ctx, r.graph)
 		r.runFileAttributionPassesLocked()
 	} else {
 		for _, fp := range r.scopedFiles() {

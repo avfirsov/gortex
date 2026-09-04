@@ -2921,6 +2921,46 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			)
 			finishDrainPressure()
 			if retErr == nil {
+				// End of this repository's drain: this block runs on the way
+				// out of IndexCtx, after persistRepoIndexState. It is not the
+				// last thing the pass does — the compact sidecars below it,
+				// the backend symbol index and the FTS normalization all still
+				// follow — but it is the first point at which BOTH halves of
+				// the freshness verdict are current, and nothing earlier on
+				// this path has them: the rows have just landed in the
+				// physical tables, and the counters describing them were
+				// written a moment ago.
+				//
+				// BeginBulkLoad was a no-op if the store was already
+				// populated, so FlushBulk returned without re-analyzing
+				// anything; nothing else has, since the store was a fraction
+				// of this size. Cheap when the statistics are already fresh.
+				//
+				// This runs INSIDE the process-global reach topology writer
+				// gate and the caller's repository mutation lane (see the
+				// BeginTopologyMutation window in IndexRepo). Reach readers
+				// give up rather than wait, so anything blocking here turns
+				// MCP answers empty for its duration.
+				//
+				// What the cooperative shape buys, exactly: the refresh never
+				// QUEUES on the store's write gate underneath these, and never
+				// holds it across more than one bounded index — so other store
+				// writers, and the bounded-gate writers that drop their
+				// batches after 15 s, keep making progress. It also bounds
+				// what THIS boundary pays under the gates above: a pass stops
+				// starting indexes once its budget is spent, so the
+				// gate-holding cost here is that budget plus one index's
+				// ANALYZE plus one bounded sqlite_schema reload. It does not
+				// make the cost zero — the remaining indexes are carried to
+				// the next boundary on a resume cursor, which is where the
+				// mechanism converges.
+				//
+				// Outside that bound, and paid under these same wider gates:
+				// two health probes, the present-index list, and the set of
+				// indexes that already carry a statistics row. All four are
+				// read-pool queries taking no store lock.
+				graph.MaybeEnsurePlannerStatsFresh(ctx, diskTarget)
+
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
 				); serr != nil {
@@ -4070,6 +4110,31 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
+	// The persisted counters are what the planner-statistics freshness check
+	// measures growth with, and on the direct-SQLite path this is the only
+	// point in the pass where they and the corpus are both current — which is
+	// why the target is resolved exactly as the counter write resolves it,
+	// rather than asserted on diskTarget (nil here, and this is precisely the
+	// incremental path a daemon spends its life on).
+	//
+	// Skipped on the shadow path. There, the payload is still in the shadow at
+	// this point: the drain, and its own check, run on the way out of this
+	// function. Asking here would judge growth against rows the physical
+	// tables do not hold yet, and would ANALYZE a table the pass has not
+	// written — which writes no statistics at all.
+	//
+	// Same lock posture as the shadow-drain site above: the reach topology
+	// writer gate and the repository mutation lane are both held here, so the
+	// refresh must never queue on the store's write gate — and it does not, it
+	// try-locks per index and defers. What this boundary pays under those
+	// wider gates is bounded the same way: the pass budget, plus the one index
+	// already in flight, plus one bounded sqlite_schema reload, with the rest
+	// carried to the next boundary on the resume cursor. The two health
+	// probes, the present-index list and the stat-row set sit outside that
+	// bound — read-pool queries taking no store lock.
+	if diskTarget == nil {
+		graph.MaybeEnsurePlannerStatsFresh(ctx, idx.indexStateTarget(nil))
+	}
 	result = &IndexResult{
 		NodeCount:        nodes,
 		EdgeCount:        edges,
@@ -6293,7 +6358,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// versions; a failed file keeps the old row so the next full pass
 	// retries the language.
 	if len(extractorStaleLangs) > 0 && len(failedFiles) == 0 {
-		idx.reconcileRepoIndexState(absRoot)
+		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// Partial work always queues the exact changed/deleted/dependent graph-file
