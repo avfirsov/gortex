@@ -615,6 +615,8 @@ A ref view that is rebuilding while already serving an older generation answers 
 
 Checkout administration is one surface with two front doors; the CLI verbs under `gortex repos` call exactly these tools ([cli.md](cli.md#worktrees-and-checkouts)). Every destructive tool previews by default: a call without `confirm` reads the catalog, returns what would happen, and writes nothing.
 
+The two removal verbs — `untrack_repository` and `forget_checkout` — decide from catalog rows and read no graph, so they run **without binding the calling session's working directory to a checkout view**. Every other tool binds it first and refuses with `view_building` or `checkout_inaccessible` when that binding cannot be made. Removal must not carry that gate: `gortex untrack <path>` relays through an MCP session whose cwd IS the checkout being removed, and requiring discovery of that checkout to succeed first would make the verb unavailable in exactly the state it exists to clean up — a working copy git is slow to answer for, or one that no longer answers at all.
+
 | Tool | Description |
 |------|-------------|
 | `list_checkouts` | List the checkout families this daemon tracks — per family the primary corpus and epoch, its dedicated graphs, every registered working copy (mode, state, both reconciler clocks with their deadlines, path evidence, route, whether a build coordinator is live) and the views rooted in its graphs. `family` narrows by family id / graph id / repo prefix / a path inside a tracked repo. Reads the catalog only |
