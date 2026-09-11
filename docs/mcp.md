@@ -615,7 +615,11 @@ A ref view that is rebuilding while already serving an older generation answers 
 
 Checkout administration is one surface with two front doors; the CLI verbs under `gortex repos` call exactly these tools ([cli.md](cli.md#worktrees-and-checkouts)). Every destructive tool previews by default: a call without `confirm` reads the catalog, returns what would happen, and writes nothing.
 
-The two removal verbs — `untrack_repository` and `forget_checkout` — decide from catalog rows and read no graph, so they run **without binding the calling session's working directory to a checkout view**. Every other tool binds it first and refuses with `view_building` or `checkout_inaccessible` when that binding cannot be made. Removal must not carry that gate: `gortex untrack <path>` relays through an MCP session whose cwd IS the checkout being removed, and requiring discovery of that checkout to succeed first would make the verb unavailable in exactly the state it exists to clean up — a working copy git is slow to answer for, or one that no longer answers at all.
+Three of these verbs — `untrack_repository`, `forget_checkout` and `explain_view` — name their target explicitly, answer from catalog rows and read no graph, so they run **without binding the calling session's working directory to a checkout view**. Every other tool binds it first and refuses with `view_building` or `checkout_inaccessible` when that binding cannot be made.
+
+These three must not carry that gate, because a broken binding is the state they exist for. `gortex untrack <path>` relays through an MCP session whose cwd IS the checkout being removed, so requiring discovery of that checkout to succeed first makes the verb unavailable exactly when the working copy is one git is slow to answer for — or no longer answers for at all — and retrying the removal does not make it any easier to discover. `explain_view` is the tool you reach for to find out why, so refusing it for the reason it was called to report leaves nothing to diagnose with.
+
+A read that answers off the graph never joins them, however convenient it would be: serving it through an unbound cwd would answer from the wrong corpus.
 
 | Tool | Description |
 |------|-------------|

@@ -174,9 +174,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withCheckoutControl(ctx, control)
 		}
 		// Catalog authority that needs no view at all: a recovery or receipt
-		// read that must stay reachable while publication is pending, and a
-		// removal that must not be hostage to discovering what it removes.
-		viewless := catalogOnlyCheckoutControl(controlOperation) || checkoutRemovalToolName(legacyName)
+		// read that must stay reachable while publication is pending, and the
+		// tools that must not be hostage to the binding they exist to fix.
+		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
 		var view *requestView
 		if !viewless {
 			var viewErr error

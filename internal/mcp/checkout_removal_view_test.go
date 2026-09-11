@@ -19,9 +19,9 @@ import (
 	"github.com/zzet/gortex/internal/reconcile"
 )
 
-// removalCalls is the removal surface, through both doors: the legacy tool
-// names and the compact facade operation that lowers onto one of them.
-func removalCalls(target string) []struct {
+// viewlessCalls is the catalog-only surface, through both doors: the legacy
+// tool names and the compact facade operation that lowers onto one of them.
+func viewlessCalls(target string) []struct {
 	name string
 	tool string
 	args map[string]any
@@ -33,6 +33,7 @@ func removalCalls(target string) []struct {
 	}{
 		{"untrack_repository", "untrack_repository", map[string]any{"path": target}},
 		{"forget_checkout", "forget_checkout", map[string]any{"path": target}},
+		{"explain_view", "explain_view", map[string]any{"path": target}},
 		{"facade_untrack", "workspace_admin", map[string]any{"operation": "untrack", "path": target}},
 	}
 }
@@ -76,7 +77,7 @@ func TestCheckoutRemovalRunsThroughAnUnbindableCWD(t *testing.T) {
 	require.False(t, readRan, "get_symbol reached its handler through an unbindable cwd")
 	assertToolError(t, res, graphview.CodeCheckoutInaccessible)
 
-	for _, call := range removalCalls(nested) {
+	for _, call := range viewlessCalls(nested) {
 		t.Run(call.name, func(t *testing.T) {
 			selectToolSurface(stack.srv, call.tool)
 			ran, bound := false, false
@@ -87,8 +88,8 @@ func TestCheckoutRemovalRunsThroughAnUnbindableCWD(t *testing.T) {
 				})
 			require.NoError(t, err)
 			require.False(t, res.IsError, viewResultText(t, res))
-			require.True(t, ran, "the removal never reached its handler")
-			require.False(t, bound, "a removal must not claim a view it never needed")
+			require.True(t, ran, "the catalog-only call never reached its handler")
+			require.False(t, bound, "a catalog-only call must not claim a view it never needed")
 		})
 	}
 }
@@ -111,7 +112,7 @@ func TestCheckoutRemovalNeverBindsTheSessionCWD(t *testing.T) {
 	require.True(t, hasNode(reader, "repo/added.go::Fresh"),
 		"the fixture cwd binds to a routed view, so the skip below is what is being observed")
 
-	for _, call := range removalCalls(stack.worktreeRoot) {
+	for _, call := range viewlessCalls(stack.worktreeRoot) {
 		t.Run(call.name, func(t *testing.T) {
 			selectToolSurface(stack.srv, call.tool)
 			ran, bound := false, false
@@ -123,15 +124,21 @@ func TestCheckoutRemovalNeverBindsTheSessionCWD(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, res.IsError, viewResultText(t, res))
 			require.True(t, ran)
-			require.False(t, bound, "a removal bound the session cwd to a view anyway")
+			require.False(t, bound, "a catalog-only call bound the session cwd to a view anyway")
 		})
 	}
 }
 
-// TestCheckoutRemovalToolRecognisesBothDoors keeps the predicate honest about
-// what it exempts: the two removal verbs and the facade operation that lowers
-// onto one of them, and nothing that reads a graph.
-func TestCheckoutRemovalToolRecognisesBothDoors(t *testing.T) {
+// TestViewlessCatalogToolRecognisesBothDoors keeps the predicate honest about
+// what it exempts, composing exactly the pair the middleware composes: the
+// three catalog-only verbs and the facade operation that lowers onto one of
+// them, and nothing that reads a graph.
+//
+// track_repository is the deliberate near-miss. It is the same facade group and
+// the same shape of argument, but it creates a checkout rather than reporting
+// on or removing one, and it has no reason to run through a cwd the daemon
+// cannot bind.
+func TestViewlessCatalogToolRecognisesBothDoors(t *testing.T) {
 	stack := newViewStack(t)
 	for _, tc := range []struct {
 		tool string
@@ -140,16 +147,19 @@ func TestCheckoutRemovalToolRecognisesBothDoors(t *testing.T) {
 	}{
 		{"untrack_repository", map[string]any{"path": "/tmp/x"}, true},
 		{"forget_checkout", map[string]any{"path": "/tmp/x"}, true},
+		{"explain_view", map[string]any{"path": "/tmp/x"}, true},
 		{"workspace_admin", map[string]any{"operation": "untrack", "path": "/tmp/x"}, true},
 		{"workspace_admin", map[string]any{"operation": "track", "path": "/tmp/x"}, false},
 		{"track_repository", map[string]any{"path": "/tmp/x"}, false},
+		{"list_checkouts", map[string]any{}, false},
+		{"reconcile_checkouts", map[string]any{}, false},
 		{"get_symbol", map[string]any{"id": "repo/keep.go::Keeper"}, false},
 	} {
 		req := mcplib.CallToolRequest{}
 		req.Params.Name = tc.tool
 		req.Params.Arguments = tc.args
-		got := stack.srv.checkoutRemovalTool(&req)
-		require.Equalf(t, tc.want, got, "%s %v", tc.tool, tc.args)
+		name, _ := stack.srv.legacyToolName(&req)
+		require.Equalf(t, tc.want, viewlessCatalogTool(name), "%s %v", tc.tool, tc.args)
 	}
 }
 
@@ -162,12 +172,13 @@ func TestCheckoutRemovalToolRecognisesBothDoors(t *testing.T) {
 // Windows or network checkout produces on its own. A graph read through that
 // cwd is refused with the reported `view_building` message; the removal, whose
 // answer comes from catalog rows, runs.
-func TestUntrackSurvivesPendingCheckoutDiscovery(t *testing.T) {
-	t.Setenv("GORTEX_TOOLS", "facade-v1")
-	f := newRealCheckoutMutationFixture(t)
-	root := filepath.Join(filepath.Dir(f.primary), "discovery-pending")
-	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "discovery-pending", root)
-
+// wedgeCheckoutDiscovery adds a linked worktree and blocks the HEAD sampler so
+// automatic discovery for it cannot finish inside its 250ms slice. That is the
+// busy outcome a slow Windows or network checkout produces on its own.
+func wedgeCheckoutDiscovery(t *testing.T, f *realCheckoutMutationFixture, branch string) string {
+	t.Helper()
+	root := filepath.Join(filepath.Dir(f.primary), branch)
+	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", branch, root)
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
@@ -180,12 +191,26 @@ func TestUntrackSurvivesPendingCheckoutDiscovery(t *testing.T) {
 		}
 	})(f.srv.lifecycle.Reconciler())
 	t.Cleanup(unblock)
+	return root
+}
+
+// assertReportedRefusal fails unless res carries the refusal from the report.
+func assertReportedRefusal(t *testing.T, res *mcplib.CallToolResult) {
+	t.Helper()
+	assertToolError(t, res, graphview.CodeViewBuilding)
+	require.Contains(t, viewResultText(t, res), "checkout mutation lane is busy",
+		"the control read must carry the reported cause, not some other refusal")
+}
+
+func TestUntrackSurvivesPendingCheckoutDiscovery(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "facade-v1")
+	f := newRealCheckoutMutationFixture(t)
+	root := wedgeCheckoutDiscovery(t, f, "discovery-pending")
 
 	// The binder really is wedged, and it fails the way the report did.
-	read := f.facade(t, root, "search", map[string]any{"operation": "symbols", "query": "Old"})
-	assertToolError(t, read, graphview.CodeViewBuilding)
-	require.Contains(t, viewResultText(t, read), "checkout mutation lane is busy",
-		"the control read must carry the reported cause, not some other refusal")
+	assertReportedRefusal(t, f.facade(t, root, "search", map[string]any{
+		"operation": "symbols", "query": "Old",
+	}))
 
 	// Same session, same wedged cwd: the removal reaches its handler and answers
 	// from the catalog. `gortex untrack` is exactly this call.
@@ -198,4 +223,36 @@ func TestUntrackSurvivesPendingCheckoutDiscovery(t *testing.T) {
 	require.Equal(t, "preview", payload["status"])
 	require.Equal(t, string(indexer.UntrackPlanPrimaryClosure), payload["plan"],
 		"the removal must return a real catalog-derived plan, not a refusal")
+}
+
+// TestExplainViewSurvivesPendingCheckoutDiscovery is the diagnosability half.
+//
+// explain_view exists to answer "why is this path not being served the way I
+// expect" — so a binding failure is its subject, not a reason to refuse it.
+// Through the same wedged cwd that refuses a graph read, it names the checkout
+// and the step that could not be taken.
+func TestExplainViewSurvivesPendingCheckoutDiscovery(t *testing.T) {
+	f := newRealCheckoutMutationFixture(t)
+	root := wedgeCheckoutDiscovery(t, f, "explain-pending")
+
+	legacy := func(name string, handler func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error), args map[string]any) *mcplib.CallToolResult {
+		t.Helper()
+		req := mcplib.CallToolRequest{}
+		req.Params.Name, req.Params.Arguments = name, args
+		ctx := WithSessionCWD(WithSessionID(context.Background(), "real-checkout-lifecycle"), root)
+		res, err := f.srv.wrapToolHandler(handler)(ctx, req)
+		require.NoError(t, err)
+		return res
+	}
+
+	assertReportedRefusal(t, legacy("get_symbol", f.srv.handleGetSymbol,
+		map[string]any{"id": "repo/edit.go::Old"}))
+
+	explained := legacy("explain_view", f.srv.handleExplainView, map[string]any{"path": f.primary})
+	require.False(t, explained.IsError, viewResultText(t, explained))
+	var binding map[string]any
+	require.NoError(t, json.Unmarshal([]byte(viewResultText(t, explained)), &binding))
+	require.Equal(t, true, binding["matched"],
+		"explain_view must answer from the catalog, not refuse for the reason it was called to report")
+	require.NotEmpty(t, binding["chain"], "the explanation carries the chain it walked")
 }

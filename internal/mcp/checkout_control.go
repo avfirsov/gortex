@@ -80,26 +80,29 @@ func catalogOnlyCheckoutControl(operation string) bool {
 	return operation == "mutation_status" || operation == "reindex_repository"
 }
 
-// checkoutRemovalTool reports a tool whose whole job is to take a checkout out
-// of the catalog. Removal names its target explicitly, decides from catalog
-// rows and reads no graph, so it runs without binding the session's working
-// directory to a checkout view.
+// viewlessCatalogTool reports a tool that answers from catalog rows alone. To
+// qualify a tool must name its target explicitly rather than inferring it from
+// the session, and read no graph — so it runs without binding the session's
+// working directory to a checkout view.
 //
-// Binding it would make removal depend on discovering the very checkout being
-// removed. Automatic discovery gets a 250ms slice per request, and a working
+// These are the tools a user reaches for when a binding is already broken, and
+// binding the cwd first makes each one unavailable in exactly the state it
+// exists for. Automatic discovery gets a 250ms slice per request; a working
 // copy git is slow to answer for — a Windows checkout behind a virus scanner,
 // a network share, a tree that no longer answers at all — spends it without
-// finishing. `gortex untrack` then fails with a retryable view_building error
-// in exactly the state it exists to clean up, and no amount of retrying the
-// removal makes the checkout easier to discover.
-func (s *Server) checkoutRemovalTool(req *mcp.CallToolRequest) bool {
-	name, _ := s.legacyToolName(req)
-	return checkoutRemovalToolName(name)
-}
-
-func checkoutRemovalToolName(name string) bool {
+// finishing, and the call is refused with a retryable view_building error:
+//
+//   - removal (untrack_repository, forget_checkout) would depend on
+//     discovering the very checkout it removes, and no amount of retrying a
+//     removal makes that checkout easier to discover;
+//   - explain_view exists to say why a path cannot be served, so refusing it
+//     for the reason it was called to report leaves nothing to diagnose with.
+//
+// A read that answers off the graph does NOT belong here, however convenient:
+// serving it through an unbound cwd would answer from the wrong corpus.
+func viewlessCatalogTool(name string) bool {
 	switch name {
-	case "untrack_repository", "forget_checkout":
+	case "untrack_repository", "forget_checkout", "explain_view":
 		return true
 	default:
 		return false
