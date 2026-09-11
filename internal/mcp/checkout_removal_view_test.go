@@ -2,15 +2,21 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/reconcile"
 )
 
 // removalCalls is the removal surface, through both doors: the legacy tool
@@ -145,4 +151,51 @@ func TestCheckoutRemovalToolRecognisesBothDoors(t *testing.T) {
 		got := stack.srv.checkoutRemovalTool(&req)
 		require.Equalf(t, tc.want, got, "%s %v", tc.tool, tc.args)
 	}
+}
+
+// TestUntrackSurvivesPendingCheckoutDiscovery reproduces the reported failure
+// with the error it actually carried, rather than a stand-in for it.
+//
+// A linked worktree that automatic discovery has not finished registering is
+// bound by observing it, and observation gets a 250ms slice. Blocking the HEAD
+// sampler spends that slice without finishing, which is the busy outcome a slow
+// Windows or network checkout produces on its own. A graph read through that
+// cwd is refused with the reported `view_building` message; the removal, whose
+// answer comes from catalog rows, runs.
+func TestUntrackSurvivesPendingCheckoutDiscovery(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "facade-v1")
+	f := newRealCheckoutMutationFixture(t)
+	root := filepath.Join(filepath.Dir(f.primary), "discovery-pending")
+	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "discovery-pending", root)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	reconcile.WithHEADSampler(func(ctx context.Context, root string) (gitstate.HEADState, error) {
+		select {
+		case <-ctx.Done():
+			return gitstate.HEADState{}, errors.New("injected Git subprocess killed")
+		case <-release:
+			return gitstate.SampleHEAD(ctx, root)
+		}
+	})(f.srv.lifecycle.Reconciler())
+	t.Cleanup(unblock)
+
+	// The binder really is wedged, and it fails the way the report did.
+	read := f.facade(t, root, "search", map[string]any{"operation": "symbols", "query": "Old"})
+	assertToolError(t, read, graphview.CodeViewBuilding)
+	require.Contains(t, viewResultText(t, read), "checkout mutation lane is busy",
+		"the control read must carry the reported cause, not some other refusal")
+
+	// Same session, same wedged cwd: the removal reaches its handler and answers
+	// from the catalog. `gortex untrack` is exactly this call.
+	removal := f.facade(t, root, "workspace_admin", map[string]any{
+		"operation": "untrack", "path": f.primary,
+	})
+	require.False(t, removal.IsError, viewResultText(t, removal))
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(viewResultText(t, removal)), &payload))
+	require.Equal(t, "preview", payload["status"])
+	require.Equal(t, string(indexer.UntrackPlanPrimaryClosure), payload["plan"],
+		"the removal must return a real catalog-derived plan, not a refusal")
 }
