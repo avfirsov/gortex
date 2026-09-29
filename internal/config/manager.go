@@ -207,6 +207,17 @@ func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Conf
 		return nil, false
 	}
 
+	// yaml.Unmarshal silently drops top-level keys it does not know —
+	// most often a mistyped key such as `index.ignore` (the real ones
+	// are top-level exclude / legacy index.exclude). Surface them so a
+	// one-word typo does not silently change what gets indexed.
+	if unknown := UnknownWorkspaceKeys(configPath); len(unknown) > 0 {
+		cm.logger.Warn("workspace config contains keys gortex does not recognize — they are ignored",
+			zap.String("repo", repoPrefix),
+			zap.String("path", configPath),
+			zap.Strings("keys", unknown))
+	}
+
 	return cfg, true
 }
 

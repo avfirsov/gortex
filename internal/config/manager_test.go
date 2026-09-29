@@ -7,6 +7,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"gopkg.in/yaml.v3"
 	"pgregory.net/rapid"
 
@@ -665,4 +668,36 @@ func TestLoadWorkspaceConfig_MalformedEditKeepsLastGoodParse(t *testing.T) {
 	cfg := cm.getWorkspaceConfig("repo")
 	require.NotNil(t, cfg)
 	assert.Equal(t, []string{"good/**"}, cfg.Exclude)
+}
+
+func TestLoadWorkspaceConfig_WarnsOnUnknownKeys(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+	cm.SetLogger(zap.New(core))
+
+	// Issue #3's typo: index.ignore does not exist — without the warning
+	// the file loads "successfully" and the intended excludes never apply.
+	repoDir := t.TempDir()
+	writeWorkspaceConfig(t, repoDir, "index:\n  ignore:\n    - \"build/**\"\n")
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	var found bool
+	for _, e := range logs.All() {
+		if e.Message != "workspace config contains keys gortex does not recognize — they are ignored" {
+			continue
+		}
+		keys, ok := e.ContextMap()["keys"]
+		require.True(t, ok, "warning must carry the offending keys")
+		assert.Equal(t, []any{"index.ignore"}, keys.([]any))
+		found = true
+	}
+	assert.True(t, found, "expected an unknown-keys warning for %s", repoDir)
+
+	// A clean config produces no such warning.
+	clean, cleanLogs := observer.New(zapcore.WarnLevel)
+	cm.SetLogger(zap.New(clean))
+	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"ok/**\"\n")
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+	assert.Empty(t, cleanLogs.All())
 }

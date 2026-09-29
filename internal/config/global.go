@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/google/renameio"
+	"github.com/go-viper/mapstructure/v2"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
@@ -205,6 +206,55 @@ func UnknownGlobalKeys(configPath ...string) []string {
 	if len(configPath) > 0 && configPath[0] != "" {
 		path = configPath[0]
 	}
+	return unknownTopLevelKeysIn(path, knownGlobalTopLevelKeys)
+}
+
+// knownWorkspaceTopLevelKeys is intentionally not maintained by hand: the
+// authoritative key set is the mapstructure tag tree of config.Config, which
+// UnknownWorkspaceKeys validates against via mapstructure metadata.
+
+// UnknownWorkspaceKeys returns the dotted paths of keys present in the
+// repo-level `.gortex.yaml` at path that gortex does not recognise — at
+// any depth, so `index.ignore` (a typo for the real index.exclude) is
+// caught, not just a misplaced top-level block. It never fails: a missing
+// or unparseable file yields no keys, so forward compatibility is
+// preserved and the parse failure is reported through the
+// malformed-config warning instead.
+func UnknownWorkspaceKeys(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	md := &mapstructure.Metadata{}
+	dec, derr := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		Result:   Default(),
+		Metadata: md,
+		TagName:  "mapstructure",
+	})
+	if derr != nil {
+		return nil
+	}
+	if err := dec.Decode(raw); err != nil && len(md.Unused) == 0 {
+		// The decode failed before unused-key accounting produced
+		// anything — treat the file as unreadable rather than guessing.
+		return nil
+	}
+	if len(md.Unused) == 0 {
+		return nil
+	}
+	sort.Strings(md.Unused)
+	return md.Unused
+}
+
+// unknownTopLevelKeysIn reads the YAML file at path and returns its
+// top-level keys that are not in the known set, sorted. Read and parse
+// errors yield no keys — the caller is expected to report the parse
+// failure through its own channel.
+func unknownTopLevelKeysIn(path string, known map[string]bool) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -215,7 +265,7 @@ func UnknownGlobalKeys(configPath ...string) []string {
 	}
 	var unknown []string
 	for k := range top {
-		if !knownGlobalTopLevelKeys[k] {
+		if !known[k] {
 			unknown = append(unknown, k)
 		}
 	}

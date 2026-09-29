@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -161,4 +163,50 @@ func TestWorkspaceTarget_LegacyFallback(t *testing.T) {
 	require.NoError(t, err)
 	// Legacy key surfaces through the workspace target's load().
 	assert.Equal(t, []string{"legacy-pat/**"}, patterns)
+}
+
+// runConfigExcludeList writes rows with fmt.Printf; captureStdout
+// (savings_test.go) redirects os.Stdout for the assertions below.
+
+func TestRunConfigExcludeList_MalformedWorkspaceAnnotated(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0755))
+	t.Chdir(root)
+
+	// The issue-#3 shape: a stray quote makes the whole file unparseable,
+	// which previously showed as the workspace layer simply being absent.
+	malformed := "exclude:\n  - \"wine-mt4/\"\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gortex.yaml"), []byte(malformed), 0644))
+
+	var errOut bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&errOut)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runConfigExcludeList(cmd, nil))
+	})
+
+	assert.Contains(t, out, "[workspace]",
+		"the workspace layer must be listed even when it loads zero patterns")
+	assert.Contains(t, out, "0 patterns loaded — file failed to parse")
+}
+
+func TestRunConfigExcludeList_UnknownKeyWarning(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0755))
+	t.Chdir(root)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gortex.yaml"),
+		[]byte("index:\n  ignore:\n    - build/**\n"), 0644))
+
+	var errOut bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&errOut)
+
+	_ = captureStdout(t, func() {
+		require.NoError(t, runConfigExcludeList(cmd, nil))
+	})
+
+	assert.Contains(t, errOut.String(), "keys gortex does not recognize")
+	assert.Contains(t, errOut.String(), "index.ignore")
 }
