@@ -60,6 +60,10 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files under .opencode/skills.
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if _, err := os.Stat(filepath.Join(env.Root, ".opencode")); err == nil {
 		return true, nil

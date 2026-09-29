@@ -199,6 +199,17 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		return emitInitDryRunIntake(cmd, absRoot)
 	}
 
+	// Resolve the adapter set before any stage runs: the skills stage
+	// wording depends on how the selected adapters deliver communities
+	// (skill files vs routing block), and an invalid --agents name
+	// should fail before indexing starts. The wizard above owns the
+	// final value of initAgents, so this stays after it.
+	registry := buildRegistry()
+	selected, err := registry.Filter(initAgents, initAgentsSkip)
+	if err != nil {
+		return err
+	}
+
 	// Bind this directory as a single-project entry point so the MCP
 	// server can resolve it without --hooks-only setups, daemon-less
 	// clients, or future runs needing manual setup. The marker is the
@@ -296,7 +307,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 				if len(generated) > 0 {
 					env.GeneratedSkills = toEnvSkills(generated)
 					env.SkillsRouting = routing
-					prog.StageDone(stageSkills, fmt.Sprintf("%d community skill(s)", len(generated)))
+					prog.StageDone(stageSkills, skillsStageLabel(len(generated), selected))
 				} else {
 					prog.StageDone(stageSkills, fmt.Sprintf("no communities large enough (min-size: %d)", initSkillsMinSize))
 				}
@@ -305,11 +316,6 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	prog.Stage(stageAdapters, "")
-	registry := buildRegistry()
-	selected, err := registry.Filter(initAgents, initAgentsSkip)
-	if err != nil {
-		return err
-	}
 
 	opts = agents.ApplyOpts{DryRun: initDryRun, Force: initForce}
 	results = make([]*agents.Result, 0, len(selected))
@@ -349,6 +355,34 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 	return nil
+}
+
+// skillsStageLabel describes what the skills stage delivers, per the
+// mechanisms the selected adapters actually use. Adapters with a native
+// skills system (Claude Code, Codex, Copilot CLI, opencode) write the
+// generated SKILL.md files; the rest — notably Pi, which has no skills
+// system at all — merge the communities routing block into their
+// instruction file. A flat "N community skill(s)" sent users hunting
+// for files that are never written (#4).
+func skillsStageLabel(n int, selected []agents.Adapter) string {
+	files, routing := 0, 0
+	for _, a := range selected {
+		if w, ok := a.(agents.SkillFilesWriter); ok && w.WritesSkillFiles() {
+			files++
+		} else {
+			routing++
+		}
+	}
+	switch {
+	case files == 0 && routing == 0:
+		return fmt.Sprintf("%d community skill(s) generated (no adapter selected to deliver them)", n)
+	case files > 0 && routing > 0:
+		return fmt.Sprintf("%d community skill(s) + communities block(s) in %d instruction file(s)", n, routing)
+	case files > 0:
+		return fmt.Sprintf("%d community skill(s)", n)
+	default:
+		return fmt.Sprintf("communities block(s) in %d instruction file(s) (no skill files)", routing)
+	}
 }
 
 func runInitHooksOnly(cmd *cobra.Command, absRoot string) error {

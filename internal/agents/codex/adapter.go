@@ -88,6 +88,10 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files (~/.codex/skills).
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("codex"); err == nil && p != "" {

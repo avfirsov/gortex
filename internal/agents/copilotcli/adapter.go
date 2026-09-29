@@ -84,6 +84,10 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files under .copilot/skills.
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
 // lookCopilotBinary is a seam so the "no Copilot installed" detection
 // test stays hermetic on a developer machine that happens to have the
 // CLI on PATH.

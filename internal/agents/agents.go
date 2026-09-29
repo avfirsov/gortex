@@ -36,6 +36,16 @@ type Adapter interface {
 	Apply(env Env, opts ApplyOpts) (*Result, error)
 }
 
+// SkillFilesWriter is implemented by adapters that deliver the
+// generated community skills as on-disk files (SKILL.md trees). Adapters
+// without a native skills system — Pi, Cursor, aider, … — only merge the
+// communities routing block into their instruction file and must NOT
+// implement it: the init stage summary uses the distinction so it never
+// claims skill files that are never written (#4).
+type SkillFilesWriter interface {
+	WritesSkillFiles() bool
+}
+
 // Mode selects between per-repo and user-level installation.
 // `gortex init` runs adapters in ModeProject; `gortex install` runs
 // them in ModeGlobal. Adapters branch on this to choose between
