@@ -29,6 +29,10 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 // Detect checks for the gemini CLI on PATH or an existing user-level
 // settings.json. We avoid colliding with the antigravity adapter's
 // detection by looking at ~/.gemini/settings.json specifically

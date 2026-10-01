@@ -44,6 +44,10 @@ var aiderIgnoreLines = []string{
 	"*.gortex-cache",
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("aider"); err == nil && p != "" {
 		return true, nil

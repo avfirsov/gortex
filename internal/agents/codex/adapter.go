@@ -92,6 +92,10 @@ func (a *Adapter) DocsURL() string { return DocsURL }
 // community skills as files (~/.codex/skills).
 func (a *Adapter) WritesSkillFiles() bool { return true }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("codex"); err == nil && p != "" {

@@ -39,6 +39,10 @@ func legacyConfigPath(home string) string {
 	return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json")
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("windsurf"); err == nil && p != "" {
 		return true, nil

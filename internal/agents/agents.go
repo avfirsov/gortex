@@ -41,9 +41,20 @@ type Adapter interface {
 // without a native skills system — Pi, Cursor, aider, … — only merge the
 // communities routing block into their instruction file and must NOT
 // implement it: the init stage summary uses the distinction so it never
-// claims skill files that are never written (#4).
+// claims skill files that are never written.
 type SkillFilesWriter interface {
 	WritesSkillFiles() bool
+}
+
+// RoutingBlockWriter is implemented by adapters that merge the
+// communities routing block (env.SkillsRouting) into an instruction
+// file. The four skill-file adapters implement it too — their
+// instruction file carries the block as well — while MCP/KI-only
+// adapters (antigravity, kimi, kiro, …) implement neither, so the init
+// stage summary counts delivery mechanisms from declarations instead of
+// assuming every non-skill-file adapter routes.
+type RoutingBlockWriter interface {
+	WritesCommunitiesRouting() bool
 }
 
 // Mode selects between per-repo and user-level installation.

@@ -256,6 +256,12 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		AnalyzeRepo:  initAnalyze,
 		Stderr:       cmd.ErrOrStderr(),
 	}
+	// What will actually run: Apply skips any adapter whose Detect() is
+	// false, so the stage summaries are derived from this filtered set.
+	// Labeling from `selected` alone counted every registered adapter on
+	// a default run (Filter("", "") returns them all), claiming
+	// instruction files for assistants that are not installed.
+	running := runningAdapters(selected, env)
 	defer func() {
 		if err != nil {
 			prog.Fail(err)
@@ -307,7 +313,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 				if len(generated) > 0 {
 					env.GeneratedSkills = toEnvSkills(generated)
 					env.SkillsRouting = routing
-					prog.StageDone(stageSkills, skillsStageLabel(len(generated), selected))
+					prog.StageDone(stageSkills, skillsStageLabel(len(generated), running))
 				} else {
 					prog.StageDone(stageSkills, fmt.Sprintf("no communities large enough (min-size: %d)", initSkillsMinSize))
 				}
@@ -332,7 +338,16 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 			results = append(results, r)
 		}
 	}
-	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", len(results)))
+	// "Configured" counts adapters Apply actually ran: an undetected
+	// adapter still returns a Result (Detected: false, nothing written),
+	// and counting it claimed setup that never happened.
+	configured := 0
+	for _, r := range results {
+		if r.Detected {
+			configured++
+		}
+	}
+	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", configured))
 
 	// Always update Gortex's own global config so the daemon picks
 	// up this repo next time it starts (harmless when no daemon).
@@ -357,25 +372,45 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	return nil
 }
 
-// skillsStageLabel describes what the skills stage delivers, per the
-// mechanisms the selected adapters actually use. Adapters with a native
-// skills system (Claude Code, Codex, Copilot CLI, opencode) write the
-// generated SKILL.md files; the rest — notably Pi, which has no skills
-// system at all — merge the communities routing block into their
-// instruction file. A flat "N community skill(s)" sent users hunting
-// for files that are never written (#4).
-func skillsStageLabel(n int, selected []agents.Adapter) string {
-	files, routing := 0, 0
+// runningAdapters filters selected down to the adapters Apply will not
+// skip: Apply gates on Detect() unless ApplyOpts.ForceDetect is set
+// (gortex init never sets it today, but the helper honours it so the
+// summaries cannot drift from Apply's gate). Detect errors mirror
+// Apply's own handling — treated as not detected.
+func runningAdapters(selected []agents.Adapter, env agents.Env) []agents.Adapter {
+	running := make([]agents.Adapter, 0, len(selected))
 	for _, a := range selected {
+		if ok, _ := a.Detect(env); ok {
+			running = append(running, a)
+		}
+	}
+	return running
+}
+
+// skillsStageLabel describes what the skills stage delivers, per the
+// mechanisms the adapters that will actually run declare. Both delivery
+// mechanisms are declared capabilities: SkillFilesWriter adapters
+// (Claude Code, Codex, Copilot CLI, opencode) write the generated
+// SKILL.md files, RoutingBlockWriter adapters merge the communities
+// block into their instruction file, and MCP/KI-only adapters (kiro,
+// antigravity, …) consume neither. Inferring routing from the absence
+// of skill files counted the neither-adapter class, and counting from
+// the unfiltered selection counted adapters Apply never runs — a flat
+// or inflated summary sent users hunting for files that are never
+// written.
+func skillsStageLabel(n int, running []agents.Adapter) string {
+	files, routing := 0, 0
+	for _, a := range running {
 		if w, ok := a.(agents.SkillFilesWriter); ok && w.WritesSkillFiles() {
 			files++
-		} else {
+		}
+		if r, ok := a.(agents.RoutingBlockWriter); ok && r.WritesCommunitiesRouting() {
 			routing++
 		}
 	}
 	switch {
 	case files == 0 && routing == 0:
-		return fmt.Sprintf("%d community skill(s) generated (no adapter selected to deliver them)", n)
+		return fmt.Sprintf("%d community skill(s) generated (no selected adapter consumes them)", n)
 	case files > 0 && routing > 0:
 		return fmt.Sprintf("%d community skill(s) + communities block(s) in %d instruction file(s)", n, routing)
 	case files > 0:

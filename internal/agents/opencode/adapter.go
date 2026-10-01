@@ -64,6 +64,10 @@ func (a *Adapter) DocsURL() string { return DocsURL }
 // community skills as files under .opencode/skills.
 func (a *Adapter) WritesSkillFiles() bool { return true }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if _, err := os.Stat(filepath.Join(env.Root, ".opencode")); err == nil {
 		return true, nil

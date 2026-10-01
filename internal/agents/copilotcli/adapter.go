@@ -93,6 +93,10 @@ func (a *Adapter) WritesSkillFiles() bool { return true }
 // CLI on PATH.
 var lookCopilotBinary = func() (string, error) { return exec.LookPath("copilot") }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 // Detect looks for the `copilot` binary or an existing config home.
 // Deliberately never keys off .vscode — Copilot-in-VS-Code is the
 // `vscode` adapter's host, and detecting on it here would configure the

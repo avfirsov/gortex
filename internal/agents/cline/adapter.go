@@ -59,6 +59,10 @@ var v060AlwaysAllow = []string{
 	"diff_context", "index_health", "get_symbol_history", "scaffold", "batch_edit", "flow_between", "taint_paths", "find_clones",
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if env.Home == "" {
 		return false, nil

@@ -61,6 +61,10 @@ func userSettingsPath(home string) string {
 	}
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 // Detect checks for the zed CLI on PATH or the platform-specific
 // settings.json directory.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {

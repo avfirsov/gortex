@@ -44,6 +44,10 @@ func cursorUserDataDir(home string) string {
 	}
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
 // Detect succeeds when any of: project has .cursor/, user has
 // ~/.cursor/, Cursor's application data directory exists, or the
 // `cursor` CLI is on PATH.
