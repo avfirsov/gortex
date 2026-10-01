@@ -54,10 +54,11 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 		// codebase-agnostic, so duplicating them into every repo is
 		// wasted disk and drift risk.
 		p.Files = append(p.Files, agents.FileAction{Path: userClaudeJSONPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"mcpServers"}})
-		p.Files = append(p.Files, agents.FileAction{Path: userSettingsPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"permissions"}})
+		settingsKeys := []string{"permissions"}
 		if env.InstallHooks {
-			p.Files = append(p.Files, agents.FileAction{Path: userSettingsPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}})
+			settingsKeys = append(settingsKeys, "hooks")
 		}
+		p.Files = append(p.Files, agents.FileAction{Path: userSettingsPath(env.Home), Action: agents.ActionWouldMerge, Keys: settingsKeys})
 		if env.InstallGlobalInstructions {
 			p.Files = append(p.Files, agents.FileAction{Path: userClaudeMdPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"gortex-rules-block"}})
 		}
@@ -245,6 +246,14 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 			return fmt.Errorf("global hooks: %w", err)
 		}
 		res.Files = append(res.Files, hookAction)
+
+		// Installs that predate #840 left hooks in settings.local.json.
+		// Claude Code reads that file as project settings, so in a
+		// session rooted at $HOME a stale entry would fire next to the
+		// new user-level one. Drop them.
+		if _, err := removeGlobalHooks(w, userSettingsLocalPath(env.Home), opts); err != nil {
+			logWarn(w, "could not remove legacy hooks from settings.local.json: %v", err)
+		}
 	}
 
 	// 4. Instruction profiles + ~/.claude/CLAUDE.md pointer block.
@@ -355,10 +364,16 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 	// 2. settings.json — drop the mcp__gortex__* permission entry and
 	// the Gortex hook entries.
 	settingsPath := userSettingsPath(env.Home)
+	// Both edits hit the same file, so it counts once.
 	permAction, err := removeGlobalPermissions(w, settingsPath, opts)
+	userHookAction, hookErr := removeGlobalHooks(w, settingsPath, opts)
+	if err == nil && hookErr != nil {
+		err = hookErr
+	}
+	if permAction.Action == agents.ActionSkip {
+		permAction = userHookAction
+	}
 	count(permAction, err, settingsPath)
-	userHookAction, err := removeGlobalHooks(w, settingsPath, opts)
-	count(userHookAction, err, settingsPath)
 
 	// 3. settings.local.json — drop hook entries left there by installs
 	// that predate the user-settings fix.
@@ -413,10 +428,10 @@ func GlobalArtifacts(home string) []string {
 	if fileContains(userClaudeJSONPath(home), `"gortex"`) {
 		present = append(present, userClaudeJSONPath(home))
 	}
-	if fileContains(userSettingsPath(home), "gortex") {
+	if settingsHaveGortex(userSettingsPath(home)) {
 		present = append(present, userSettingsPath(home))
 	}
-	if fileContains(userSettingsLocalPath(home), "gortex") {
+	if settingsHaveGortex(userSettingsLocalPath(home)) {
 		present = append(present, userSettingsLocalPath(home))
 	}
 	if fileContains(userClaudeMdPath(home), agents.GlobalRulesStartMarker) {
@@ -564,6 +579,37 @@ func fileContains(path, needle string) bool {
 		return false
 	}
 	return strings.Contains(string(data), needle)
+}
+
+// settingsHaveGortex reports whether a settings file carries something
+// RemoveGlobal would strip: an mcp__gortex__ permission or a Gortex hook
+// entry. User-owned entries that merely mention gortex do not count.
+func settingsHaveGortex(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var settings map[string]any
+	if json.Unmarshal(data, &settings) != nil {
+		return false
+	}
+	if perms, ok := settings["permissions"].(map[string]any); ok {
+		if allow, ok := perms["allow"].([]any); ok {
+			for _, entry := range allow {
+				if s, ok := entry.(string); ok && strings.Contains(s, "mcp__gortex__") {
+					return true
+				}
+			}
+		}
+	}
+	if hooks, ok := settings["hooks"].(map[string]any); ok {
+		for event := range hooks {
+			if hasGortexHookEntry(hooks, event) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func pathExists(path string) bool {

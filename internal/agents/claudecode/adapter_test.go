@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -607,17 +608,17 @@ func TestRemoveGlobalCleansLegacyLocalHooks(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
 	env.Mode = agents.ModeGlobal
 	env.InstallHooks = true
-	dir := filepath.Join(env.Home, ".claude")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	legacy := filepath.Join(dir, "settings.local.json")
-	if err := os.WriteFile(legacy, []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/usr/local/bin/gortex hook"}]}]}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	a := New()
 	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
 		t.Fatalf("apply: %v", err)
+	}
+	dir := filepath.Join(env.Home, ".claude")
+	legacy := filepath.Join(dir, "settings.local.json")
+	if err := os.WriteFile(legacy, []byte(legacyLocalHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := GlobalArtifacts(env.Home); !slices.Contains(got, legacy) {
+		t.Errorf("GlobalArtifacts should list the legacy file, got %v", got)
 	}
 	if _, failures := a.RemoveGlobal(env, agents.ApplyOpts{}); len(failures) != 0 {
 		t.Fatalf("RemoveGlobal failures: %v", failures)
@@ -626,5 +627,67 @@ func TestRemoveGlobalCleansLegacyLocalHooks(t *testing.T) {
 		if b, _ := os.ReadFile(filepath.Join(dir, name)); strings.Contains(string(b), "gortex hook") {
 			t.Errorf("%s still carries a gortex hook:\n%s", name, b)
 		}
+	}
+}
+
+const legacyLocalHooks = `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/old/bin/gortex hook"}]}]}}`
+
+// TestApplyGlobalMigratesLegacyLocalHooks: re-running install after upgrading
+// moves the hooks out of settings.local.json so a session rooted at $HOME
+// does not load them twice.
+func TestApplyGlobalMigratesLegacyLocalHooks(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+	dir := filepath.Join(env.Home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.local.json"), []byte(legacyLocalHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "settings.local.json")); strings.Contains(string(b), "gortex") {
+		t.Errorf("legacy hooks left in settings.local.json:\n%s", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "settings.json")); !strings.Contains(string(b), "gortex") {
+		t.Errorf("hooks missing from settings.json:\n%s", b)
+	}
+}
+
+// TestRemoveGlobalCountsSettingsOnce: permissions and hooks share
+// settings.json, which must count as one removed artifact, and a user-owned
+// entry that merely mentions gortex is neither listed nor removed.
+func TestRemoveGlobalCountsSettingsOnce(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+	dir := filepath.Join(env.Home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"permissions":{"allow":["Bash(gortex status)"]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := GlobalArtifacts(env.Home); slices.Contains(got, settings) {
+		t.Errorf("user-owned entry should not be listed, got %v", got)
+	}
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	artifacts := GlobalArtifacts(env.Home)
+	removed, failures := a.RemoveGlobal(env, agents.ApplyOpts{})
+	if len(failures) != 0 {
+		t.Fatalf("RemoveGlobal failures: %v", failures)
+	}
+	if removed != len(artifacts) {
+		t.Errorf("RemoveGlobal removed %d, GlobalArtifacts listed %d: %v", removed, len(artifacts), artifacts)
+	}
+	if b, _ := os.ReadFile(settings); !strings.Contains(string(b), "Bash(gortex status)") {
+		t.Errorf("user-owned entry was removed:\n%s", b)
 	}
 }
