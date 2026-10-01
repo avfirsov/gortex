@@ -676,7 +676,7 @@ func TestLoadWorkspaceConfig_WarnsOnUnknownKeys(t *testing.T) {
 	require.NoError(t, err)
 	cm.SetLogger(zap.New(core))
 
-	// Issue #3's typo: index.ignore does not exist — without the warning
+	// The index.ignore typo: it does not exist — without the warning
 	// the file loads "successfully" and the intended excludes never apply.
 	repoDir := t.TempDir()
 	writeWorkspaceConfig(t, repoDir, "index:\n  ignore:\n    - \"build/**\"\n")
@@ -700,4 +700,50 @@ func TestLoadWorkspaceConfig_WarnsOnUnknownKeys(t *testing.T) {
 	writeWorkspaceConfig(t, repoDir, "exclude:\n  - \"ok/**\"\n")
 	cm.LoadWorkspaceConfig("my-repo", repoDir)
 	assert.Empty(t, cleanLogs.All())
+}
+
+// TestWorkspaceParseAgreementWithSurfaces pins the shared acceptance
+// semantics: the daemon loader, `gortex init`'s warning, and
+// `config exclude list` must agree on which workspace files parse.
+// The table mirrors TestWarnIfWorkspaceConfigIgnored_Agreement and
+// TestRunConfigExcludeList_Agreement in cmd/gortex — keep the three
+// in sync.
+func TestWorkspaceParseAgreementWithSurfaces(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		// accepted = the daemon uses the file (authoritative parse);
+		// false = the daemon ignores it and keeps the last good parse.
+		accepted bool
+	}{
+		{"valid list", "exclude:\n  - vendor/**\n", true},
+		// viper's weak decode accepts a scalar exclude; yaml.Unmarshal
+		// rejects it. The daemon must ignore the file — and init must
+		// warn, which is exactly what the shared parser guarantees.
+		{"scalar exclude", "exclude: vendor/\n", false},
+		// A schema violation (project + projects) is NOT a parse
+		// failure: the loader accepts the file. init must not raise a
+		// false "failed to parse" alarm on it.
+		{"schema violation, project+projects", "project: a\nprojects:\n  - name: p\n    paths: [\"x/**\"]\n", true},
+		{"stray quote", "exclude:\n  - \"broken\n", false},
+	}
+
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+	cm.SetLogger(zap.NewNop())
+
+	repoDir := t.TempDir()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeWorkspaceConfig(t, repoDir, tc.body)
+			cfg, authoritative := cm.readWorkspaceConfig("agreement-repo", repoDir)
+			if tc.accepted {
+				assert.True(t, authoritative, "daemon must accept this file")
+				assert.NotNil(t, cfg)
+			} else {
+				assert.False(t, authoritative, "daemon must ignore this file")
+				assert.Nil(t, cfg)
+			}
+		})
+	}
 }

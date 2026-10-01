@@ -32,7 +32,7 @@ func TestUnknownWorkspaceKeys_FlagsTopLevelAndNestedTypos(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".gortex.yaml")
 
-	// Issue #3's exact trap: index.ignore does not exist (the real key
+	// The exact trap this guards: index.ignore does not exist (the real key
 	// is index.exclude) — and a wholly invented top-level block.
 	require.NoError(t, os.WriteFile(path, []byte(
 		"index:\n  ignore:\n    - \"build/\"\nbogus_section:\n  x: 1\n"), 0644))

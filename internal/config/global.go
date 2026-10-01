@@ -239,8 +239,11 @@ func UnknownWorkspaceKeys(path string) []string {
 		return nil
 	}
 	if err := dec.Decode(raw); err != nil && len(md.Unused) == 0 {
-		// The decode failed before unused-key accounting produced
-		// anything — treat the file as unreadable rather than guessing.
+		// The decode failed (e.g. a type error such as
+		// `index: {workers: lots, ignore: [x]}`) before unused-key
+		// accounting produced anything — yield no keys and let the
+		// malformed-config warning report the file instead of guessing
+		// at a partial key list.
 		return nil
 	}
 	if len(md.Unused) == 0 {

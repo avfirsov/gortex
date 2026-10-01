@@ -429,21 +429,23 @@ func gitToplevel(start string) string {
 	}
 }
 
-// readWorkspaceYAML loads .gortex.yaml. Returns nil with no error when
-// the file is absent — the workspace target creates it on save.
+// readWorkspaceYAML loads .gortex.yaml into a zero-value Config: callers
+// mutate and write the result back, and seeding it with Default() would
+// persist computed defaults into the file on save. Parse acceptance is
+// still the daemon's — it goes through the shared
+// config.ParseWorkspaceFileInto parser, so this surface agrees with the
+// daemon and with `gortex init` on which files are honored. Returns nil
+// with no error when the file is absent — the workspace target creates it
+// on save.
 func readWorkspaceYAML(path string) (*config.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	cfg := &config.Config{}
+	if err := config.ParseWorkspaceFileInto(path, cfg); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var cfg config.Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	return &cfg, nil
+	return cfg, nil
 }
 
 // writeWorkspaceYAML writes .gortex.yaml. The round-trip through the

@@ -173,8 +173,9 @@ func TestRunConfigExcludeList_MalformedWorkspaceAnnotated(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0755))
 	t.Chdir(root)
 
-	// The issue-#3 shape: a stray quote makes the whole file unparseable,
-	// which previously showed as the workspace layer simply being absent.
+	// The stray-quote shape: a single bad quote makes the whole file
+	// unparseable, which previously showed as the workspace layer simply
+	// being absent.
 	malformed := "exclude:\n  - \"wine-mt4/\"\"\n"
 	require.NoError(t, os.WriteFile(filepath.Join(root, ".gortex.yaml"), []byte(malformed), 0644))
 
@@ -209,4 +210,52 @@ func TestRunConfigExcludeList_UnknownKeyWarning(t *testing.T) {
 
 	assert.Contains(t, errOut.String(), "keys gortex does not recognize")
 	assert.Contains(t, errOut.String(), "index.ignore")
+}
+
+// TestRunConfigExcludeList_Agreement pins that the workspace layer's
+// reporting agrees with the daemon loader and the init warning on which
+// files parse — same acceptance semantics via the shared
+// config.ParseWorkspaceFileInto parser. The table mirrors
+// TestWorkspaceParseAgreementWithSurfaces (internal/config) and
+// TestWarnIfWorkspaceConfigIgnored_Agreement — keep the three in sync.
+func TestRunConfigExcludeList_Agreement(t *testing.T) {
+	cases := []struct {
+		name             string
+		body             string
+		wantMalformedRow bool
+	}{
+		{"valid list", "exclude:\n  - vendor/**\n", false},
+		// viper's weak decode accepts a scalar exclude; yaml.Unmarshal
+		// rejects it — the row must say so instead of the layer silently
+		// disappearing.
+		{"scalar exclude", "exclude: vendor/\n", true},
+		// Schema violations are not parse failures: the file parses, so
+		// no failure annotation (and no stderr warning).
+		{"schema violation, project+projects", "project: a\nprojects:\n  - name: p\n    paths: [\"x/**\"]\n", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0755))
+			t.Chdir(root)
+			require.NoError(t, os.WriteFile(filepath.Join(root, ".gortex.yaml"), []byte(tc.body), 0644))
+
+			var errOut bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetErr(&errOut)
+
+			out := captureStdout(t, func() {
+				require.NoError(t, runConfigExcludeList(cmd, nil))
+			})
+
+			if tc.wantMalformedRow {
+				assert.Contains(t, out, "[workspace]")
+				assert.Contains(t, out, "0 patterns loaded — file failed to parse")
+			} else {
+				assert.NotContains(t, out, "file failed to parse")
+			}
+			assert.Empty(t, errOut.String())
+		})
+	}
 }
