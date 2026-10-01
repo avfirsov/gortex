@@ -9,7 +9,7 @@ import (
 
 func TestBinaryArtifactReason(t *testing.T) {
 	// A Serena-style tool-cache pickle: a claimed extension holding a
-	// binary payload — the exact file class from issue #2.
+	// binary payload — the exact file class this guard targets.
 	pickle := append([]byte("\x80\x04\x95\x1a\x00"), 0x00, 0x00)
 	assert.NotEqual(t, "", binaryArtifactReason(pickle))
 

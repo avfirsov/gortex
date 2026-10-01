@@ -200,14 +200,15 @@ func TestIndex_ParseFailedSkipTelemetry(t *testing.T) {
 
 // countingExtractor is a parser.Extractor that counts Extract calls, so
 // a test can prove the binary guard fired BEFORE any extraction work.
-type countingExtractor struct{}
-
-var countingExtractorCalls atomic.Int32
+// The counter lives on the extractor instance so each test owns its own —
+// a package-level counter made the assertions order- and run-count-
+// dependent (failing under -count=2 and -shuffle).
+type countingExtractor struct{ calls atomic.Int32 }
 
 func (e *countingExtractor) Language() string     { return "fake" }
 func (e *countingExtractor) Extensions() []string { return []string{".pkl", ".fk"} }
 func (e *countingExtractor) Extract(filePath string, _ []byte) (*parser.ExtractionResult, error) {
-	countingExtractorCalls.Add(1)
+	e.calls.Add(1)
 	return &parser.ExtractionResult{
 		Nodes: []*graph.Node{{ID: filePath, Kind: graph.KindFile, Name: filePath}},
 	}, nil
@@ -215,12 +216,13 @@ func (e *countingExtractor) Extract(filePath string, _ []byte) (*parser.Extracti
 
 // TestIndex_BinarySkipTelemetry verifies a binary payload claimed by a
 // registered language (a .pkl tool cache against the Pkl extractor, the
-// issue #2 case) becomes a synthetic skip node instead of feeding
+// reported case) becomes a synthetic skip node instead of feeding
 // tree-sitter's error recovery, and that the pass still completes. The
 // custom registry isolates the guard from the real Pkl grammar.
 func TestIndex_BinarySkipTelemetry(t *testing.T) {
+	ext := &countingExtractor{}
 	reg := parser.NewRegistry()
-	reg.Register(&countingExtractor{})
+	reg.Register(ext)
 	cfg := config.Default().Index
 	cfg.Workers = 1
 	idx := New(graph.New(), reg, cfg, zap.NewNop())
@@ -240,7 +242,7 @@ func TestIndex_BinarySkipTelemetry(t *testing.T) {
 	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
 	require.NotEmpty(t, n.Meta["binary_reason"])
 	// The extractor never ran on the binary bytes.
-	require.Equal(t, int32(1), countingExtractorCalls.Load())
+	require.Equal(t, int32(1), ext.calls.Load())
 
 	// The skip is a successful read: no failure row is recorded, so the
 	// file does not re-enter the failure-ledger retry path on the next
@@ -256,8 +258,9 @@ func TestIndex_BinarySkipTelemetry(t *testing.T) {
 // watcher path: a save of a binary file claimed by an extension yields
 // a synthetic node and a clean return, not a parse failure.
 func TestIndexFile_BinarySkip(t *testing.T) {
+	ext := &countingExtractor{}
 	reg := parser.NewRegistry()
-	reg.Register(&countingExtractor{})
+	reg.Register(ext)
 	cfg := config.Default().Index
 	idx := New(graph.New(), reg, cfg, zap.NewNop())
 
@@ -267,7 +270,7 @@ func TestIndexFile_BinarySkip(t *testing.T) {
 		t.Fatalf("index: %v", err)
 	}
 
-	countingExtractorCalls.Store(0)
+	before := ext.calls.Load()
 	binary := filepath.Join(dir, "raw_document_symbols.pkl")
 	writeFile(t, binary, "\x80\x04\x95\x00\x00")
 	require.NoError(t, idx.indexFile(binary, false))
@@ -275,7 +278,8 @@ func TestIndexFile_BinarySkip(t *testing.T) {
 	n := idx.graph.GetNode("raw_document_symbols.pkl")
 	require.NotNil(t, n)
 	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
-	require.Equal(t, int32(0), countingExtractorCalls.Load())
+	// The extractor never ran on the binary bytes.
+	require.Equal(t, before, ext.calls.Load())
 }
 
 func walkedFilePaths(fs []walkedFile) []string {

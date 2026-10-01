@@ -40,13 +40,19 @@ var minifiableLang = map[string]bool{
 // There is deliberately no config gate on this class: unlike a minified
 // bundle, NUL-bearing bytes can never parse as text, so "index it anyway"
 // is never a meaningful user choice — only a slower way to burn the parse
-// budget (issue #2). Tool caches under a claimed extension are the
+// budget. Tool caches under a claimed extension are the
 // reported case: Serena rewrites .serena/cache/*.pkl, the .pkl extension
 // belongs to the Pkl language, and every reconcile re-fed the binary into
 // the fallback chunker for a ~15s timeout with zero nodes.
 func binaryArtifactReason(src []byte) string {
 	if !parser.LooksBinary(src) {
 		return ""
+	}
+	// A UTF-16 text source is NUL-interleaved like any binary payload;
+	// name it distinctly so a text file is not mislabelled as binary in
+	// index_health telemetry.
+	if len(src) >= 2 && ((src[0] == 0xFF && src[1] == 0xFE) || (src[0] == 0xFE && src[1] == 0xFF)) {
+		return "utf-16 text source (NUL-interleaved; nothing a text grammar can extract)"
 	}
 	return "binary source (NUL byte within the first 8 KiB)"
 }

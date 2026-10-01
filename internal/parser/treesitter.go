@@ -66,10 +66,13 @@ type QueryResult struct {
 
 // ErrBinarySource is returned when the source carries a NUL byte within
 // its first binarySniffBytes — the same tell git uses to classify a blob
-// as binary. A genuine text source never contains NUL; a binary payload
-// that a language extension nonetheless claimed (a tool cache .pkl, an
-// object file) drives tree-sitter's error recovery into pathological
-// balancing, burning the whole parse budget for zero nodes.
+// as binary. A NUL-bearing source is not text a text grammar can consume
+// without pathological error recovery: a binary payload that a language
+// extension nonetheless claimed (a tool cache .pkl, an object file)
+// drives tree-sitter into pathological balancing, burning the whole
+// parse budget for zero nodes. UTF-16 text is NUL-interleaved too and is
+// classified here as binary — the pipeline never transcodes it, so it
+// never yielded useful nodes as "text" either.
 var ErrBinarySource = errors.New("source is binary: refusing to feed NUL-bearing bytes to a text grammar")
 
 // binarySniffBytes bounds the binary content sniff. Git classifies a blob

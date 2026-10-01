@@ -35,6 +35,14 @@ func TestParseErrorCountGo(t *testing.T) {
 		t.Fatalf("broken Go: got (%d, %v), want (>0, true)", n, ok)
 	}
 
+	// A NUL byte is a content verdict (parser.ErrBinarySource), not a
+	// parse-infrastructure failure: the gate must keep its opinion so an
+	// edit that would write binary bytes is treated as a regression.
+	nul := []byte("package main\n\nfunc Add(a, b int) int { return a\x00 + b }\n")
+	if n, ok := parseErrorCount("go", nul); !ok || n == 0 {
+		t.Fatalf("NUL-bearing Go: got (%d, %v), want (>0, true)", n, ok)
+	}
+
 	// Unsupported language degrades to no-opinion.
 	if n, ok := parseErrorCount("cobol", clean); ok || n != 0 {
 		t.Fatalf("unsupported lang: got (%d, %v), want (0, false)", n, ok)
@@ -51,6 +59,12 @@ func TestCheckParseGate(t *testing.T) {
 	// clean -> broken: a regression, must block.
 	if r := checkParseGate("x.go", clean, broken); !r.Checked || !r.Blocked {
 		t.Errorf("clean->broken: got %+v, want Checked && Blocked", r)
+	}
+	// clean -> NUL-bearing: the ErrBinarySource verdict counts as a
+	// regression, so an edit that writes binary bytes is refused.
+	nul := []byte("package main\n\nfunc Add(a, b int) int { return a\x00 + b }\n")
+	if r := checkParseGate("x.go", clean, nul); !r.Checked || !r.Blocked {
+		t.Errorf("clean->nul: got %+v, want Checked && Blocked", r)
 	}
 	// clean -> clean: no regression.
 	if r := checkParseGate("x.go", clean, clean); !r.Checked || r.Blocked {

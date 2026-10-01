@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,9 +72,20 @@ func parseErrorCount(lang string, content []byte) (int, bool) {
 		return 0, false
 	}
 	tree, err := parser.ParseFile(content, sl)
-	if err != nil || tree == nil {
-		// A failure here is a tree-sitter cancellation / timeout, not a
+	if err != nil {
+		// ErrBinarySource is a content verdict, not infrastructure: a NUL
+		// byte in the sniff window means the candidate content would write
+		// binary bytes into a text source. Count it as a parse regression
+		// so the gate blocks it — otherwise the ParseFile guard would
+		// switch the gate off for exactly the content it refuses.
+		if errors.Is(err, parser.ErrBinarySource) {
+			return 1, true
+		}
+		// Any other failure is a tree-sitter cancellation / timeout, not a
 		// syntax verdict — stay silent rather than block on infrastructure.
+		return 0, false
+	}
+	if tree == nil {
 		return 0, false
 	}
 	pt := parser.NewParseTree(tree, content, lang)

@@ -54,7 +54,7 @@ var Builtin = []string{
 	// rewrites .serena/cache/*.pkl on every session; the .pkl extension
 	// is claimed by the Pkl language, so without this entry the binary
 	// caches re-entered discovery on every rewrite and burned the parse
-	// budget on each reconcile (issue #2).
+	// budget on each reconcile.
 	".serena/cache/",
 	// Dependency caches a repo-local toolchain home materializes inside the
 	// working tree. A harness that pins M2_HOME / store-dir at the repo
