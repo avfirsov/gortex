@@ -56,7 +56,7 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 		p.Files = append(p.Files, agents.FileAction{Path: userClaudeJSONPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"mcpServers"}})
 		p.Files = append(p.Files, agents.FileAction{Path: userSettingsPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"permissions"}})
 		if env.InstallHooks {
-			p.Files = append(p.Files, agents.FileAction{Path: userSettingsLocalPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}})
+			p.Files = append(p.Files, agents.FileAction{Path: userSettingsPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}})
 		}
 		if env.InstallGlobalInstructions {
 			p.Files = append(p.Files, agents.FileAction{Path: userClaudeMdPath(env.Home), Action: agents.ActionWouldMerge, Keys: []string{"gortex-rules-block"}})
@@ -236,9 +236,11 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 	}
 	res.Files = append(res.Files, permAction)
 
-	// 3. ~/.claude/settings.local.json — user-level hooks.
+	// 3. ~/.claude/settings.json — user-level hooks. Claude Code only
+	// loads settings.local.json as a project file, so user-scope hooks
+	// must live in settings.json to run.
 	if env.InstallHooks {
-		hookAction, err := InstallHookWithMode(w, userSettingsLocalPath(env.Home), env.HookMode, opts)
+		hookAction, err := InstallHookWithMode(w, userSettingsPath(env.Home), env.HookMode, opts)
 		if err != nil {
 			return fmt.Errorf("global hooks: %w", err)
 		}
@@ -350,12 +352,16 @@ func (a *Adapter) RemoveGlobal(env agents.Env, opts agents.ApplyOpts) (removed i
 	mcpAction, err := removeGlobalMCPConfig(w, mcpPath, opts)
 	count(mcpAction, err, mcpPath)
 
-	// 2. settings.json — drop the mcp__gortex__* permission entry.
+	// 2. settings.json — drop the mcp__gortex__* permission entry and
+	// the Gortex hook entries.
 	settingsPath := userSettingsPath(env.Home)
 	permAction, err := removeGlobalPermissions(w, settingsPath, opts)
 	count(permAction, err, settingsPath)
+	userHookAction, err := removeGlobalHooks(w, settingsPath, opts)
+	count(userHookAction, err, settingsPath)
 
-	// 3. settings.local.json — drop the Gortex hook entries.
+	// 3. settings.local.json — drop hook entries left there by installs
+	// that predate the user-settings fix.
 	localPath := userSettingsLocalPath(env.Home)
 	hookAction, err := removeGlobalHooks(w, localPath, opts)
 	count(hookAction, err, localPath)
@@ -407,7 +413,7 @@ func GlobalArtifacts(home string) []string {
 	if fileContains(userClaudeJSONPath(home), `"gortex"`) {
 		present = append(present, userClaudeJSONPath(home))
 	}
-	if fileContains(userSettingsPath(home), "mcp__gortex__") {
+	if fileContains(userSettingsPath(home), "gortex") {
 		present = append(present, userSettingsPath(home))
 	}
 	if fileContains(userSettingsLocalPath(home), "gortex") {
