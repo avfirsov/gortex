@@ -148,13 +148,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	// always disclosed its own truncation (`_truncated_by_budget`); this is
 	// the limit path's equivalent.
 	if searchTextBoundByLimit(rawMatches, limit) {
-		resp["_truncated_by_limit"] = true
-		resp["_limit_applied"] = limit
-		resp["count_is_exact"] = false
-		resp["truncation_note"] = searchTextTruncationNote
-		if requestedLimit > limit {
-			resp["_limit_requested"] = requestedLimit
-		}
+		stampLimitTruncation(resp, requestedLimit, limit, searchTextTruncationNote)
 	}
 	// Body-visible disclosure for a repo-narrowed zero (the _meta scope
 	// fields are invisible in CLI output and most clients). No recheck
@@ -202,7 +196,7 @@ const searchTextTruncationNote = "the search stopped at `limit`, so `count` is a
 // corpus holding exactly that many matches — a spurious "verify this" is the
 // safe direction to be wrong in, against silently losing most of the result.
 func searchTextBoundByLimit(rawMatches, limit int) bool {
-	return limit > 0 && rawMatches >= limit
+	return boundByLimit(rawMatches, limit)
 }
 
 // filterTextMatchesByPath keeps only the trigram matches whose file
