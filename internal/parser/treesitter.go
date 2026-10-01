@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -62,9 +63,33 @@ type QueryResult struct {
 	Captures map[string]*CapturedNode
 }
 
+// ErrUTF16Source is returned when the source carries a UTF-16 byte-order
+// mark. Feeding UTF-16 bytes to a grammar as if they were UTF-8 produces
+// NUL-interleaved garbage whose error recovery is pathological (minutes
+// per file); transcoding to UTF-8 first would shift every byte coordinate
+// the extractor slices from the original buffer. The right fix per caller
+// is to skip the file (indexing) or transcode and keep the transcode as
+// the extraction buffer.
+var ErrUTF16Source = errors.New("source is UTF-16: refusing to parse NUL-interleaved bytes as UTF-8")
+
+// hasUTF16BOM reports whether src starts with a UTF-16 byte-order mark
+// (LE or BE).
+func hasUTF16BOM(src []byte) bool {
+	return len(src) >= 2 && ((src[0] == 0xFF && src[1] == 0xFE) || (src[0] == 0xFE && src[1] == 0xFF))
+}
+
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
+	// Guard before the parser pool: a UTF-16 source parses pathologically
+	// and its BOM is the only cheap tell. The indexer's BOM-strip transform
+	// deliberately leaves UTF-16 marks in place so this check can fire.
+	// Ordering contract with #834 (NUL-byte binary sniff at the top of
+	// ParseFile): this UTF-16 check must run BEFORE any binary/NUL sniff,
+	// or UTF-16 sources get labelled "binary" instead of "UTF-16".
+	if hasUTF16BOM(src) {
+		return nil, ErrUTF16Source
+	}
 	parser := getParser(lang)
 	// Pool the parser only on a clean parse. An errored parse (cancelled
 	// / timed out) may have left the C parser's canceled_balancing flag
