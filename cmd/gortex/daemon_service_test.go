@@ -129,8 +129,9 @@ func TestRenderSystemdUnit_PropagatesXDG(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, out, "Environment=XDG_CACHE_HOME=/home/u/.cache")
-	// A value containing whitespace is double-quoted per systemd rules.
-	assert.Contains(t, out, `Environment=XDG_DATA_HOME="/home/u/has space"`)
+	// An assignment containing whitespace is double-quoted as a whole,
+	// because systemd recognizes a quote only at the start of an item.
+	assert.Contains(t, out, `Environment="XDG_DATA_HOME=/home/u/has space"`)
 
 	// Environment lines must sit inside [Service], ahead of [Install].
 	svcStart := strings.Index(out, "[Service]")
@@ -259,8 +260,8 @@ func TestRenderSystemdUnit_CapturesPATH(t *testing.T) {
 	// value (relevant to this native fixture when tests run on Windows).
 	want := strings.ReplaceAll(first+sep+second, "\\", "\\\\")
 	want = strings.ReplaceAll(want, "%", "%%")
-	assert.Contains(t, out, "\nEnvironment=PATH=\""+want+"\"\n")
-	assert.Equal(t, 1, strings.Count(out, "Environment=PATH="))
+	assert.Contains(t, out, "\nEnvironment=\"PATH="+want+"\"\n")
+	assert.Equal(t, 1, strings.Count(out, "PATH="))
 	assert.NotContains(t, out, "/opt/homebrew/bin")
 	assert.NotContains(t, out, "GORTEX_")
 	assert.NotContains(t, out, "must-not-be-captured")
@@ -272,7 +273,7 @@ func TestRenderSystemdUnit_EmptyPATH(t *testing.T) {
 			t.Setenv("PATH", path)
 			out, err := renderSystemdUnit("/bin/gortex", "/log", nil)
 			require.NoError(t, err)
-			assert.NotContains(t, out, "Environment=PATH=")
+			assert.NotContains(t, out, "PATH=")
 		})
 	}
 }

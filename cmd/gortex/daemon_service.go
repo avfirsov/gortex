@@ -130,13 +130,15 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// systemdEnvValue renders a value safe for a systemd Environment= line.
+// systemdEnvValue renders a KEY=value assignment safe for a systemd
+// Environment= line.
 // `%` is escaped to `%%` because systemd treats it as a specifier
 // introducer across the whole unit file (systemd.unit(5)) — an
 // unescaped `%d` in a path would expand to a directory specifier and
-// silently change the value the daemon sees. Values containing
-// whitespace are additionally double-quoted (with embedded quotes /
-// backslashes escaped) per systemd's quoting rules. Plain paths (the
+// silently change the value the daemon sees. An assignment containing
+// whitespace is additionally double-quoted as a whole (with embedded quotes /
+// backslashes escaped): systemd.syntax(7) recognizes a quote only at the
+// start of an item, so `KEY="a b"` would not be unquoted. Plain paths (the
 // common case) pass through unchanged.
 func systemdEnvValue(v string) string {
 	v = strings.ReplaceAll(v, "%", "%%")
@@ -602,7 +604,7 @@ After=network.target
 Type=simple
 ExecStart={{.Exe}} daemon start
 {{- range .EnvVars}}
-Environment={{.Key}}={{.Value}}
+Environment={{.}}
 {{- end}}
 Restart=on-failure
 RestartSec=2
@@ -614,17 +616,17 @@ WantedBy=default.target
 `
 
 // renderSystemdUnit fills systemdUnitTemplate, quoting Environment=
-// values that need it.
+// assignments that need it.
 func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error) {
 	if path := servicePath(nil); path != "" {
 		env = append([]serviceEnvVar{{Key: "PATH", Value: path}}, env...)
 	}
 	data := struct {
 		Exe, LogPath string
-		EnvVars      []serviceEnvVar
-	}{Exe: exe, LogPath: logPath, EnvVars: make([]serviceEnvVar, len(env))}
+		EnvVars      []string
+	}{Exe: exe, LogPath: logPath, EnvVars: make([]string, len(env))}
 	for i, e := range env {
-		data.EnvVars[i] = serviceEnvVar{Key: e.Key, Value: systemdEnvValue(e.Value)}
+		data.EnvVars[i] = systemdEnvValue(e.Key + "=" + e.Value)
 	}
 	var buf bytes.Buffer
 	if err := template.Must(template.New("unit").Parse(systemdUnitTemplate)).Execute(&buf, data); err != nil {
