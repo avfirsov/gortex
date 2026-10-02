@@ -575,7 +575,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		// store already spends on the graph itself.
 		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
-		transforms:    newTransformPipeline(cfg.Transforms, logger),
+		transforms:    newTransformPipeline(cfg.Transforms, reg, logger),
 		logger:        logger,
 		fileMtimes:    make(map[string]int64),
 		contractCache: make(map[string]*contractCacheEntry),

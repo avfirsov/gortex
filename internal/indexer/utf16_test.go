@@ -8,9 +8,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 )
 
 // utf16LEWithBOM encodes s as UTF-16LE with the byte-order mark a Windows
@@ -237,4 +239,46 @@ func TestSilentZeroExtraction(t *testing.T) {
 
 	require.False(t, silentZeroExtraction(nil))
 	require.False(t, silentZeroExtraction(&parser.ExtractionResult{}))
+}
+
+// TestUTF16DecodeTransform_SkipsAssetExtensions pins the review's minor:
+// the decoder must not run on content destined for an AssetExtractor
+// (image / PDF / office / data) — that content is binary on purpose, and
+// feeding it to the decoder is where the one heuristic misdetection came
+// from. Source extensions still decode.
+func TestUTF16DecodeTransform_SkipsAssetExtensions(t *testing.T) {
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	p := newTransformPipeline(nil, reg, zap.NewNop())
+
+	payload := utf16LEWithBOM(t, "código declarado en UTF-16")
+	// The BOM stripper is always on, so an asset file loses the mark; the
+	// pinned point is that the payload is NOT transcoded.
+	stripped := stripBOM(payload)
+
+	require.Equal(t, stripped, p.run("report.pdf", payload),
+		"a PDF-bound payload must reach its asset extractor untranslated")
+	require.Equal(t, stripped, p.run("photo.png", payload),
+		"an image-bound payload must reach its asset extractor untranslated")
+	require.Equal(t, stripped, p.run("sheet.xlsx", payload),
+		"an office-bound payload must reach its asset extractor untranslated")
+	require.NotEqual(t, payload, p.run("src.cs", payload),
+		"a source extension still decodes")
+	require.Equal(t, "código declarado en UTF-16", string(p.run("src.cs", payload)))
+}
+
+// TestRegistryAssetExtensions sanity-checks the skip set the decoder is
+// built from: asset-bearing extensions are in it, source extensions are not.
+func TestRegistryAssetExtensions(t *testing.T) {
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+
+	ext := reg.AssetExtensions()
+	require.NotEmpty(t, ext)
+	for _, a := range []string{".pdf", ".png", ".jpg", ".xlsx", ".pptx"} {
+		require.Contains(t, ext, a, "%s is an asset extension", a)
+	}
+	for _, s := range []string{".go", ".cs", ".ts"} {
+		require.NotContains(t, ext, s, "%s is a source extension", s)
+	}
 }

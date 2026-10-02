@@ -4215,6 +4215,12 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
 		return res
 	}
+	// Same UTF-16 refusal as edit_symbol: the match below would fail
+	// with a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_symbol", node.FilePath).Error()
+		return res
+	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
 

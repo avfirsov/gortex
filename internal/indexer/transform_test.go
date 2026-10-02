@@ -28,7 +28,7 @@ func TestStripBOM(t *testing.T) {
 }
 
 func TestTransformPipeline_BOMStripIsBuiltIn(t *testing.T) {
-	p := newTransformPipeline(nil, zap.NewNop())
+	p := newTransformPipeline(nil, nil, zap.NewNop())
 	withBOM := append([]byte{0xEF, 0xBB, 0xBF}, []byte("package main\n")...)
 	require.Equal(t, []byte("package main\n"), p.run("x.go", withBOM))
 }
@@ -40,7 +40,7 @@ func TestTransformPipeline_NilSafe(t *testing.T) {
 }
 
 func TestTransformPipeline_RuleWithNoCommandIgnored(t *testing.T) {
-	p := newTransformPipeline([]config.TransformRule{{Name: "broken"}}, zap.NewNop())
+	p := newTransformPipeline([]config.TransformRule{{Name: "broken"}}, nil, zap.NewNop())
 	require.Len(t, p.transforms, 2) // the built-ins: BOM stripper + UTF-16 decoder
 }
 
@@ -74,7 +74,7 @@ func TestTransformPipeline_FailingCommandKeepsBytes(t *testing.T) {
 	// A failing transform must not drop the file — earlier bytes win.
 	p := newTransformPipeline([]config.TransformRule{{
 		Name: "broken", Command: []string{"gortex-no-such-binary-xyz"},
-	}}, zap.NewNop())
+	}}, nil, zap.NewNop())
 	require.Equal(t, []byte("untouched"), p.run("a.go", []byte("untouched")))
 }
 

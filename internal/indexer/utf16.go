@@ -3,6 +3,8 @@ package indexer
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
+	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -26,14 +28,41 @@ import (
 // file by stored byte extents. The coordinate-stable path
 // (prepareCoordinateStable) keeps refusing UTF-16, which is correct
 // there: rename recovery edits the raw file.
-type utf16DecodeTransform struct{}
+//
+// The transform skips every extension whose extractor is an AssetExtractor
+// (image, PDF, office, data): that content is binary on purpose, and feeding
+// it to the decoder is where the one heuristic misdetection came from.
+type utf16DecodeTransform struct {
+	// assetExts holds the file extensions (with dot, as extMap keys them)
+	// whose extractor consumes raw binary content. Empty means never skip.
+	assetExts map[string]bool
+}
 
-func (utf16DecodeTransform) name() string        { return "utf16-decode" }
-func (utf16DecodeTransform) matches(string) bool { return true }
-func (utf16DecodeTransform) asLanguage() string  { return "" }
+func (utf16DecodeTransform) name() string       { return "utf16-decode" }
+func (utf16DecodeTransform) asLanguage() string { return "" }
+
+func (t utf16DecodeTransform) matches(path string) bool {
+	return len(t.assetExts) == 0 || !t.assetExts[strings.ToLower(filepath.Ext(path))]
+}
 
 func (utf16DecodeTransform) apply(_ string, src []byte) ([]byte, error) {
 	return decodeUTF16Source(src), nil
+}
+
+// LooksUTF16Source reports whether src is confidently UTF-16 text — a BOM
+// outright, or the conservative single-parity NUL heuristic without one.
+// The MCP read and edit paths use it to stay consistent with what the
+// indexer decoded before extraction (#846).
+func LooksUTF16Source(src []byte) bool {
+	_, ok := utf16Endianness(src)
+	return ok
+}
+
+// DecodeUTF16Source is the exported form of decodeUTF16Source, for the
+// read paths that must serve the same text extraction saw (#846). It is
+// an identity for every non-UTF-16 input.
+func DecodeUTF16Source(src []byte) []byte {
+	return decodeUTF16Source(src)
 }
 
 // utf16SampleBytes bounds the no-BOM sniff. 8 KiB matches the binary
