@@ -202,6 +202,11 @@ func TestServicePath(t *testing.T) {
 		},
 		{name: "empty systemd PATH stays empty"},
 		{name: "all relative systemd PATH stays empty", path: sep + "." + sep + "relative/bin"},
+		{
+			name: "entries containing CR or LF are dropped",
+			path: strings.Join([]string{first + "\nExecStartPre=/bin/false", second + "\r", first}, sep),
+			want: first,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("PATH", tt.path)

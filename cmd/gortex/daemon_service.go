@@ -98,14 +98,16 @@ func xdgServiceEnv() []serviceEnvVar {
 // servicePath captures the installing shell's PATH so supervised language
 // servers can be found outside the standard locations. Re-run install-service
 // to re-capture changed values. Only absolute entries are kept: relative and
-// empty entries would resolve against the service's working directory. Entries
-// need not exist yet; duplicates are removed without changing the shell's order.
+// empty entries would resolve against the service's working directory. An
+// entry containing CR or LF is dropped, because it would split a systemd
+// Environment= line. Entries need not exist yet; duplicates are removed without
+// changing the shell's order.
 // Missing defaults are appended for launchd; systemd keeps its default when the
 // captured PATH is empty.
 func servicePath(defaults []string) string {
 	var entries []string
 	for _, entry := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
-		if filepath.IsAbs(entry) && !slices.Contains(entries, entry) {
+		if filepath.IsAbs(entry) && !strings.ContainsAny(entry, "\r\n") && !slices.Contains(entries, entry) {
 			entries = append(entries, entry)
 		}
 	}
