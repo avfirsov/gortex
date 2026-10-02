@@ -115,6 +115,14 @@ projects:
 	assert.Equal(t, "work", proj.Repos[0].Ref)
 }
 
+func TestUnknownGlobalKeysRecognizesDaemon(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("daemon:\n  memory_limit: 4GiB\ntypo: true\n")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	require.Equal(t, []string{"typo"}, UnknownGlobalKeys(path))
+}
+
 func TestLoadGlobal_MalformedYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

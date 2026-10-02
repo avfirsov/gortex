@@ -186,6 +186,7 @@ func (gc *GlobalConfig) MergeEmbeddingInto(local EmbeddingConfig) EmbeddingConfi
 var knownGlobalTopLevelKeys = map[string]bool{
 	"projects": true, "repos": true, "active_project": true,
 	"exclude": true, "llm": true, "embedding": true, "mcp": true,
+	"daemon": true,
 }
 
 // UnknownGlobalKeys returns the top-level keys present in the global config file
