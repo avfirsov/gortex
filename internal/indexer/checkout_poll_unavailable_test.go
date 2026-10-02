@@ -122,7 +122,18 @@ func TestCheckoutPollMissingRootStillAcceptsExplicitDemand(t *testing.T) {
 
 func TestCheckoutLifecycleRetiresMissingBackedOffCoordinator(t *testing.T) {
 	f := newLifecycleFixture(t)
-	defer f.close()
+	// The lifecycle is closed inside the bubble below, which started its
+	// coordinator. Closing it again outside the bubble would touch channels
+	// the bubble owns, so the outer teardown closes it only when the bubble
+	// did not run.
+	lifecycleClosed := false
+	defer func() {
+		if !lifecycleClosed {
+			_ = f.lc.Close()
+		}
+		_ = f.mi.Close(context.Background())
+		_ = f.store.Close()
+	}()
 	ctx := context.Background()
 	main := f.gitRepo("backoff-main")
 	root := f.worktreeOf(main, "backoff-wt")
@@ -150,7 +161,10 @@ func TestCheckoutLifecycleRetiresMissingBackedOffCoordinator(t *testing.T) {
 	runGit(t, main, "worktree", "prune")
 
 	synctest.Test(t, func(t *testing.T) {
-		defer func() { _ = f.lc.Close() }()
+		defer func() {
+			_ = f.lc.Close()
+			lifecycleClosed = true
+		}()
 		cycles := make(chan struct{}, 16)
 		c := scheduleOnlyCoordinator(checkoutID, root, 15*time.Second, time.Millisecond, func() { cycles <- struct{}{} })
 		defer func() { _ = c.Close() }()
