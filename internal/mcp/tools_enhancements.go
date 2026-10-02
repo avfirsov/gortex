@@ -2897,7 +2897,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

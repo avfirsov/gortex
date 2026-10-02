@@ -381,7 +381,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		reader = nil
 	}
 
-	diff, err := analysis.MapGitDiff(reader, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiffContext(ctx, reader, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
