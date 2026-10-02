@@ -2,6 +2,34 @@ package trigram
 
 import "testing"
 
+// TestPathUnderAnyPrefix_SegmentBoundary pins the segment-boundary
+// semantics the in-search path restriction must share with the
+// post-filter (#845 round-2): a prefix matches the exact path or
+// anything under prefix/, never a raw string extension — `pkg/su`
+// must not consume a limit slot on `pkg/sub/x.go` that the post-filter
+// would drop.
+func TestPathUnderAnyPrefix_SegmentBoundary(t *testing.T) {
+	cases := []struct {
+		path string
+		pre  string
+		want bool
+	}{
+		{"pkg/sub/x.go", "pkg/sub", true},
+		{"pkg/sub/x.go", "pkg/su", false},
+		{"pkg/sub", "pkg/sub", true},
+		{"pkg/sub/x.go", "", true},
+		{"pkg/sub/x.go", "other", false},
+	}
+	for _, tc := range cases {
+		if got := PathUnderAnyPrefix(tc.path, []string{tc.pre}); got != tc.want {
+			t.Errorf("PathUnderAnyPrefix(%q, %q) = %v, want %v", tc.path, tc.pre, got, tc.want)
+		}
+	}
+	if !PathUnderAnyPrefix("anything", nil) {
+		t.Error("an empty prefix set is the unscoped default")
+	}
+}
+
 // TestSearcher_GrepPaths_PrefixAppliedBeforeLimit pins the issue-#827
 // semantics: the path restriction runs before the limit cut, so a
 // scoped query returns scoped matches even when out-of-scope files own

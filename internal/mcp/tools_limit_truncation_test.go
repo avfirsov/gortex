@@ -135,6 +135,39 @@ func TestBoundByLimit(t *testing.T) {
 	}
 }
 
+// TestGraphQueryLimitTruncation_IsLegibleThroughTheHandler pins the
+// #845 round-2 gap: the compact-format test above builds its SubGraph
+// with Truncated already set, so it pins the renderers, not the
+// handler. These run graph_query through callTool at a limit below
+// the node count, so removing the fold in handleGraphQuery fails
+// here.
+func TestGraphQueryLimitTruncation_IsLegibleThroughTheHandler(t *testing.T) {
+	srv := limitServerWith(t, "a.go", "b.go", "c.go")
+
+	t.Run("gcx meta", func(t *testing.T) {
+		res := callTool(t, srv, "graph_query", map[string]any{
+			"query": "nodes kind=function", "limit": 2, "format": "gcx",
+		})
+		require.False(t, res.IsError, "%+v", res.Content)
+		payload := res.Content[0].(mcplib.TextContent).Text
+		dec := wire.NewDecoder(strings.NewReader(payload))
+		h, err := dec.Header()
+		require.NoError(t, err)
+		require.Equal(t, "true", h.Meta["truncated"],
+			"a limit-clamped count must not be corroborated by truncated: false")
+	})
+
+	t.Run("toon field", func(t *testing.T) {
+		res := callTool(t, srv, "graph_query", map[string]any{
+			"query": "nodes kind=function", "limit": 2, "format": "toon",
+		})
+		require.False(t, res.IsError, "%+v", res.Content)
+		text := res.Content[0].(mcplib.TextContent).Text
+		require.Contains(t, text, "truncated: true",
+			"a limit-clamped count must not be corroborated by truncated: false")
+	})
+}
+
 func TestStampLimitTruncation_ReportsRequestedWhenClamped(t *testing.T) {
 	resp := map[string]any{}
 	stampLimitTruncation(resp, 50000, 1000, "note")
