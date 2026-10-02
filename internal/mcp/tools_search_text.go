@@ -75,6 +75,18 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	useRegexp := req.GetBool("regexp", false)
 	pathFilter := s.resolvePathFilter(req, fieldQuery{})
 	scopedMultiGrep := s.multiIndexer != nil && (resolved.RepoAllow != nil || len(pathFilter) > 0)
+	// Normalise and route the raw `path` filters before they ride into
+	// the search (#845): the in-search restriction matches repo-relative
+	// paths inside each per-repo searcher, so the raw spellings an agent
+	// copies back from graph tools ("alpha/pkg/sub") or writes by hand
+	// ("./pkg/sub", "pkg\sub", "/pkg/sub") must not silently zero the
+	// result. A repo-qualified filter routes to its repo alone;
+	// unqualified filters apply to every searched repo.
+	var sharedPathPrefixes []string
+	var perRepoPathPrefixes map[string][]string
+	if s.multiIndexer != nil && len(pathFilter) > 0 {
+		sharedPathPrefixes, perRepoPathPrefixes = splitPathFilterForRepos(pathFilter, s.multiIndexer.RepoPrefixes())
+	}
 	var matches []trigram.Match
 	needsFinalLimit := false
 	if view := requestViewFromContext(ctx); view.routed() {
@@ -89,26 +101,23 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	} else if useRegexp {
 		var err error
 		if scopedMultiGrep {
-			matches, err = s.multiIndexer.GrepRegexpForRepos(query, "", resolved.RepoAllow, limit)
+			matches, err = s.multiIndexer.GrepRegexpForReposPaths(query, resolved.RepoAllow, sharedPathPrefixes, perRepoPathPrefixes, limit)
 			needsFinalLimit = true
 		} else if s.multiIndexer != nil {
-			matches, err = s.multiIndexer.GrepRegexp(query, "", limit)
+			matches, err = s.multiIndexer.GrepRegexpPaths(query, normalizePathPrefixes(pathFilter), limit)
 		} else {
-			matches, err = s.indexer.GrepRegexp(query, "", limit)
+			matches, err = s.indexer.GrepRegexpPaths(query, normalizePathPrefixes(pathFilter), limit)
 		}
 		if err != nil {
 			return mcp.NewToolResultError("search_text: invalid regexp: " + err.Error()), nil
 		}
 	} else if scopedMultiGrep {
-		matches = s.multiIndexer.GrepTextForReposPaths(query, resolved.RepoAllow, pathFilter, limit)
+		matches = s.multiIndexer.GrepTextForReposPaths(query, resolved.RepoAllow, sharedPathPrefixes, perRepoPathPrefixes, limit)
 		needsFinalLimit = true
 	} else if s.multiIndexer != nil {
-		// A path filter rides into the search itself, before the limit
-		// cut (issue #827): a subtree slice must not be wiped out by a
-		// head of out-of-scope matches owning the global ordering.
-		matches = s.multiIndexer.GrepTextPaths(query, pathFilter, limit)
+		matches = s.multiIndexer.GrepText(query, limit)
 	} else {
-		matches = s.indexer.GrepTextPaths(query, pathFilter, limit)
+		matches = s.indexer.GrepTextPaths(query, normalizePathPrefixes(pathFilter), limit)
 	}
 
 	// Counted BEFORE the filters below, and that ordering is the whole point.
@@ -197,6 +206,47 @@ const searchTextTruncationNote = "the search stopped at `limit`, so `count` is a
 // safe direction to be wrong in, against silently losing most of the result.
 func searchTextBoundByLimit(rawMatches, limit int) bool {
 	return boundByLimit(rawMatches, limit)
+}
+
+// splitPathFilterForRepos normalises the raw `path` filters and routes
+// them for the multi-repo in-search restriction (#845). A filter
+// qualified with a tracked repo prefix — "alpha/pkg/sub", the spelling
+// every graph tool returns and an agent copies back — routes to that
+// repo alone as a repo-relative remainder ("" when the filter names
+// the repo itself), so it no longer fans out to every repo and silently
+// zeroes there. Unqualified filters ("pkg/sub", after the raw forms
+// "./pkg/sub", "pkg\sub", "/pkg/sub" are normalised) apply to every
+// searched repo — the additive semantics of the expanded post-filter.
+// Returns the shared set plus the per-repo remainders; both nil when
+// nothing survives normalisation.
+func splitPathFilterForRepos(paths []string, repoPrefixes []string) (shared []string, perRepo map[string][]string) {
+	norm := normalizePathPrefixes(paths)
+	if len(norm) == 0 {
+		return nil, nil
+	}
+	for _, p := range norm {
+		bestRepo := ""
+		bestLen := 0
+		for _, rp := range repoPrefixes {
+			rp = strings.Trim(rp, "/")
+			if rp != "" && (p == rp || strings.HasPrefix(p, rp+"/")) && len(rp) > bestLen {
+				bestRepo, bestLen = rp, len(rp)
+			}
+		}
+		if bestRepo == "" {
+			shared = append(shared, p)
+			continue
+		}
+		remainder := ""
+		if len(p) > bestLen {
+			remainder = p[bestLen+1:]
+		}
+		if perRepo == nil {
+			perRepo = map[string][]string{}
+		}
+		perRepo[bestRepo] = append(perRepo[bestRepo], remainder)
+	}
+	return shared, perRepo
 }
 
 // filterTextMatchesByPath keeps only the trigram matches whose file

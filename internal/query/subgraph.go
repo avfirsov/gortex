@@ -107,29 +107,20 @@ type SubGraph struct {
 	// an agent see at a glance whether the usage list already covers
 	// tests instead of re-grepping *_test.go files to find out.
 	UsageSummary *UsageSummary `json:"usage_summary,omitempty"`
-	// TruncatedByLimit is attached by graph_query when the working set
+	// Limit-bound disclosure (#672), flat — the same shape the
+	// map-returning tools (search_text, find_declaration) stamp onto
+	// their responses via stampLimitTruncation, so a client checking
+	// `_truncated_by_limit === true` handles every clamping tool the
+	// same way (#845). graph_query populates these when the working set
 	// stopped at the caller's `limit` rather than exhausting the graph —
 	// so a result of exactly `limit` nodes is legible as "possibly more",
-	// not "exhaustive" (#672). Omitted for every other traversal that
-	// shares this struct and for results the corpus exhausted. The
-	// map-returning tools (search_text, find_declaration) emit the same
-	// disclosure flat on their response maps via stampLimitTruncation.
-	TruncatedByLimit *LimitTruncation `json:"_truncated_by_limit,omitempty"`
-}
-
-// LimitTruncation is the limit-bound disclosure a clamped result carries:
-// the effective ceiling the result stopped at, the caller's requested
-// limit when the hard cap (not the caller) chose it, and a note naming
-// the escape hatch.
-type LimitTruncation struct {
-	// Applied is the effective limit the result stopped at.
-	Applied int `json:"limit_applied"`
-	// Requested is the caller's original `limit` when the hard cap, not
-	// the caller, chose the effective one. Omitted when the caller's own
-	// limit bound the result.
-	Requested int `json:"limit_requested,omitempty"`
-	// Note explains what is a floor and how to widen the result.
-	Note string `json:"truncation_note"`
+	// not "exhaustive". Zero-valued for every other traversal that
+	// shares this struct, and for results the corpus exhausted.
+	TruncatedByLimit bool   `json:"_truncated_by_limit,omitempty"`
+	LimitApplied     int    `json:"_limit_applied,omitempty"`
+	LimitRequested   int    `json:"_limit_requested,omitempty"`
+	CountIsExact     *bool  `json:"count_is_exact,omitempty"`
+	TruncationNote   string `json:"truncation_note,omitempty"`
 }
 
 // UsageSummary is the compact completeness rollup on a find_usages

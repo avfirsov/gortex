@@ -28,9 +28,10 @@ func boundByLimit(rawCount, limit int) bool {
 // chose the effective limit, the caller's requested value rides along as
 // `_limit_requested`.
 //
-// SubGraph-returning tools (graph_query) carry the same disclosure as the
-// query.LimitTruncation struct instead — their responses serialize the
-// struct, not a map.
+// graph_query stamps the same flat shape on its SubGraph
+// (query.SubGraph's TruncatedByLimit field family), and additionally
+// folds the cut into sg.Truncated so the compact renderers that carry a
+// `truncated` header (gcx, TOON, compact) corroborate the flag too.
 func stampLimitTruncation(resp map[string]any, requested, applied int, note string) {
 	resp["_truncated_by_limit"] = true
 	resp["_limit_applied"] = applied

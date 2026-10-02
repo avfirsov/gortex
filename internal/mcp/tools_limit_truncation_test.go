@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	wire "github.com/gortexhq/gcx-go"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -85,12 +87,17 @@ func TestGraphQuery_LimitBoundResultDisclosesTruncation(t *testing.T) {
 	out := limitJSONResponse(t, res)
 
 	require.Equal(t, float64(2), out["total_nodes"])
-	bound, ok := out["_truncated_by_limit"].(map[string]any)
-	require.True(t, ok, "a result bound by limit must carry the _truncated_by_limit disclosure, got %v", out["_truncated_by_limit"])
-	require.Equal(t, float64(2), bound["limit_applied"])
-	note, _ := bound["truncation_note"].(string)
+	// The disclosure rides the same flat shape search_text and
+	// find_declaration stamp via stampLimitTruncation, so a client
+	// checking `_truncated_by_limit === true` handles every tool the
+	// same way (#845).
+	require.Equal(t, true, out["_truncated_by_limit"],
+		"a result bound by limit must carry the _truncated_by_limit disclosure")
+	require.Equal(t, float64(2), out["_limit_applied"])
+	require.Equal(t, false, out["count_is_exact"])
+	note, _ := out["truncation_note"].(string)
 	require.Contains(t, note, "floor")
-	_, present := bound["limit_requested"]
+	_, present := out["_limit_requested"]
 	require.False(t, present, "the caller's own limit bound this result; nothing was clamped")
 }
 
@@ -146,4 +153,39 @@ func TestStampLimitTruncation_OmitsRequestedWhenCallerChose(t *testing.T) {
 
 	_, present := resp["_limit_requested"]
 	require.False(t, present, "the caller's own limit bound this result; nothing was clamped")
+}
+
+// TestGraphQueryLimitTruncation_IsLegibleInCompactFormats pins the #845
+// review fix: gcx and TOON render a `truncated` flag from sg.Truncated,
+// so folding the limit cut into that flag is what keeps a limit-clamped
+// count from being corroborated by an explicit `truncated: false` in the
+// compact formats.
+func TestGraphQueryLimitTruncation_IsLegibleInCompactFormats(t *testing.T) {
+	sg := &query.SubGraph{
+		Nodes: []*graph.Node{
+			newTestNode("x.go::A", "A", graph.KindFunction, "x.go", 1),
+			newTestNode("x.go::B", "B", graph.KindFunction, "x.go", 5),
+		},
+		TotalNodes: 2,
+		// What handleGraphQuery stamps when the pipeline lands on limit.
+		Truncated:       true,
+		TruncatedByLimit: true,
+		LimitApplied:    2,
+		CountIsExact:    &[]bool{false}[0],
+		TruncationNote:  graphQueryTruncationNote,
+	}
+
+	t.Run("gcx meta", func(t *testing.T) {
+		payload, err := encodeSubGraph("graph_query", sg, nil)
+		require.NoError(t, err)
+		dec := wire.NewDecoder(strings.NewReader(string(payload)))
+		h, _ := dec.Header()
+		require.Equal(t, "true", h.Meta["truncated"])
+	})
+
+	t.Run("toon field", func(t *testing.T) {
+		out := subGraphToTOON(sg, nil)
+		require.Contains(t, out, "truncated: true",
+			"a limit-clamped count must not be corroborated by truncated: false")
+	})
 }

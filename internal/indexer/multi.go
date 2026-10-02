@@ -3517,14 +3517,7 @@ func capGrepMatches(matches []trigram.Match, limit int) []trigram.Match {
 // single-Indexer path (Indexer.GrepText) is used by callers without a
 // MultiIndexer.
 func (mi *MultiIndexer) GrepText(query string, limit int) []trigram.Match {
-	return capGrepMatches(mi.GrepTextForReposPaths(query, nil, nil, limit), limit)
-}
-
-// GrepTextPaths is GrepText restricted to repo-relative forward-slash
-// path prefixes applied inside each per-repo search, before that
-// repo's limit cut (issue #827). Empty prefixes mean unscoped.
-func (mi *MultiIndexer) GrepTextPaths(query string, pathPrefixes []string, limit int) []trigram.Match {
-	return capGrepMatches(mi.GrepTextForReposPaths(query, nil, pathPrefixes, limit), limit)
+	return capGrepMatches(mi.GrepTextForReposPaths(query, nil, nil, nil, limit), limit)
 }
 
 // GrepTextForRepos is the scoped variant of GrepText. When repoAllow is
@@ -3532,15 +3525,22 @@ func (mi *MultiIndexer) GrepTextPaths(query string, pathPrefixes []string, limit
 // searched repo independently; the returned union is intentionally not
 // globally capped so callers can apply path / graph-scope filters first.
 func (mi *MultiIndexer) GrepTextForRepos(query string, repoAllow map[string]bool, perRepoLimit int) []trigram.Match {
-	return mi.GrepTextForReposPaths(query, repoAllow, nil, perRepoLimit)
+	return mi.GrepTextForReposPaths(query, repoAllow, nil, nil, perRepoLimit)
 }
 
 // GrepTextForReposPaths is GrepTextForRepos with an in-search path
-// restriction: pathPrefixes are repo-relative forward-slash prefixes
-// each per-repo Indexer applies BEFORE its perRepoLimit cut, so a repo
-// whose unscoped head is all out-of-scope files still contributes its
-// in-scope matches (issue #827). Empty pathPrefixes mean unscoped.
-func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string]bool, pathPrefixes []string, perRepoLimit int) []trigram.Match {
+// restriction applied inside each per-repo search BEFORE that repo's
+// perRepoLimit cut, so a repo whose unscoped head is all out-of-scope
+// files still contributes its in-scope matches (issue #827).
+//
+// sharedPathPrefixes are repo-relative forward-slash prefixes every
+// searched repo applies. perRepoPathPrefixes routes repo-qualified
+// filters ("alpha/pkg/sub" — the spelling every graph tool returns) to
+// that repo alone as repo-relative remainders, so a repo-prefixed path
+// no longer fans out to every repo and zeroes the result there (#845).
+// A repo's effective set is the union of both; an empty string inside a
+// repo's set means the whole repo (unscoped). nil sets mean unscoped.
+func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string]bool, sharedPathPrefixes []string, perRepoPathPrefixes map[string][]string, perRepoLimit int) []trigram.Match {
 	if mi == nil || query == "" {
 		return nil
 	}
@@ -3549,7 +3549,7 @@ func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string
 		if idx == nil {
 			return nil
 		}
-		return stampGrepMatchPaths(prefix, idx.GrepTextPaths(query, pathPrefixes, perRepoLimit))
+		return stampGrepMatchPaths(prefix, idx.GrepTextPaths(query, effectivePathPrefixes(prefix, sharedPathPrefixes, perRepoPathPrefixes), perRepoLimit))
 	}
 
 	// Per-repo cap mirrors the caller's page size when set. The caller
@@ -3559,7 +3559,7 @@ func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string
 	jobs := mi.grepRepoJobs(repoAllow)
 	out := make([]trigram.Match, 0, len(jobs)*8)
 	for _, j := range jobs {
-		hits := j.idx.GrepTextPaths(query, pathPrefixes, perRepoLimit)
+		hits := j.idx.GrepTextPaths(query, effectivePathPrefixes(j.prefix, sharedPathPrefixes, perRepoPathPrefixes), perRepoLimit)
 		if len(hits) == 0 {
 			continue
 		}
@@ -3568,6 +3568,31 @@ func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string
 		// see the same shape they get from the graph nodes.
 		out = append(out, stampGrepMatchPaths(j.prefix, hits)...)
 	}
+	return out
+}
+
+// effectivePathPrefixes unions the shared and repo-qualified prefix sets
+// for one repo. An empty string in the repo's qualified set (a filter
+// naming the repo itself, e.g. `path: alpha`) makes the repo unscoped —
+// the filter selects the whole repo. A repo with no qualified entry
+// applies just the shared set; a repo WITH a qualified entry applies the
+// union, matching the additive semantics of the expanded post-filter.
+func effectivePathPrefixes(repo string, shared []string, perRepo map[string][]string) []string {
+	if len(perRepo) == 0 {
+		return shared
+	}
+	own, ok := perRepo[repo]
+	if !ok || len(own) == 0 {
+		return shared
+	}
+	for _, p := range own {
+		if p == "" {
+			return nil
+		}
+	}
+	out := make([]string, 0, len(shared)+len(own))
+	out = append(out, shared...)
+	out = append(out, own...)
 	return out
 }
 
@@ -3585,6 +3610,14 @@ func (mi *MultiIndexer) GrepRegexp(pattern, pathPrefix string, limit int) ([]tri
 		return nil, err
 	}
 	return capGrepMatches(hits, limit), nil
+}
+
+// GrepRegexpPaths is GrepRegexp restricted to repo-relative
+// forward-slash path prefixes, matched on segment boundaries and
+// applied inside each per-repo search BEFORE the limit cut (#845).
+// Empty prefixes mean unscoped.
+func (mi *MultiIndexer) GrepRegexpPaths(pattern string, pathPrefixes []string, limit int) ([]trigram.Match, error) {
+	return mi.GrepRegexpForReposPaths(pattern, nil, pathPrefixes, nil, limit)
 }
 
 // GrepRegexpForRepos is the scoped variant of GrepRegexp. repoAllow and
@@ -3609,6 +3642,46 @@ func (mi *MultiIndexer) GrepRegexpForRepos(pattern, pathPrefix string, repoAllow
 	out := make([]trigram.Match, 0, len(jobs)*8)
 	for _, j := range jobs {
 		hits, err := j.idx.GrepRegexp(pattern, pathPrefix, perRepoLimit)
+		if err != nil {
+			// First compile error short-circuits — the pattern is the
+			// caller's fault and won't compile in any other indexer
+			// either (the trigram searcher uses the same regexp engine).
+			return nil, err
+		}
+		if len(hits) == 0 {
+			continue
+		}
+		out = append(out, stampGrepMatchPaths(j.prefix, hits)...)
+	}
+	return out, nil
+}
+
+// GrepRegexpForReposPaths is GrepRegexpForRepos with the in-search path
+// restriction GrepTextForReposPaths applies to literal searches:
+// sharedPathPrefixes and perRepoPathPrefixes have the same union and
+// whole-repo ("") semantics, and the restriction lands BEFORE each
+// repo's perRepoLimit cut — so "Closes #827" holds for regexp queries
+// too, not just literals (#845).
+func (mi *MultiIndexer) GrepRegexpForReposPaths(pattern string, repoAllow map[string]bool, sharedPathPrefixes []string, perRepoPathPrefixes map[string][]string, perRepoLimit int) ([]trigram.Match, error) {
+	if mi == nil || pattern == "" {
+		return nil, nil
+	}
+	if prefix, ok := singleAllowedRepo(repoAllow); ok {
+		idx := mi.GetIndexer(prefix)
+		if idx == nil {
+			return nil, nil
+		}
+		hits, err := idx.GrepRegexpPaths(pattern, effectivePathPrefixes(prefix, sharedPathPrefixes, perRepoPathPrefixes), perRepoLimit)
+		if err != nil {
+			return nil, err
+		}
+		return stampGrepMatchPaths(prefix, hits), nil
+	}
+
+	jobs := mi.grepRepoJobs(repoAllow)
+	out := make([]trigram.Match, 0, len(jobs)*8)
+	for _, j := range jobs {
+		hits, err := j.idx.GrepRegexpPaths(pattern, effectivePathPrefixes(j.prefix, sharedPathPrefixes, perRepoPathPrefixes), perRepoLimit)
 		if err != nil {
 			// First compile error short-circuits — the pattern is the
 			// caller's fault and won't compile in any other indexer

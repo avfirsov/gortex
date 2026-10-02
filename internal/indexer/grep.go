@@ -6,7 +6,6 @@ import (
 	"regexp/syntax"
 	"sort"
 
-	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
@@ -55,15 +54,13 @@ func (idx *Indexer) GrepTextPaths(query string, prefixes []string, limit int) []
 }
 
 // filterKnownPathsByPrefix keeps the known file list entries sitting
-// under one of the forward-slash repo-relative prefixes.
+// under one of the forward-slash repo-relative prefixes, matched on
+// segment boundaries — the same semantics the warm path applies.
 func filterKnownPathsByPrefix(paths, prefixes []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, rel := range paths {
-		for _, pre := range prefixes {
-			if graphpath.HasPrefix(rel, pre) {
-				out = append(out, rel)
-				break
-			}
+		if trigram.PathUnderAnyPrefix(rel, prefixes) {
+			out = append(out, rel)
 		}
 	}
 	return out
@@ -248,6 +245,34 @@ func (idx *Indexer) GrepRegexp(pattern, pathPrefix string, limit int) ([]trigram
 	// which is what the literal-free branch of the warm path does anyway.
 	matches, _ := trigram.GrepRegexpPathsBounded(
 		context.Background(), idx.rootPath, idx.knownFilePaths(), re, pathPrefix, limit, 0,
+	)
+	return matches, nil
+}
+
+// GrepRegexpPaths is GrepRegexp restricted to documents under one of
+// the forward-slash path prefixes, matched on segment boundaries. The
+// restriction applies BEFORE the limit cut, so a regexp query scoped
+// with `path` surfaces scoped matches even when out-of-scope files own
+// the head of the global ordering (issue #827 for regexp queries,
+// #845). Empty prefixes mean unscoped.
+func (idx *Indexer) GrepRegexpPaths(pattern string, prefixes []string, limit int) ([]trigram.Match, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	if s := idx.warmTrigramSearcher(); s != nil {
+		literals := extractRegexLiterals(pattern)
+		return s.GrepRegexpPaths(re, literals, prefixes, limit), nil
+	}
+	// Streaming fallback: the prefix restriction filters the known file
+	// list before the bounded scan, so the cold path keeps the same
+	// pre-truncation semantics as the warm one.
+	filtered := filterKnownPathsByPrefix(idx.knownFilePaths(), prefixes)
+	matches, _ := trigram.GrepRegexpPathsBounded(
+		context.Background(), idx.rootPath, filtered, re, "", limit, 0,
 	)
 	return matches, nil
 }

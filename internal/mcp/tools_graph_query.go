@@ -54,7 +54,7 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 		limit = 100
 	}
 	// Kept so the response can say the cap, not the caller, chose the
-	// effective limit (see query.LimitTruncation).
+	// effective limit (see the query.SubGraph disclosure fields).
 	requestedLimit := limit
 	if limit > 1000 {
 		limit = 1000
@@ -76,17 +76,22 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 	// exactly limit nodes is disclosed even when the graph held exactly
 	// that many — a spurious "verify this" is the safe direction.
 	if boundByLimit(len(sg.Nodes), limit) {
-		disc := &query.LimitTruncation{
-			Applied: limit,
-			Note:    graphQueryTruncationNote,
-		}
-		// Requested only rides along when the cap, not the caller, chose
-		// the effective limit — an int can't carry that distinction via
-		// omitempty, so the field is populated conditionally.
+		// sg.Truncated folds the limit cut into the flag the compact
+		// renderers already emit: gcx's `truncated` meta and TOON's
+		// `truncated` field were rendering `false` next to a limit-clamped
+		// count — the exact #672 failure mode in compact formats (#845).
+		sg.Truncated = true
+		// JSON rides the flat disclosure shape search_text and
+		// find_declaration emit, so a client checking
+		// `_truncated_by_limit === true` handles every tool the same way.
+		sg.TruncatedByLimit = true
+		sg.LimitApplied = limit
+		exact := false
+		sg.CountIsExact = &exact
+		sg.TruncationNote = graphQueryTruncationNote
 		if requestedLimit > limit {
-			disc.Requested = requestedLimit
+			sg.LimitRequested = requestedLimit
 		}
-		sg.TruncatedByLimit = disc
 	}
 
 	allowed, filterErr := s.resolveRepoFilter(ctx, req)
