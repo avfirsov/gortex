@@ -136,13 +136,14 @@ func xmlEscape(s string) string {
 // introducer across the whole unit file (systemd.unit(5)) — an
 // unescaped `%d` in a path would expand to a directory specifier and
 // silently change the value the daemon sees. An assignment containing
-// whitespace is additionally double-quoted as a whole (with embedded quotes /
-// backslashes escaped): systemd.syntax(7) recognizes a quote only at the
-// start of an item, so `KEY="a b"` would not be unquoted. Plain paths (the
-// common case) pass through unchanged.
+// whitespace, a backslash or a quote is additionally double-quoted as a whole
+// (with embedded quotes / backslashes escaped): systemd.syntax(7) recognizes
+// a quote only at the start of an item, so `KEY="a b"` would not be unquoted,
+// and systemd applies C-style escapes such as `\t` to unquoted text too.
+// Plain paths (the common case) pass through unchanged.
 func systemdEnvValue(v string) string {
 	v = strings.ReplaceAll(v, "%", "%%")
-	if !strings.ContainsAny(v, " \t") {
+	if !strings.ContainsAny(v, " \t\\\"'") {
 		return v
 	}
 	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)

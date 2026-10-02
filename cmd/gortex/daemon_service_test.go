@@ -283,6 +283,15 @@ func TestSystemdEnvValue_QuotesWhitespace(t *testing.T) {
 	assert.Equal(t, `"/home/u/my data"`, systemdEnvValue("/home/u/my data"))
 }
 
+// TestSystemdEnvValue_QuotesEscapesAndQuotes covers characters systemd
+// interprets in unquoted text: a backslash starts a C-style escape (`\t`
+// would become a tab), and a quote starts a quoted section.
+func TestSystemdEnvValue_QuotesEscapesAndQuotes(t *testing.T) {
+	assert.Equal(t, `"PATH=/opt/a\\tools"`, systemdEnvValue(`PATH=/opt/a\tools`))
+	assert.Equal(t, `"PATH=/opt/\"q\"/bin"`, systemdEnvValue(`PATH=/opt/"q"/bin`))
+	assert.Equal(t, `"PATH=/opt/it's/bin"`, systemdEnvValue(`PATH=/opt/it's/bin`))
+}
+
 // TestSystemdEnvValue_EscapesPercent guards the systemd specifier escape:
 // a literal % in a path must become %% or systemd expands it (e.g. %d)
 // and the daemon resolves a different directory than was captured.
