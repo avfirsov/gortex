@@ -313,7 +313,7 @@ func runConfigExcludeList(cmd *cobra.Command, _ []string) error {
 					}
 				}
 			}
-			// Unknown top-level keys are silently dropped by yaml.Unmarshal;
+			// Unknown keys at any depth are silently dropped by yaml.Unmarshal;
 			// flag them here where a config typo is cheapest to spot.
 			if unknown := config.UnknownWorkspaceKeys(wsPath); len(unknown) > 0 {
 				fmt.Fprintf(cmd.ErrOrStderr(),

@@ -211,8 +211,8 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	// A repo .gortex.yaml that fails to parse, or carries unknown
-	// top-level keys, is silently reduced to defaults — the exact moment
+	// A repo .gortex.yaml that fails to parse, or carries unknown keys
+	// (at any depth), is silently reduced to defaults — the exact moment
 	// a one-character typo turns into "indexing proceeds on the wrong
 	// file set". Say it out loud before anything else runs.
 	warnIfWorkspaceConfigIgnored(cmd.ErrOrStderr(), absRoot)

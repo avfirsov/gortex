@@ -670,6 +670,59 @@ func TestLoadWorkspaceConfig_MalformedEditKeepsLastGoodParse(t *testing.T) {
 	assert.Equal(t, []string{"good/**"}, cfg.Exclude)
 }
 
+// TestLoadWorkspaceConfig_ReadErrorVsParseError pins the split between
+// the two failure messages in readWorkspaceConfig: a file that cannot be
+// READ (here, `.gortex.yaml` as a directory) must report "failed to read
+// workspace config", while a file that reads but does not PARSE must
+// report "malformed workspace config, keeping the last good parse".
+// Forcing one message for every error must fail this test.
+func TestLoadWorkspaceConfig_ReadErrorVsParseError(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+	core, logs := observer.New(zapcore.WarnLevel)
+	cm.SetLogger(zap.New(core))
+
+	// Read error: the path exists but is a directory, so os.ReadFile
+	// fails with EISDIR on every platform.
+	readDir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(readDir, ".gortex.yaml"), 0o755))
+	cm.LoadWorkspaceConfig("repo", readDir)
+
+	// Parse error: the file reads fine but is not valid YAML.
+	parseDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(parseDir, ".gortex.yaml"),
+		[]byte(":::invalid yaml content"), 0o644))
+	cm.LoadWorkspaceConfig("repo", parseDir)
+
+	readMsg := "failed to read workspace config"
+	parseMsg := "malformed workspace config, keeping the last good parse"
+	var sawRead, sawParse bool
+	for _, e := range logs.All() {
+		switch e.Message {
+		case readMsg:
+			sawRead = true
+		case parseMsg:
+			sawParse = true
+		}
+	}
+	assert.True(t, sawRead, "a read failure must report %q, got: %v", readMsg, logMessages(logs))
+	assert.True(t, sawParse, "a parse failure must report %q, got: %v", parseMsg, logMessages(logs))
+}
+
+// logMessages is a failure-report helper: the distinct warning messages
+// the observer captured, for a compact assertion diff.
+func logMessages(logs *observer.ObservedLogs) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range logs.All() {
+		if !seen[e.Message] {
+			seen[e.Message] = true
+			out = append(out, e.Message)
+		}
+	}
+	return out
+}
+
 func TestLoadWorkspaceConfig_WarnsOnUnknownKeys(t *testing.T) {
 	core, logs := observer.New(zapcore.WarnLevel)
 	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")

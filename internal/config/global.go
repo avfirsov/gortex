@@ -209,14 +209,12 @@ func UnknownGlobalKeys(configPath ...string) []string {
 	return unknownTopLevelKeysIn(path, knownGlobalTopLevelKeys)
 }
 
-// knownWorkspaceTopLevelKeys is intentionally not maintained by hand: the
-// authoritative key set is the mapstructure tag tree of config.Config, which
-// UnknownWorkspaceKeys validates against via mapstructure metadata.
-
 // UnknownWorkspaceKeys returns the dotted paths of keys present in the
 // repo-level `.gortex.yaml` at path that gortex does not recognise — at
 // any depth, so `index.ignore` (a typo for the real index.exclude) is
-// caught, not just a misplaced top-level block. It never fails: a missing
+// caught, not just a misplaced top-level block. The key set is not
+// maintained by hand: it is the mapstructure tag tree of config.Config,
+// validated via mapstructure metadata. It never fails: a missing
 // or unparseable file yields no keys, so forward compatibility is
 // preserved and the parse failure is reported through the
 // malformed-config warning instead.
