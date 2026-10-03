@@ -178,6 +178,36 @@ func utf16FileBytes(t *testing.T, dir string) []byte {
 // the NUL-interleaved bytes and report written:true. The refusal must come
 // from the write planner (before any plan is materialised) and the file must
 // keep its exact bytes.
+// TestScaffold_RefusesUTF16SourceAndLeavesFileUntouched pins the scaffold
+// write path (#846): scaffold's non-dry-run apply used to read, splice and
+// write with os.WriteFile directly — outside commitFileMutation — so a
+// UTF-16 source came back "applied": true with the file grown by an odd
+// byte count, corrupting everything after the insertion point. The write
+// now funnels through commitFileMutation, whose UTF-16 guard refuses it.
+func TestScaffold_RefusesUTF16SourceAndLeavesFileUntouched(t *testing.T) {
+	srv, dir := utf16ServerWith(t)
+	node := utf16SymbolNamed(t, srv, "Legacy.cs", "B")
+	original := utf16FileBytes(t, dir)
+
+	// findAndCallHandler's eager map does not carry the deferred
+	// enhancement tools, so the handler is invoked directly — the same
+	// pattern the safe_delete refusal test below uses.
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "scaffold"
+	req.Params.Arguments = map[string]any{
+		"id": node.ID, "new_name": "Cee", "dry_run": false,
+	}
+	res, err := srv.handleScaffold(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError, "a UTF-16 source must be refused, not scaffolded into: %+v", res.Content)
+	msg := res.Content[0].(mcplib.TextContent).Text
+	require.Contains(t, msg, "UTF-16", "the refusal must name the encoding")
+	require.Contains(t, msg, "scaffold", "the refusal must name the tool that refused")
+
+	after := utf16FileBytes(t, dir)
+	require.Equal(t, original, after, "the refused scaffold must not touch the file's bytes")
+}
+
 func TestRenameSymbol_RefusesUTF16SourceAndLeavesFileUntouched(t *testing.T) {
 	srv, dir := utf16ServerWith(t)
 	node := utf16SymbolNamed(t, srv, "Legacy.cs", "B")

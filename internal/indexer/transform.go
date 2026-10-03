@@ -310,10 +310,16 @@ func (bomStripTransform) apply(_ string, src []byte) ([]byte, error) {
 // remains, and a coordinate-stable preparation still refuses the source
 // outright (see neutralizeSourceBOM).
 func stripBOM(src []byte) []byte {
-	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+	switch {
+	case len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF:
 		return src[3:]
+	case len(src) >= 2 && src[0] == 0xFF && src[1] == 0xFE:
+		return src[2:]
+	case len(src) >= 2 && src[0] == 0xFE && src[1] == 0xFF:
+		return src[2:]
+	default:
+		return src
 	}
-	return src
 }
 
 // --- user-pluggable: external command ------------------------------------

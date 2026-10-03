@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -274,7 +275,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
-	deletedIDs, err := applyPendingDeletes(pending)
+	deletedIDs, err := s.applyPendingDeletes(ctx, pending)
 	if err != nil {
 		// Fail-fast: surface what was done up to this point so the
 		// caller can recover. Treat the failure as a tool error.
@@ -343,7 +344,7 @@ type pendingDelete struct {
 // rewritten once. Returns the IDs of symbols whose bytes were
 // removed; on first error, the partial list rides alongside the
 // error.
-func applyPendingDeletes(pending []*pendingDelete) ([]string, error) {
+func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDelete) ([]string, error) {
 	byFile := map[string][]*pendingDelete{}
 	order := []string{}
 	for _, p := range pending {
@@ -398,8 +399,21 @@ func applyPendingDeletes(pending []*pendingDelete) ([]string, error) {
 			deleted = append(deleted, p.node.ID)
 		}
 		newContent := strings.Join(lines, "\n")
-		if err := os.WriteFile(abs, []byte(newContent), 0o644); err != nil {
-			return deleted, fmt.Errorf("could not write %s: %v", abs, err)
+		// The UTF-16 refusal above is the early, per-file UX; the commit
+		// funnels through commitFileMutation so safe_delete shares the
+		// cancellation gate, the atomic rename, and the mutation receipt
+		// with every other mutating writer (#846: "every writer funnels
+		// here" is meant literally).
+		rel := abs
+		if s.indexer != nil {
+			if root := s.indexer.RootPath(); root != "" {
+				if r, rerr := filepath.Rel(root, abs); rerr == nil {
+					rel = r
+				}
+			}
+		}
+		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), 0o644); werr != nil {
+			return deleted, fmt.Errorf("could not write %s: %v", abs, werr)
 		}
 	}
 	return deleted, nil
