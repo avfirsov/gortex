@@ -84,10 +84,12 @@ type IndexResult struct {
 	QuarantinedFiles int `json:"quarantined_files,omitempty"`
 	// SkippedFiles is the number of files skipped by the size cap
 	// (MaxFileSize), the per-file extraction timeout (MaxExtractMillis),
-	// or the content-admission policy (index.content — oversized documents
-	// and, by default, binary/vector data assets). Each is recorded in the
-	// graph as a synthetic file node carrying skipped_due_to_size /
-	// skipped_due_to_timeout / skipped_due_to_content telemetry. Zero
+	// a binary-content sniff (a NUL byte in the prefix — a tool cache or
+	// object file claimed by a language extension), or the content-admission
+	// policy (index.content — oversized documents and, by default, binary/
+	// vector data assets). Each is recorded in the graph as a synthetic file
+	// node carrying skipped_due_to_size / skipped_due_to_timeout /
+	// skipped_due_to_binary / skipped_due_to_content telemetry. Zero
 	// unless one of those gates fires.
 	SkippedFiles int `json:"skipped_files,omitempty"`
 	// DeletedFileCount is the number of previously-indexed files that
@@ -3312,6 +3314,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var fileCount int64
 	var skippedByTimeout int64
 	var skippedByMinified int64
+	var skippedByBinary int64
 	// Parse-subphase instrumentation. The per-stage numbers are SUMMED
 	// worker nanoseconds — read/extract/batch overlap across the pool, so
 	// their sum legitimately exceeds the critical-path wall emitted beside
@@ -3612,6 +3615,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						}
 						if _, ok := result.Nodes[0].Meta["skipped_due_to_minified"]; ok {
 							atomic.AddInt64(&skippedByMinified, 1)
+						}
+						if _, ok := result.Nodes[0].Meta["skipped_due_to_binary"]; ok {
+							atomic.AddInt64(&skippedByBinary, 1)
 						}
 					}
 
@@ -4219,7 +4225,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		EdgeCount:        edges,
 		FileCount:        int(fileCount),
 		QuarantinedFiles: quarantine.Len(),
-		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified),
+		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
 		DurationMs:       time.Since(start).Milliseconds(),
 		Errors:           errors,
 	}

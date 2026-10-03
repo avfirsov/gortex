@@ -2557,6 +2557,16 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 
 	var entries []analysis.HotspotEntry
 	if threshold == 0 {
+		// getHotspots serves the cached ranking, which does not exist
+		// until the first RunAnalysis pass lands (analysisEpoch == 0
+		// until then, and ensureHotspots fails closed with nil). Gating
+		// on the on-demand pass keeps this handler aligned with the
+		// sibling communities/processes handlers: before the pass the
+		// caller gets analysis_pending with a retry hint instead of an
+		// empty ranking indistinguishable from "no hotspots".
+		if pending := s.ensureAnalysis(); !pending.Ready {
+			return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "hotspots"))
+		}
 		entries = s.getHotspots()
 	} else {
 		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)

@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,11 +151,45 @@ func TestParseFile_RejectsUTF16Source(t *testing.T) {
 	})
 }
 
-// TestParseCtx_DeadlineAbortsPathologicalParse pins the deadline fix:
+// TestParseFile_RejectsBinarySource pins the binary-content guard: a
+// NUL byte in the sniff window means the bytes are not text any grammar
+// can consume (a tool-cache .pkl claimed by the Pkl extension was the
+// reported case), and the guard must fail fast — before the parse pool
+// or any error-recovery balancing work.
+func TestParseFile_RejectsBinarySource(t *testing.T) {
+	pickle := append([]byte("\x80\x04\x95\x1a\x00\x00"), make([]byte, 512)...)
+	start := time.Now()
+	tree, err := ParseFile(pickle, golang.GetLanguage())
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, ErrBinarySource)
+	assert.Nil(t, tree)
+	assert.Less(t, elapsed, time.Second,
+		"the binary guard must fail fast, before any parse work")
+
+	t.Run("nul-beyond-window-is-not-sniffed", func(t *testing.T) {
+		// The sniff covers the first 8 KiB only. Text whose first NUL
+		// sits past the window parses (tree-sitter is error-tolerant);
+		// the indexer's own sniff of the full prefix is what catches it.
+		late := append([]byte(strings.Repeat("a", binarySniffBytes)), 0x00)
+		tree, err := ParseFile(late, golang.GetLanguage())
+		if err == nil {
+			tree.Close()
+		}
+		require.NoError(t, err)
+	})
+
+	t.Run("text-still-parses", func(t *testing.T) {
+		tree, err := ParseFile([]byte("package main\n\nfunc A() {}\n"), golang.GetLanguage())
+		require.NoError(t, err)
+		tree.Close()
+	})
+}
+
+// TestParseCtx_DeadlineAbortsPathologicalParse pins existing behaviour:
 // NUL-interleaved (UTF-16-shaped) bytes drive tree-sitter's error-recovery
-// balancing hard, and before the end-clock fix the context deadline was
-// never honored in that phase (the ProgressCallback is not invoked while
-// balancing). The parse must now abort at the budget.
+// balancing hard, and the context deadline IS honored in every phase —
+// tree-sitter's progress check fires in balancing too. The parse must
+// abort at the budget.
 func TestParseCtx_DeadlineAbortsPathologicalParse(t *testing.T) {
 	var b bytes.Buffer
 	pattern := []byte("f\x00u\x00n\x00c\x00 \x00x\x00(\x00)\x00 \x00{\x00 \x00a\x00=\x00b\x00;\x00 \x00}\x00\n\x00")
@@ -172,10 +207,8 @@ func TestParseCtx_DeadlineAbortsPathologicalParse(t *testing.T) {
 	defer cancel()
 	_, err := p.ParseCtx(ctx, nil, src)
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Skipf("grammar parsed the input in %v; timeout path not exercised", elapsed)
-	}
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"the pathological parse must exceed the budget and abort, not finish in %v", elapsed)
 	assert.Less(t, elapsed, 5*time.Second,
 		"the deadline must abort the parse, not merely be recorded")
 }
