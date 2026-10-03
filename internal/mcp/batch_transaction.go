@@ -837,6 +837,11 @@ func batchAliasedPathPairs(paths []string, followed func(string) os.FileInfo) []
 }
 
 func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, error) {
+	// Same UTF-16 refusal as edit_file: the match below would fail with
+	// a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		return nil, false, refuseUTF16Edit("batch edit_file", edit.Path)
+	}
 	fileStr := string(content)
 	matches := findEOLMatches(fileStr, edit.OldString)
 	if matches.count == 0 {

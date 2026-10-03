@@ -204,6 +204,12 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", err)), nil
 	}
+	// Refuse the same way edit_file does: the deletion splices graph-derived
+	// UTF-8 lines into NUL-interleaved bytes (#846). This also covers the
+	// dry-run preview, whose raw-byte line split would be NUL-laden garbage.
+	if indexer.LooksUTF16Source(content) {
+		return mcp.NewToolResultError(refuseUTF16Edit("safe_delete_symbol", node.FilePath).Error()), nil
+	}
 	lines := strings.Split(string(content), "\n")
 	if node.StartLine > len(lines) || node.EndLine > len(lines) {
 		return mcp.NewToolResultError("symbol line range exceeds file length"), nil
@@ -353,6 +359,11 @@ func applyPendingDeletes(pending []*pendingDelete) ([]string, error) {
 		content, err := os.ReadFile(abs)
 		if err != nil {
 			return deleted, fmt.Errorf("could not read %s: %v", abs, err)
+		}
+		// Refuse UTF-16 sources before splicing raw bytes (#846) — this is
+		// the shared delete writer, so cascade targets are covered too.
+		if indexer.LooksUTF16Source(content) {
+			return deleted, refuseUTF16Edit("safe_delete_symbol", abs)
 		}
 		lines := strings.Split(string(content), "\n")
 		// Materialise ranges for entries that arrived with zero

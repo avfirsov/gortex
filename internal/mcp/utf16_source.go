@@ -64,3 +64,16 @@ func refuseUTF16Edit(tool, path string) error {
 		" is UTF-16 on disk, and a text splice into its NUL-interleaved bytes would corrupt it. " +
 		"Re-encode the file as UTF-8 (e.g. `iconv -f UTF-16LE -t UTF-8`), edit it externally, and let the watcher re-index.")
 }
+
+// guardUTF16SourceWrite is the shared write-path check (#846): every tool
+// that commits bytes to a source file funnels through commitFileMutation,
+// which calls it, so a text-splice writer added later refuses here too.
+// Handlers whose pre-write matching would fail with a misleading message
+// call it (or the content-based check) early instead, for the encoding-
+// specific refusal before any work is planned.
+func guardUTF16SourceWrite(tool, relPath, absPath string) error {
+	if fileLooksUTF16(absPath) {
+		return refuseUTF16Edit(tool, relPath)
+	}
+	return nil
+}

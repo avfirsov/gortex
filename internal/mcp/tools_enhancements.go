@@ -4349,6 +4349,12 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
 		return res
 	}
+	// Same UTF-16 refusal as edit_file: the match below would fail with a
+	// misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_file", relPath).Error()
+		return res
+	}
 	fileStr := string(content)
 	matches := findEOLMatches(fileStr, edit.OldString)
 	count := matches.count
