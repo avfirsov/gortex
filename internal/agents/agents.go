@@ -52,9 +52,18 @@ type SkillFilesWriter interface {
 // instruction file carries the block as well — while MCP/KI-only
 // adapters (antigravity, kimi, kiro, …) implement neither, so the init
 // stage summary counts delivery mechanisms from declarations instead of
-// assuming every non-skill-file adapter routes.
+// assuming every non-skill-file adapter routes. The path is declared as
+// well: several adapters share one instruction file (four of them
+// upsert into the repo's AGENTS.md, vscode and copilot-cli into
+// .github/copilot-instructions.md), so the summary counts distinct
+// files, not adapters.
 type RoutingBlockWriter interface {
 	WritesCommunitiesRouting() bool
+
+	// CommunitiesRoutingPath reports the instruction file (project
+	// mode) that carries the communities routing block. It must return
+	// the same path the adapter's Plan/Apply write the block to.
+	CommunitiesRoutingPath(env Env) string
 }
 
 // Mode selects between per-repo and user-level installation.

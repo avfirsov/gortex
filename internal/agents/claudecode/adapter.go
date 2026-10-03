@@ -41,6 +41,13 @@ func (a *Adapter) WritesSkillFiles() bool { return true }
 // communities routing block into its instruction file (project mode).
 func (a *Adapter) WritesCommunitiesRouting() bool { return true }
 
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode (the communities block is canonical in AGENTS.md; CLAUDE.md only carries the import).
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, "AGENTS.md")
+}
+
+
 // Detect always returns true. Claude Code is the "home" agent for
 // `gortex init` — a project may not be opened in Claude Code today
 // but we always want the integration files on disk so the team's

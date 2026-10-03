@@ -97,6 +97,13 @@ var lookCopilotBinary = func() (string, error) { return exec.LookPath("copilot")
 // communities routing block into its instruction file (project mode).
 func (a *Adapter) WritesCommunitiesRouting() bool { return true }
 
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return repoInstructionsPath(env.Root)
+}
+
+
 // Detect looks for the `copilot` binary or an existing config home.
 // Deliberately never keys off .vscode — Copilot-in-VS-Code is the
 // `vscode` adapter's host, and detecting on it here would configure the

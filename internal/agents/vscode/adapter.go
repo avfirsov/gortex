@@ -38,6 +38,13 @@ func (a *Adapter) DocsURL() string { return DocsURL }
 // communities routing block into its instruction file (project mode).
 func (a *Adapter) WritesCommunitiesRouting() bool { return true }
 
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".github", "copilot-instructions.md")
+}
+
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if _, err := os.Stat(filepath.Join(env.Root, ".vscode")); err == nil {
 		return true, nil

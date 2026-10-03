@@ -96,6 +96,13 @@ func (a *Adapter) WritesSkillFiles() bool { return true }
 // communities routing block into its instruction file (project mode).
 func (a *Adapter) WritesCommunitiesRouting() bool { return true }
 
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, "AGENTS.md")
+}
+
+
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("codex"); err == nil && p != "" {

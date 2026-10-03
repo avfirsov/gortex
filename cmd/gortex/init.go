@@ -313,7 +313,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 				if len(generated) > 0 {
 					env.GeneratedSkills = toEnvSkills(generated)
 					env.SkillsRouting = routing
-					prog.StageDone(stageSkills, skillsStageLabel(len(generated), running))
+					prog.StageDone(stageSkills, skillsStageLabel(len(generated), running, env))
 				} else {
 					prog.StageDone(stageSkills, fmt.Sprintf("no communities large enough (min-size: %d)", initSkillsMinSize))
 				}
@@ -341,13 +341,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	// "Configured" counts adapters Apply actually ran: an undetected
 	// adapter still returns a Result (Detected: false, nothing written),
 	// and counting it claimed setup that never happened.
-	configured := 0
-	for _, r := range results {
-		if r.Detected {
-			configured++
-		}
-	}
-	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", configured))
+	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", countConfigured(results)))
 
 	// Always update Gortex's own global config so the daemon picks
 	// up this repo next time it starts (harmless when no daemon).
@@ -372,11 +366,22 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	return nil
 }
 
+// countConfigured reports how many Apply results came from an adapter
+// that actually ran. An undetected adapter still returns a Result
+// (Detected: false, nothing written) — it must not count as configured.
+func countConfigured(results []*agents.Result) int {
+	n := 0
+	for _, r := range results {
+		if r != nil && r.Detected {
+			n++
+		}
+	}
+	return n
+}
+
 // runningAdapters filters selected down to the adapters Apply will not
-// skip: Apply gates on Detect() unless ApplyOpts.ForceDetect is set
-// (gortex init never sets it today, but the helper honours it so the
-// summaries cannot drift from Apply's gate). Detect errors mirror
-// Apply's own handling — treated as not detected.
+// skip: Apply gates on Detect(), and gortex init never sets ForceDetect.
+// Detect errors mirror Apply's own handling — treated as not detected.
 func runningAdapters(selected []agents.Adapter, env agents.Env) []agents.Adapter {
 	running := make([]agents.Adapter, 0, len(selected))
 	for _, a := range selected {
@@ -397,15 +402,24 @@ func runningAdapters(selected []agents.Adapter, env agents.Env) []agents.Adapter
 // of skill files counted the neither-adapter class, and counting from
 // the unfiltered selection counted adapters Apply never runs — a flat
 // or inflated summary sent users hunting for files that are never
-// written.
-func skillsStageLabel(n int, running []agents.Adapter) string {
+// written. The routing count is over distinct instruction files, not
+// adapters: four adapters (claude-code, codex, opencode, pi) upsert the
+// block into the same repo AGENTS.md and vscode / copilot-cli share
+// .github/copilot-instructions.md, so counting adapters claimed the
+// same file once per writer.
+func skillsStageLabel(n int, running []agents.Adapter, env agents.Env) string {
 	files, routing := 0, 0
+	seenRouting := make(map[string]bool, len(running))
 	for _, a := range running {
 		if w, ok := a.(agents.SkillFilesWriter); ok && w.WritesSkillFiles() {
 			files++
 		}
 		if r, ok := a.(agents.RoutingBlockWriter); ok && r.WritesCommunitiesRouting() {
-			routing++
+			path := r.CommunitiesRoutingPath(env)
+			if !seenRouting[path] {
+				seenRouting[path] = true
+				routing++
+			}
 		}
 	}
 	switch {
