@@ -30,8 +30,8 @@ As of upstream v1.10.1, no released version keeps torn-down watches alive.
   completion packet is dequeued. Packets for torn-down watches are dropped.
   Packets for superseded reads are parsed but do not re-arm. Teardown runs
   once per watch, so its handle is closed once. `Close` waits for outstanding
-  packets before closing the port. Submitted upstream as a pull request
-  against fsnotify#768.
+  packets before closing the port. Submitted upstream as
+  [fsnotify#782](https://github.com/fsnotify/fsnotify/pull/782).
 - `backend_windows.go`: `sendError` puts `Close`'s handshake token back the way
   `sendEvent` does, from
   [fsnotify#769](https://github.com/fsnotify/fsnotify/pull/769).
