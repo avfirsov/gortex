@@ -2726,8 +2726,15 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 			newLines = append(newLines, "")
 			newLines = append(newLines, edit.Code)
 			newLines = append(newLines, lines[insertIdx:]...)
+			// Keep the file's existing mode: the atomic commit applies perm
+			// to the replacement, so a fixed 0o644 would strip a script's
+			// executable bit.
+			perm := os.FileMode(0o644)
+			if info, err := os.Stat(absPath); err == nil {
+				perm = info.Mode().Perm()
+			}
 			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edit.FilePath, absPath,
-				[]byte(strings.Join(newLines, "\n")), 0o644)
+				[]byte(strings.Join(newLines, "\n")), perm)
 			if writeErr != nil {
 				if errors.Is(writeErr, errMutationNotApplied) {
 					return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil

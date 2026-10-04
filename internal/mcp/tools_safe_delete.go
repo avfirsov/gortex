@@ -412,7 +412,14 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 				}
 			}
 		}
-		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), 0o644); werr != nil {
+		// Keep the file's existing mode: the atomic commit applies perm to
+		// the replacement, so a fixed 0o644 would strip a script's
+		// executable bit.
+		perm := os.FileMode(0o644)
+		if info, err := os.Stat(abs); err == nil {
+			perm = info.Mode().Perm()
+		}
+		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), perm); werr != nil {
 			return deleted, fmt.Errorf("could not write %s: %v", abs, werr)
 		}
 	}
