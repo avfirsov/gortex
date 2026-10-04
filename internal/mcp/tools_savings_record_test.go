@@ -41,10 +41,6 @@ func TestReadFamilyToolsRecordSavings(t *testing.T) {
 		return parsed.ETag
 	}
 
-	// Replay each etag immediately after a transferring call. Neighbourhood
-	// walks with Detail:"brief" nil live node Meta (stripMeta), so the first
-	// replay can still transfer once the payload settles. After that, a
-	// matching if_none_match must book nothing.
 	recordThenWarmPoll := func(name string, args map[string]any) {
 		t.Helper()
 		before := calls()
@@ -53,24 +49,13 @@ func TestReadFamilyToolsRecordSavings(t *testing.T) {
 		afterTransfer := calls()
 		require.Greater(t, afterTransfer, before, "%s must record a savings observation", name)
 
-		replay := func(etag string) *mcplib.CallToolResult {
-			t.Helper()
-			next := make(map[string]any, len(args)+1)
-			for k, v := range args {
-				next[k] = v
-			}
-			next["if_none_match"] = etag
-			out := callToolByName(t, srv, ctx, name, next)
-			require.False(t, out.IsError, "not-modified %s must succeed: %s", name, textOfResult(t, out))
-			return out
+		replay := make(map[string]any, len(args)+1)
+		for k, v := range args {
+			replay[k] = v
 		}
-
-		etag := etagOf(textOfResult(t, res))
-		res = replay(etag)
-		if calls() != afterTransfer {
-			afterTransfer = calls()
-			res = replay(etagOf(textOfResult(t, res)))
-		}
+		replay["if_none_match"] = etagOf(textOfResult(t, res))
+		res = callToolByName(t, srv, ctx, name, replay)
+		require.False(t, res.IsError, "not-modified %s must succeed: %s", name, textOfResult(t, res))
 		require.Equal(t, afterTransfer, calls(), "not-modified %s must not record", name)
 	}
 
@@ -82,10 +67,19 @@ func TestReadFamilyToolsRecordSavings(t *testing.T) {
 	require.Equal(t, int64(3), calls(), "get_editing_context must record a savings observation")
 
 	recordThenWarmPoll("get_symbol_source", map[string]any{"id": "main.go::Hello"})
-	recordThenWarmPoll("batch_symbols", map[string]any{
+
+	batchArgs := map[string]any{
 		"ids":            []any{"myrepo/main.go::Hello"},
 		"include_source": true,
-	})
+	}
+	// batch_symbols walks callers/callees with Detail:"brief", which
+	// ends in query.stripMeta. On graph.New() that nils Meta on the
+	// stored nodes, so the first payload includes Hello's signature and
+	// the next does not. SQLite GetNode returns a copy, so a production
+	// daemon is unaffected. Prime once so the baseline ETag is stable.
+	prime := callToolByName(t, srv, ctx, "batch_symbols", batchArgs)
+	require.False(t, prime.IsError, "batch_symbols prime must succeed: %s", textOfResult(t, prime))
+	recordThenWarmPoll("batch_symbols", batchArgs)
 	recordThenWarmPoll("smart_context", map[string]any{"task": "Hello"})
 
 	snap := srv.tokenStats.snapshot()
