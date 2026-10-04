@@ -222,7 +222,6 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/coder/hnsw v0.6.1
 	github.com/davalillo/tree-sitter-mql5 v0.2.0
-	github.com/fsnotify/fsnotify v1.10.1
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/gofrs/flock v0.13.1
@@ -304,6 +303,7 @@ require (
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/gomlx/compute v0.1.14 // indirect
 	github.com/gomlx/compute-onnx v0.1.13 // indirect
